@@ -10,13 +10,53 @@ const scrollContainer = ref<HTMLElement | null>(null);
 const sentinel = ref<HTMLElement | null>(null);
 let observer: IntersectionObserver | null = null;
 
+// Decode a byte array to string, attempting JSON parse for pretty formatting
+function decodeBytes(bytes: number[]): unknown {
+  try {
+    const str = new TextDecoder().decode(new Uint8Array(bytes));
+    try {
+      return JSON.parse(str);
+    } catch {
+      return str;
+    }
+  } catch {
+    return bytes;
+  }
+}
+
+// Recursively decode byte arrays in operation objects
+function decodeOperations(obj: unknown): unknown {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) {
+    // Check if it's a byte array (all numbers 0-255)
+    if (obj.length > 0 && obj.every(v => typeof v === 'number' && v >= 0 && v <= 255)) {
+      return decodeBytes(obj);
+    }
+    return obj.map(decodeOperations);
+  }
+  if (typeof obj === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      // Decode operation payloads
+      if ((key === 'Set' || key === 'Append' || key === 'Merge') && Array.isArray(value)) {
+        result[key] = decodeBytes(value as number[]);
+      } else {
+        result[key] = decodeOperations(value);
+      }
+    }
+    return result;
+  }
+  return obj;
+}
+
 function formatPayload(payload: unknown): string {
   if (typeof payload === 'string') return payload;
   if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) {
     return `[Binary: ${(payload as ArrayBuffer).byteLength || (payload as Uint8Array).length} bytes]`;
   }
   try {
-    return JSON.stringify(payload, null, 2);
+    const decoded = decodeOperations(payload);
+    return JSON.stringify(decoded, null, 2);
   } catch {
     return String(payload);
   }
