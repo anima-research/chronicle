@@ -10,6 +10,32 @@ const scrollContainer = ref<HTMLElement | null>(null);
 const sentinel = ref<HTMLElement | null>(null);
 let observer: IntersectionObserver | null = null;
 
+// Resizable detail panel
+const detailPanelHeight = ref(256);
+const isResizing = ref(false);
+const minPanelHeight = 100;
+const maxPanelHeight = 600;
+
+function startResize(e: MouseEvent) {
+  isResizing.value = true;
+  const startY = e.clientY;
+  const startHeight = detailPanelHeight.value;
+
+  function onMouseMove(e: MouseEvent) {
+    const delta = startY - e.clientY;
+    detailPanelHeight.value = Math.min(maxPanelHeight, Math.max(minPanelHeight, startHeight + delta));
+  }
+
+  function onMouseUp() {
+    isResizing.value = false;
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+  }
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+}
+
 // Decode a byte array to string, attempting JSON parse for pretty formatting
 function decodeBytes(bytes: number[]): unknown {
   try {
@@ -191,8 +217,14 @@ watch(() => branchesStore.currentBranch, () => {
     </div>
 
     <!-- Detail Panel -->
-    <div v-if="recordsStore.selectedRecord" class="border-t border-gray-200 bg-white h-64 overflow-auto">
-      <div class="p-4">
+    <div v-if="recordsStore.selectedRecord" class="border-t border-gray-200 bg-white flex flex-col" :style="{ height: detailPanelHeight + 'px' }">
+      <!-- Resize Handle -->
+      <div
+        @mousedown="startResize"
+        class="h-1.5 cursor-ns-resize bg-gray-200 hover:bg-blue-400 transition-colors flex-shrink-0"
+        :class="isResizing ? 'bg-blue-500' : ''"
+      />
+      <div class="p-4 overflow-auto flex-1">
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold text-gray-900">Record Details</h3>
           <button
@@ -230,9 +262,9 @@ watch(() => branchesStore.currentBranch, () => {
             <span class="ml-2 font-mono">{{ recordsStore.selectedRecord.linkedTo.join(', ') }}</span>
           </div>
         </div>
-        <div class="mt-4">
+        <div class="mt-4 flex-1 flex flex-col min-h-0">
           <span class="text-gray-500 text-sm">Payload:</span>
-          <pre class="mt-1 p-3 bg-gray-100 rounded text-xs font-mono overflow-auto max-h-32">{{ formatPayload(recordsStore.selectedRecord.payload) }}</pre>
+          <pre class="mt-1 p-3 bg-gray-100 rounded text-xs font-mono overflow-auto flex-1">{{ formatPayload(recordsStore.selectedRecord.payload) }}</pre>
         </div>
       </div>
     </div>
