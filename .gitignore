@@ -8,6 +8,7 @@ node_modules/
 
 # Build artifacts
 *.d.ts
+!ui/env.d.ts
 index.js
 
 # Test artifacts
