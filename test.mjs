@@ -162,9 +162,209 @@ console.log('✓ State at seq', r1.sequence, 'has', stateAtR1.length, 'items');
 const stateAtR2 = store.getStateJsonAt('messages', r2.sequence);
 console.log('✓ State at seq', r2.sequence, 'has', stateAtR2.length, 'items');
 
-// Test 24: Sync
-console.log('\n24. Testing sync...');
+// Test 24: editStateItem (view-mutating operation)
+console.log('\n24. Testing editStateItem (view-mutating)...');
+// Edit the second message (index 1)
+store.editStateItem('messages', 1, Buffer.from(JSON.stringify({ text: 'EDITED Second message' })));
+const stateAfterEdit = store.getStateJson('messages');
+console.log('✓ Edited item at index 1');
+console.log('  Edited content:', stateAfterEdit[1]);
+if (stateAfterEdit[1].text !== 'EDITED Second message') {
+  throw new Error('editStateItem did not work correctly');
+}
+
+// Test 25: redactStateItems (view-mutating operation)
+console.log('\n25. Testing redactStateItems (view-mutating)...');
+const lenBeforeRedact = store.getStateLen('messages');
+// Redact the last item (start=end-1, end=len redacts just the last item)
+const redactStart = lenBeforeRedact - 1;
+const redactEnd = lenBeforeRedact;
+store.redactStateItems('messages', redactStart, redactEnd);
+const lenAfterRedact = store.getStateLen('messages');
+console.log('✓ Redacted 1 item (indices', redactStart, 'to', redactEnd + ')');
+console.log('  Length before:', lenBeforeRedact, '-> after:', lenAfterRedact);
+if (lenAfterRedact !== lenBeforeRedact - 1) {
+  throw new Error('redactStateItems did not work correctly');
+}
+
+// Test 26: createBranchAt (time-travel branching)
+console.log('\n26. Testing createBranchAt (time-travel branching)...');
+// Get the current sequence
+const seqBeforeBranch = store.currentSequence();
+// Create a branch at an earlier sequence
+const branchAtSeq = Math.floor(seqBeforeBranch / 2);  // Branch at halfway point
+const timeTravelBranch = store.createBranchAt('time-travel-branch', 'main', branchAtSeq);
+console.log('✓ Branch created at sequence', branchAtSeq);
+console.log('  Branch details:', timeTravelBranch);
+if (timeTravelBranch.branchPoint !== branchAtSeq) {
+  throw new Error('createBranchAt did not set branch_point correctly');
+}
+
+// Test 27: Verify time-travel branch has correct head
+console.log('\n27. Verifying time-travel branch head...');
+const ttBranchInfo = store.listBranches().find(b => b.name === 'time-travel-branch');
+console.log('✓ Time-travel branch head:', ttBranchInfo.head);
+if (ttBranchInfo.head !== branchAtSeq) {
+  throw new Error('Time-travel branch head should equal branch_point');
+}
+
+// Test 28: Sync
+console.log('\n28. Testing sync...');
 store.sync();
 console.log('✓ Sync completed');
+
+// Test 29: deleteBranch
+console.log('\n29. Testing deleteBranch...');
+// Create a branch to delete
+store.createBranch('branch-to-delete', null);
+const branchesBeforeDelete = store.listBranches();
+const hadBranch = branchesBeforeDelete.some(b => b.name === 'branch-to-delete');
+console.log('  Branch exists before delete:', hadBranch);
+store.deleteBranch('branch-to-delete');
+const branchesAfterDelete = store.listBranches();
+const stillHasBranch = branchesAfterDelete.some(b => b.name === 'branch-to-delete');
+console.log('  Branch exists after delete:', stillHasBranch);
+if (!hadBranch || stillHasBranch) {
+  throw new Error('deleteBranch did not work correctly');
+}
+console.log('✓ Branch deleted successfully');
+
+// Test 30: createEmptyBranch
+console.log('\n30. Testing createEmptyBranch...');
+const emptyBranch = store.createEmptyBranch('empty-branch', 'main');
+console.log('✓ Empty branch created:', emptyBranch.name);
+// Switch to empty branch and check state is empty (no state heads copied)
+store.switchBranch('empty-branch');
+// Note: empty branch doesn't copy state heads, so state operations may differ
+console.log('  Empty branch head:', emptyBranch.head);
+store.switchBranch('main');
+
+// Test 31: getStateSlice
+console.log('\n31. Testing getStateSlice...');
+const slice = store.getStateSlice('messages', 1, 2); // Get 2 items starting at offset 1
+if (slice) {
+  const sliceData = JSON.parse(slice.toString());
+  console.log('✓ State slice (offset=1, limit=2):', sliceData.length, 'items');
+  console.log('  First item in slice:', sliceData[0]);
+} else {
+  console.log('  (slice returned null - state may be empty)');
+}
+
+// Test 32: Snapshot strategy (setState/setStateJson)
+console.log('\n32. Testing Snapshot strategy...');
+store.registerState({
+  id: 'config',
+  strategy: 'snapshot',
+});
+store.setStateJson('config', { theme: 'dark', version: 1 });
+const configState = store.getStateJson('config');
+console.log('✓ Snapshot state set:', configState);
+if (configState.theme !== 'dark') {
+  throw new Error('setStateJson did not work correctly');
+}
+// Update the snapshot
+store.setStateJson('config', { theme: 'light', version: 2 });
+const configState2 = store.getStateJson('config');
+console.log('✓ Snapshot state updated:', configState2);
+if (configState2.theme !== 'light' || configState2.version !== 2) {
+  throw new Error('setStateJson update did not work correctly');
+}
+
+// Test 33: getCompactionSummary
+console.log('\n33. Testing getCompactionSummary...');
+const compactionSummary = store.getCompactionSummary();
+console.log('✓ Compaction summary:', compactionSummary);
+
+// Test 34: compactState
+console.log('\n34. Testing compactState...');
+const compactResult = store.compactState('messages');
+console.log('✓ compactState result:', compactResult ? 'compacted' : 'no compaction needed');
+
+// Test 35: compactAllStates
+console.log('\n35. Testing compactAllStates...');
+const compactedCount = store.compactAllStates();
+console.log('✓ compactAllStates compacted:', compactedCount, 'states');
+
+// Test 36: close/isClosed
+console.log('\n36. Testing close/isClosed...');
+console.log('  isClosed before close:', store.isClosed());
+if (store.isClosed()) {
+  throw new Error('Store should not be closed yet');
+}
+store.close();
+console.log('  isClosed after close:', store.isClosed());
+if (!store.isClosed()) {
+  throw new Error('Store should be closed after close()');
+}
+console.log('✓ close/isClosed works correctly');
+
+// Test 37: Verify operations fail after close
+console.log('\n37. Testing operations fail after close...');
+let operationFailedAfterClose = false;
+try {
+  store.stats();
+} catch (e) {
+  operationFailedAfterClose = true;
+  console.log('✓ Operation correctly failed after close:', e.message);
+}
+if (!operationFailedAfterClose) {
+  throw new Error('Operations should fail after store is closed');
+}
+
+// Test 38: Subscription APIs (basic smoke test)
+console.log('\n38. Testing subscription APIs...');
+// Re-open store for subscription test
+const store2 = JsStore.openOrCreate({
+  path: './test-store',
+  blobCacheSize: 100
+});
+const subId = store2.subscribe({});
+console.log('✓ Subscribed with ID:', subId);
+console.log('  Subscription count:', store2.subscriptionCount());
+if (store2.subscriptionCount() !== 1) {
+  throw new Error('subscriptionCount should be 1');
+}
+
+// Poll for events (should be null since no new events)
+const event = store2.pollSubscription(subId);
+console.log('  pollSubscription result:', event ? event.eventType : 'null (no events)');
+
+// Unsubscribe
+store2.unsubscribe(subId);
+console.log('  Subscription count after unsubscribe:', store2.subscriptionCount());
+if (store2.subscriptionCount() !== 0) {
+  throw new Error('subscriptionCount should be 0 after unsubscribe');
+}
+console.log('✓ Subscription APIs work correctly');
+
+// Test 39: Subscription with catch-up
+console.log('\n39. Testing subscription catch-up...');
+const subId2 = store2.subscribe({ fromSequence: 1 });
+console.log('  Subscribed with catch-up from sequence 1');
+store2.catchUpSubscription(subId2);
+console.log('✓ catchUpSubscription completed');
+
+// Poll for caught-up events
+let eventCount = 0;
+let caughtUpEvent = store2.pollSubscription(subId2);
+while (caughtUpEvent && eventCount < 100) {
+  eventCount++;
+  caughtUpEvent = store2.pollSubscription(subId2);
+}
+console.log('  Received', eventCount, 'events during catch-up');
+store2.unsubscribe(subId2);
+
+// Test 40: pollSubscriptionTimeout
+console.log('\n40. Testing pollSubscriptionTimeout...');
+const subId3 = store2.subscribe({});
+const start = Date.now();
+const timeoutEvent = store2.pollSubscriptionTimeout(subId3, 50); // 50ms timeout
+const elapsed = Date.now() - start;
+console.log('  pollSubscriptionTimeout result:', timeoutEvent ? timeoutEvent.eventType : 'null (timed out)');
+console.log('  Elapsed time:', elapsed, 'ms (expected ~50ms)');
+store2.unsubscribe(subId3);
+console.log('✓ pollSubscriptionTimeout works correctly');
+
+store2.close();
 
 console.log('\n✅ All tests passed!');

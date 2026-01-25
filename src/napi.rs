@@ -380,6 +380,24 @@ impl JsStore {
         })
     }
 
+    /// Create a new branch at a specific sequence point.
+    /// This enables time-travel branching - the new branch will have state as of that sequence.
+    #[napi]
+    pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
+        let store = self.get_store()?;
+        let branch = store
+            .create_branch_at(&name, &from, Sequence(at_sequence as u64))
+            .map_err(to_napi_error)?;
+        Ok(JsBranch {
+            id: branch.id.0.to_string(),
+            name: branch.name,
+            head: branch.head.0 as i64,
+            parent_id: branch.parent.map(|p| p.0.to_string()),
+            branch_point: branch.branch_point.map(|s| s.0 as i64),
+            created: branch.created.0,
+        })
+    }
+
     /// Create a new branch without copying state from parent.
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
@@ -746,7 +764,8 @@ impl JsStore {
         let store = self.get_store()?;
         let from_seq = filter.from_sequence.map(|s| Sequence(s as u64));
         let to_seq = filter.to_sequence.map(|s| Sequence(s as u64));
-        let limit = filter.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+        // Default limit to 10,000 to avoid capacity overflow panics
+        let limit = filter.limit.map(|l| l as usize).unwrap_or(10_000);
         let offset = filter.offset.map(|o| o as usize).unwrap_or(0);
         let reverse = filter.reverse.unwrap_or(false);
         let types = filter.types;
