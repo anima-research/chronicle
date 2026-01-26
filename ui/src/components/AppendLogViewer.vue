@@ -55,10 +55,15 @@ function isExpanded(idx: number): boolean {
   return expandedItems.value.has(idx);
 }
 
-// Format timestamp
+// Format timestamp - show date if not today
 function formatTime(ts?: number): string {
   if (!ts) return '';
-  return new Date(ts).toLocaleTimeString();
+  const date = new Date(ts);
+  const today = new Date();
+  const isToday = date.getFullYear() === today.getFullYear() &&
+                  date.getMonth() === today.getMonth() &&
+                  date.getDate() === today.getDate();
+  return isToday ? date.toLocaleTimeString() : date.toLocaleString();
 }
 
 // Get log type color
