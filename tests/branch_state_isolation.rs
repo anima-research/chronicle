@@ -822,7 +822,13 @@ fn test_create_branch_at_persists_across_reopen() {
     {
         let store = open_store(&dir);
 
-        store.switch_branch("time-travel").unwrap();
+        // Verify branch head persisted correctly (should still equal branch_point)
+        let branch = store.switch_branch("time-travel").unwrap();
+        assert_eq!(
+            branch.head,
+            chronicle::Sequence(2),
+            "branch head should persist as branch_point"
+        );
         let state = store.get_state("log").unwrap().unwrap();
         let data: Vec<String> = serde_json::from_slice(&state).unwrap();
         assert_eq!(data, vec!["a", "b"]);
@@ -943,6 +949,221 @@ fn test_create_branch_at_head_sequence() {
     let state = store.get_state("data").unwrap().unwrap();
     let data: Vec<String> = serde_json::from_slice(&state).unwrap();
     assert_eq!(data, vec!["a", "b"]);
+}
+
+#[test]
+fn test_create_branch_at_does_not_advance_head() {
+    // Verifies that create_branch_at does NOT write new records to the branch.
+    // The branch's head should equal the branch_point, not advance past it.
+    // This documents the chain-sharing behavior (vs the old snapshot-writing approach).
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "state1".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    store
+        .register_state(StateRegistration {
+            id: "state2".to_string(),
+            strategy: StateStrategy::Snapshot,
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Build up state on main
+    store
+        .update_state("state1", StateOperation::Append(b"\"a\"".to_vec()))
+        .unwrap();
+    store
+        .update_state("state2", StateOperation::Set(b"{\"x\": 1}".to_vec()))
+        .unwrap();
+    store
+        .update_state("state1", StateOperation::Append(b"\"b\"".to_vec()))
+        .unwrap();
+    store
+        .update_state("state1", StateOperation::Append(b"\"c\"".to_vec()))
+        .unwrap();
+    // Main is now at seq 4
+
+    let branch_point = chronicle::Sequence(2);
+
+    // Create branch at seq 2
+    let new_branch = store
+        .create_branch_at("time-travel", "main", branch_point)
+        .unwrap();
+
+    // Key assertion: branch head should equal branch_point (no new records written)
+    assert_eq!(
+        new_branch.head, branch_point,
+        "create_branch_at should not advance head past branch_point"
+    );
+    assert_eq!(
+        new_branch.branch_point,
+        Some(branch_point),
+        "branch_point should be set"
+    );
+
+    // Verify state is still correct
+    store.switch_branch("time-travel").unwrap();
+    let state1 = store.get_state("state1").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state1).unwrap();
+    assert_eq!(data, vec!["a"]); // Append at seq 1 included; appends at seq 3, 4 are after branch_point
+
+    let state2 = store.get_state("state2").unwrap().unwrap();
+    let obj: serde_json::Value = serde_json::from_slice(&state2).unwrap();
+    assert_eq!(obj, serde_json::json!({"x": 1})); // Set at seq 2, included (at branch_point)
+}
+
+#[test]
+fn test_create_branch_at_with_edit_and_redact() {
+    // Verifies create_branch_at works correctly when the chain includes
+    // Edit and Redact operations before the branch point.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Build state with various operations
+    store
+        .update_state("items", StateOperation::Append(b"\"first\"".to_vec()))
+        .unwrap(); // seq 1: ["first"]
+    store
+        .update_state("items", StateOperation::Append(b"\"second\"".to_vec()))
+        .unwrap(); // seq 2: ["first", "second"]
+    store
+        .update_state(
+            "items",
+            StateOperation::Edit {
+                index: 0,
+                new_value: b"\"FIRST\"".to_vec(),
+            },
+        )
+        .unwrap(); // seq 3: ["FIRST", "second"]
+    store
+        .update_state("items", StateOperation::Append(b"\"third\"".to_vec()))
+        .unwrap(); // seq 4: ["FIRST", "second", "third"]
+    store
+        .update_state("items", StateOperation::Redact { start: 1, end: 2 })
+        .unwrap(); // seq 5: ["FIRST", "third"]
+    store
+        .update_state("items", StateOperation::Append(b"\"fourth\"".to_vec()))
+        .unwrap(); // seq 6: ["FIRST", "third", "fourth"]
+
+    // Branch at seq 3 (after edit, before later append and redact)
+    let branch = store
+        .create_branch_at("after-edit", "main", chronicle::Sequence(3))
+        .unwrap();
+    assert_eq!(branch.head, chronicle::Sequence(3));
+
+    store.switch_branch("after-edit").unwrap();
+    let state = store.get_state("items").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["FIRST", "second"]); // Edit applied, but not later ops
+
+    // Branch at seq 5 (after redact)
+    store.switch_branch("main").unwrap();
+    let branch2 = store
+        .create_branch_at("after-redact", "main", chronicle::Sequence(5))
+        .unwrap();
+    assert_eq!(branch2.head, chronicle::Sequence(5));
+
+    store.switch_branch("after-redact").unwrap();
+    let state = store.get_state("items").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["FIRST", "third"]); // Redact applied
+}
+
+#[test]
+fn test_create_branch_at_after_compaction() {
+    // Verifies create_branch_at works when state has been compacted (full snapshot).
+    // The branch at a pre-snapshot sequence should still reconstruct correctly.
+    //
+    // With delta_snapshot_every=3, full_snapshot_every=6, the sequence looks like:
+    // seq 1: Append item1
+    // seq 2: Append item2
+    // seq 3: Append item3 → triggers delta snapshot at seq 4
+    // seq 4: DeltaSnapshot [item1, item2, item3]
+    // seq 5: Append item4
+    // seq 6: Append item5
+    // seq 7: Append item6 → triggers delta (3 ops), which triggers full (2 deltas)
+    // seq 8: FullSnapshot [item1..item6]
+    // seq 9: Append item7
+    // ... etc.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "log".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 3,
+                full_snapshot_every: 6,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Add items - tracking what state exists at each sequence
+    for i in 1..=10 {
+        store
+            .update_state(
+                "log",
+                StateOperation::Append(format!("\"item{}\"", i).into_bytes()),
+            )
+            .unwrap();
+    }
+
+    // Branch at seq 3 (item1, item2, item3 - just before delta snapshot)
+    let branch = store
+        .create_branch_at("at-seq-3", "main", chronicle::Sequence(3))
+        .unwrap();
+    assert_eq!(branch.head, chronicle::Sequence(3));
+
+    store.switch_branch("at-seq-3").unwrap();
+    let state = store.get_state("log").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["item1", "item2", "item3"]);
+
+    // Branch at seq 4 (the delta snapshot itself - still item1, item2, item3)
+    store.switch_branch("main").unwrap();
+    let branch2 = store
+        .create_branch_at("at-seq-4", "main", chronicle::Sequence(4))
+        .unwrap();
+    assert_eq!(branch2.head, chronicle::Sequence(4));
+
+    store.switch_branch("at-seq-4").unwrap();
+    let state = store.get_state("log").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["item1", "item2", "item3"]); // Delta snapshot doesn't add items
+
+    // Branch at seq 5 (item4 added after the delta)
+    store.switch_branch("main").unwrap();
+    let branch3 = store
+        .create_branch_at("at-seq-5", "main", chronicle::Sequence(5))
+        .unwrap();
+    assert_eq!(branch3.head, chronicle::Sequence(5));
+
+    store.switch_branch("at-seq-5").unwrap();
+    let state = store.get_state("log").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["item1", "item2", "item3", "item4"]);
 }
 
 // =============================================================================

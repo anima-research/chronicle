@@ -420,72 +420,6 @@ impl Store {
         Ok(record)
     }
 
-    /// Write a snapshot to a specific branch (used for branch state materialization).
-    ///
-    /// This is similar to update_state but:
-    /// - Writes to a specific branch rather than the current branch
-    /// - Only writes Snapshot operations
-    /// - Does not trigger auto-snapshot logic
-    fn write_snapshot_for_branch(
-        &self,
-        branch_id: crate::types::BranchId,
-        state_id: &str,
-        data: Vec<u8>,
-    ) -> Result<()> {
-        let _lock = self.write_lock.lock();
-
-        let branch = self
-            .branches
-            .get_branch_by_id(branch_id)
-            .ok_or_else(|| StoreError::BranchNotFound(format!("{:?}", branch_id)))?;
-
-        let operation = StateOperation::Snapshot(data);
-
-        // Get current head offset for this state (for chaining) - will be None for new branch
-        let prev_update_offset = self
-            .state
-            .get_head(branch_id, state_id)
-            .map(|h| h.head_offset);
-
-        let next_seq = branch.head.next();
-
-        // Create the state update record payload
-        let update = StateUpdateRecord {
-            record_id: RecordId(0), // Will be assigned
-            global_sequence: next_seq,
-            state_id: state_id.to_string(),
-            prev_update_offset,
-            operation: operation.clone(),
-            timestamp: Timestamp::now(),
-        };
-
-        // Serialize and append
-        let payload = serde_json::to_vec(&update)?;
-        let input = RecordInput::raw("state_update", payload);
-
-        let (record, offset) = self.log.append(input, branch_id, next_seq)?;
-
-        // Update the state manager with the offset
-        self.state
-            .record_update(branch_id, state_id, offset, &operation)?;
-
-        // Update indices
-        self.index.add(
-            record.id,
-            branch_id,
-            next_seq,
-            offset,
-            &record.record_type,
-            &record.caused_by,
-            &record.linked_to,
-        );
-
-        // Update branch head
-        self.branches.update_head(branch_id, next_seq)?;
-
-        Ok(())
-    }
-
     /// Get the current value of a state.
     pub fn get_state(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
@@ -576,6 +510,89 @@ impl Store {
         }
 
         Ok(Some(state))
+    }
+
+    /// Find the chain head info (offset and item count) at a historical sequence.
+    ///
+    /// Used by `create_branch_at` to point a new branch at an existing chain position
+    /// without writing new records. Returns `(head_offset, item_count)` or None if
+    /// no state existed at that sequence.
+    fn find_chain_info_at(
+        &self,
+        branch_id: crate::types::BranchId,
+        state_id: &str,
+        at_sequence: Sequence,
+    ) -> Result<Option<(u64, usize)>> {
+        let head = match self.state.get_head(branch_id, state_id) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        // Walk chain to find the last update at or before target sequence
+        let mut current_offset = Some(head.head_offset);
+        let mut found_offset: Option<u64> = None;
+        let mut operations = Vec::new();
+        let mut hit_snapshot = false;
+
+        while let Some(offset) = current_offset {
+            let record = self.log.read_at(offset)?;
+
+            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+
+            // Skip if this record is after the target sequence
+            if record.sequence > at_sequence {
+                current_offset = update.prev_update_offset;
+                continue;
+            }
+
+            // This is the first record at or before target - it becomes our head
+            if found_offset.is_none() {
+                found_offset = Some(offset);
+            }
+
+            // Collect operations to compute item_count
+            match &update.operation {
+                StateOperation::Snapshot(_) => {
+                    operations.push(update.operation.clone());
+                    break;
+                }
+                StateOperation::DeltaSnapshot(_) => {
+                    operations.push(update.operation.clone());
+                    hit_snapshot = true;
+                }
+                _ => {
+                    if !hit_snapshot {
+                        operations.push(update.operation.clone());
+                    }
+                }
+            }
+
+            current_offset = update.prev_update_offset;
+        }
+
+        let head_offset = match found_offset {
+            Some(o) => o,
+            None => return Ok(None), // No state at that sequence
+        };
+
+        // Reconstruct state to count items
+        operations.reverse();
+        let mut state = Vec::new();
+        for op in operations {
+            state = crate::state::apply_operation(state, op)?;
+        }
+
+        // Count items in the resulting state (assumes JSON array for AppendLog)
+        let item_count = if state.is_empty() {
+            0
+        } else {
+            serde_json::from_slice::<Vec<serde_json::Value>>(&state)
+                .map(|arr| arr.len())
+                .unwrap_or(0)
+        };
+
+        Ok(Some((head_offset, item_count)))
     }
 
     /// Get the length of an AppendLog state without loading all items.
@@ -1060,18 +1077,8 @@ impl Store {
     /// Create a branch at a specific sequence (time-travel branching).
     ///
     /// This creates a new branch that starts with the state as it existed at the
-    /// given sequence on the parent branch. The state is materialized by writing
-    /// snapshot records to the new branch.
-    ///
-    /// # Branch Head vs Branch Point
-    ///
-    /// The returned branch's `head` may be greater than `at` because state
-    /// materialization writes snapshot records:
-    /// - `branch_point`: The sequence this branch diverged from (always equals `at`)
-    /// - `head`: The current head sequence (equals `at` + number of states materialized)
-    ///
-    /// For example, if branching at sequence 5 with 3 registered states, the branch
-    /// will have `branch_point = 5` and `head = 8` (5 + 3 snapshots).
+    /// given sequence on the parent branch. The new branch's state heads point to
+    /// the same underlying chain as the parent - no new records are written.
     ///
     /// # Arguments
     ///
@@ -1086,25 +1093,21 @@ impl Store {
 
         let new_branch = self.branches.create_branch_at(name, from, at)?;
 
-        // Materialize parent state at branch point into new branch.
-        // This gives the new branch its own independent state chain starting
-        // with snapshots of the parent's state at the branch point.
+        // Point the new branch's state heads at the parent's chain at the branch point.
+        // No new records are written - the branch shares the existing chain up to this point.
         for state_id in self.state.state_ids() {
-            if let Some(bytes) = self.get_state_at_for_branch(parent.id, &state_id, at)? {
-                self.write_snapshot_for_branch(new_branch.id, &state_id, bytes)?;
+            if let Some((head_offset, item_count)) =
+                self.find_chain_info_at(parent.id, &state_id, at)?
+            {
+                self.state
+                    .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
             }
         }
 
-        // Broadcast branch created (get updated branch with potentially new head)
-        let final_branch = self
-            .branches
-            .get_branch(name)
-            .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
-
         self.subscriptions
-            .broadcast_branch_created(&final_branch, Some(from.to_string()));
+            .broadcast_branch_created(&new_branch, Some(from.to_string()));
 
-        Ok(final_branch)
+        Ok(new_branch)
     }
 
     /// Switch to a different branch.
