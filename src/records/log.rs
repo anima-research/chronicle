@@ -5,7 +5,7 @@ use crate::types::{BranchId, PayloadEncoding, Record, RecordId, RecordInput, Seq
 use parking_lot::RwLock;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Magic bytes for record log.
 const LOG_MAGIC: &[u8; 4] = b"REC\0";
@@ -13,13 +13,8 @@ const LOG_MAGIC: &[u8; 4] = b"REC\0";
 /// Current log format version.
 const LOG_VERSION: u8 = 1;
 
-/// Record header size (fixed part).
-const RECORD_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + 8 + 8 + 8; // magic + version + flags + id + seq + branch + timestamp
-
 /// Append-only record log.
 pub struct RecordLog {
-    /// Path to the log file.
-    path: PathBuf,
 
     /// Log file handle.
     file: RwLock<File>,
@@ -71,7 +66,6 @@ impl RecordLog {
         };
 
         Ok(Self {
-            path,
             file: RwLock::new(file),
             next_id: RwLock::new(next_id),
             file_size: RwLock::new(file_size),
@@ -132,7 +126,7 @@ impl RecordLog {
 
     /// Force sync all pending writes to disk.
     pub fn sync(&self) -> Result<()> {
-        let mut file = self.file.write();
+        let file = self.file.write();
         file.sync_all()?;
         *self.writes_since_sync.write() = 0;
         Ok(())
@@ -146,12 +140,12 @@ impl RecordLog {
     }
 
     /// Iterate all records from the beginning.
-    pub fn iter(&self) -> RecordIterator {
+    pub fn iter(&self) -> RecordIterator<'_> {
         self.iter_from(0)
     }
 
     /// Iterate all records from a given offset.
-    pub fn iter_from(&self, offset: u64) -> RecordIterator {
+    pub fn iter_from(&self, offset: u64) -> RecordIterator<'_> {
         RecordIterator {
             log: self,
             offset,
