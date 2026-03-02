@@ -395,12 +395,12 @@ fn test_blob_deduplication_across_sessions() {
     };
 
     let content = b"deduplicated content";
-    let mut hash1 = None;
+    let hash1;
 
     // First session
     {
         let store = Store::create(config.clone()).unwrap();
-        hash1 = Some(store.store_blob(content, "text/plain").unwrap());
+        hash1 = store.store_blob(content, "text/plain").unwrap();
         store.sync().unwrap();
     }
 
@@ -410,7 +410,7 @@ fn test_blob_deduplication_across_sessions() {
         let hash2 = store.store_blob(content, "text/plain").unwrap();
 
         // Should be the same hash (deduplicated)
-        assert_eq!(hash1.unwrap(), hash2);
+        assert_eq!(hash1, hash2);
 
         // Should still be retrievable
         let blob = store.get_blob(&hash2).unwrap().unwrap();
@@ -580,8 +580,8 @@ fn test_get_state_at_with_edits() {
         .unwrap();
 
     // Add [1, 2, 3]
-    let r1 = store.update_state("list", StateOperation::Append(b"1".to_vec())).unwrap();
-    let r2 = store.update_state("list", StateOperation::Append(b"2".to_vec())).unwrap();
+    let _r1 = store.update_state("list", StateOperation::Append(b"1".to_vec())).unwrap();
+    let _r2 = store.update_state("list", StateOperation::Append(b"2".to_vec())).unwrap();
     let r3 = store.update_state("list", StateOperation::Append(b"3".to_vec())).unwrap();
 
     // Edit index 1: [1, 2, 3] -> [1, 99, 3]
