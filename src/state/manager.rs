@@ -259,6 +259,16 @@ impl StateManager {
                 head.ops_since_delta_snapshot += 1;
                 // Set replaces entire state - can't track count without parsing
             }
+            StateOperation::TreeSet { .. } | StateOperation::TreeRemove { .. } | StateOperation::TreeBatch { .. } => {
+                head.ops_since_delta_snapshot += 1;
+                // Tree ops: item_count not accurately tracked per-op for trees.
+                // Count is set on full snapshot only.
+            }
+            StateOperation::TreeDeltaSnapshot(_) => {
+                head.ops_since_delta_snapshot = 0;
+                head.delta_snapshots_since_full += 1;
+                head.last_delta_snapshot_offset = Some(offset);
+            }
             StateOperation::Delta { .. } | StateOperation::Field { .. } => {
                 head.ops_since_delta_snapshot += 1;
                 // Delta/Field operations for Struct type - don't change count
@@ -350,7 +360,7 @@ impl StateManager {
                     operations.push(update.operation.clone());
                     break;
                 }
-                StateOperation::DeltaSnapshot(_) => {
+                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
                     // Delta snapshot - add it and continue looking for more snapshots
                     // but stop collecting regular operations
                     operations.push(update.operation.clone());
@@ -431,6 +441,18 @@ impl StateManager {
                     } else {
                         Some(SnapshotNeeded::Delta)
                     }
+                } else {
+                    None
+                }
+            }
+            StateStrategy::Tree {
+                delta_snapshot_every,
+                full_snapshot_every,
+            } => {
+                if head.delta_snapshots_since_full >= *full_snapshot_every {
+                    Some(SnapshotNeeded::Full)
+                } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
+                    Some(SnapshotNeeded::Delta)
                 } else {
                     None
                 }

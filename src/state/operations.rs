@@ -1,7 +1,7 @@
 //! State operation application.
 
 use crate::error::{Result, StoreError};
-use crate::types::StateOperation;
+use crate::types::{StateOperation, TreeEntry, TreeOp, TreeState};
 
 /// Apply a state operation to a value.
 ///
@@ -96,6 +96,66 @@ pub fn apply_operation(state: Vec<u8>, operation: StateOperation) -> Result<Vec<
             arr[index] = new_item;
 
             serde_json::to_vec(&arr).map_err(|e| StoreError::Serialization(e.to_string()))
+        }
+
+        StateOperation::TreeSet { path, entry } => {
+            let mut tree: TreeState = if state.is_empty() {
+                TreeState::new()
+            } else {
+                serde_json::from_slice(&state)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
+            };
+            let tree_entry: TreeEntry = serde_json::from_slice(&entry)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            tree.insert(path, tree_entry);
+            serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
+        }
+
+        StateOperation::TreeRemove { path } => {
+            let mut tree: TreeState = if state.is_empty() {
+                TreeState::new()
+            } else {
+                serde_json::from_slice(&state)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
+            };
+            tree.remove(&path);
+            serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
+        }
+
+        StateOperation::TreeBatch { ops } => {
+            let mut tree: TreeState = if state.is_empty() {
+                TreeState::new()
+            } else {
+                serde_json::from_slice(&state)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
+            };
+            let tree_ops: Vec<TreeOp> = serde_json::from_slice(&ops)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            for op in tree_ops {
+                match op {
+                    TreeOp::Set { path, entry } => { tree.insert(path, entry); }
+                    TreeOp::Remove { path } => { tree.remove(&path); }
+                }
+            }
+            serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
+        }
+
+        StateOperation::TreeDeltaSnapshot(delta) => {
+            let mut tree: TreeState = if state.is_empty() {
+                TreeState::new()
+            } else {
+                serde_json::from_slice(&state)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
+            };
+            let tree_ops: Vec<TreeOp> = serde_json::from_slice(&delta)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            for op in tree_ops {
+                match op {
+                    TreeOp::Set { path, entry } => { tree.insert(path, entry); }
+                    TreeOp::Remove { path } => { tree.remove(&path); }
+                }
+            }
+            serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
         }
 
         StateOperation::Field { name, operation } => {
@@ -237,6 +297,150 @@ mod tests {
 
         let arr: Vec<i32> = serde_json::from_slice(&state).unwrap();
         assert_eq!(arr, vec![1, 2, 3]);
+    }
+
+    fn make_tree_entry(hash: &str, size: u64) -> TreeEntry {
+        TreeEntry {
+            blob_hash: hash.to_string(),
+            size,
+            mode: 0o644,
+        }
+    }
+
+    #[test]
+    fn test_tree_set() {
+        let state = vec![];
+        let entry = serde_json::to_vec(&make_tree_entry("abc123", 100)).unwrap();
+        let op = StateOperation::TreeSet {
+            path: "src/main.rs".to_string(),
+            entry,
+        };
+        let state = apply_operation(state, op).unwrap();
+        let tree: TreeState = serde_json::from_slice(&state).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree["src/main.rs"].blob_hash, "abc123");
+        assert_eq!(tree["src/main.rs"].size, 100);
+    }
+
+    #[test]
+    fn test_tree_set_overwrite() {
+        let state = vec![];
+        let entry1 = serde_json::to_vec(&make_tree_entry("abc123", 100)).unwrap();
+        let state = apply_operation(
+            state,
+            StateOperation::TreeSet {
+                path: "file.txt".to_string(),
+                entry: entry1,
+            },
+        )
+        .unwrap();
+
+        let entry2 = serde_json::to_vec(&make_tree_entry("def456", 200)).unwrap();
+        let state = apply_operation(
+            state,
+            StateOperation::TreeSet {
+                path: "file.txt".to_string(),
+                entry: entry2,
+            },
+        )
+        .unwrap();
+
+        let tree: TreeState = serde_json::from_slice(&state).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree["file.txt"].blob_hash, "def456");
+        assert_eq!(tree["file.txt"].size, 200);
+    }
+
+    #[test]
+    fn test_tree_remove() {
+        // Build tree with two files
+        let mut tree = TreeState::new();
+        tree.insert("a.txt".to_string(), make_tree_entry("aaa", 10));
+        tree.insert("b.txt".to_string(), make_tree_entry("bbb", 20));
+        let state = serde_json::to_vec(&tree).unwrap();
+
+        let state = apply_operation(
+            state,
+            StateOperation::TreeRemove {
+                path: "a.txt".to_string(),
+            },
+        )
+        .unwrap();
+
+        let tree: TreeState = serde_json::from_slice(&state).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert!(tree.contains_key("b.txt"));
+        assert!(!tree.contains_key("a.txt"));
+    }
+
+    #[test]
+    fn test_tree_remove_nonexistent() {
+        let state = vec![];
+        let result = apply_operation(
+            state,
+            StateOperation::TreeRemove {
+                path: "nope.txt".to_string(),
+            },
+        )
+        .unwrap();
+        let tree: TreeState = serde_json::from_slice(&result).unwrap();
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_tree_batch() {
+        let state = vec![];
+        let ops = vec![
+            TreeOp::Set {
+                path: "src/lib.rs".to_string(),
+                entry: make_tree_entry("aaa", 50),
+            },
+            TreeOp::Set {
+                path: "src/main.rs".to_string(),
+                entry: make_tree_entry("bbb", 100),
+            },
+            TreeOp::Set {
+                path: "README.md".to_string(),
+                entry: make_tree_entry("ccc", 200),
+            },
+            TreeOp::Remove {
+                path: "src/lib.rs".to_string(),
+            },
+        ];
+        let ops_bytes = serde_json::to_vec(&ops).unwrap();
+        let state = apply_operation(state, StateOperation::TreeBatch { ops: ops_bytes }).unwrap();
+
+        let tree: TreeState = serde_json::from_slice(&state).unwrap();
+        assert_eq!(tree.len(), 2);
+        assert!(tree.contains_key("src/main.rs"));
+        assert!(tree.contains_key("README.md"));
+        assert!(!tree.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_tree_delta_snapshot() {
+        // Start with a tree
+        let mut tree = TreeState::new();
+        tree.insert("a.txt".to_string(), make_tree_entry("aaa", 10));
+        let state = serde_json::to_vec(&tree).unwrap();
+
+        // Apply delta: add b.txt, remove a.txt
+        let delta_ops = vec![
+            TreeOp::Set {
+                path: "b.txt".to_string(),
+                entry: make_tree_entry("bbb", 20),
+            },
+            TreeOp::Remove {
+                path: "a.txt".to_string(),
+            },
+        ];
+        let delta = serde_json::to_vec(&delta_ops).unwrap();
+        let state = apply_operation(state, StateOperation::TreeDeltaSnapshot(delta)).unwrap();
+
+        let tree: TreeState = serde_json::from_slice(&state).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert!(tree.contains_key("b.txt"));
+        assert!(!tree.contains_key("a.txt"));
     }
 
     #[test]

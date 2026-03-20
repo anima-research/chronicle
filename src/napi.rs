@@ -6,6 +6,7 @@ use crate::{
         DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
         SubscriptionHandle, SubscriptionId,
     },
+    types::{TreeChange, TreeEntry, TreeOp},
     CompactionSummary, Record, RecordId, Sequence, StateOperation, StateRegistration,
     StateStrategy, Store, StoreConfig,
 };
@@ -217,6 +218,45 @@ impl From<CompactionSummary> for JsCompactionSummary {
             states_needing_compaction: s.states_needing_compaction as i64,
         }
     }
+}
+
+// --- Tree types ---
+
+/// A tree entry (file in a tree state).
+#[napi(object)]
+pub struct JsTreeEntry {
+    pub blob_hash: String,
+    pub size: i64,
+    pub mode: i32,
+}
+
+/// A tree operation for batch updates.
+#[napi(object)]
+pub struct JsTreeOp {
+    /// "set" or "remove"
+    pub op: String,
+    pub path: String,
+    pub entry: Option<JsTreeEntry>,
+}
+
+/// A change between two tree states.
+#[napi(object)]
+pub struct JsTreeChange {
+    /// "added", "modified", or "removed"
+    pub change_type: String,
+    pub path: String,
+    pub entry: Option<JsTreeEntry>,
+    pub old_entry: Option<JsTreeEntry>,
+    pub new_entry: Option<JsTreeEntry>,
+}
+
+/// A tree list entry (path + entry).
+#[napi(object)]
+pub struct JsTreeListEntry {
+    pub path: String,
+    pub blob_hash: String,
+    pub size: i64,
+    pub mode: i32,
 }
 
 fn to_napi_error(e: StoreError) -> napi::Error {
@@ -480,6 +520,10 @@ impl JsStore {
             "snapshot" => StateStrategy::Snapshot,
             "append_log" => StateStrategy::AppendLog {
                 delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(100) as u64,
+                full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
+            },
+            "tree" => StateStrategy::Tree {
+                delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
                 full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
             },
             _ => return Err(napi::Error::from_reason("Invalid strategy")),
@@ -816,6 +860,7 @@ impl JsStore {
                         StateStrategy::Snapshot => "snapshot".to_string(),
                         StateStrategy::AppendLog { .. } => "append_log".to_string(),
                         StateStrategy::Delta { .. } => "delta".to_string(),
+                        StateStrategy::Tree { .. } => "tree".to_string(),
                         StateStrategy::Struct { .. } => "struct".to_string(),
                     })
                     .unwrap_or_else(|| "unknown".to_string());
@@ -1035,5 +1080,174 @@ impl JsStore {
     pub fn subscription_count(&self) -> Result<i64> {
         let store = self.get_store()?;
         Ok(store.subscription_count() as i64)
+    }
+
+    // --- Tree Operations ---
+
+    /// Set a single file in a tree state.
+    #[napi]
+    pub fn tree_set(
+        &self,
+        state_id: String,
+        path: String,
+        entry: JsTreeEntry,
+    ) -> Result<JsRecord> {
+        let store = self.get_store()?;
+        let tree_entry = TreeEntry {
+            blob_hash: entry.blob_hash,
+            size: entry.size as u64,
+            mode: entry.mode as u32,
+        };
+        let record = store
+            .tree_set(&state_id, &path, &tree_entry)
+            .map_err(to_napi_error)?;
+        Ok(record.into())
+    }
+
+    /// Remove a single file from a tree state.
+    #[napi]
+    pub fn tree_remove(&self, state_id: String, path: String) -> Result<JsRecord> {
+        let store = self.get_store()?;
+        let record = store.tree_remove(&state_id, &path).map_err(to_napi_error)?;
+        Ok(record.into())
+    }
+
+    /// Apply a batch of tree operations atomically.
+    #[napi]
+    pub fn tree_batch(&self, state_id: String, ops: Vec<JsTreeOp>) -> Result<JsRecord> {
+        let store = self.get_store()?;
+        let tree_ops: Vec<TreeOp> = ops
+            .into_iter()
+            .map(|op| match op.op.as_str() {
+                "set" => {
+                    let entry = op
+                        .entry
+                        .ok_or_else(|| napi::Error::from_reason("TreeOp 'set' requires entry"))?;
+                    Ok(TreeOp::Set {
+                        path: op.path,
+                        entry: TreeEntry {
+                            blob_hash: entry.blob_hash,
+                            size: entry.size as u64,
+                            mode: entry.mode as u32,
+                        },
+                    })
+                }
+                "remove" => Ok(TreeOp::Remove { path: op.path }),
+                other => Err(napi::Error::from_reason(format!(
+                    "Invalid tree op: '{}', expected 'set' or 'remove'",
+                    other
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let record = store
+            .tree_batch(&state_id, &tree_ops)
+            .map_err(to_napi_error)?;
+        Ok(record.into())
+    }
+
+    /// Get a single file entry from a tree state.
+    #[napi]
+    pub fn tree_get(&self, state_id: String, path: String) -> Result<Option<JsTreeEntry>> {
+        let store = self.get_store()?;
+        let entry = store
+            .tree_get(&state_id, &path)
+            .map_err(to_napi_error)?;
+        Ok(entry.map(|e| JsTreeEntry {
+            blob_hash: e.blob_hash,
+            size: e.size as i64,
+            mode: e.mode as i32,
+        }))
+    }
+
+    /// List files in a tree state, optionally filtered by path prefix.
+    #[napi]
+    pub fn tree_list(
+        &self,
+        state_id: String,
+        prefix: Option<String>,
+    ) -> Result<Vec<JsTreeListEntry>> {
+        let store = self.get_store()?;
+        let entries = store
+            .tree_list(&state_id, prefix.as_deref())
+            .map_err(to_napi_error)?;
+        Ok(entries
+            .into_iter()
+            .map(|(path, entry)| JsTreeListEntry {
+                path,
+                blob_hash: entry.blob_hash,
+                size: entry.size as i64,
+                mode: entry.mode as i32,
+            })
+            .collect())
+    }
+
+    /// Compute diff between a tree state at two sequence points.
+    #[napi]
+    pub fn tree_diff(
+        &self,
+        state_id: String,
+        from_sequence: i64,
+        to_sequence: i64,
+    ) -> Result<Vec<JsTreeChange>> {
+        let store = self.get_store()?;
+        let changes = store
+            .tree_diff(
+                &state_id,
+                Sequence(from_sequence as u64),
+                Sequence(to_sequence as u64),
+            )
+            .map_err(to_napi_error)?;
+
+        Ok(changes
+            .into_iter()
+            .map(|change| match change {
+                TreeChange::Added { path, entry } => JsTreeChange {
+                    change_type: "added".to_string(),
+                    path,
+                    entry: Some(JsTreeEntry {
+                        blob_hash: entry.blob_hash,
+                        size: entry.size as i64,
+                        mode: entry.mode as i32,
+                    }),
+                    old_entry: None,
+                    new_entry: None,
+                },
+                TreeChange::Modified { path, old, new } => JsTreeChange {
+                    change_type: "modified".to_string(),
+                    path,
+                    entry: None,
+                    old_entry: Some(JsTreeEntry {
+                        blob_hash: old.blob_hash,
+                        size: old.size as i64,
+                        mode: old.mode as i32,
+                    }),
+                    new_entry: Some(JsTreeEntry {
+                        blob_hash: new.blob_hash,
+                        size: new.size as i64,
+                        mode: new.mode as i32,
+                    }),
+                },
+                TreeChange::Removed { path, entry } => JsTreeChange {
+                    change_type: "removed".to_string(),
+                    path,
+                    entry: Some(JsTreeEntry {
+                        blob_hash: entry.blob_hash,
+                        size: entry.size as i64,
+                        mode: entry.mode as i32,
+                    }),
+                    old_entry: None,
+                    new_entry: None,
+                },
+            })
+            .collect())
+    }
+
+    /// Force a full snapshot of a tree state (compaction).
+    #[napi]
+    pub fn tree_snapshot(&self, state_id: String) -> Result<Option<JsRecord>> {
+        let store = self.get_store()?;
+        let record = store.tree_snapshot(&state_id).map_err(to_napi_error)?;
+        Ok(record.map(|r| r.into()))
     }
 }

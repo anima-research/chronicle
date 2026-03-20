@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -254,6 +254,16 @@ pub enum StateStrategy {
         full_snapshot_every: u64,
     },
 
+    /// Filesystem-tree state: sorted map of path → TreeEntry.
+    /// Each entry references a blob hash in blob storage.
+    /// Uses periodic snapshots with delta-based compaction.
+    Tree {
+        /// Create a delta snapshot after this many operations.
+        delta_snapshot_every: u64,
+        /// Create a full snapshot after this many delta snapshots.
+        full_snapshot_every: u64,
+    },
+
     /// Nested structure with per-field strategies.
     Struct {
         fields: HashMap<String, Box<StateStrategy>>,
@@ -292,6 +302,20 @@ pub enum StateOperation {
     /// Stores items added since last delta or full snapshot.
     /// During reconstruction, delta snapshots are concatenated.
     DeltaSnapshot(Vec<u8>),
+
+    /// Set a single path in a tree state (Tree strategy).
+    TreeSet { path: String, entry: Vec<u8> },
+
+    /// Remove a single path from a tree state (Tree strategy).
+    TreeRemove { path: String },
+
+    /// Batch of tree operations, applied atomically (Tree strategy).
+    /// Payload is serialized `Vec<TreeOp>`.
+    TreeBatch { ops: Vec<u8> },
+
+    /// Delta snapshot for Tree strategy.
+    /// Contains serialized `Vec<TreeOp>` of all changes since last snapshot.
+    TreeDeltaSnapshot(Vec<u8>),
 
     /// Update specific field (Struct strategy).
     Field {
@@ -332,6 +356,44 @@ pub struct StateRegistration {
     #[serde(default)]
     pub initial_value: Option<Vec<u8>>,
 }
+
+/// A single entry in a tree state (represents a file).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeEntry {
+    /// SHA-256 hash of the file content (stored in blob storage).
+    pub blob_hash: String,
+    /// Size of the content in bytes.
+    pub size: u64,
+    /// File mode (e.g., 0o644 for regular, 0o755 for executable, 0o120000 for symlink).
+    pub mode: u32,
+}
+
+/// A single operation on a tree entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TreeOp {
+    /// Set (add or update) a file at a path.
+    Set { path: String, entry: TreeEntry },
+    /// Remove a file at a path.
+    Remove { path: String },
+}
+
+/// A change between two tree states (returned by tree_diff).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TreeChange {
+    /// File was added.
+    Added { path: String, entry: TreeEntry },
+    /// File was modified (content or mode changed).
+    Modified {
+        path: String,
+        old: TreeEntry,
+        new: TreeEntry,
+    },
+    /// File was removed.
+    Removed { path: String, entry: TreeEntry },
+}
+
+/// The tree state itself: a sorted map of path → TreeEntry.
+pub type TreeState = BTreeMap<String, TreeEntry>;
 
 /// Store statistics.
 #[derive(Clone, Debug, Default)]
