@@ -240,6 +240,11 @@ pub struct JsTreeOp {
 }
 
 /// A change between two tree states.
+///
+/// Field population by change_type:
+/// - "added": `entry` = the new entry, `old_entry` = None, `new_entry` = None
+/// - "modified": `entry` = None, `old_entry` = previous entry, `new_entry` = current entry
+/// - "removed": `entry` = the removed entry, `old_entry` = None, `new_entry` = None
 #[napi(object)]
 pub struct JsTreeChange {
     /// "added", "modified", or "removed"

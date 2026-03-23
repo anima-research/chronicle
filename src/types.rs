@@ -304,18 +304,17 @@ pub enum StateOperation {
     DeltaSnapshot(Vec<u8>),
 
     /// Set a single path in a tree state (Tree strategy).
-    TreeSet { path: String, entry: Vec<u8> },
+    TreeSet { path: String, entry: TreeEntry },
 
     /// Remove a single path from a tree state (Tree strategy).
     TreeRemove { path: String },
 
     /// Batch of tree operations, applied atomically (Tree strategy).
-    /// Payload is serialized `Vec<TreeOp>`.
-    TreeBatch { ops: Vec<u8> },
+    TreeBatch { ops: Vec<TreeOp> },
 
     /// Delta snapshot for Tree strategy.
-    /// Contains serialized `Vec<TreeOp>` of all changes since last snapshot.
-    TreeDeltaSnapshot(Vec<u8>),
+    /// Contains `Vec<TreeOp>` of all changes since last snapshot.
+    TreeDeltaSnapshot(Vec<TreeOp>),
 
     /// Update specific field (Struct strategy).
     Field {

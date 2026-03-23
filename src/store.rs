@@ -364,7 +364,21 @@ impl Store {
                 // flexibility - the actual validation happens at reconstruction time.
                 let _ = (start, end); // Suppress unused warnings
             }
-            // Append, Set, Snapshot, DeltaSnapshot - no validation needed
+            StateOperation::TreeSet { .. }
+            | StateOperation::TreeRemove { .. }
+            | StateOperation::TreeBatch { .. } => {
+                if !matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::Tree { .. })
+                ) {
+                    return Err(StoreError::InvalidOperation(format!(
+                        "Tree operations require Tree strategy, state '{}' uses {:?}",
+                        state_id,
+                        self.state.get_strategy(state_id)
+                    )));
+                }
+            }
+            // Append, Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
             _ => {}
         }
 
@@ -584,15 +598,22 @@ impl Store {
             state = crate::state::apply_operation(state, op)?;
         }
 
-        // Count items in the resulting state (assumes JSON array for AppendLog, or tree map for Tree)
+        // Count items in the resulting state using strategy-aware parsing
         let item_count = if state.is_empty() {
             0
-        } else if let Ok(tree) = serde_json::from_slice::<std::collections::BTreeMap<String, serde_json::Value>>(&state) {
-            tree.len()
         } else {
-            serde_json::from_slice::<Vec<serde_json::Value>>(&state)
-                .map(|arr| arr.len())
-                .unwrap_or(0)
+            match self.state.get_strategy(state_id) {
+                Some(crate::types::StateStrategy::Tree { .. }) => {
+                    serde_json::from_slice::<TreeState>(&state)
+                        .map(|t| t.len())
+                        .unwrap_or(0)
+                }
+                _ => {
+                    serde_json::from_slice::<Vec<serde_json::Value>>(&state)
+                        .map(|arr| arr.len())
+                        .unwrap_or(0)
+                }
+            }
         };
 
         Ok(Some((head_offset, item_count)))
@@ -1056,11 +1077,11 @@ impl Store {
     /// Compute tree operations since the last delta or full snapshot.
     ///
     /// Walks the chain collecting TreeSet/TreeRemove/TreeBatch operations until hitting a snapshot.
-    /// Returns serialized Vec<TreeOp>.
-    fn compute_tree_delta_ops(&self, state_id: &str) -> Result<Vec<u8>> {
+    /// Returns Vec<TreeOp> directly (no serialization).
+    fn compute_tree_delta_ops(&self, state_id: &str) -> Result<Vec<TreeOp>> {
         let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
             Some(h) => h,
-            None => return Ok(serde_json::to_vec(&Vec::<TreeOp>::new())?),
+            None => return Ok(Vec::new()),
         };
 
         let mut ops: Vec<TreeOp> = Vec::new();
@@ -1073,11 +1094,9 @@ impl Store {
 
             match &update.operation {
                 StateOperation::TreeSet { path, entry } => {
-                    let tree_entry: TreeEntry = serde_json::from_slice(entry)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     ops.push(TreeOp::Set {
                         path: path.clone(),
-                        entry: tree_entry,
+                        entry: entry.clone(),
                     });
                 }
                 StateOperation::TreeRemove { path } => {
@@ -1085,10 +1104,8 @@ impl Store {
                         path: path.clone(),
                     });
                 }
-                StateOperation::TreeBatch { ops: batch_bytes } => {
-                    let batch_ops: Vec<TreeOp> = serde_json::from_slice(batch_bytes)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    ops.extend(batch_ops);
+                StateOperation::TreeBatch { ops: batch_ops } => {
+                    ops.extend(batch_ops.clone());
                 }
                 StateOperation::Snapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
                     break;
@@ -1102,19 +1119,18 @@ impl Store {
         // Reverse since we collected in reverse order
         ops.reverse();
 
-        serde_json::to_vec(&ops).map_err(|e| StoreError::Serialization(e.to_string()))
+        Ok(ops)
     }
 
     // --- Tree Operations ---
 
     /// Set a single file in a tree state.
     pub fn tree_set(&self, state_id: &str, path: &str, entry: &TreeEntry) -> Result<Record> {
-        let entry_bytes = serde_json::to_vec(entry)?;
         self.update_state(
             state_id,
             StateOperation::TreeSet {
                 path: path.to_string(),
-                entry: entry_bytes,
+                entry: entry.clone(),
             },
         )
     }
@@ -1131,8 +1147,7 @@ impl Store {
 
     /// Apply a batch of tree operations atomically.
     pub fn tree_batch(&self, state_id: &str, ops: &[TreeOp]) -> Result<Record> {
-        let ops_bytes = serde_json::to_vec(ops)?;
-        self.update_state(state_id, StateOperation::TreeBatch { ops: ops_bytes })
+        self.update_state(state_id, StateOperation::TreeBatch { ops: ops.to_vec() })
     }
 
     /// Get a single file entry from a tree state.
@@ -1156,11 +1171,21 @@ impl Store {
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
         match prefix {
-            Some(p) => Ok(tree
-                .range(p.to_string()..)
-                .take_while(|(k, _)| k.starts_with(p))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()),
+            Some(p) => {
+                let start = p.to_string();
+                // Compute exclusive upper bound by incrementing last byte
+                let mut end = start.clone();
+                if let Some(last) = end.pop() {
+                    end.push(char::from(last as u8 + 1));
+                    Ok(tree
+                        .range(start..end)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect())
+                } else {
+                    // Empty prefix — return all
+                    Ok(tree.into_iter().collect())
+                }
+            }
             None => Ok(tree.into_iter().collect()),
         }
     }

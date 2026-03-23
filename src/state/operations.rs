@@ -1,7 +1,30 @@
 //! State operation application.
 
 use crate::error::{Result, StoreError};
-use crate::types::{StateOperation, TreeEntry, TreeOp, TreeState};
+use crate::types::{StateOperation, TreeOp, TreeState};
+
+/// Deserialize tree state from bytes, treating empty as a new tree.
+fn deserialize_tree(state: &[u8]) -> Result<TreeState> {
+    if state.is_empty() {
+        Ok(TreeState::new())
+    } else {
+        serde_json::from_slice(state).map_err(|e| StoreError::Deserialization(e.to_string()))
+    }
+}
+
+/// Apply a sequence of tree ops (Set/Remove) to a mutable tree.
+fn apply_tree_ops(tree: &mut TreeState, ops: Vec<TreeOp>) {
+    for op in ops {
+        match op {
+            TreeOp::Set { path, entry } => {
+                tree.insert(path, entry);
+            }
+            TreeOp::Remove { path } => {
+                tree.remove(&path);
+            }
+        }
+    }
+}
 
 /// Apply a state operation to a value.
 ///
@@ -99,62 +122,26 @@ pub fn apply_operation(state: Vec<u8>, operation: StateOperation) -> Result<Vec<
         }
 
         StateOperation::TreeSet { path, entry } => {
-            let mut tree: TreeState = if state.is_empty() {
-                TreeState::new()
-            } else {
-                serde_json::from_slice(&state)
-                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
-            };
-            let tree_entry: TreeEntry = serde_json::from_slice(&entry)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-            tree.insert(path, tree_entry);
+            let mut tree = deserialize_tree(&state)?;
+            tree.insert(path, entry);
             serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
         }
 
         StateOperation::TreeRemove { path } => {
-            let mut tree: TreeState = if state.is_empty() {
-                TreeState::new()
-            } else {
-                serde_json::from_slice(&state)
-                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
-            };
+            let mut tree = deserialize_tree(&state)?;
             tree.remove(&path);
             serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
         }
 
         StateOperation::TreeBatch { ops } => {
-            let mut tree: TreeState = if state.is_empty() {
-                TreeState::new()
-            } else {
-                serde_json::from_slice(&state)
-                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
-            };
-            let tree_ops: Vec<TreeOp> = serde_json::from_slice(&ops)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-            for op in tree_ops {
-                match op {
-                    TreeOp::Set { path, entry } => { tree.insert(path, entry); }
-                    TreeOp::Remove { path } => { tree.remove(&path); }
-                }
-            }
+            let mut tree = deserialize_tree(&state)?;
+            apply_tree_ops(&mut tree, ops);
             serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
         }
 
-        StateOperation::TreeDeltaSnapshot(delta) => {
-            let mut tree: TreeState = if state.is_empty() {
-                TreeState::new()
-            } else {
-                serde_json::from_slice(&state)
-                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
-            };
-            let tree_ops: Vec<TreeOp> = serde_json::from_slice(&delta)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-            for op in tree_ops {
-                match op {
-                    TreeOp::Set { path, entry } => { tree.insert(path, entry); }
-                    TreeOp::Remove { path } => { tree.remove(&path); }
-                }
-            }
+        StateOperation::TreeDeltaSnapshot(ops) => {
+            let mut tree = deserialize_tree(&state)?;
+            apply_tree_ops(&mut tree, ops);
             serde_json::to_vec(&tree).map_err(|e| StoreError::Serialization(e.to_string()))
         }
 
@@ -190,6 +177,7 @@ pub fn apply_operation(state: Vec<u8>, operation: StateOperation) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TreeEntry;
     use serde_json::json;
 
     #[test]
@@ -310,10 +298,9 @@ mod tests {
     #[test]
     fn test_tree_set() {
         let state = vec![];
-        let entry = serde_json::to_vec(&make_tree_entry("abc123", 100)).unwrap();
         let op = StateOperation::TreeSet {
             path: "src/main.rs".to_string(),
-            entry,
+            entry: make_tree_entry("abc123", 100),
         };
         let state = apply_operation(state, op).unwrap();
         let tree: TreeState = serde_json::from_slice(&state).unwrap();
@@ -325,22 +312,20 @@ mod tests {
     #[test]
     fn test_tree_set_overwrite() {
         let state = vec![];
-        let entry1 = serde_json::to_vec(&make_tree_entry("abc123", 100)).unwrap();
         let state = apply_operation(
             state,
             StateOperation::TreeSet {
                 path: "file.txt".to_string(),
-                entry: entry1,
+                entry: make_tree_entry("abc123", 100),
             },
         )
         .unwrap();
 
-        let entry2 = serde_json::to_vec(&make_tree_entry("def456", 200)).unwrap();
         let state = apply_operation(
             state,
             StateOperation::TreeSet {
                 path: "file.txt".to_string(),
-                entry: entry2,
+                entry: make_tree_entry("def456", 200),
             },
         )
         .unwrap();
@@ -407,8 +392,7 @@ mod tests {
                 path: "src/lib.rs".to_string(),
             },
         ];
-        let ops_bytes = serde_json::to_vec(&ops).unwrap();
-        let state = apply_operation(state, StateOperation::TreeBatch { ops: ops_bytes }).unwrap();
+        let state = apply_operation(state, StateOperation::TreeBatch { ops }).unwrap();
 
         let tree: TreeState = serde_json::from_slice(&state).unwrap();
         assert_eq!(tree.len(), 2);
@@ -434,8 +418,7 @@ mod tests {
                 path: "a.txt".to_string(),
             },
         ];
-        let delta = serde_json::to_vec(&delta_ops).unwrap();
-        let state = apply_operation(state, StateOperation::TreeDeltaSnapshot(delta)).unwrap();
+        let state = apply_operation(state, StateOperation::TreeDeltaSnapshot(delta_ops)).unwrap();
 
         let tree: TreeState = serde_json::from_slice(&state).unwrap();
         assert_eq!(tree.len(), 1);
