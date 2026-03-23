@@ -1084,6 +1084,9 @@ impl Store {
             None => return Ok(Vec::new()),
         };
 
+        // Collect ops in reverse (newest first) — deduplicate to last-write-wins per path.
+        // Since we walk from newest to oldest, the first op we see for a path is the final state.
+        let mut seen = std::collections::HashSet::new();
         let mut ops: Vec<TreeOp> = Vec::new();
         let mut current_offset = Some(head.head_offset);
 
@@ -1092,20 +1095,32 @@ impl Store {
             let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
+            let mut push_if_unseen = |op: TreeOp| {
+                let path = match &op {
+                    TreeOp::Set { path, .. } | TreeOp::Remove { path } => path.clone(),
+                };
+                if seen.insert(path) {
+                    ops.push(op);
+                }
+            };
+
             match &update.operation {
                 StateOperation::TreeSet { path, entry } => {
-                    ops.push(TreeOp::Set {
+                    push_if_unseen(TreeOp::Set {
                         path: path.clone(),
                         entry: entry.clone(),
                     });
                 }
                 StateOperation::TreeRemove { path } => {
-                    ops.push(TreeOp::Remove {
+                    push_if_unseen(TreeOp::Remove {
                         path: path.clone(),
                     });
                 }
                 StateOperation::TreeBatch { ops: batch_ops } => {
-                    ops.extend(batch_ops.clone());
+                    // Process batch ops in reverse so later ops in same batch win
+                    for op in batch_ops.iter().rev() {
+                        push_if_unseen(op.clone());
+                    }
                 }
                 StateOperation::Snapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
                     break;
@@ -1124,8 +1139,24 @@ impl Store {
 
     // --- Tree Operations ---
 
+    /// Validate a tree path: must be non-empty, relative, no null bytes, no `.` or `..` components.
+    fn validate_tree_path(path: &str) -> Result<()> {
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains('\0')
+            || path.split('/').any(|c| c == ".." || c == ".")
+        {
+            return Err(StoreError::InvalidOperation(format!(
+                "Invalid tree path: '{}'",
+                path
+            )));
+        }
+        Ok(())
+    }
+
     /// Set a single file in a tree state.
     pub fn tree_set(&self, state_id: &str, path: &str, entry: &TreeEntry) -> Result<Record> {
+        Self::validate_tree_path(path)?;
         self.update_state(
             state_id,
             StateOperation::TreeSet {
@@ -1137,6 +1168,7 @@ impl Store {
 
     /// Remove a single file from a tree state.
     pub fn tree_remove(&self, state_id: &str, path: &str) -> Result<Record> {
+        Self::validate_tree_path(path)?;
         self.update_state(
             state_id,
             StateOperation::TreeRemove {
@@ -1147,6 +1179,13 @@ impl Store {
 
     /// Apply a batch of tree operations atomically.
     pub fn tree_batch(&self, state_id: &str, ops: &[TreeOp]) -> Result<Record> {
+        for op in ops {
+            match op {
+                TreeOp::Set { path, .. } | TreeOp::Remove { path } => {
+                    Self::validate_tree_path(path)?;
+                }
+            }
+        }
         self.update_state(state_id, StateOperation::TreeBatch { ops: ops.to_vec() })
     }
 
@@ -1173,18 +1212,11 @@ impl Store {
         match prefix {
             Some(p) => {
                 let start = p.to_string();
-                // Compute exclusive upper bound by incrementing last byte
-                let mut end = start.clone();
-                if let Some(last) = end.pop() {
-                    end.push(char::from(last as u8 + 1));
-                    Ok(tree
-                        .range(start..end)
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect())
-                } else {
-                    // Empty prefix — return all
-                    Ok(tree.into_iter().collect())
-                }
+                Ok(tree
+                    .range(start..)
+                    .take_while(|(k, _)| k.starts_with(p))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect())
             }
             None => Ok(tree.into_iter().collect()),
         }

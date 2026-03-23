@@ -321,3 +321,45 @@ fn test_tree_diff_modifications() {
         other => panic!("Expected Modified, got {:?}", other),
     }
 }
+
+// --- Path validation ---
+
+#[test]
+fn test_tree_path_validation() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    register_tree(&store, "files");
+
+    // Valid paths should work
+    store.tree_set("files", "src/main.rs", &entry("hash", 100)).unwrap();
+    store.tree_set("files", "a.txt", &entry("hash", 10)).unwrap();
+    store.tree_set("files", "deep/nested/path/file.rs", &entry("hash", 50)).unwrap();
+
+    // Invalid paths should be rejected
+    let cases = vec![
+        ("", "empty path"),
+        ("/absolute", "absolute path"),
+        ("../escape", "parent traversal"),
+        ("dir/../file", "embedded parent traversal"),
+        ("./relative", "dot component"),
+        ("dir/./file", "embedded dot component"),
+        ("has\0null", "null byte"),
+    ];
+
+    for (path, desc) in cases {
+        let result = store.tree_set("files", path, &entry("hash", 10));
+        assert!(result.is_err(), "Expected error for {}: {}", desc, path);
+    }
+
+    // Remove should also validate
+    assert!(store.tree_remove("files", "../escape").is_err());
+
+    // Batch should also validate
+    let result = store.tree_batch("files", &[
+        TreeOp::Set { path: "valid.txt".to_string(), entry: entry("h", 1) },
+        TreeOp::Set { path: "../bad".to_string(), entry: entry("h", 1) },
+    ]);
+    assert!(result.is_err());
+    // The valid entry should NOT have been applied (batch is atomic, validation is upfront)
+    assert!(store.tree_get("files", "valid.txt").unwrap().is_none());
+}

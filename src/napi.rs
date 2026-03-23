@@ -242,16 +242,18 @@ pub struct JsTreeOp {
 /// A change between two tree states.
 ///
 /// Field population by change_type:
-/// - "added": `entry` = the new entry, `old_entry` = None, `new_entry` = None
-/// - "modified": `entry` = None, `old_entry` = previous entry, `new_entry` = current entry
-/// - "removed": `entry` = the removed entry, `old_entry` = None, `new_entry` = None
+/// Field population by change_type:
+/// - "added": `old_entry` = None, `new_entry` = the new entry
+/// - "modified": `old_entry` = previous entry, `new_entry` = current entry
+/// - "removed": `old_entry` = the removed entry, `new_entry` = None
 #[napi(object)]
 pub struct JsTreeChange {
     /// "added", "modified", or "removed"
     pub change_type: String,
     pub path: String,
-    pub entry: Option<JsTreeEntry>,
+    /// Previous entry (None for "added")
     pub old_entry: Option<JsTreeEntry>,
+    /// Current entry (None for "removed")
     pub new_entry: Option<JsTreeEntry>,
 }
 
@@ -1210,18 +1212,16 @@ impl JsStore {
                 TreeChange::Added { path, entry } => JsTreeChange {
                     change_type: "added".to_string(),
                     path,
-                    entry: Some(JsTreeEntry {
+                    old_entry: None,
+                    new_entry: Some(JsTreeEntry {
                         blob_hash: entry.blob_hash,
                         size: entry.size as i64,
                         mode: entry.mode as i32,
                     }),
-                    old_entry: None,
-                    new_entry: None,
                 },
                 TreeChange::Modified { path, old, new } => JsTreeChange {
                     change_type: "modified".to_string(),
                     path,
-                    entry: None,
                     old_entry: Some(JsTreeEntry {
                         blob_hash: old.blob_hash,
                         size: old.size as i64,
@@ -1236,12 +1236,11 @@ impl JsStore {
                 TreeChange::Removed { path, entry } => JsTreeChange {
                     change_type: "removed".to_string(),
                     path,
-                    entry: Some(JsTreeEntry {
+                    old_entry: Some(JsTreeEntry {
                         blob_hash: entry.blob_hash,
                         size: entry.size as i64,
                         mode: entry.mode as i32,
                     }),
-                    old_entry: None,
                     new_entry: None,
                 },
             })
