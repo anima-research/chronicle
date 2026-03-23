@@ -9,6 +9,7 @@ use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionI
 use crate::types::{
     Blob, Branch, Hash, Record, RecordId, RecordInput, Sequence,
     StateOperation, StateRegistration, StateUpdateRecord, StoreStats, Timestamp,
+    TreeChange, TreeEntry, TreeOp, TreeState,
 };
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -363,7 +364,21 @@ impl Store {
                 // flexibility - the actual validation happens at reconstruction time.
                 let _ = (start, end); // Suppress unused warnings
             }
-            // Append, Set, Snapshot, DeltaSnapshot - no validation needed
+            StateOperation::TreeSet { .. }
+            | StateOperation::TreeRemove { .. }
+            | StateOperation::TreeBatch { .. } => {
+                if !matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::Tree { .. })
+                ) {
+                    return Err(StoreError::InvalidOperation(format!(
+                        "Tree operations require Tree strategy, state '{}' uses {:?}",
+                        state_id,
+                        self.state.get_strategy(state_id)
+                    )));
+                }
+            }
+            // Append, Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
             _ => {}
         }
 
@@ -483,7 +498,7 @@ impl Store {
                     operations.push(update.operation.clone());
                     break;
                 }
-                StateOperation::DeltaSnapshot(_) => {
+                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
                     operations.push(update.operation.clone());
                     hit_snapshot = true;
                 }
@@ -557,7 +572,7 @@ impl Store {
                     operations.push(update.operation.clone());
                     break;
                 }
-                StateOperation::DeltaSnapshot(_) => {
+                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
                     operations.push(update.operation.clone());
                     hit_snapshot = true;
                 }
@@ -583,13 +598,22 @@ impl Store {
             state = crate::state::apply_operation(state, op)?;
         }
 
-        // Count items in the resulting state (assumes JSON array for AppendLog)
+        // Count items in the resulting state using strategy-aware parsing
         let item_count = if state.is_empty() {
             0
         } else {
-            serde_json::from_slice::<Vec<serde_json::Value>>(&state)
-                .map(|arr| arr.len())
-                .unwrap_or(0)
+            match self.state.get_strategy(state_id) {
+                Some(crate::types::StateStrategy::Tree { .. }) => {
+                    serde_json::from_slice::<TreeState>(&state)
+                        .map(|t| t.len())
+                        .unwrap_or(0)
+                }
+                _ => {
+                    serde_json::from_slice::<Vec<serde_json::Value>>(&state)
+                        .map(|arr| arr.len())
+                        .unwrap_or(0)
+                }
+            }
         };
 
         Ok(Some((head_offset, item_count)))
@@ -974,13 +998,28 @@ impl Store {
                 Ok(Some(record))
             }
             Some(SnapshotNeeded::Delta) => {
-                let delta_items = self.compute_delta_items(state_id)?;
-                let record = self.update_state_internal(
-                    state_id,
-                    StateOperation::DeltaSnapshot(delta_items),
-                    skip_auto,
-                )?;
-                Ok(Some(record))
+                // Check if this is a Tree strategy (uses TreeDeltaSnapshot) or AppendLog (uses DeltaSnapshot)
+                let is_tree = matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::Tree { .. })
+                );
+                if is_tree {
+                    let delta_ops = self.compute_tree_delta_ops(state_id)?;
+                    let record = self.update_state_internal(
+                        state_id,
+                        StateOperation::TreeDeltaSnapshot(delta_ops),
+                        skip_auto,
+                    )?;
+                    Ok(Some(record))
+                } else {
+                    let delta_items = self.compute_delta_items(state_id)?;
+                    let record = self.update_state_internal(
+                        state_id,
+                        StateOperation::DeltaSnapshot(delta_items),
+                        skip_auto,
+                    )?;
+                    Ok(Some(record))
+                }
             }
         }
     }
@@ -1033,6 +1072,249 @@ impl Store {
         appended_items.reverse();
 
         serde_json::to_vec(&appended_items).map_err(|e| StoreError::Serialization(e.to_string()))
+    }
+
+    /// Compute tree operations since the last delta or full snapshot.
+    ///
+    /// Walks the chain collecting TreeSet/TreeRemove/TreeBatch operations until hitting a snapshot.
+    /// Returns Vec<TreeOp> directly (no serialization).
+    fn compute_tree_delta_ops(&self, state_id: &str) -> Result<Vec<TreeOp>> {
+        let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
+            Some(h) => h,
+            None => return Ok(Vec::new()),
+        };
+
+        // Collect ops in reverse (newest first) — deduplicate to last-write-wins per path.
+        // Since we walk from newest to oldest, the first op we see for a path is the final state.
+        let mut seen = std::collections::HashSet::new();
+        let mut ops: Vec<TreeOp> = Vec::new();
+        let mut current_offset = Some(head.head_offset);
+
+        while let Some(offset) = current_offset {
+            let record = self.log.read_at(offset)?;
+            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+
+            let mut push_if_unseen = |op: TreeOp| {
+                let path = match &op {
+                    TreeOp::Set { path, .. } | TreeOp::Remove { path } => path.clone(),
+                };
+                if seen.insert(path) {
+                    ops.push(op);
+                }
+            };
+
+            match &update.operation {
+                StateOperation::TreeSet { path, entry } => {
+                    push_if_unseen(TreeOp::Set {
+                        path: path.clone(),
+                        entry: entry.clone(),
+                    });
+                }
+                StateOperation::TreeRemove { path } => {
+                    push_if_unseen(TreeOp::Remove {
+                        path: path.clone(),
+                    });
+                }
+                StateOperation::TreeBatch { ops: batch_ops } => {
+                    // Process batch ops in reverse so later ops in same batch win
+                    for op in batch_ops.iter().rev() {
+                        push_if_unseen(op.clone());
+                    }
+                }
+                StateOperation::Snapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
+                    break;
+                }
+                _ => {}
+            }
+
+            current_offset = update.prev_update_offset;
+        }
+
+        // Reverse since we collected in reverse order
+        ops.reverse();
+
+        Ok(ops)
+    }
+
+    // --- Tree Operations ---
+
+    /// Validate a tree path: must be non-empty, relative, no null bytes, no `.` or `..` components.
+    fn validate_tree_path(path: &str) -> Result<()> {
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains('\0')
+            || path.split('/').any(|c| c == ".." || c == ".")
+        {
+            return Err(StoreError::InvalidOperation(format!(
+                "Invalid tree path: '{}'",
+                path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set a single file in a tree state.
+    pub fn tree_set(&self, state_id: &str, path: &str, entry: &TreeEntry) -> Result<Record> {
+        Self::validate_tree_path(path)?;
+        self.update_state(
+            state_id,
+            StateOperation::TreeSet {
+                path: path.to_string(),
+                entry: entry.clone(),
+            },
+        )
+    }
+
+    /// Remove a single file from a tree state.
+    pub fn tree_remove(&self, state_id: &str, path: &str) -> Result<Record> {
+        Self::validate_tree_path(path)?;
+        self.update_state(
+            state_id,
+            StateOperation::TreeRemove {
+                path: path.to_string(),
+            },
+        )
+    }
+
+    /// Apply a batch of tree operations atomically.
+    pub fn tree_batch(&self, state_id: &str, ops: &[TreeOp]) -> Result<Record> {
+        for op in ops {
+            match op {
+                TreeOp::Set { path, .. } | TreeOp::Remove { path } => {
+                    Self::validate_tree_path(path)?;
+                }
+            }
+        }
+        self.update_state(state_id, StateOperation::TreeBatch { ops: ops.to_vec() })
+    }
+
+    /// Get a single file entry from a tree state.
+    pub fn tree_get(&self, state_id: &str, path: &str) -> Result<Option<TreeEntry>> {
+        let state = match self.get_state(state_id)? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+        let tree: TreeState = serde_json::from_slice(&state)
+            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+        Ok(tree.get(path).cloned())
+    }
+
+    /// List files in a tree state, optionally filtered by path prefix.
+    pub fn tree_list(&self, state_id: &str, prefix: Option<&str>) -> Result<Vec<(String, TreeEntry)>> {
+        let state = match self.get_state(state_id)? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(Vec::new()),
+        };
+        let tree: TreeState = serde_json::from_slice(&state)
+            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+
+        match prefix {
+            Some(p) => {
+                let start = p.to_string();
+                Ok(tree
+                    .range(start..)
+                    .take_while(|(k, _)| k.starts_with(p))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect())
+            }
+            None => Ok(tree.into_iter().collect()),
+        }
+    }
+
+    /// Compute the diff between a tree state at two sequence points.
+    ///
+    /// Returns a list of changes (Added, Modified, Removed).
+    pub fn tree_diff(
+        &self,
+        state_id: &str,
+        from_seq: Sequence,
+        to_seq: Sequence,
+    ) -> Result<Vec<TreeChange>> {
+        let from_state = self.get_state_at(state_id, from_seq)?;
+        let to_state = self.get_state_at(state_id, to_seq)?;
+
+        let from_tree: TreeState = match from_state {
+            Some(s) if !s.is_empty() => serde_json::from_slice(&s)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?,
+            _ => TreeState::new(),
+        };
+        let to_tree: TreeState = match to_state {
+            Some(s) if !s.is_empty() => serde_json::from_slice(&s)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?,
+            _ => TreeState::new(),
+        };
+
+        let mut changes = Vec::new();
+
+        // Merge-join over sorted maps
+        let mut from_iter = from_tree.iter().peekable();
+        let mut to_iter = to_tree.iter().peekable();
+
+        loop {
+            match (from_iter.peek(), to_iter.peek()) {
+                (None, None) => break,
+                (Some((path, entry)), None) => {
+                    changes.push(TreeChange::Removed {
+                        path: (*path).clone(),
+                        entry: (*entry).clone(),
+                    });
+                    from_iter.next();
+                }
+                (None, Some((path, entry))) => {
+                    changes.push(TreeChange::Added {
+                        path: (*path).clone(),
+                        entry: (*entry).clone(),
+                    });
+                    to_iter.next();
+                }
+                (Some((from_path, from_entry)), Some((to_path, to_entry))) => {
+                    match from_path.cmp(to_path) {
+                        std::cmp::Ordering::Less => {
+                            changes.push(TreeChange::Removed {
+                                path: (*from_path).clone(),
+                                entry: (*from_entry).clone(),
+                            });
+                            from_iter.next();
+                        }
+                        std::cmp::Ordering::Greater => {
+                            changes.push(TreeChange::Added {
+                                path: (*to_path).clone(),
+                                entry: (*to_entry).clone(),
+                            });
+                            to_iter.next();
+                        }
+                        std::cmp::Ordering::Equal => {
+                            if from_entry != to_entry {
+                                changes.push(TreeChange::Modified {
+                                    path: (*from_path).clone(),
+                                    old: (*from_entry).clone(),
+                                    new: (*to_entry).clone(),
+                                });
+                            }
+                            from_iter.next();
+                            to_iter.next();
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(changes)
+    }
+
+    /// Force a full snapshot of a tree state (compaction).
+    pub fn tree_snapshot(&self, state_id: &str) -> Result<Option<Record>> {
+        let current = match self.get_state(state_id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let record = self.update_state_internal(
+            state_id,
+            StateOperation::Snapshot(current),
+            true, // skip auto-snapshot
+        )?;
+        Ok(Some(record))
     }
 
     // --- Branch Operations ---
