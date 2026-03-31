@@ -1,5 +1,5 @@
 {
-  "name": "@anima-research/chronicle",
+  "name": "@animalabs/chronicle",
   "version": "0.1.0",
   "description": "A branchable, time-traveling record store with causation tracking",
   "main": "index.js",
