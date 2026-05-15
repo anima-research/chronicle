@@ -130,6 +130,15 @@ impl RecordLog {
         Ok((record, offset))
     }
 
+    /// Peek the record id the next `append` will assign, without consuming it.
+    ///
+    /// Only meaningful while the caller holds the outer write-serialisation
+    /// lock (e.g. `Store::write_lock`); without that, another append can race
+    /// in and the peeked value becomes stale.
+    pub fn peek_next_id(&self) -> crate::types::RecordId {
+        crate::types::RecordId(*self.next_id.read())
+    }
+
     /// Force sync all pending writes to disk.
     pub fn sync(&self) -> Result<()> {
         let mut file = self.file.write();
