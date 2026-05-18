@@ -710,10 +710,10 @@ fn test_causation_chain_persists_across_reopen() {
     assert_eq!(effects, vec![response_id]);
 }
 
-// --- append_to_state_json_assigning + auto-snapshot toggle ---
+// --- append_to_state_json_with_identity + auto-snapshot toggle ---
 
 #[test]
-fn test_assigning_append_round_trip_after_reopen() {
+fn test_append_with_identity_round_trip_after_reopen() {
     // Each appended item carries `id`/`sequence` fields populated server-side
     // with the values chronicle will assign to that record. After a reopen,
     // those values must still match the actual `record.id` / `record.sequence`
@@ -738,7 +738,7 @@ fn test_assigning_append_round_trip_after_reopen() {
         for i in 0..5 {
             let item = json!({ "text": format!("msg-{}", i) });
             let record = store
-                .append_to_state_json_assigning("msgs", item, "id", "sequence")
+                .append_to_state_json_with_identity("msgs", item, "id", "sequence")
                 .unwrap();
             expected.push((record.id.0.to_string(), record.sequence.0 as i64));
         }
@@ -771,7 +771,7 @@ fn test_assigning_append_round_trip_after_reopen() {
 }
 
 #[test]
-fn test_assigning_append_rejects_non_object() {
+fn test_append_with_identity_rejects_non_object() {
     let dir = TempDir::new().unwrap();
     let store = test_store(&dir);
     store
@@ -789,12 +789,12 @@ fn test_assigning_append_rejects_non_object() {
     // and write nothing to the chain.
     for v in [json!([1, 2, 3]), json!("scalar"), json!(42)] {
         let err = store
-            .append_to_state_json_assigning("msgs", v, "id", "sequence")
+            .append_to_state_json_with_identity("msgs", v, "id", "sequence")
             .unwrap_err();
         let msg = format!("{}", err);
         assert!(
-            msg.contains("non-object"),
-            "expected non-object error, got: {}",
+            msg.contains("JSON object"),
+            "expected 'JSON object' error, got: {}",
             msg
         );
     }
@@ -833,7 +833,7 @@ fn test_auto_snapshot_toggle_suppresses_then_compact_installs() {
     for i in 0..20 {
         let item = json!({ "i": i });
         store
-            .append_to_state_json_assigning("msgs", item, "id", "sequence")
+            .append_to_state_json_with_identity("msgs", item, "id", "sequence")
             .unwrap();
     }
     let stats = store.get_chain_stats("msgs").unwrap().unwrap();
@@ -854,7 +854,7 @@ fn test_auto_snapshot_toggle_suppresses_then_compact_installs() {
     store.set_auto_snapshot(true);
     assert!(store.auto_snapshot_enabled());
     store
-        .append_to_state_json_assigning("msgs", json!({ "i": 20 }), "id", "sequence")
+        .append_to_state_json_with_identity("msgs", json!({ "i": 20 }), "id", "sequence")
         .unwrap();
     let stats = store.get_chain_stats("msgs").unwrap().unwrap();
     assert_eq!(stats.total_operations, 22);
@@ -900,7 +900,7 @@ fn test_auto_snapshot_toggle_default_path_still_snapshots() {
     assert!(store.auto_snapshot_enabled(), "default must be enabled");
     for i in 0..20 {
         store
-            .append_to_state_json_assigning("msgs", json!({ "i": i }), "id", "sequence")
+            .append_to_state_json_with_identity("msgs", json!({ "i": i }), "id", "sequence")
             .unwrap();
     }
     let stats = store.get_chain_stats("msgs").unwrap().unwrap();

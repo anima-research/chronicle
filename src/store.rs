@@ -385,7 +385,7 @@ impl Store {
     /// id as a string (matching the napi `JsRecord.id` shape); `sequence_field`
     /// receives the assigned sequence as a number. Existing values at those
     /// keys are overwritten.
-    pub fn append_to_state_json_assigning(
+    pub fn append_to_state_json_with_identity(
         &self,
         state_id: &str,
         item: serde_json::Value,
@@ -398,7 +398,7 @@ impl Store {
                 serde_json::Value::Object(map) => map,
                 _ => {
                     return Err(StoreError::InvalidOperation(
-                        "non-object payload passed to assigning append".into(),
+                        "payload must be a JSON object".into(),
                     ));
                 }
             };
@@ -421,7 +421,7 @@ impl Store {
     /// the whole operation so the peeked id/seq match what `log.append`
     /// actually assigns. Validation runs after the builder, so the builder
     /// can also surface `InvalidOperation` (e.g. for non-object payloads in
-    /// the assigning path).
+    /// `append_to_state_json_with_identity`).
     fn update_state_with_builder<F>(
         &self,
         state_id: &str,

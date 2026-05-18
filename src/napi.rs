@@ -626,7 +626,7 @@ impl JsStore {
     /// stored item to carry its own chronicle identity — it avoids the
     /// follow-up Edit that would otherwise promote every snapshot to Full.
     #[napi]
-    pub fn append_to_state_json_assigning(
+    pub fn append_to_state_json_with_identity(
         &self,
         state_id: String,
         item: serde_json::Value,
@@ -635,7 +635,7 @@ impl JsStore {
     ) -> Result<JsRecord> {
         let store = self.get_store()?;
         let record = store
-            .append_to_state_json_assigning(&state_id, item, &id_field, &sequence_field)
+            .append_to_state_json_with_identity(&state_id, item, &id_field, &sequence_field)
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
