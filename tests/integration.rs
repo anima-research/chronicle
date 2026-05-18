@@ -709,3 +709,208 @@ fn test_causation_chain_persists_across_reopen() {
     let effects = store.get_effects(msg_id);
     assert_eq!(effects, vec![response_id]);
 }
+
+// --- append_to_state_json_assigning + auto-snapshot toggle ---
+
+#[test]
+fn test_assigning_append_round_trip_after_reopen() {
+    // Each appended item carries `id`/`sequence` fields populated server-side
+    // with the values chronicle will assign to that record. After a reopen,
+    // those values must still match the actual `record.id` / `record.sequence`
+    // — otherwise the payload-vs-envelope identity contract is silently broken.
+    let dir = TempDir::new().unwrap();
+
+    let mut expected: Vec<(String, i64)> = Vec::new();
+
+    {
+        let store = test_store(&dir);
+        store
+            .register_state(StateRegistration {
+                id: "msgs".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        for i in 0..5 {
+            let item = json!({ "text": format!("msg-{}", i) });
+            let record = store
+                .append_to_state_json_assigning("msgs", item, "id", "sequence")
+                .unwrap();
+            expected.push((record.id.0.to_string(), record.sequence.0 as i64));
+        }
+    }
+
+    // Reopen and read state back via get_state.
+    let store = Store::open(StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: false,
+    })
+    .unwrap();
+    let bytes = store.get_state("msgs").unwrap().unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(items.len(), expected.len());
+    for (i, item) in items.iter().enumerate() {
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap();
+        let seq = item.get("sequence").and_then(|v| v.as_i64()).unwrap();
+        assert_eq!(
+            id, expected[i].0,
+            "embedded id must equal record.id for slot {}",
+            i
+        );
+        assert_eq!(
+            seq, expected[i].1,
+            "embedded sequence must equal record.sequence for slot {}",
+            i
+        );
+    }
+}
+
+#[test]
+fn test_assigning_append_rejects_non_object() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    store
+        .register_state(StateRegistration {
+            id: "msgs".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Array, string, number — all non-objects, all must surface InvalidOperation
+    // and write nothing to the chain.
+    for v in [json!([1, 2, 3]), json!("scalar"), json!(42)] {
+        let err = store
+            .append_to_state_json_assigning("msgs", v, "id", "sequence")
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("non-object"),
+            "expected non-object error, got: {}",
+            msg
+        );
+    }
+
+    // Rejected calls must not have written anything. `get_chain_stats`
+    // returns `None` for a state with no chain head, which is the correct
+    // empty-state shape here.
+    assert!(
+        store.get_chain_stats("msgs").unwrap().is_none(),
+        "rejected calls must not write any state ops",
+    );
+}
+
+#[test]
+fn test_auto_snapshot_toggle_suppresses_then_compact_installs() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    // Small thresholds so even a modest write count would normally trigger
+    // multiple snapshots.
+    store
+        .register_state(StateRegistration {
+            id: "msgs".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 5,
+                full_snapshot_every: 5,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // With auto-snapshot disabled, 20 appends should produce exactly 20 state
+    // ops and zero snapshots.
+    store.set_auto_snapshot(false);
+    assert!(!store.auto_snapshot_enabled());
+    for i in 0..20 {
+        let item = json!({ "i": i });
+        store
+            .append_to_state_json_assigning("msgs", item, "id", "sequence")
+            .unwrap();
+    }
+    let stats = store.get_chain_stats("msgs").unwrap().unwrap();
+    assert_eq!(stats.total_operations, 20);
+    assert!(
+        !stats.has_full_snapshot,
+        "no snapshot must be written while toggle is off",
+    );
+
+    // compact_state installs a single Full snapshot regardless of the toggle.
+    store.compact_state("msgs").unwrap().unwrap();
+    let stats = store.get_chain_stats("msgs").unwrap().unwrap();
+    assert_eq!(stats.total_operations, 21, "20 appends + 1 snapshot");
+    assert!(stats.has_full_snapshot);
+
+    // Re-enable, write one more append — it shouldn't trigger another snapshot
+    // immediately (counter just reset).
+    store.set_auto_snapshot(true);
+    assert!(store.auto_snapshot_enabled());
+    store
+        .append_to_state_json_assigning("msgs", json!({ "i": 20 }), "id", "sequence")
+        .unwrap();
+    let stats = store.get_chain_stats("msgs").unwrap().unwrap();
+    assert_eq!(stats.total_operations, 22);
+
+    // Reopen and confirm reconstruction sees all 21 items, in order.
+    drop(store);
+    let store = Store::open(StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: false,
+    })
+    .unwrap();
+    let bytes = store.get_state("msgs").unwrap().unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(items.len(), 21);
+    for (i, item) in items.iter().enumerate() {
+        assert_eq!(item.get("i").and_then(|v| v.as_i64()), Some(i as i64));
+    }
+}
+
+#[test]
+fn test_auto_snapshot_toggle_default_path_still_snapshots() {
+    // Sanity: with the toggle in its default state (on), the existing
+    // snapshot policy still fires. Guards against an accidental wiring
+    // regression where the flag's default is misread.
+    //
+    // `delta_snapshot_every:5, full_snapshot_every:2` → after 5 appends a
+    // Delta fires, after another 5 a Delta, after another 5 the policy
+    // promotes to a Full. So 20 appends gives at least one Full snapshot.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    store
+        .register_state(StateRegistration {
+            id: "msgs".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 5,
+                full_snapshot_every: 2,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    assert!(store.auto_snapshot_enabled(), "default must be enabled");
+    for i in 0..20 {
+        store
+            .append_to_state_json_assigning("msgs", json!({ "i": i }), "id", "sequence")
+            .unwrap();
+    }
+    let stats = store.get_chain_stats("msgs").unwrap().unwrap();
+    assert!(
+        stats.has_full_snapshot,
+        "default-on toggle must let the snapshot policy fire normally",
+    );
+    assert!(
+        stats.total_operations > 20,
+        "chain must include at least one snapshot record (got {} ops)",
+        stats.total_operations,
+    );
+}

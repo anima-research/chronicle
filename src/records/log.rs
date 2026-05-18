@@ -132,10 +132,11 @@ impl RecordLog {
 
     /// Peek the record id the next `append` will assign, without consuming it.
     ///
-    /// Only meaningful while the caller holds the outer write-serialisation
-    /// lock (e.g. `Store::write_lock`); without that, another append can race
-    /// in and the peeked value becomes stale.
-    pub fn peek_next_id(&self) -> crate::types::RecordId {
+    /// Only meaningful while the caller holds `Store::write_lock`; without
+    /// that, another append can race in and the peeked value becomes stale.
+    /// Crate-internal because there's no safe way to use it from outside
+    /// `Store` — exposing it would invite the staleness footgun.
+    pub(crate) fn peek_next_id(&self) -> crate::types::RecordId {
         crate::types::RecordId(*self.next_id.read())
     }
 
