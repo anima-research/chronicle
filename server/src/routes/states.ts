@@ -8,6 +8,11 @@ import type { JsStore, StateResponse } from '../types.js';
 export function createStateRoutes(store: JsStore): Router {
   const router = Router();
 
+  // Check if a state ID is registered (exists but may be empty)
+  function isRegistered(stateId: string): boolean {
+    return store.listStates().some(s => s.id === stateId);
+  }
+
   // GET / - List all states
   router.get('/', (_req, res) => {
     try {
@@ -126,6 +131,14 @@ export function createStateRoutes(store: JsStore): Router {
       const sliceBuffer = store.getStateSlice(stateId, offset, limit);
 
       if (sliceBuffer === null) {
+        // Registered but empty → return empty results
+        if (isRegistered(stateId)) {
+          res.json({
+            success: true,
+            data: { items: [], offset, limit, total: 0, hasMore: false },
+          });
+          return;
+        }
         res.status(404).json({
           success: false,
           error: 'State not found or not an append-log state',
@@ -170,6 +183,13 @@ export function createStateRoutes(store: JsStore): Router {
       const tailBuffer = store.getStateTail(stateId, count);
 
       if (tailBuffer === null) {
+        if (isRegistered(stateId)) {
+          res.json({
+            success: true,
+            data: { items: [], count, total: 0 },
+          });
+          return;
+        }
         res.status(404).json({
           success: false,
           error: 'State not found or not an append-log state',
@@ -210,6 +230,13 @@ export function createStateRoutes(store: JsStore): Router {
       const length = store.getStateLen(stateId);
 
       if (length === null) {
+        if (isRegistered(stateId)) {
+          res.json({
+            success: true,
+            data: { length: 0 },
+          });
+          return;
+        }
         res.status(404).json({
           success: false,
           error: 'State not found or not an append-log state',
@@ -247,6 +274,13 @@ export function createStateRoutes(store: JsStore): Router {
 
       const totalLen = store.getStateLen(stateId);
       if (totalLen === null) {
+        if (isRegistered(stateId)) {
+          res.json({
+            success: true,
+            data: { items: [], total: 0, query, field: field || null },
+          });
+          return;
+        }
         res.status(404).json({
           success: false,
           error: 'State not found or not an append-log state',

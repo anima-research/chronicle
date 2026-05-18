@@ -9,13 +9,10 @@ use crate::records::RecordLog;
 use crate::types::{BranchId, RecordId, Sequence};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Index mapping sequence numbers to file offsets.
 pub struct RecordIndex {
-    /// Path to the index file.
-    path: PathBuf,
-
     /// In-memory index: (branch, sequence) -> offset.
     /// Uses BTreeMap for O(log n) range queries and ordered iteration.
     entries: RwLock<BTreeMap<(BranchId, Sequence), u64>>,
@@ -38,8 +35,8 @@ impl RecordIndex {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
+        let _path = path;
         Ok(Self {
-            path,
             entries: RwLock::new(BTreeMap::new()),
             id_to_offset: RwLock::new(HashMap::new()),
             type_index: RwLock::new(HashMap::new()),

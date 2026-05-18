@@ -9,6 +9,8 @@ const props = defineProps<{
 const viewMode = ref<'formatted' | 'raw'>('formatted');
 const expandedPaths = ref<Set<string>>(new Set());
 const defaultExpanded = ref(true);
+// Track expanded long strings separately (default collapsed)
+const expandedStrings = ref<Set<string>>(new Set());
 
 // Detect if data is structured (object/array) vs plain text/binary
 const isStructured = computed(() => {
@@ -37,8 +39,23 @@ const rawDisplay = computed(() => {
 // Reset expanded state when data changes
 watch(() => props.data, () => {
   expandedPaths.value = new Set();
+  expandedStrings.value = new Set();
   defaultExpanded.value = true;
 });
+
+function isStringExpanded(path: string): boolean {
+  return expandedStrings.value.has(path);
+}
+
+function toggleStringExpand(path: string) {
+  if (expandedStrings.value.has(path)) {
+    expandedStrings.value.delete(path);
+  } else {
+    expandedStrings.value.add(path);
+  }
+  // Trigger reactivity
+  expandedStrings.value = new Set(expandedStrings.value);
+}
 
 function isExpanded(path: string): boolean {
   if (expandedPaths.value.has(path)) {
@@ -147,7 +164,7 @@ async function copyToClipboard() {
 
       <!-- Formatted view with highlighting -->
       <div v-else class="leading-relaxed">
-        <JsonNode :value="data" :path="'$'" :is-expanded="isExpanded" :toggle-expand="toggleExpand" />
+        <JsonNode :value="data" :path="'$'" :is-expanded="isExpanded" :toggle-expand="toggleExpand" :is-string-expanded="isStringExpanded" :toggle-string-expand="toggleStringExpand" />
       </div>
     </div>
 
@@ -169,6 +186,8 @@ interface JsonNodeProps {
   isLast?: boolean;
   isExpanded: (path: string) => boolean;
   toggleExpand: (path: string) => void;
+  isStringExpanded: (path: string) => boolean;
+  toggleStringExpand: (path: string) => void;
 }
 
 function getType(val: unknown): string {
@@ -190,12 +209,58 @@ function renderJsonNode(props: JsonNodeProps): VNode {
   // Primitives
   if (type === 'string') {
     const strVal = props.value as string;
-    // Truncate very long strings
-    const display = strVal.length > 500 ? strVal.slice(0, 500) + '...' : strVal;
-    return h('div', { class: 'whitespace-nowrap' }, [
-      keyPrefix,
-      h('span', { class: 'text-green-700' }, `"${display}"`),
-      h('span', { class: 'text-gray-400' }, comma),
+    const truncateThreshold = 500;
+    const isLong = strVal.length > truncateThreshold;
+    const expanded = props.isStringExpanded(props.path);
+
+    if (!isLong) {
+      // Short string - render normally
+      return h('div', { class: 'whitespace-nowrap' }, [
+        keyPrefix,
+        h('span', { class: 'text-green-700' }, `"${strVal}"`),
+        h('span', { class: 'text-gray-400' }, comma),
+      ]);
+    }
+
+    // Long string - render with expand/collapse toggle
+    if (!expanded) {
+      // Collapsed view - show truncated with expand button
+      const truncated = strVal.slice(0, truncateThreshold);
+      return h('div', { class: 'whitespace-nowrap' }, [
+        h('span', {
+          class: 'cursor-pointer select-none text-gray-400 hover:text-gray-600 mr-1',
+          onClick: (e: Event) => { e.stopPropagation(); props.toggleStringExpand(props.path); },
+          title: 'Click to expand',
+        }, '\u25b6'),
+        keyPrefix,
+        h('span', { class: 'text-green-700' }, `"${truncated}`),
+        h('span', {
+          class: 'text-blue-500 cursor-pointer hover:underline mx-1',
+          onClick: (e: Event) => { e.stopPropagation(); props.toggleStringExpand(props.path); },
+        }, `... [${strVal.length - truncateThreshold} more chars]`),
+        h('span', { class: 'text-green-700' }, '"'),
+        h('span', { class: 'text-gray-400' }, comma),
+      ]);
+    }
+
+    // Expanded view - show full string with collapse button
+    return h('div', { class: 'whitespace-normal' }, [
+      h('div', { class: 'flex items-start' }, [
+        h('span', {
+          class: 'cursor-pointer select-none text-gray-400 hover:text-gray-600 mr-1 flex-shrink-0',
+          onClick: (e: Event) => { e.stopPropagation(); props.toggleStringExpand(props.path); },
+          title: 'Click to collapse',
+        }, '\u25bc'),
+        h('div', { class: 'flex-1 min-w-0' }, [
+          keyPrefix,
+          h('span', { class: 'text-green-700 break-all' }, `"${strVal}"`),
+          h('span', { class: 'text-gray-400' }, comma),
+          h('span', {
+            class: 'text-blue-500 cursor-pointer hover:underline ml-2 text-xs',
+            onClick: (e: Event) => { e.stopPropagation(); props.toggleStringExpand(props.path); },
+          }, '[collapse]'),
+        ]),
+      ]),
     ]);
   }
 
@@ -267,6 +332,8 @@ function renderJsonNode(props: JsonNodeProps): VNode {
             isLast: idx === arr.length - 1,
             isExpanded: props.isExpanded,
             toggleExpand: props.toggleExpand,
+            isStringExpanded: props.isStringExpanded,
+            toggleStringExpand: props.toggleStringExpand,
           })
         )
       ),
@@ -323,6 +390,8 @@ function renderJsonNode(props: JsonNodeProps): VNode {
             isLast: idx === keys.length - 1,
             isExpanded: props.isExpanded,
             toggleExpand: props.toggleExpand,
+            isStringExpanded: props.isStringExpanded,
+            toggleStringExpand: props.toggleStringExpand,
           })
         )
       ),
@@ -346,6 +415,8 @@ const JsonNode = defineComponent({
     isLast: { type: Boolean, default: true },
     isExpanded: { type: Function as PropType<(path: string) => boolean>, required: true },
     toggleExpand: { type: Function as PropType<(path: string) => void>, required: true },
+    isStringExpanded: { type: Function as PropType<(path: string) => boolean>, required: true },
+    toggleStringExpand: { type: Function as PropType<(path: string) => void>, required: true },
   },
   setup(props): () => VNode {
     return (): VNode => renderJsonNode({
@@ -355,6 +426,8 @@ const JsonNode = defineComponent({
       isLast: props.isLast,
       isExpanded: props.isExpanded,
       toggleExpand: props.toggleExpand,
+      isStringExpanded: props.isStringExpanded,
+      toggleStringExpand: props.toggleStringExpand,
     });
   },
 });

@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::types::{
-    BranchSummary, DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
-    SubscriptionHandle, SubscriptionId,
+    BranchSummary, DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionHandle,
+    SubscriptionId,
 };
 
 /// Default threshold for including payload in record events (bytes).
@@ -17,7 +17,6 @@ const DEFAULT_PAYLOAD_THRESHOLD: usize = 4096;
 
 /// Internal subscription state.
 struct Subscription {
-    id: SubscriptionId,
     config: SubscriptionConfig,
     sender: Sender<StoreEvent>,
     /// Whether catch-up is complete.
@@ -109,7 +108,6 @@ impl SubscriptionManager {
         let (sender, receiver) = bounded(config.buffer_size);
 
         let subscription = Subscription {
-            id,
             config,
             sender,
             caught_up: false,
@@ -286,6 +284,7 @@ impl Default for SubscriptionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subscriptions::types::SubscriptionFilter;
     use crate::types::{BranchId, PayloadEncoding, RecordId, Timestamp};
     use std::time::Duration;
 
