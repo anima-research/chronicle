@@ -616,6 +616,30 @@ impl JsStore {
         Ok(record.into())
     }
 
+    /// Append JSON to an AppendLog state, injecting the assigned record id
+    /// and sequence into the payload in a single atomic op.
+    ///
+    /// `item` must be a JSON object. `idField` receives the assigned record
+    /// id (as a string, matching `JsRecord.id`); `sequenceField` receives the
+    /// assigned sequence (as a number). Use this in place of
+    /// `appendToStateJson` + `editStateItem` when the caller wants each
+    /// stored item to carry its own chronicle identity — it avoids the
+    /// follow-up Edit that would otherwise promote every snapshot to Full.
+    #[napi]
+    pub fn append_to_state_json_with_identity(
+        &self,
+        state_id: String,
+        item: serde_json::Value,
+        id_field: String,
+        sequence_field: String,
+    ) -> Result<JsRecord> {
+        let store = self.get_store()?;
+        let record = store
+            .append_to_state_json_with_identity(&state_id, item, &id_field, &sequence_field)
+            .map_err(to_napi_error)?;
+        Ok(record.into())
+    }
+
     /// Edit an item in an AppendLog state.
     #[napi]
     pub fn edit_state_item(
@@ -694,6 +718,26 @@ impl JsStore {
     }
 
     // --- Compaction ---
+
+    /// Toggle auto-snapshotting inside `update_state`.
+    ///
+    /// While disabled, snapshot thresholds are tracked but no snapshot record
+    /// is written. Use this around bulk imports to avoid the O(N²) snapshot
+    /// series, and call `compactState` afterwards to write a single final
+    /// snapshot so reconstruction stays fast. Default is `true`.
+    #[napi]
+    pub fn set_auto_snapshot(&self, enabled: bool) -> Result<()> {
+        let store = self.get_store()?;
+        store.set_auto_snapshot(enabled);
+        Ok(())
+    }
+
+    /// Whether auto-snapshotting is currently enabled.
+    #[napi]
+    pub fn auto_snapshot_enabled(&self) -> Result<bool> {
+        let store = self.get_store()?;
+        Ok(store.auto_snapshot_enabled())
+    }
 
     /// Compact a state by creating a full snapshot.
     #[napi]

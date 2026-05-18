@@ -15,6 +15,7 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Store configuration.
@@ -95,6 +96,11 @@ pub struct Store {
 
     /// Lock for write operations to ensure atomicity.
     write_lock: Mutex<()>,
+
+    /// When false, `update_state` skips the auto-snapshot pass. Bulk loaders
+    /// (e.g. importers) turn this off to avoid the O(N²) snapshot series and
+    /// take a single compacting snapshot at the end via `compact_state`.
+    auto_snapshot_enabled: AtomicBool,
 }
 
 impl Store {
@@ -143,6 +149,7 @@ impl Store {
             branches,
             subscriptions: SubscriptionManager::new(),
             write_lock: Mutex::new(()),
+            auto_snapshot_enabled: AtomicBool::new(true),
         })
     }
 
@@ -176,7 +183,32 @@ impl Store {
             branches,
             subscriptions: SubscriptionManager::new(),
             write_lock: Mutex::new(()),
+            auto_snapshot_enabled: AtomicBool::new(true),
         })
+    }
+
+    /// Toggle the auto-snapshot pass inside `update_state`.
+    ///
+    /// While disabled, snapshot thresholds are still tracked but no snapshot
+    /// record is written — reconstruction will walk the full chain on every
+    /// read until a snapshot is installed. Intended for bulk loaders. Typical
+    /// flow:
+    ///
+    ///   1. `set_auto_snapshot(false)`
+    ///   2. perform bulk writes
+    ///   3. `compact_state(state_id)` to install a single final snapshot
+    ///   4. `set_auto_snapshot(true)` if further writes are expected
+    ///
+    /// Default is `true`. The flag is a plain bool with `Relaxed` ordering:
+    /// it's only ever read by `update_state` itself; nothing else is
+    /// synchronised through it.
+    pub fn set_auto_snapshot(&self, enabled: bool) {
+        self.auto_snapshot_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the auto-snapshot pass is currently enabled.
+    pub fn auto_snapshot_enabled(&self) -> bool {
+        self.auto_snapshot_enabled.load(Ordering::Relaxed)
     }
 
     // --- Record Operations ---
@@ -339,9 +371,76 @@ impl Store {
         operation: StateOperation,
         skip_auto_snapshot: bool,
     ) -> Result<Record> {
+        self.update_state_with_builder(state_id, skip_auto_snapshot, move |_, _| Ok(operation))
+    }
+
+    /// Append a JSON object to an AppendLog state, injecting the assigned
+    /// record id and sequence into the payload before serialising. This lets
+    /// callers write items that carry their own chronicle identity in one op,
+    /// instead of the older append-then-edit pattern (which forced every
+    /// threshold-triggered snapshot to be Full because the Edit flipped
+    /// `has_non_append_since_snapshot`).
+    ///
+    /// `item` must be a JSON object. `id_field` receives the assigned record
+    /// id as a string (matching the napi `JsRecord.id` shape); `sequence_field`
+    /// receives the assigned sequence as a number. Existing values at those
+    /// keys are overwritten.
+    pub fn append_to_state_json_with_identity(
+        &self,
+        state_id: &str,
+        item: serde_json::Value,
+        id_field: &str,
+        sequence_field: &str,
+    ) -> Result<Record> {
+        self.update_state_with_builder(state_id, false, move |id, seq| {
+            let mut item = item;
+            let map = match &mut item {
+                serde_json::Value::Object(map) => map,
+                _ => {
+                    return Err(StoreError::InvalidOperation(
+                        "payload must be a JSON object".into(),
+                    ));
+                }
+            };
+            map.insert(
+                id_field.to_string(),
+                serde_json::Value::String(id.0.to_string()),
+            );
+            map.insert(
+                sequence_field.to_string(),
+                serde_json::Value::Number(serde_json::Number::from(seq.0)),
+            );
+            let bytes = serde_json::to_vec(&item)?;
+            Ok(StateOperation::Append(bytes))
+        })
+    }
+
+    /// Core update path. Builds the operation via a closure that receives the
+    /// about-to-be-assigned `(record_id, sequence)`; callers that don't need
+    /// those values pass a closure that ignores them. Holds `write_lock` for
+    /// the whole operation so the peeked id/seq match what `log.append`
+    /// actually assigns. Validation runs after the builder, so the builder
+    /// can also surface `InvalidOperation` (e.g. for non-object payloads in
+    /// `append_to_state_json_with_identity`).
+    fn update_state_with_builder<F>(
+        &self,
+        state_id: &str,
+        skip_auto_snapshot: bool,
+        operation_builder: F,
+    ) -> Result<Record>
+    where
+        F: FnOnce(RecordId, Sequence) -> Result<StateOperation>,
+    {
         let _lock = self.write_lock.lock();
 
         let branch = self.branches.current_branch();
+        let prev_update_offset = self.state.get_head(branch.id, state_id).map(|h| h.head_offset);
+        let next_seq = branch.head.next();
+        // `peek_next_id` is only valid while `write_lock` is held — nothing
+        // else can `log.append` between here and the call below.
+        let next_id = self.log.peek_next_id();
+
+        let operation = operation_builder(next_id, next_seq)?;
 
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
         // - Append: Always succeeds, no validation needed
@@ -382,11 +481,6 @@ impl Store {
             _ => {}
         }
 
-        // Get current head offset for this state (for chaining)
-        let prev_update_offset = self.state.get_head(branch.id, state_id).map(|h| h.head_offset);
-
-        let next_seq = branch.head.next();
-
         // Create the state update record payload
         let update = StateUpdateRecord {
             record_id: RecordId(0), // Will be assigned
@@ -402,6 +496,14 @@ impl Store {
         let input = RecordInput::raw("state_update", payload);
 
         let (record, offset) = self.log.append(input, branch.id, next_seq)?;
+        // Tripwire: peek + append must agree because `write_lock` is held
+        // across both. If this ever fires, the JSON payload on disk would
+        // claim id X while the record envelope says Y — silent corruption.
+        // Kept on in release builds for that reason.
+        assert_eq!(
+            record.id, next_id,
+            "record id assignment raced under write_lock",
+        );
 
         // Update the state manager with the offset
         self.state.record_update(branch.id, state_id, offset, &operation)?;
@@ -426,7 +528,7 @@ impl Store {
 
         // Auto-snapshot if needed (based on strategy thresholds)
         // Done after indices/branch update so the snapshot sees consistent state
-        if !skip_auto_snapshot {
+        if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(_lock);
             self.auto_snapshot_if_needed(state_id)?;
