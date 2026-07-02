@@ -735,8 +735,10 @@ impl Store {
 
     /// Get a slice of an AppendLog state.
     ///
-    /// This is efficient for accessing recent items (near the end) because
-    /// we traverse from HEAD. For items near the start, consider caching.
+    /// Served from the state manager's per-item cache: the full state is
+    /// materialized and split at most once per head_offset, after which
+    /// slices are O(returned data). The result is the items re-joined as a
+    /// JSON array (item bytes verbatim).
     ///
     /// - `offset`: Starting index (0-based from beginning of array)
     /// - `limit`: Maximum number of items to return
@@ -748,25 +750,40 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Option<Vec<u8>>> {
-        // For now, reconstruct full state and slice
-        // TODO: Optimize to only reconstruct what's needed
-        let state = match self.get_state(state_id)? {
-            Some(s) => s,
+        let branch_id = self.branches.current_branch().id;
+        let items = match self.state.get_state_items(branch_id, state_id)? {
+            Some(i) => i,
             None => return Ok(None),
         };
 
-        if state.is_empty() {
-            return Ok(Some(serde_json::to_vec(&Vec::<serde_json::Value>::new())?));
+        let start = offset.min(items.len());
+        let end = offset.saturating_add(limit).min(items.len());
+
+        let slice = &items[start..end];
+        let total: usize = slice.iter().map(|i| i.len()).sum();
+        let mut out = Vec::with_capacity(total + slice.len() + 2);
+        out.push(b'[');
+        for (i, item) in slice.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(item);
         }
+        out.push(b']');
+        Ok(Some(out))
+    }
 
-        let arr: Vec<serde_json::Value> = serde_json::from_slice(&state)
-            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-
-        let end = (offset + limit).min(arr.len());
-        let start = offset.min(arr.len());
-        let slice: Vec<_> = arr[start..end].to_vec();
-
-        Ok(Some(serde_json::to_vec(&slice)?))
+    /// Get a single item of an AppendLog state by index, as raw JSON bytes.
+    ///
+    /// O(item size) once the per-item cache is warm (see `get_state_slice`).
+    /// Returns `None` if the state doesn't exist or the index is out of range.
+    pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
+        let branch_id = self.branches.current_branch().id;
+        let items = match self.state.get_state_items(branch_id, state_id)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        Ok(items.get(index).cloned())
     }
 
     /// Get the last N items from an AppendLog state.
@@ -2168,6 +2185,100 @@ mod tests {
         let slice = store.get_state_slice("items", 15, 5).unwrap().unwrap();
         let arr: Vec<i32> = serde_json::from_slice(&slice).unwrap();
         assert_eq!(arr, Vec::<i32>::new());
+
+        // Overflow-safe: offset + limit past usize::MAX must not panic
+        let slice = store.get_state_slice("items", 5, usize::MAX).unwrap().unwrap();
+        let arr: Vec<i32> = serde_json::from_slice(&slice).unwrap();
+        assert_eq!(arr, vec![6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn test_get_state_item() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 10,
+            },
+            initial_value: None,
+        }).unwrap();
+
+        // Missing state -> None
+        assert!(store.get_state_item("items", 0).unwrap().is_none());
+
+        for i in 1..=5 {
+            store.update_state("items", StateOperation::Append(
+                serde_json::to_vec(&json!({"id": i})).unwrap()
+            )).unwrap();
+        }
+
+        // Point lookups (warm the item cache, then read repeatedly)
+        for _ in 0..3 {
+            let item = store.get_state_item("items", 2).unwrap().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&item).unwrap();
+            assert_eq!(v["id"], 3);
+        }
+
+        // Out of range -> None
+        assert!(store.get_state_item("items", 5).unwrap().is_none());
+
+        // A write after cached reads must be visible (head_offset invalidation)
+        store.update_state("items", StateOperation::Append(
+            serde_json::to_vec(&json!({"id": 6})).unwrap()
+        )).unwrap();
+        let item = store.get_state_item("items", 5).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(v["id"], 6);
+
+        // An edit must be visible too
+        store.update_state("items", StateOperation::Edit {
+            index: 0,
+            new_value: serde_json::to_vec(&json!({"id": 100})).unwrap(),
+        }).unwrap();
+        let item = store.get_state_item("items", 0).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(v["id"], 100);
+    }
+
+    #[test]
+    fn test_get_state_item_branch_isolation() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 10,
+            },
+            initial_value: None,
+        }).unwrap();
+
+        store.update_state("items", StateOperation::Append(
+            serde_json::to_vec(&json!("base")).unwrap()
+        )).unwrap();
+
+        // Warm cache on the original branch
+        let item = store.get_state_item("items", 0).unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&item).unwrap(), json!("base"));
+
+        // Fork, append on the fork — reads must reflect the fork, then the
+        // original again after switching back (no cross-branch bleed).
+        store.create_branch("fork", None).unwrap();
+        store.switch_branch("fork").unwrap();
+        store.update_state("items", StateOperation::Append(
+            serde_json::to_vec(&json!("forked")).unwrap()
+        )).unwrap();
+        assert_eq!(store.get_state_len("items").unwrap(), Some(2));
+        let item = store.get_state_item("items", 1).unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&item).unwrap(), json!("forked"));
+
+        store.switch_branch("main").unwrap();
+        assert_eq!(store.get_state_len("items").unwrap(), Some(1));
+        assert!(store.get_state_item("items", 1).unwrap().is_none());
     }
 
     #[test]

@@ -707,6 +707,35 @@ impl JsStore {
         Ok(slice.map(Buffer::from))
     }
 
+    /// Get a single item of an AppendLog state by index, as JSON.
+    ///
+    /// O(item size) once the per-item cache is warm — unlike `getStateJson`,
+    /// which materializes and converts the entire state on every call. Use
+    /// this for point lookups in large states. Returns `null` if the state
+    /// doesn't exist or the index is out of range.
+    #[napi]
+    pub fn get_state_item_json(
+        &self,
+        state_id: String,
+        index: i64,
+    ) -> Result<Option<serde_json::Value>> {
+        if index < 0 {
+            return Ok(None);
+        }
+        let store = self.get_store()?;
+        let item = store
+            .get_state_item(&state_id, index as usize)
+            .map_err(to_napi_error)?;
+        match item {
+            Some(bytes) => {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Get the last N items from an AppendLog state.
     #[napi]
     pub fn get_state_tail(&self, state_id: String, count: i64) -> Result<Option<Buffer>> {

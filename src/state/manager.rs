@@ -111,6 +111,18 @@ struct CachedState {
     head_offset: u64, // To detect staleness
 }
 
+/// Cached per-item byte spans of an array-shaped (AppendLog) state.
+///
+/// Items are the raw JSON bytes of each array element, split once per
+/// materialization via `serde_json::value::RawValue` (boundary scan only —
+/// no `Value` tree is built). Shared out as `Arc` so repeated item/slice
+/// reads never re-copy the whole state.
+#[derive(Clone)]
+struct CachedItems {
+    items: Arc<Vec<Vec<u8>>>,
+    head_offset: u64, // To detect staleness (same discipline as CachedState)
+}
+
 /// State manager handles per-state chains and reconstruction.
 ///
 /// Uses disk-based chain traversal (no in-memory update storage)
@@ -124,6 +136,11 @@ pub struct StateManager {
 
     /// LRU cache for reconstructed states.
     cache: RwLock<LruCache<String, CachedState>>,
+
+    /// LRU cache for per-item byte spans of array-shaped states.
+    /// Populated lazily by `get_state_items`; invalidated in lockstep
+    /// with `cache` (same key scheme, same head_offset validity check).
+    items_cache: RwLock<LruCache<String, CachedItems>>,
 
     /// Reference to record log for disk-based chain traversal.
     log: Option<Arc<RecordLog>>,
@@ -144,6 +161,7 @@ impl StateManager {
             path,
             index: RwLock::new(StateIndex::default()),
             cache: RwLock::new(LruCache::new(cache_size)),
+            items_cache: RwLock::new(LruCache::new(cache_size)),
             log: None,
         })
     }
@@ -167,6 +185,7 @@ impl StateManager {
             path: path.clone(),
             index: RwLock::new(StateIndex::default()),
             cache: RwLock::new(LruCache::new(cache_size)),
+            items_cache: RwLock::new(LruCache::new(cache_size)),
             log: None,
         };
 
@@ -279,6 +298,7 @@ impl StateManager {
         // Use a cache key that includes branch
         let cache_key = format!("{}:{}", branch_id.0, state_id);
         self.cache.write().pop(&cache_key);
+        self.items_cache.write().pop(&cache_key);
 
         Ok(())
     }
@@ -331,6 +351,75 @@ impl StateManager {
         }
 
         Ok(Some(value))
+    }
+
+    /// Get the current value of an array-shaped (AppendLog) state as
+    /// per-item raw JSON byte spans.
+    ///
+    /// The full state is materialized at most once per head_offset; the
+    /// split result is cached and shared out as `Arc`, so item and slice
+    /// reads are O(returned data) instead of O(state size). Validity is
+    /// governed by the same head_offset discipline as `get_state` — any
+    /// write to the state (on this branch) produces a new head_offset and
+    /// the next read re-materializes. No caller-side invalidation exists.
+    ///
+    /// Returns an error if the state is not a JSON array (e.g. a Snapshot
+    /// strategy state holding an object) — matching the behavior of the
+    /// previous slice implementation.
+    pub fn get_state_items(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<Vec<Vec<u8>>>>> {
+        let index = self.index.read();
+        let key = (branch_id, state_id.to_string());
+        let head = match index.heads.get(&key) {
+            Some(h) => h.clone(),
+            None => return Ok(None),
+        };
+        drop(index);
+
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+
+        // Check items cache
+        {
+            let mut cache = self.items_cache.write();
+            if let Some(cached) = cache.get(&cache_key) {
+                if cached.head_offset == head.head_offset {
+                    return Ok(Some(Arc::clone(&cached.items)));
+                }
+                // Stale entry, will re-materialize
+            }
+        }
+
+        // Materialize the full state once (served from the byte cache when
+        // warm), then split into item spans without building a Value tree.
+        let state = match self.get_state(branch_id, state_id)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let items: Vec<Vec<u8>> = if state.is_empty() {
+            Vec::new()
+        } else {
+            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&state)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            raw.iter().map(|r| r.get().as_bytes().to_vec()).collect()
+        };
+        let items = Arc::new(items);
+
+        {
+            let mut cache = self.items_cache.write();
+            cache.put(
+                cache_key,
+                CachedItems {
+                    items: Arc::clone(&items),
+                    head_offset: head.head_offset,
+                },
+            );
+        }
+
+        Ok(Some(items))
     }
 
     /// Reconstruct state by traversing chain from disk.
@@ -529,6 +618,7 @@ impl StateManager {
     /// Clear the cache (useful for testing or memory pressure).
     pub fn clear_cache(&self) {
         self.cache.write().clear();
+        self.items_cache.write().clear();
     }
 
     /// Get cache statistics.
@@ -1163,6 +1253,130 @@ mod tests {
         let head = manager.get_head(TEST_BRANCH, "items").unwrap();
         assert_eq!(head.delta_snapshots_since_full, 0);
         assert!(head.last_full_snapshot_offset.is_some());
+    }
+
+    #[test]
+    fn test_get_state_items_split_and_staleness() {
+        let (_dir, log, manager) = setup_test();
+
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 10,
+                    full_snapshot_every: 5,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        // Nonexistent state -> None
+        assert!(manager.get_state_items(TEST_BRANCH, "items").unwrap().is_none());
+
+        let item1 = serde_json::to_vec(&serde_json::json!({"id": "a", "n": 1})).unwrap();
+        let offset1 =
+            append_state_update(&log, "items", None, StateOperation::Append(item1.clone()), 1);
+        manager
+            .record_update(TEST_BRANCH, "items", offset1, &StateOperation::Append(item1))
+            .unwrap();
+
+        let items = manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap();
+        assert_eq!(items.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_slice(&items[0]).unwrap();
+        assert_eq!(parsed["id"], "a");
+
+        // Append again — cached items must be invalidated by head_offset change
+        let item2 = serde_json::to_vec(&serde_json::json!({"id": "b", "n": 2})).unwrap();
+        let offset2 = append_state_update(
+            &log,
+            "items",
+            Some(offset1),
+            StateOperation::Append(item2.clone()),
+            2,
+        );
+        manager
+            .record_update(TEST_BRANCH, "items", offset2, &StateOperation::Append(item2))
+            .unwrap();
+
+        let items = manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap();
+        assert_eq!(items.len(), 2);
+        let parsed: serde_json::Value = serde_json::from_slice(&items[1]).unwrap();
+        assert_eq!(parsed["id"], "b");
+
+        // Item bytes must reparse to exactly what the full state contains
+        let full = manager.get_state(TEST_BRANCH, "items").unwrap().unwrap();
+        let full_arr: Vec<serde_json::Value> = serde_json::from_slice(&full).unwrap();
+        for (i, item) in items.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_slice(item).unwrap();
+            assert_eq!(v, full_arr[i]);
+        }
+    }
+
+    #[test]
+    fn test_get_state_items_redact_invalidation() {
+        let (_dir, log, manager) = setup_test();
+
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 10,
+                    full_snapshot_every: 5,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        let mut prev = None;
+        for i in 0..4u64 {
+            let item = serde_json::to_vec(&serde_json::json!(i)).unwrap();
+            let offset = append_state_update(
+                &log,
+                "items",
+                prev,
+                StateOperation::Append(item.clone()),
+                i + 1,
+            );
+            manager
+                .record_update(TEST_BRANCH, "items", offset, &StateOperation::Append(item))
+                .unwrap();
+            prev = Some(offset);
+        }
+
+        // Warm the items cache
+        let items = manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap();
+        assert_eq!(items.len(), 4);
+
+        // Redact [1,3) — cache must not serve the stale 4-item split
+        let redact = StateOperation::Redact { start: 1, end: 3 };
+        let offset = append_state_update(&log, "items", prev, redact.clone(), 5);
+        manager.record_update(TEST_BRANCH, "items", offset, &redact).unwrap();
+
+        let items = manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap();
+        assert_eq!(items.len(), 2);
+        let v0: serde_json::Value = serde_json::from_slice(&items[0]).unwrap();
+        let v1: serde_json::Value = serde_json::from_slice(&items[1]).unwrap();
+        assert_eq!(v0, serde_json::json!(0));
+        assert_eq!(v1, serde_json::json!(3));
+    }
+
+    #[test]
+    fn test_get_state_items_non_array_errors() {
+        let (_dir, log, manager) = setup_test();
+
+        manager
+            .register_state(StateRegistration {
+                id: "obj".to_string(),
+                strategy: StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+
+        let set = StateOperation::Set(b"{\"not\":\"an array\"}".to_vec());
+        let offset = append_state_update(&log, "obj", None, set.clone(), 1);
+        manager.record_update(TEST_BRANCH, "obj", offset, &set).unwrap();
+
+        assert!(manager.get_state_items(TEST_BRANCH, "obj").is_err());
     }
 
     #[test]
