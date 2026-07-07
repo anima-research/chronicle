@@ -3,7 +3,7 @@
 use crate::blobs::BlobStorage;
 use crate::branches::BranchManager;
 use crate::error::{Result, StoreError};
-use crate::records::{RecordIndex, RecordLog};
+use crate::records::{RecordIndex, RecordLog, RecoveryReport};
 use crate::state::StateManager;
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
@@ -172,13 +172,21 @@ impl Store {
         // shutdown it can be stale-low (log has newer records -> next append
         // would reuse a durable sequence) or point past a truncated torn tail.
         // Both are corrected here from the sequences the log scan collected.
-        let head_fixes = branches.reconcile_heads(log.max_sequences());
-        for fix in &head_fixes {
+        let reconciliation = branches.reconcile_heads(log.max_sequences());
+        for fix in &reconciliation.head_fixes {
             tracing::warn!(
                 branch = %fix.name,
                 old_head = fix.old_head.0,
                 new_head = fix.new_head.0,
                 "reconciled branch head to match durable log (stale branches.bin or torn tail)"
+            );
+        }
+        for orphan in &reconciliation.orphaned_branch_ids {
+            tracing::warn!(
+                branch_id = orphan.0,
+                "durable log holds records for a BranchId absent from branches.bin \
+                 (orphaned by a crash before metadata flush); its records are unreachable \
+                 and next_id was clamped so the id is never reissued"
             );
         }
 
@@ -214,6 +222,17 @@ impl Store {
             write_lock: Mutex::new(()),
             auto_snapshot_enabled: AtomicBool::new(true),
         })
+    }
+
+    /// Torn-tail recovery the log performed on the most recent open, if any.
+    ///
+    /// Returns `Some(report)` when `open` truncated a torn/partial tail record
+    /// (crash during append), describing how many bytes and records were
+    /// dropped, or `None` when the log opened cleanly. Callers that need to know
+    /// their store silently lost un-fsynced writes on open can consult this
+    /// instead of scraping the `tracing` warning out of logs.
+    pub fn recovery(&self) -> Option<RecoveryReport> {
+        self.log.recovery().cloned()
     }
 
     /// Toggle the auto-snapshot pass inside `update_state`.

@@ -5,7 +5,7 @@
 //! final record made `Store::open` fail entirely, taking the whole agent
 //! (history, checkpoints, lessons pointers) offline after any unclean kill.
 
-use chronicle::{RecordInput, Sequence, Store, StoreConfig, StoreError};
+use chronicle::{BranchId, RecordInput, Sequence, Store, StoreConfig, StoreError};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -228,6 +228,90 @@ fn stale_branches_bin_does_not_reissue_durable_sequence() {
     seqs.dedup();
     assert_eq!(before, seqs.len(), "no duplicate sequences may exist");
     assert_eq!(seqs, (1..=11).collect::<Vec<_>>(), "sequences 1..=11, contiguous");
+}
+
+/// Regression for the *branch-identity* variant of the duplicate-sequence bug:
+/// a stale `branches.bin` also rolls back `next_id`, so a branch that was
+/// created and written to — but lost before its metadata flushed — leaves
+/// durable records under a BranchId that a naive `create_branch` would happily
+/// re-issue. The reborn branch would then adopt the dead branch's records as
+/// ghosts and reissue their sequences. Reconciliation must clamp `next_id`
+/// above every BranchId the log holds.
+#[test]
+fn stale_next_id_does_not_reissue_branch_id_over_durable_records() {
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().join("store");
+    let branches_path = store_path.join("branches.bin");
+
+    // 1. Three records on main, synced. Snapshot branches.bin at this baseline:
+    //    main head = 3, next_id = 2, and NO "feature" branch yet.
+    let store = Store::create(config(&store_path)).unwrap();
+    for i in 1..=3u64 {
+        store
+            .append(RecordInput::raw("message", format!("main {}", i).into_bytes()))
+            .unwrap();
+    }
+    store.sync().unwrap();
+    let baseline_branches = std::fs::read(&branches_path).unwrap();
+
+    // 2. Create "feature" (gets BranchId(2)), switch to it, append 3 records.
+    //    These reach the durable log under BranchId(2), sequences 4..=6.
+    let feature = store.create_branch("feature", None).unwrap();
+    assert_eq!(feature.id, BranchId(2));
+    store.switch_branch("feature").unwrap();
+    for i in 1..=3u64 {
+        store
+            .append(RecordInput::raw("message", format!("feature {}", i).into_bytes()))
+            .unwrap();
+    }
+    store.sync().unwrap();
+    drop(store);
+
+    // 3. Simulate a crash where feature's records reached the log but the
+    //    metadata flush that would have recorded the branch (and bumped
+    //    next_id) did not: roll branches.bin back to the baseline. The log
+    //    still holds BranchId(2)'s three durable records.
+    std::fs::write(&branches_path, &baseline_branches).unwrap();
+
+    // 4. Reopen. Reconciliation must clamp next_id above BranchId(2) and flag it
+    //    as orphaned.
+    let store = Store::open_or_create(config(&store_path)).unwrap();
+    let recovery = store.recovery();
+    assert!(recovery.is_none(), "log tail was intact; only metadata was rolled back");
+
+    // 5. The next branch MUST NOT reuse the dead BranchId(2) — it gets BranchId(3).
+    let reborn = store.create_branch("other", None).unwrap();
+    assert_ne!(
+        reborn.id,
+        BranchId(2),
+        "must not reissue the dead branch's id and adopt its durable records"
+    );
+    assert_eq!(reborn.id, BranchId(3), "next_id clamped above every BranchId in the log");
+
+    // 6. "other" must be ghost-free: it does NOT see feature's durable records.
+    store.switch_branch("other").unwrap();
+    let ghosts = store.query_range(None, None, 1000, false, None).unwrap();
+    assert!(
+        ghosts.is_empty(),
+        "a freshly created branch must not adopt another branch's durable records"
+    );
+
+    // 7. Appending on "other" lands on BranchId(3) at a fresh sequence — it does
+    //    not reissue a sequence already occupied by feature's durable records.
+    let appended = store
+        .append(RecordInput::raw("message", b"on-other".to_vec()))
+        .unwrap();
+    assert_eq!(appended.branch, BranchId(3));
+    assert_eq!(
+        appended.sequence,
+        Sequence(4),
+        "fresh branch appends on its own id; no durable sequence is reissued"
+    );
+
+    // 8. main still holds exactly its three original records.
+    store.switch_branch("main").unwrap();
+    let main_records = store.query_range(None, None, 1000, false, None).unwrap();
+    assert_eq!(main_records.len(), 3, "main's durable records are untouched");
 }
 
 /// A torn `payload_len` field (e.g. 0xFFFFFFFF from a tear) must be rejected on

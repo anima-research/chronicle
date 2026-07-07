@@ -6,5 +6,5 @@
 mod log;
 mod index;
 
-pub use log::RecordLog;
+pub use log::{RecordLog, RecoveryReport};
 pub use index::RecordIndex;

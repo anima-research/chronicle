@@ -591,9 +591,30 @@ impl RecordLog {
                     if &buf[i..i + magic_len] == LOG_MAGIC {
                         let candidate = pos + i as u64;
                         file.seek(SeekFrom::Start(candidate))?;
-                        if let Ok(rec) = Self::read_record_bounded(file, file_size - candidate) {
-                            if rec.id.0 > max_id {
-                                return Ok(true);
+                        match Self::read_record_bounded(file, file_size - candidate) {
+                            Ok(rec) => {
+                                if rec.id.0 > max_id {
+                                    return Ok(true);
+                                }
+                            }
+                            Err(e) => {
+                                // Only framing/checksum/EOF failures are expected
+                                // while probing garbage bytes. A genuine I/O error
+                                // (e.g. EIO) must propagate and fail the open — not
+                                // be absolved into "no valid record here", which
+                                // could flip a mid-log corruption verdict into a
+                                // torn-tail truncation of possibly-valid data.
+                                let torn_candidate = matches!(
+                                    &e,
+                                    StoreError::InvalidFormat(_)
+                                        | StoreError::ChecksumMismatch { .. }
+                                ) || matches!(
+                                    &e,
+                                    StoreError::Io(io) if io.kind() == ErrorKind::UnexpectedEof
+                                );
+                                if !torn_candidate {
+                                    return Err(e);
+                                }
                             }
                         }
                     }

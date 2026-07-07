@@ -72,6 +72,18 @@ pub struct JsStoreStats {
     pub blob_size_bytes: i64,
 }
 
+/// Torn-tail recovery report surfaced to JavaScript. Present only when the
+/// most recent `open` truncated a torn/partial tail record.
+#[napi(object)]
+pub struct JsRecoveryReport {
+    /// Byte offset the log was truncated back to (end of the last valid record).
+    pub truncated_at: i64,
+    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced records).
+    pub dropped_bytes: i64,
+    /// Number of valid records that survived recovery.
+    pub valid_records: i64,
+}
+
 /// Configuration for creating a store.
 #[napi(object)]
 pub struct JsStoreConfig {
@@ -341,6 +353,21 @@ impl JsStore {
     #[napi]
     pub fn is_closed(&self) -> bool {
         self.inner.is_none()
+    }
+
+    /// Torn-tail recovery the log performed on open, if any.
+    ///
+    /// Returns a report when `open` silently truncated a torn/partial tail
+    /// record (crash during append), or `null` when the log opened cleanly.
+    /// Lets JS callers detect lost un-fsynced writes without scraping logs.
+    #[napi]
+    pub fn recovery(&self) -> Result<Option<JsRecoveryReport>> {
+        let store = self.get_store()?;
+        Ok(store.recovery().map(|r| JsRecoveryReport {
+            truncated_at: r.truncated_at as i64,
+            dropped_bytes: r.dropped_bytes as i64,
+            valid_records: r.valid_records as i64,
+        }))
     }
 
     // --- Records ---

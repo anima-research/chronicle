@@ -5,4 +5,6 @@
 
 mod manager;
 
-pub use manager::{BranchGcOptions, BranchGcResult, BranchManager};
+pub use manager::{
+    BranchGcOptions, BranchGcResult, BranchManager, HeadReconciliation, ReconciliationReport,
+};
