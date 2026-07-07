@@ -3,8 +3,9 @@
 use crate::error::{Result, StoreError};
 use crate::types::{BranchId, PayloadEncoding, Record, RecordId, RecordInput, Sequence, Timestamp};
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// Magic bytes for record log.
@@ -12,6 +13,36 @@ const LOG_MAGIC: &[u8; 4] = b"REC\0";
 
 /// Current log format version.
 const LOG_VERSION: u8 = 1;
+
+/// What an open-time scan of the log found and (if a torn tail was recovered)
+/// what it dropped. Surfaced via [`RecordLog::recovery`] so callers can log or
+/// react to silent data truncation instead of only seeing a stderr warning.
+#[derive(Clone, Debug)]
+pub struct RecoveryReport {
+    /// Byte offset the file was truncated back to (end of the last valid record).
+    pub truncated_at: u64,
+    /// Number of trailing bytes discarded. NOTE: this is *all* bytes after the
+    /// last valid record — with the default `sync_interval`, up to that many
+    /// un-fsynced records. Bit-rot in the final fsynced record is
+    /// indistinguishable from a tear and is counted here too.
+    pub dropped_bytes: u64,
+    /// Number of valid records that survived (i.e. the length of the recovered log).
+    pub valid_records: u64,
+}
+
+/// Outcome of a full validating scan of the log.
+struct ScanResult {
+    /// Maximum record ID observed across all valid records.
+    max_id: u64,
+    /// Byte length of the valid prefix (== file_size when nothing was torn).
+    valid_len: u64,
+    /// Count of valid records.
+    valid_records: u64,
+    /// Maximum sequence observed per branch — used to reconcile branch heads
+    /// against the durable log (a stale `branches.bin` or a torn tail can leave
+    /// the persisted head disagreeing with what the log actually holds).
+    branch_max_seq: HashMap<BranchId, Sequence>,
+}
 
 /// Append-only record log.
 pub struct RecordLog {
@@ -30,6 +61,13 @@ pub struct RecordLog {
 
     /// Sync every N writes (0 = sync every write, critical for durability vs performance)
     sync_interval: u64,
+
+    /// Highest sequence seen per branch during the open scan. Immutable after
+    /// open; `Store::open` reconciles branch heads against this.
+    branch_max_seq: HashMap<BranchId, Sequence>,
+
+    /// If a torn tail was recovered on open, what was dropped. `None` otherwise.
+    recovery: Option<RecoveryReport>,
 }
 
 impl RecordLog {
@@ -48,11 +86,21 @@ impl RecordLog {
     /// - sync_interval = 1000: sync every 1000 writes (fastest, least durable)
     ///
     /// On open, the log is validated end-to-end (framing + checksums). A
-    /// torn/partial record at the *tail* (the crash-during-append case) is
-    /// recovered by truncating the file back to the last valid record; a
-    /// warning is logged. Corruption in the *middle* of the log — i.e. a bad
-    /// record with valid records after it — is NOT auto-recoverable and fails
-    /// the open with `StoreError::Corruption`.
+    /// torn/partial *tail* — the crash-during-append case — is recovered by
+    /// truncating the file back to the last valid record boundary. This drops
+    /// **all** trailing bytes after that boundary, which (with a non-zero
+    /// `sync_interval`) can be up to `sync_interval` un-fsynced records, not a
+    /// single record; bit-rot in the final fsynced record is byte-for-byte
+    /// indistinguishable from a tear and is dropped the same way. Details are
+    /// logged and surfaced via [`RecordLog::recovery`].
+    ///
+    /// Only `UnexpectedEof`, `InvalidFormat`, and `ChecksumMismatch` are treated
+    /// as torn-tail candidates. Any other I/O error (e.g. `EIO` from a flaky
+    /// sector or a network filesystem) propagates and fails the open rather than
+    /// triggering a truncation of possibly-valid data.
+    ///
+    /// Corruption in the *middle* of the log — a bad record with valid records
+    /// after it — is NOT auto-recoverable and fails with `StoreError::Corruption`.
     pub fn open_with_sync_interval(path: impl AsRef<Path>, sync_interval: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
@@ -68,29 +116,33 @@ impl RecordLog {
         // Validate the log and determine the next record ID. Recovers a torn
         // tail record (crash mid-append) by truncating to the last valid
         // record; fails on mid-log corruption.
-        let (next_id, file_size) = if file_size > 0 {
-            let (max_id, valid_len) = Self::scan_log(&mut file, file_size)?;
-            if valid_len < file_size {
-                let dropped = file_size - valid_len;
+        let (next_id, file_size, branch_max_seq, recovery) = if file_size > 0 {
+            let scan = Self::scan_log(&mut file, &path, file_size)?;
+            let recovery = if scan.valid_len < file_size {
+                let dropped = file_size - scan.valid_len;
                 tracing::warn!(
                     path = %path.display(),
-                    offset = valid_len,
+                    truncated_at = scan.valid_len,
                     dropped_bytes = dropped,
-                    "record log has a torn tail record; truncating to last valid record"
+                    valid_records = scan.valid_records,
+                    "record log tail was torn (crash during append); truncating ALL bytes \
+                     after the last valid record. Up to `sync_interval` un-fsynced records may \
+                     be lost, and bit-rot in the final fsynced record is indistinguishable from \
+                     a tear and is dropped the same way"
                 );
-                eprintln!(
-                    "[chronicle] warning: record log {} has a torn tail record; \
-                     truncating {} trailing byte(s) at offset {} (last valid record boundary)",
-                    path.display(),
-                    dropped,
-                    valid_len
-                );
-                file.set_len(valid_len)?;
+                file.set_len(scan.valid_len)?;
                 file.sync_all()?;
-            }
-            (max_id + 1, valid_len)
+                Some(RecoveryReport {
+                    truncated_at: scan.valid_len,
+                    dropped_bytes: dropped,
+                    valid_records: scan.valid_records,
+                })
+            } else {
+                None
+            };
+            (scan.max_id + 1, scan.valid_len, scan.branch_max_seq, recovery)
         } else {
-            (1, 0)
+            (1, 0, HashMap::new(), None)
         };
 
         Ok(Self {
@@ -99,7 +151,24 @@ impl RecordLog {
             file_size: RwLock::new(file_size),
             writes_since_sync: RwLock::new(0),
             sync_interval: if sync_interval == 0 { 1 } else { sync_interval },
+            branch_max_seq,
+            recovery,
         })
+    }
+
+    /// Highest sequence observed per branch during the open scan.
+    ///
+    /// `Store::open` reconciles `BranchManager` heads against this so a stale
+    /// `branches.bin` (only written on sync/Drop) can never hand out a sequence
+    /// already occupied by a durable record, nor leave a persisted head pointing
+    /// past a truncated tail.
+    pub fn max_sequences(&self) -> &HashMap<BranchId, Sequence> {
+        &self.branch_max_seq
+    }
+
+    /// Recovery report if a torn tail was truncated on open, else `None`.
+    pub fn recovery(&self) -> Option<&RecoveryReport> {
+        self.recovery.as_ref()
     }
 
     /// Append a record to the log.
@@ -257,7 +326,28 @@ impl RecordLog {
     }
 
     /// Read a record from the file at current position.
+    ///
+    /// Hot path: trusts the framed length fields. Only call this on offsets
+    /// known to be valid record boundaries.
     fn read_record(file: &mut File) -> Result<Record> {
+        Self::read_record_inner(file, None)
+    }
+
+    /// Like [`Self::read_record`] but rejects any framed length field that
+    /// exceeds `remaining` (bytes from the record start to EOF) *before*
+    /// allocating. Used on the recovery paths ([`Self::scan_log`],
+    /// [`Self::has_valid_record_after`]) where the length fields come from
+    /// possibly-torn or garbage bytes: a corrupt `payload_len` of `0xFFFFFFFF`
+    /// would otherwise request a 4 GiB allocation and OOM-kill the process
+    /// mid-recovery (fatal inside a memory-cgroup'd container).
+    fn read_record_bounded(file: &mut File, remaining: u64) -> Result<Record> {
+        Self::read_record_inner(file, Some(remaining))
+    }
+
+    /// Shared record decoder. When `bound` is `Some(remaining)`, any length
+    /// field larger than `remaining` is rejected as `InvalidFormat` before
+    /// allocation.
+    fn read_record_inner(file: &mut File, bound: Option<u64>) -> Result<Record> {
         // Magic
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
@@ -303,6 +393,14 @@ impl RecordLog {
         let mut type_len_bytes = [0u8; 2];
         file.read_exact(&mut type_len_bytes)?;
         let type_len = u16::from_le_bytes(type_len_bytes) as usize;
+        if let Some(remaining) = bound {
+            if type_len as u64 > remaining {
+                return Err(StoreError::InvalidFormat(format!(
+                    "record type length {} exceeds {} remaining byte(s)",
+                    type_len, remaining
+                )));
+            }
+        }
         let mut type_bytes = vec![0u8; type_len];
         file.read_exact(&mut type_bytes)?;
         let record_type = String::from_utf8_lossy(&type_bytes).into_owned();
@@ -321,6 +419,14 @@ impl RecordLog {
         let mut payload_len_bytes = [0u8; 4];
         file.read_exact(&mut payload_len_bytes)?;
         let payload_len = u32::from_le_bytes(payload_len_bytes) as usize;
+        if let Some(remaining) = bound {
+            if payload_len as u64 > remaining {
+                return Err(StoreError::InvalidFormat(format!(
+                    "record payload length {} exceeds {} remaining byte(s)",
+                    payload_len, remaining
+                )));
+            }
+        }
         let mut payload = vec![0u8; payload_len];
         file.read_exact(&mut payload)?;
 
@@ -372,52 +478,101 @@ impl RecordLog {
         })
     }
 
-    /// Validate the log from the beginning, returning the maximum record ID
-    /// seen and the byte length of the valid prefix.
+    /// Validate the log from the beginning, returning a [`ScanResult`].
     ///
-    /// Every record is fully parsed (framing + payload checksum). On the
-    /// first invalid record:
-    /// - if any *valid* record exists after the failure point, this is
+    /// Every record is fully parsed (framing + payload checksum) with the
+    /// length-bounded reader so a torn length field can't trigger a huge
+    /// allocation. On the first invalid record:
+    /// - if the read error is *not* a torn-tail candidate (`UnexpectedEof`,
+    ///   `InvalidFormat`, `ChecksumMismatch`), it propagates — a real I/O error
+    ///   (e.g. `EIO`) must fail the open, never trigger truncation;
+    /// - else if any *valid* record exists after the failure point, this is
     ///   mid-log corruption — unrecoverable without data loss — and an error
     ///   is returned;
     /// - otherwise the invalid bytes are a torn tail record (crash during the
-    ///   last append) and `Ok((max_id, valid_len))` is returned with
-    ///   `valid_len < file_size`, so the caller can truncate.
-    fn scan_log(file: &mut File, file_size: u64) -> Result<(u64, u64)> {
+    ///   last append) and the result is returned with `valid_len < file_size`,
+    ///   so the caller can truncate.
+    fn scan_log(file: &mut File, path: &Path, file_size: u64) -> Result<ScanResult> {
         let mut max_id = 0u64;
         let mut valid_len = 0u64;
+        let mut valid_records = 0u64;
+        let mut branch_max_seq: HashMap<BranchId, Sequence> = HashMap::new();
 
         while valid_len < file_size {
             file.seek(SeekFrom::Start(valid_len))?;
-            match Self::read_record(file) {
+            let remaining = file_size - valid_len;
+            match Self::read_record_bounded(file, remaining) {
                 Ok(record) => {
                     max_id = max_id.max(record.id.0);
+                    let entry = branch_max_seq
+                        .entry(record.branch)
+                        .or_insert(Sequence(0));
+                    if record.sequence.0 > entry.0 {
+                        *entry = record.sequence;
+                    }
+                    valid_records += 1;
                     valid_len = file.stream_position()?;
                 }
-                Err(_) => {
-                    if Self::has_valid_record_after(file, valid_len, file_size)? {
+                Err(e) => {
+                    // Only framing/checksum/EOF failures are torn-tail
+                    // candidates. A genuine I/O error (EIO, network-FS hiccup)
+                    // must NOT be absolved into a truncation of valid data.
+                    let torn_candidate = matches!(
+                        &e,
+                        StoreError::InvalidFormat(_) | StoreError::ChecksumMismatch { .. }
+                    ) || matches!(&e, StoreError::Io(io) if io.kind() == ErrorKind::UnexpectedEof);
+
+                    if !torn_candidate {
+                        return Err(e);
+                    }
+
+                    if Self::has_valid_record_after(file, valid_len, file_size, max_id)? {
                         return Err(StoreError::Corruption(format!(
                             "corrupt record at offset {} with valid records after it; \
-                             refusing to open (mid-log corruption is not auto-recoverable)",
-                            valid_len
+                             refusing to open (mid-log corruption is not auto-recoverable): {}",
+                            valid_len, e
                         )));
                     }
-                    // Torn tail: caller truncates to valid_len.
+                    // Torn tail: caller truncates to valid_len. Record which
+                    // error made us classify the tail as torn.
+                    tracing::warn!(
+                        path = %path.display(),
+                        offset = valid_len,
+                        error = %e,
+                        "record log tail classified as torn (no valid record follows)"
+                    );
                     break;
                 }
             }
         }
 
-        Ok((max_id, valid_len))
+        Ok(ScanResult {
+            max_id,
+            valid_len,
+            valid_records,
+            branch_max_seq,
+        })
     }
 
     /// Check whether any fully valid record starts strictly after `bad_offset`.
     ///
-    /// Scans the remaining bytes for the record magic and attempts a full
-    /// parse (including checksum) at each candidate. Used to distinguish a
-    /// recoverable torn tail (no valid record follows) from mid-log
-    /// corruption (valid records follow the bad one).
-    fn has_valid_record_after(file: &mut File, bad_offset: u64, file_size: u64) -> Result<bool> {
+    /// Scans the remaining bytes for the record magic and attempts a
+    /// length-bounded parse (including checksum) at each candidate. A candidate
+    /// only counts if it also passes a plausibility gate: its record ID must be
+    /// greater than every ID seen in the valid prefix (`max_id`), since IDs are
+    /// assigned monotonically at append. This keeps a genuine following record
+    /// (always id > max_id) recognised while making it far harder for arbitrary
+    /// `Raw` payload bytes that happen to embed a valid record image to
+    /// masquerade as mid-log corruption and needlessly brick the store.
+    ///
+    /// Used to distinguish a recoverable torn tail (no valid record follows)
+    /// from mid-log corruption (valid records follow the bad one).
+    fn has_valid_record_after(
+        file: &mut File,
+        bad_offset: u64,
+        file_size: u64,
+        max_id: u64,
+    ) -> Result<bool> {
         const CHUNK_SIZE: u64 = 64 * 1024;
         let magic_len = LOG_MAGIC.len(); // 4
 
@@ -436,8 +591,10 @@ impl RecordLog {
                     if &buf[i..i + magic_len] == LOG_MAGIC {
                         let candidate = pos + i as u64;
                         file.seek(SeekFrom::Start(candidate))?;
-                        if Self::read_record(file).is_ok() {
-                            return Ok(true);
+                        if let Ok(rec) = Self::read_record_bounded(file, file_size - candidate) {
+                            if rec.id.0 > max_id {
+                                return Ok(true);
+                            }
                         }
                     }
                 }

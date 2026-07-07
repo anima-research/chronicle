@@ -196,6 +196,37 @@ impl StateManager {
         Ok(manager)
     }
 
+    /// Validate that every persisted chain-head offset points inside the valid
+    /// region of the log (`< valid_len`).
+    ///
+    /// `state.bin` is only flushed on `sync()`/`Drop`, so after a torn tail is
+    /// truncated on log open, a persisted `head_offset` (or snapshot offset)
+    /// could point into bytes that no longer exist — dereferencing it later
+    /// would read garbage or a wrong record. Any offset at or past `valid_len`
+    /// is unrecoverable metadata corruption and fails the open loudly rather
+    /// than silently.
+    pub fn validate_offsets(&self, valid_len: u64) -> Result<()> {
+        let index = self.index.read();
+        for ((branch, state_id), head) in index.heads.iter() {
+            let offsets = [
+                Some(head.head_offset),
+                head.last_delta_snapshot_offset,
+                head.last_full_snapshot_offset,
+            ];
+            for offset in offsets.into_iter().flatten() {
+                if offset >= valid_len {
+                    return Err(StoreError::Corruption(format!(
+                        "state '{}' on branch {:?} has chain offset {} at/past the valid log \
+                         length {}; state metadata is newer than the durable log (torn tail or \
+                         corrupt state.bin)",
+                        state_id, branch, offset, valid_len
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register a new state with its strategy.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
         let mut index = self.index.write();

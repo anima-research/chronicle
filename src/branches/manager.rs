@@ -5,6 +5,19 @@ use crate::types::{Branch, BranchId, Sequence, Timestamp};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// A single branch head that was corrected during open-time reconciliation.
+#[derive(Clone, Debug)]
+pub struct HeadReconciliation {
+    /// Branch that was adjusted.
+    pub name: String,
+    /// Branch id.
+    pub id: BranchId,
+    /// Head recorded in `branches.bin`.
+    pub old_head: Sequence,
+    /// Head the durable log implies.
+    pub new_head: Sequence,
+}
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -263,6 +276,48 @@ impl BranchManager {
 
         *self.current.write() = id;
         Ok(branch)
+    }
+
+    /// Reconcile persisted branch heads against the durable record log.
+    ///
+    /// `branches.bin` is only written on `sync()`/`Drop`, so after an unclean
+    /// shutdown it can disagree with the log in *both* directions:
+    /// - **stale-low**: the log holds records newer than the persisted head
+    ///   (crash after appends but before the metadata flush). Trusting the
+    ///   stale head would make the next append reuse a sequence already
+    ///   occupied by a durable record — a silent duplicate sequence.
+    /// - **too-high**: a torn tail was truncated on log open, leaving the head
+    ///   pointing past the last surviving record — a permanent hole.
+    ///
+    /// For each branch we clamp the head to `max(branch_point, log_max)` where
+    /// `log_max` is the highest sequence the log actually holds for that branch
+    /// (from [`RecordLog::max_sequences`]). The `branch_point` floor preserves
+    /// heads inherited from a parent for branches that have no records of their
+    /// own yet. Returns the list of corrections made (empty when consistent).
+    pub fn reconcile_heads(
+        &self,
+        log_max_seq: &HashMap<BranchId, Sequence>,
+    ) -> Vec<HeadReconciliation> {
+        let mut index = self.index.write();
+        let mut changes = Vec::new();
+
+        for branch in index.branches.values_mut() {
+            let floor = branch.branch_point.map(|s| s.0).unwrap_or(0);
+            let log_max = log_max_seq.get(&branch.id).map(|s| s.0).unwrap_or(0);
+            let reconciled = floor.max(log_max);
+
+            if reconciled != branch.head.0 {
+                changes.push(HeadReconciliation {
+                    name: branch.name.clone(),
+                    id: branch.id,
+                    old_head: branch.head,
+                    new_head: Sequence(reconciled),
+                });
+                branch.head = Sequence(reconciled);
+            }
+        }
+
+        changes
     }
 
     /// Update the head of a branch.
@@ -837,6 +892,43 @@ mod tests {
             let main = manager.get_branch(MAIN_BRANCH).unwrap();
             assert_eq!(main.head, Sequence(5));
         }
+    }
+
+    #[test]
+    fn test_reconcile_heads_both_directions_and_floor() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+
+        // main: persisted head 5 (stale-low; log actually holds up to 10).
+        manager.update_head(BranchId(1), Sequence(5)).unwrap();
+        // child branched at main's (then-)head 5: inherits head 5, bp 5, and
+        // has NO records of its own in the log.
+        let child = manager.create_branch("child", None).unwrap();
+        assert_eq!(child.branch_point, Some(Sequence(5)));
+
+        let mut log_max = HashMap::new();
+        log_max.insert(BranchId(1), Sequence(10)); // main durable to 10
+
+        let changes = manager.reconcile_heads(&log_max);
+
+        // main raised 5 -> 10 (kills duplicate-sequence bug).
+        assert_eq!(manager.get_branch(MAIN_BRANCH).unwrap().head, Sequence(10));
+        // child has no log records: head stays at its branch_point floor (5),
+        // NOT lowered to 0.
+        assert_eq!(manager.get_branch("child").unwrap().head, Sequence(5));
+        // Only main changed.
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, MAIN_BRANCH);
+        assert_eq!(changes[0].old_head, Sequence(5));
+        assert_eq!(changes[0].new_head, Sequence(10));
+
+        // Now the too-high direction: head persisted past a truncated tail.
+        let mut log_max2 = HashMap::new();
+        log_max2.insert(BranchId(1), Sequence(7)); // log truncated back to 7
+        let changes2 = manager.reconcile_heads(&log_max2);
+        assert_eq!(manager.get_branch(MAIN_BRANCH).unwrap().head, Sequence(7));
+        assert_eq!(changes2.len(), 1);
+        assert_eq!(changes2[0].new_head, Sequence(7));
     }
 
     #[test]

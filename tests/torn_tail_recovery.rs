@@ -69,10 +69,13 @@ fn torn_tail_record_is_recovered_on_open() {
     assert!(new_len < len - 5, "log file should have been truncated");
 
     // The store keeps working: new appends land and survive a clean reopen.
+    // After branch-head reconciliation the head is clamped to the last
+    // surviving record (N-1), so the next append is exactly N — no hole, no
+    // reused sequence.
     let appended = store
         .append(RecordInput::raw("message", b"after recovery".to_vec()))
         .unwrap();
-    assert!(appended.sequence > Sequence(N - 1));
+    assert_eq!(appended.sequence, Sequence(N));
     store.sync().unwrap();
     drop(store);
 
@@ -159,4 +162,110 @@ fn midlog_corruption_still_fails_open() {
         c.windows(9).any(|w| w == b"payload 5")
     };
     assert!(needle_still_there, "mid-log corruption must not truncate the log");
+}
+
+/// Regression for the duplicate-sequence bug: a stale `branches.bin` (persisted
+/// head older than the durable log) must NOT let the next append reuse a
+/// sequence already occupied by a durable record. Reconciliation raises the
+/// stale head to what the log actually holds.
+#[test]
+fn stale_branches_bin_does_not_reissue_durable_sequence() {
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().join("store");
+    let branches_path = store_path.join("branches.bin");
+
+    // 1. Five records, synced: branches.bin now records head = 5, log holds 5.
+    let store = Store::create(config(&store_path)).unwrap();
+    for i in 1..=5u64 {
+        store
+            .append(RecordInput::raw("message", format!("first {}", i).into_bytes()))
+            .unwrap();
+    }
+    store.sync().unwrap();
+
+    // Snapshot the stale branches.bin (head = 5).
+    let stale_branches = std::fs::read(&branches_path).unwrap();
+
+    // 2. Five MORE records, synced: log + branches.bin now both at 10.
+    for i in 6..=10u64 {
+        store
+            .append(RecordInput::raw("message", format!("second {}", i).into_bytes()))
+            .unwrap();
+    }
+    store.sync().unwrap();
+    drop(store);
+
+    // 3. Simulate a crash where the log's 5 newer records reached disk but the
+    //    branches.bin metadata flush did not: roll branches.bin back to head=5
+    //    while leaving all 10 durable records in the log.
+    std::fs::write(&branches_path, &stale_branches).unwrap();
+
+    // 4. Reopen. Reconciliation must raise the head from the stale 5 to the
+    //    log's actual 10 — so the next append is 11, not a duplicate 6.
+    let store = Store::open_or_create(config(&store_path)).unwrap();
+
+    // All ten durable records are still visible (nothing was dropped).
+    let records = store.query_range(None, None, 1000, false, None).unwrap();
+    assert_eq!(records.len(), 10, "all durable records must remain visible");
+
+    let appended = store
+        .append(RecordInput::raw("message", b"post-crash".to_vec()))
+        .unwrap();
+    assert_eq!(
+        appended.sequence,
+        Sequence(11),
+        "append after a stale branches.bin must NOT reuse a durable sequence"
+    );
+
+    // No two records share a sequence on the branch.
+    store.sync().unwrap();
+    drop(store);
+    let store = Store::open_or_create(config(&store_path)).unwrap();
+    let records = store.query_range(None, None, 1000, false, None).unwrap();
+    let mut seqs: Vec<u64> = records.iter().map(|r| r.sequence.0).collect();
+    let before = seqs.len();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(before, seqs.len(), "no duplicate sequences may exist");
+    assert_eq!(seqs, (1..=11).collect::<Vec<_>>(), "sequences 1..=11, contiguous");
+}
+
+/// A torn `payload_len` field (e.g. 0xFFFFFFFF from a tear) must be rejected on
+/// the recovery scan WITHOUT attempting a multi-gigabyte allocation. This
+/// reproduces the OOM-during-recovery crash-loop the length guard prevents.
+#[test]
+fn torn_payload_len_is_rejected_without_huge_alloc() {
+    let dir = TempDir::new().unwrap();
+    let store_path = dir.path().join("store");
+    create_store_with_records(&store_path, 3);
+
+    // Corrupt the LAST record's payload_len field to 0xFFFFFFFF and truncate
+    // the tail, making it a torn-tail candidate whose length field, if trusted,
+    // would request a ~4 GiB allocation during the open scan.
+    let log_path = store_path.join("records.log");
+    let mut file = OpenOptions::new().read(true).write(true).open(&log_path).unwrap();
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).unwrap();
+
+    // Find the last record's payload text ("payload 3") and overwrite the
+    // 4-byte payload_len that immediately precedes it with 0xFFFFFFFF.
+    let needle = b"payload 3";
+    let payload_pos = contents
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .expect("last record payload not found") as u64;
+    let len_field_pos = payload_pos - 4; // payload_len sits right before payload
+    file.seek(SeekFrom::Start(len_field_pos)).unwrap();
+    file.write_all(&0xFFFF_FFFFu32.to_le_bytes()).unwrap();
+    // Drop the actual payload bytes so this is unambiguously a torn tail.
+    file.set_len(payload_pos).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    // Open must succeed by recovering the two intact records — and must NOT
+    // try to allocate 4 GiB (the length guard rejects the field, classifying
+    // the record as a torn tail). If it OOMs, this test crashes instead.
+    let store = Store::open_or_create(config(&store_path)).unwrap();
+    let records = store.query_range(None, None, 1000, false, None).unwrap();
+    assert_eq!(records.len(), 2, "two intact records recovered, torn tail dropped");
 }

@@ -167,6 +167,35 @@ impl Store {
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
 
+        // Reconcile branch heads against what the durable log actually holds.
+        // `branches.bin` is only flushed on sync/Drop, so after an unclean
+        // shutdown it can be stale-low (log has newer records -> next append
+        // would reuse a durable sequence) or point past a truncated torn tail.
+        // Both are corrected here from the sequences the log scan collected.
+        let head_fixes = branches.reconcile_heads(log.max_sequences());
+        for fix in &head_fixes {
+            tracing::warn!(
+                branch = %fix.name,
+                old_head = fix.old_head.0,
+                new_head = fix.new_head.0,
+                "reconciled branch head to match durable log (stale branches.bin or torn tail)"
+            );
+        }
+
+        // Fail loudly if state metadata points past the (possibly truncated)
+        // valid log — its offsets would otherwise dereference to garbage.
+        state.validate_offsets(log.size())?;
+
+        // Surface any torn-tail recovery the log performed on open.
+        if let Some(rec) = log.recovery() {
+            tracing::warn!(
+                truncated_at = rec.truncated_at,
+                dropped_bytes = rec.dropped_bytes,
+                valid_records = rec.valid_records,
+                "record log recovered a torn tail on open"
+            );
+        }
+
         // Rebuild index from log (O(N) startup, but O(1) sync)
         let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
 
