@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/chronicle",
-  "version": "0.2.2",
+  "version": "0.2.5",
   "description": "A branchable, time-traveling record store with causation tracking",
   "main": "index.js",
   "types": "index.d.ts",

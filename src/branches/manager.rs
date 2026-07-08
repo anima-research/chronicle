@@ -5,6 +5,34 @@ use crate::types::{Branch, BranchId, Sequence, Timestamp};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// A single branch head that was corrected during open-time reconciliation.
+#[derive(Clone, Debug)]
+pub struct HeadReconciliation {
+    /// Branch that was adjusted.
+    pub name: String,
+    /// Branch id.
+    pub id: BranchId,
+    /// Head recorded in `branches.bin`.
+    pub old_head: Sequence,
+    /// Head the durable log implies.
+    pub new_head: Sequence,
+}
+
+/// Outcome of reconciling persisted branch metadata against the durable log on
+/// open. Returned by [`BranchManager::reconcile_heads`].
+#[derive(Clone, Debug, Default)]
+pub struct ReconciliationReport {
+    /// Per-branch head corrections (empty when every head already agreed).
+    pub head_fixes: Vec<HeadReconciliation>,
+    /// BranchIds the durable log holds records for but that are absent from
+    /// `branches.bin` — orphaned records left by a branch that was created and
+    /// written to, then lost before its metadata was flushed. Their records
+    /// remain in the log but the branch is unreachable; `next_id` is clamped
+    /// above them so a future `create_branch` can never re-issue the id and
+    /// adopt them as ghosts.
+    pub orphaned_branch_ids: Vec<BranchId>,
+}
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -263,6 +291,75 @@ impl BranchManager {
 
         *self.current.write() = id;
         Ok(branch)
+    }
+
+    /// Reconcile persisted branch heads against the durable record log.
+    ///
+    /// `branches.bin` is only written on `sync()`/`Drop`, so after an unclean
+    /// shutdown it can disagree with the log in *both* directions:
+    /// - **stale-low**: the log holds records newer than the persisted head
+    ///   (crash after appends but before the metadata flush). Trusting the
+    ///   stale head would make the next append reuse a sequence already
+    ///   occupied by a durable record — a silent duplicate sequence.
+    /// - **too-high**: a torn tail was truncated on log open, leaving the head
+    ///   pointing past the last surviving record — a permanent hole.
+    ///
+    /// For each branch we clamp the head to `max(branch_point, log_max)` where
+    /// `log_max` is the highest sequence the log actually holds for that branch
+    /// (from [`RecordLog::max_sequences`]). The `branch_point` floor preserves
+    /// heads inherited from a parent for branches that have no records of their
+    /// own yet.
+    ///
+    /// The same stale-`branches.bin` mechanism also threatens branch *identity*:
+    /// `create_branch` bumps `next_id` only in memory (persisted alongside the
+    /// branches on sync/Drop), so a crash after creating a branch and appending
+    /// to it — but before the metadata flush — leaves the log holding records
+    /// for a BranchId that a rolled-back `next_id` would happily re-issue. The
+    /// new branch would then adopt those durable records as ghosts and reissue
+    /// their sequences. We therefore also clamp `next_id` above every BranchId
+    /// the log actually holds, and report any such BranchId that is missing from
+    /// `branches.bin` (orphaned records) so the caller can log it.
+    ///
+    /// Returns a [`ReconciliationReport`]: the head corrections made (empty when
+    /// consistent) plus any orphaned BranchIds discovered.
+    pub fn reconcile_heads(
+        &self,
+        log_max_seq: &HashMap<BranchId, Sequence>,
+    ) -> ReconciliationReport {
+        let mut index = self.index.write();
+        let mut report = ReconciliationReport::default();
+
+        for branch in index.branches.values_mut() {
+            let floor = branch.branch_point.map(|s| s.0).unwrap_or(0);
+            let log_max = log_max_seq.get(&branch.id).map(|s| s.0).unwrap_or(0);
+            let reconciled = floor.max(log_max);
+
+            if reconciled != branch.head.0 {
+                report.head_fixes.push(HeadReconciliation {
+                    name: branch.name.clone(),
+                    id: branch.id,
+                    old_head: branch.head,
+                    new_head: Sequence(reconciled),
+                });
+                branch.head = Sequence(reconciled);
+            }
+        }
+
+        // Clamp `next_id` above every BranchId present in the durable log, and
+        // flag ids the log holds but `branches.bin` doesn't (orphaned records).
+        // Because branches and `next_id` are serialised together in one file,
+        // any id in the log at or above `next_id` is necessarily one that never
+        // reached `branches.bin` — the reissue-danger case.
+        for &branch_id in log_max_seq.keys() {
+            if branch_id.0 >= index.next_id {
+                index.next_id = branch_id.0 + 1;
+            }
+            if !index.branches.contains_key(&branch_id) {
+                report.orphaned_branch_ids.push(branch_id);
+            }
+        }
+
+        report
     }
 
     /// Update the head of a branch.
@@ -837,6 +934,72 @@ mod tests {
             let main = manager.get_branch(MAIN_BRANCH).unwrap();
             assert_eq!(main.head, Sequence(5));
         }
+    }
+
+    #[test]
+    fn test_reconcile_heads_both_directions_and_floor() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+
+        // main: persisted head 5 (stale-low; log actually holds up to 10).
+        manager.update_head(BranchId(1), Sequence(5)).unwrap();
+        // child branched at main's (then-)head 5: inherits head 5, bp 5, and
+        // has NO records of its own in the log.
+        let child = manager.create_branch("child", None).unwrap();
+        assert_eq!(child.branch_point, Some(Sequence(5)));
+
+        let mut log_max = HashMap::new();
+        log_max.insert(BranchId(1), Sequence(10)); // main durable to 10
+
+        let report = manager.reconcile_heads(&log_max);
+
+        // main raised 5 -> 10 (kills duplicate-sequence bug).
+        assert_eq!(manager.get_branch(MAIN_BRANCH).unwrap().head, Sequence(10));
+        // child has no log records: head stays at its branch_point floor (5),
+        // NOT lowered to 0.
+        assert_eq!(manager.get_branch("child").unwrap().head, Sequence(5));
+        // Only main changed.
+        assert_eq!(report.head_fixes.len(), 1);
+        assert_eq!(report.head_fixes[0].name, MAIN_BRANCH);
+        assert_eq!(report.head_fixes[0].old_head, Sequence(5));
+        assert_eq!(report.head_fixes[0].new_head, Sequence(10));
+        // main is a known branch: not orphaned.
+        assert!(report.orphaned_branch_ids.is_empty());
+
+        // Now the too-high direction: head persisted past a truncated tail.
+        let mut log_max2 = HashMap::new();
+        log_max2.insert(BranchId(1), Sequence(7)); // log truncated back to 7
+        let report2 = manager.reconcile_heads(&log_max2);
+        assert_eq!(manager.get_branch(MAIN_BRANCH).unwrap().head, Sequence(7));
+        assert_eq!(report2.head_fixes.len(), 1);
+        assert_eq!(report2.head_fixes[0].new_head, Sequence(7));
+    }
+
+    #[test]
+    fn test_reconcile_clamps_next_id_over_orphaned_log_branch() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+
+        // Simulate a crash: the log holds records for BranchId(2) (a branch that
+        // was created and written to) but `branches.bin` never recorded it, so
+        // `next_id` is still the freshly-initialised 2.
+        let mut log_max = HashMap::new();
+        log_max.insert(BranchId(1), Sequence(3)); // main
+        log_max.insert(BranchId(2), Sequence(6)); // orphaned branch's records
+
+        let report = manager.reconcile_heads(&log_max);
+
+        // BranchId(2) is unreachable metadata-wise but its records are durable.
+        assert_eq!(report.orphaned_branch_ids, vec![BranchId(2)]);
+
+        // The next branch MUST NOT be handed BranchId(2) (which would adopt the
+        // orphaned records); it must get BranchId(3).
+        let next = manager.create_branch("other", None).unwrap();
+        assert_eq!(
+            next.id,
+            BranchId(3),
+            "next_id must be clamped above every BranchId present in the log"
+        );
     }
 
     #[test]

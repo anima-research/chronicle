@@ -46,9 +46,11 @@ pub mod wal;
 
 // Re-exports
 pub use blobs::BlobStorage;
-pub use branches::{BranchGcOptions, BranchGcResult, BranchManager};
+pub use branches::{
+    BranchGcOptions, BranchGcResult, BranchManager, HeadReconciliation, ReconciliationReport,
+};
 pub use error::{Result, StoreError};
-pub use records::{RecordIndex, RecordLog};
+pub use records::{RecordIndex, RecordLog, RecoveryReport};
 pub use state::{
     apply_operation, ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex,
     StateManager,
