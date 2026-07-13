@@ -581,6 +581,55 @@ fn test_redact_with_auto_snapshots() {
     assert_eq!(arr.len(), 15, "Should have 15 messages after redacting 5, got {}", arr.len());
 }
 
+#[test]
+fn test_set_on_append_log_forces_full_snapshot_without_resurrection() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = test_store(&dir);
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 3,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        // The Set is the third operation, exactly at the delta threshold.
+        // A delta must not walk past it and collect these replaced appends.
+        for value in ["removed_1", "removed_2"] {
+            store
+                .update_state(
+                    "messages",
+                    StateOperation::Append(serde_json::to_vec(value).unwrap()),
+                )
+                .unwrap();
+        }
+        store
+            .update_state(
+                "messages",
+                StateOperation::Set(serde_json::to_vec(&vec!["kept"]).unwrap()),
+            )
+            .unwrap();
+
+        let state = store.get_state("messages").unwrap().unwrap();
+        let messages: Vec<String> = serde_json::from_slice(&state).unwrap();
+        assert_eq!(messages, vec!["kept"]);
+
+        let stats = store.get_compaction_stats("messages").unwrap();
+        assert!(stats.last_full_snapshot_offset.is_some());
+        assert!(stats.last_delta_snapshot_offset.is_none());
+    }
+
+    // Verify the durable reconstruction, not only the writer's cache.
+    let reopened = open_store(&dir);
+    let state = reopened.get_state("messages").unwrap().unwrap();
+    let messages: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(messages, vec!["kept"]);
+}
+
 // =============================================================================
 // PERFORMANCE TESTS
 // =============================================================================

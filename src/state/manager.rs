@@ -82,14 +82,14 @@ pub struct StateChainHead {
     /// File offset of most recent full snapshot.
     pub last_full_snapshot_offset: Option<u64>,
 
-    /// Whether there are non-Append operations (Edit, Redact) since the last snapshot.
+    /// Whether there are non-Append operations (Edit, Redact, Set) since the last snapshot.
     /// When true, a full snapshot should be created instead of a delta snapshot,
     /// because delta snapshots can only track Append operations.
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
     /// Current number of items in the state (for O(1) length queries).
-    /// Updated on each Append (+1), Redact (-(end-start)), Snapshot (=snapshot.len).
+    /// Updated on each Append (+1), Redact (-(end-start)), and Set/Snapshot (=value.len).
     #[serde(default)]
     pub item_count: usize,
 }
@@ -278,9 +278,9 @@ impl StateManager {
                 head.last_delta_snapshot_offset = None; // Full snapshot supersedes deltas
                 head.has_non_append_since_snapshot = false; // Reset the flag
                 // Update item count from snapshot
-                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(data) {
-                    head.item_count = arr.len();
-                }
+                head.item_count = serde_json::from_slice::<Vec<serde_json::Value>>(data)
+                    .map(|arr| arr.len())
+                    .unwrap_or(0);
             }
             StateOperation::DeltaSnapshot(_) => {
                 // Delta snapshot resets op counter, increments delta counter
@@ -305,9 +305,16 @@ impl StateManager {
                 head.has_non_append_since_snapshot = true;
                 // Edit doesn't change count
             }
-            StateOperation::Set(_) => {
+            StateOperation::Set(data) => {
                 head.ops_since_delta_snapshot += 1;
-                // Set replaces entire state - can't track count without parsing
+                // Set replaces the entire state. Append-log delta snapshots only
+                // consolidate Append operations, so allowing a delta after Set
+                // would walk past the replacement and resurrect older appends.
+                // Force the next threshold snapshot to contain the full state.
+                head.has_non_append_since_snapshot = true;
+                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(data) {
+                    head.item_count = arr.len();
+                }
             }
             StateOperation::TreeSet { .. } | StateOperation::TreeRemove { .. } | StateOperation::TreeBatch { .. } => {
                 head.ops_since_delta_snapshot += 1;
