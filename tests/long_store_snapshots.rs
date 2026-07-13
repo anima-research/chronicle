@@ -630,6 +630,86 @@ fn test_set_on_append_log_forces_full_snapshot_without_resurrection() {
     assert_eq!(messages, vec!["kept"]);
 }
 
+/// Regression: between a Set and the next full snapshot, the optimized read
+/// paths (`get_state_tail` fast path, `iter_state_items`) must treat Set as a
+/// full-state terminal. Both used to walk past it, resurrecting replaced
+/// appends (and `iter_state_items` dropped the Set's value entirely).
+#[test]
+fn test_set_on_append_log_read_paths_before_snapshot() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = test_store(&dir);
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    // High thresholds: no snapshot fires, so reads cross the raw Set.
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        for value in ["removed_1", "removed_2"] {
+            store
+                .update_state(
+                    "messages",
+                    StateOperation::Append(serde_json::to_vec(value).unwrap()),
+                )
+                .unwrap();
+        }
+        store
+            .update_state(
+                "messages",
+                StateOperation::Set(
+                    serde_json::to_vec(&vec!["kept_1", "kept_2", "kept_3"]).unwrap(),
+                ),
+            )
+            .unwrap();
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec("kept_4").unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(store.get_state_len("messages").unwrap(), Some(4));
+
+        // Tail fast path (count < item_count) must not walk past the Set.
+        let tail = store.get_state_tail("messages", 2).unwrap().unwrap();
+        let messages: Vec<String> = serde_json::from_slice(&tail).unwrap();
+        assert_eq!(messages, vec!["kept_3", "kept_4"]);
+
+        // Tail request larger than the Set's own array must stop at the Set.
+        let tail = store.get_state_tail("messages", 3).unwrap().unwrap();
+        let messages: Vec<String> = serde_json::from_slice(&tail).unwrap();
+        assert_eq!(messages, vec!["kept_2", "kept_3", "kept_4"]);
+
+        // Item iteration must apply the Set, not skip it.
+        let items: Vec<String> = store
+            .iter_state_items("messages")
+            .unwrap()
+            .unwrap()
+            .map(|r| serde_json::from_value(r.unwrap()).unwrap())
+            .collect();
+        assert_eq!(items, vec!["kept_1", "kept_2", "kept_3", "kept_4"]);
+    }
+
+    // Same reads against the durable log after reopen.
+    let reopened = open_store(&dir);
+    let tail = reopened.get_state_tail("messages", 2).unwrap().unwrap();
+    let messages: Vec<String> = serde_json::from_slice(&tail).unwrap();
+    assert_eq!(messages, vec!["kept_3", "kept_4"]);
+    let items: Vec<String> = reopened
+        .iter_state_items("messages")
+        .unwrap()
+        .unwrap()
+        .map(|r| serde_json::from_value(r.unwrap()).unwrap())
+        .collect();
+    assert_eq!(items, vec!["kept_1", "kept_2", "kept_3", "kept_4"]);
+}
+
 // =============================================================================
 // PERFORMANCE TESTS
 // =============================================================================

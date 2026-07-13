@@ -902,6 +902,22 @@ impl Store {
                     }
                     break; // Full snapshot - we're done
                 }
+                StateOperation::Set(data) => {
+                    // Set replaces the entire state - it is a full-state
+                    // terminal, exactly like Snapshot. Walking past it would
+                    // resurrect replaced items.
+                    let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
+                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                    let need = count - items_collected.len();
+                    let start = arr.len().saturating_sub(need);
+                    for item in arr[start..].iter().rev() {
+                        items_collected.push(item.clone());
+                        if items_collected.len() >= count {
+                            break;
+                        }
+                    }
+                    break; // Full state - we're done
+                }
                 StateOperation::Edit { .. } | StateOperation::Redact { .. } => {
                     // Edit/Redact make tail optimization complex - fall back to full reconstruct
                     need_full_reconstruct = true;
@@ -957,9 +973,10 @@ impl Store {
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
             match &update.operation {
-                StateOperation::Snapshot(_) => {
+                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
+                    // Both replace the entire state - nothing older matters
                     ops.push(update.operation.clone());
-                    break; // Full snapshot has everything
+                    break;
                 }
                 StateOperation::DeltaSnapshot(_) => {
                     ops.push(update.operation.clone());
@@ -988,6 +1005,12 @@ impl Store {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     all_items.extend(arr);
+                }
+                StateOperation::Set(data) => {
+                    // Set replaces the entire state
+                    let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
+                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                    all_items = arr;
                 }
                 StateOperation::Redact { start, end } => {
                     let start = start.min(all_items.len());
@@ -1913,9 +1936,10 @@ impl StateItemIterator {
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
             match &update.operation {
-                StateOperation::Snapshot(_) => {
+                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
+                    // Both replace the entire state - nothing older matters
                     ops.push(update.operation.clone());
-                    break; // Full snapshot has everything
+                    break;
                 }
                 StateOperation::DeltaSnapshot(_) => {
                     ops.push(update.operation.clone());
@@ -1944,6 +1968,12 @@ impl StateItemIterator {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer.extend(arr);
+                }
+                StateOperation::Set(data) => {
+                    // Set replaces the entire state
+                    let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
+                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                    self.items_buffer = arr;
                 }
                 StateOperation::Redact { start, end } => {
                     let start = start.min(self.items_buffer.len());
