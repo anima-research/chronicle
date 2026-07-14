@@ -92,3 +92,46 @@ fn probe_record_append_store_size() {
         println!("store_size={:<8} {:>10.1} us/append", store_size, per_op);
     }
 }
+
+/// Diagnostic: tally state-op record types and sizes for the append_log gate
+/// workload, to see exactly when snapshots fire under the current policy.
+#[test]
+#[ignore = "manual probe"]
+fn probe_snapshot_tally() {
+    use chronicle::StateOperation as SO;
+    let dir = TempDir::new().unwrap();
+    let store = create_store(&dir);
+    register_log(&store, 100, 20);
+    for i in 0..2000usize {
+        append_json(&store, i);
+    }
+    store.sync().unwrap();
+    let recs: Vec<_> = store
+        .iter_from(chronicle::Sequence(0))
+        .filter_map(|r| r.ok().map(|(_, rec)| rec))
+        .collect();
+    let mut tally: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut snapshot_seqs: Vec<(u64, usize)> = Vec::new();
+    for r in &recs {
+        let upd: chronicle::StateUpdateRecord = match serde_json::from_slice(&r.payload) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let (name, bytes) = match &upd.operation {
+            SO::Append(d) => ("Append", d.len()),
+            SO::Snapshot(d) => ("Snapshot(full)", d.len()),
+            SO::DeltaSnapshot(d) => ("DeltaSnapshot", d.len()),
+            other => ("other", serde_json::to_vec(other).map(|v| v.len()).unwrap_or(0)),
+        };
+        if name == "Snapshot(full)" {
+            snapshot_seqs.push((r.sequence.0, bytes));
+        }
+        let e = tally.entry(name).or_default();
+        e.0 += 1;
+        e.1 += bytes;
+    }
+    for (name, (count, bytes)) in &tally {
+        println!("{:<16} count={:<6} bytes={}", name, count, bytes);
+    }
+    println!("full snapshots at (seq, bytes): {:?}", snapshot_seqs);
+}

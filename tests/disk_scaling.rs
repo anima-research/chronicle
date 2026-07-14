@@ -75,6 +75,20 @@ fn assert_linear(name: &str, sizes: &[usize], bytes: &[u64], max_ratio_per_4x: f
 
 const SIZES: [usize; 3] = [500, 2_000, 8_000];
 
+/// Sizes for the growing-state tests. Deeper than SIZES so every 4× window
+/// sits in the snapshot policy's steady state (the first full snapshot fires
+/// at ~2k ops at framework-default cadence; windows straddling it measure the
+/// warm-up transient, not the asymptote).
+const GROWTH_SIZES: [usize; 3] = [4_000, 16_000, 64_000];
+
+/// Ratio limit for the growing-state tests. Size-aware (doubling) full
+/// snapshots write ≈2× the append bytes in total (S + 2S + 4S + … ≤ 2N), so
+/// with delta snapshots (≈1× appends) the steady-state total is ≈4× appends
+/// and the per-4×-ops ratio converges to ~4.1–4.4 with phase-of-doubling
+/// wobble. The old fixed-interval policy measures ≥7.5× at these same sizes —
+/// 5.5 separates the two cleanly with margin both ways.
+const GROWTH_LIMIT: f64 = 5.5;
+
 /// Plain record appends: bytes/op must be constant.
 #[test]
 fn record_append_disk_linear() {
@@ -90,9 +104,8 @@ fn record_append_disk_linear() {
 
 /// AppendLog via raw Append ops at framework-default snapshot cadence.
 #[test]
-#[ignore = "known quadratic: fixed-interval full snapshots embed whole state, O(N^2/K) disk — see anima-research/chronicle#11; un-ignore when snapshot spacing is size-aware"]
 fn append_log_disk_linear() {
-    let bytes = measure(&SIZES, |store, n| {
+    let bytes = measure(&GROWTH_SIZES, |store, n| {
         store
             .register_state(StateRegistration {
                 id: "log".to_string(),
@@ -114,14 +127,13 @@ fn append_log_disk_linear() {
                 .unwrap();
         }
     });
-    assert_linear("append_log(100x20)", &SIZES, &bytes, 5.0);
+    assert_linear("append_log(100x20)", &GROWTH_SIZES, &bytes, GROWTH_LIMIT);
 }
 
 /// The AF inference/process-log write path (append_to_state_json_with_identity).
 #[test]
-#[ignore = "known quadratic: same snapshot-cadence term as append_log_disk_linear — see anima-research/chronicle#11"]
 fn json_append_with_identity_disk_linear() {
-    let bytes = measure(&SIZES, |store, n| {
+    let bytes = measure(&GROWTH_SIZES, |store, n| {
         store
             .register_state(StateRegistration {
                 id: "log".to_string(),
@@ -143,14 +155,13 @@ fn json_append_with_identity_disk_linear() {
                 .unwrap();
         }
     });
-    assert_linear("json_append_with_identity", &SIZES, &bytes, 5.0);
+    assert_linear("json_append_with_identity", &GROWTH_SIZES, &bytes, GROWTH_LIMIT);
 }
 
 /// Tree states (the AF turn-checkpoints layout): unique-path inserts.
 #[test]
-#[ignore = "known quadratic: same snapshot-cadence term as append_log_disk_linear, worst case (growing key set) — see anima-research/chronicle#11"]
 fn tree_disk_linear() {
-    let bytes = measure(&SIZES, |store, n| {
+    let bytes = measure(&GROWTH_SIZES, |store, n| {
         store
             .register_state(StateRegistration {
                 id: "tree".to_string(),
@@ -175,7 +186,7 @@ fn tree_disk_linear() {
                 .unwrap();
         }
     });
-    assert_linear("tree(100x20)", &SIZES, &bytes, 5.0);
+    assert_linear("tree(100x20)", &GROWTH_SIZES, &bytes, GROWTH_LIMIT);
 }
 
 /// Tree overwrite churn: repeatedly rewriting the SAME small set of paths.
