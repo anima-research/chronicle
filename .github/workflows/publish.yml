@@ -121,6 +121,12 @@ jobs:
         run: |
           ls -la index.js index.d.ts *.node
           node -e "require('./index.js')" || true
+          # Binaries ship inside this tarball; the platform packages named by
+          # napi prepublish were never published. A manifest that declares
+          # them as optionalDependencies breaks 'npm ci' for every consumer
+          # on npm >= 11 (missing-from-lock sync error), so fail the release
+          # if they ever reappear.
+          node -e "if (require('./package.json').optionalDependencies) { throw new Error('optionalDependencies in manifest — would break npm ci for consumers') }"
 
       - name: Publish
         run: npm publish --access public --provenance

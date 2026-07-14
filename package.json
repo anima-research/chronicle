@@ -19,7 +19,6 @@
   "scripts": {
     "build": "napi build --platform --release --features napi-bindings",
     "build:debug": "napi build --platform --features napi-bindings",
-    "prepublishOnly": "napi prepublish -t npm",
     "test": "node test.mjs"
   },
   "devDependencies": {
