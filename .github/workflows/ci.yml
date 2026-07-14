@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      # npm ci installs the lock verbatim: npm >= 11 'npm install' silently
+      # re-resolves platform packages missing from the lock, so only npm ci
+      # fails loudly on a broken or out-of-sync lockfile.
+      - name: Install dependencies (strict lockfile)
+        run: npm ci
+
+      - name: Cargo tests
+        run: cargo test --features napi-bindings
+
+      - name: Build native module (debug)
+        run: npx napi build --platform --features napi-bindings
+
+      - name: Node smoke test
+        run: npm test
