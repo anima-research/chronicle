@@ -34,8 +34,11 @@ jobs:
       - name: Install dependencies (strict lockfile)
         run: npm ci
 
+      # No napi-bindings feature here: napi symbols only exist inside a Node
+      # process, so test executables cannot link with it (the cdylib can).
+      # The napi surface is covered by the napi build + node smoke test below.
       - name: Cargo tests
-        run: cargo test --features napi-bindings
+        run: cargo test
 
       - name: Build native module (debug)
         run: npx napi build --platform --features napi-bindings
