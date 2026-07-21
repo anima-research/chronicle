@@ -26,6 +26,135 @@ fn apply_tree_ops(tree: &mut TreeState, ops: Vec<TreeOp>) {
     }
 }
 
+/// Accumulator for single-materialization op application: the state is held
+/// in decoded form across the whole op sequence instead of being re-parsed
+/// and re-serialized per op.
+enum Materialized {
+    /// Raw bytes — the initial/terminal form (empty, or a Set/Snapshot/Delta
+    /// payload that nothing structured has touched yet).
+    Raw(Vec<u8>),
+    /// Decoded JSON array (AppendLog-family states).
+    Arr(Vec<serde_json::Value>),
+    /// Decoded path→entry map (Tree states).
+    Tree(TreeState),
+}
+
+impl Materialized {
+    fn as_arr(&mut self) -> Result<&mut Vec<serde_json::Value>> {
+        if let Materialized::Raw(bytes) = self {
+            let arr: Vec<serde_json::Value> = if bytes.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
+            };
+            *self = Materialized::Arr(arr);
+        }
+        match self {
+            Materialized::Arr(a) => Ok(a),
+            // A tree op followed by an array op (or vice versa) on one state
+            // is malformed; the legacy per-op path would fail the same way at
+            // its serde parse.
+            _ => Err(StoreError::Deserialization(
+                "state is not a JSON array".to_string(),
+            )),
+        }
+    }
+
+    fn as_tree(&mut self) -> Result<&mut TreeState> {
+        if let Materialized::Raw(bytes) = self {
+            *self = Materialized::Tree(deserialize_tree(bytes)?);
+        }
+        match self {
+            Materialized::Tree(t) => Ok(t),
+            _ => Err(StoreError::Deserialization(
+                "state is not a tree object".to_string(),
+            )),
+        }
+    }
+
+    fn into_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            Materialized::Raw(bytes) => Ok(bytes),
+            Materialized::Arr(arr) => serde_json::to_vec(&arr)
+                .map_err(|e| StoreError::Serialization(e.to_string())),
+            Materialized::Tree(tree) => serde_json::to_vec(&tree)
+                .map_err(|e| StoreError::Serialization(e.to_string())),
+        }
+    }
+}
+
+/// Apply a whole op sequence with a single decode and a single encode.
+///
+/// Semantically identical to folding `apply_operation` over `ops` (same
+/// clamping, same out-of-bounds errors, same serde value round-trip), but
+/// O(state + ops) instead of O(state × ops): reconstruction chains — reopen,
+/// cache miss, branch switch, time travel — stop paying a full parse and
+/// re-serialize per op. Ops with no fast path (`Field`) fall back to
+/// `apply_operation` for that op only.
+pub fn materialize_operations(ops: Vec<StateOperation>) -> Result<Vec<u8>> {
+    let mut acc = Materialized::Raw(Vec::new());
+
+    for op in ops {
+        match op {
+            StateOperation::Set(value)
+            | StateOperation::Snapshot(value)
+            | StateOperation::Delta { new_value: value, .. } => {
+                acc = Materialized::Raw(value);
+            }
+            StateOperation::Append(item) => {
+                let item_value: serde_json::Value = serde_json::from_slice(&item)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                acc.as_arr()?.push(item_value);
+            }
+            StateOperation::DeltaSnapshot(delta_items) => {
+                let delta_arr: Vec<serde_json::Value> = serde_json::from_slice(&delta_items)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                acc.as_arr()?.extend(delta_arr);
+            }
+            StateOperation::Redact { start, end } => {
+                let arr = acc.as_arr()?;
+                let start = start.min(arr.len());
+                let end = end.min(arr.len());
+                if start < end {
+                    arr.drain(start..end);
+                }
+            }
+            StateOperation::Edit { index, new_value } => {
+                let arr = acc.as_arr()?;
+                if index >= arr.len() {
+                    return Err(StoreError::Corruption(format!(
+                        "Edit index {} out of bounds (len {})",
+                        index,
+                        arr.len()
+                    )));
+                }
+                let new_item: serde_json::Value = serde_json::from_slice(&new_value)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                arr[index] = new_item;
+            }
+            StateOperation::TreeSet { path, entry } => {
+                acc.as_tree()?.insert(path, entry);
+            }
+            StateOperation::TreeRemove { path } => {
+                acc.as_tree()?.remove(&path);
+            }
+            StateOperation::TreeBatch { ops } | StateOperation::TreeDeltaSnapshot(ops) => {
+                apply_tree_ops(acc.as_tree()?, ops);
+            }
+            other => {
+                // No fast path (Field / future variants): round-trip through
+                // the per-op application for this op only.
+                let bytes = std::mem::replace(&mut acc, Materialized::Raw(Vec::new()))
+                    .into_bytes()?;
+                acc = Materialized::Raw(apply_operation(bytes, other)?);
+            }
+        }
+    }
+
+    acc.into_bytes()
+}
+
 /// Apply a state operation to a value.
 ///
 /// The value is expected to be JSON-encoded for structured operations.
