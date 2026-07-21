@@ -667,12 +667,9 @@ impl Store {
             return Ok(None);
         }
 
-        // Apply operations in forward order
+        // Apply operations in forward order (single materialization pass)
         operations.reverse();
-        let mut state = Vec::new();
-        for op in operations {
-            state = crate::state::apply_operation(state, op)?;
-        }
+        let state = crate::state::materialize_operations(operations)?;
 
         Ok(Some(state))
     }
@@ -741,12 +738,9 @@ impl Store {
             None => return Ok(None), // No state at that sequence
         };
 
-        // Reconstruct state to count items
+        // Reconstruct state to count items (single materialization pass)
         operations.reverse();
-        let mut state = Vec::new();
-        for op in operations {
-            state = crate::state::apply_operation(state, op)?;
-        }
+        let state = crate::state::materialize_operations(operations)?;
 
         // Count items in the resulting state using strategy-aware parsing
         let item_count = if state.is_empty() {

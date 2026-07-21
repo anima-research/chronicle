@@ -84,7 +84,6 @@ fn register_log(store: &Store) {
 /// Pure appends at framework-default cadence: cold read must be ~linear even
 /// with the doubling policy's long delta-snapshot chains.
 #[test]
-#[ignore = "known quadratic: per-op reconstruction makes cold reads O(tail x N); un-ignore with single-pass materialization"]
 fn cold_read_append_log_linear() {
     let times: Vec<f64> = COLD_SIZES
         .iter()

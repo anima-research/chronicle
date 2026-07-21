@@ -194,7 +194,6 @@ fn tree_disk_linear() {
 /// stay linear (historically this forced a FULL snapshot of the whole state
 /// at every delta boundary — O(N²/D), the worst quadratic in the family).
 #[test]
-#[ignore = "known quadratic: has_non_append forces a full snapshot every delta interval — O(N^2/D) disk; un-ignore with the deferred-full policy"]
 fn edit_sprinkled_append_log_disk_linear() {
     let bytes = measure(&GROWTH_SIZES, |store, n| {
         store
