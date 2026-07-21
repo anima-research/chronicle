@@ -189,6 +189,50 @@ fn tree_disk_linear() {
     assert_linear("tree(100x20)", &GROWTH_SIZES, &bytes, GROWTH_LIMIT);
 }
 
+/// Appends with an Edit sprinkled every 50 ops — the autobio summary-merge
+/// pattern. Edits set has_non_append_since_snapshot; disk must nevertheless
+/// stay linear (historically this forced a FULL snapshot of the whole state
+/// at every delta boundary — O(N²/D), the worst quadratic in the family).
+#[test]
+#[ignore = "known quadratic: has_non_append forces a full snapshot every delta interval — O(N^2/D) disk; un-ignore with the deferred-full policy"]
+fn edit_sprinkled_append_log_disk_linear() {
+    let bytes = measure(&GROWTH_SIZES, |store, n| {
+        store
+            .register_state(StateRegistration {
+                id: "log".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 20,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        for i in 0..n {
+            store
+                .update_state(
+                    "log",
+                    StateOperation::Append(
+                        serde_json::to_vec(&json!({"seq": i, "body": "x".repeat(64)})).unwrap(),
+                    ),
+                )
+                .unwrap();
+            if i % 50 == 49 {
+                store
+                    .update_state(
+                        "log",
+                        StateOperation::Edit {
+                            index: i / 2,
+                            new_value: serde_json::to_vec(&json!({"seq": i / 2, "body": "edited"}))
+                                .unwrap(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+    });
+    assert_linear("edit_sprinkled_append_log", &GROWTH_SIZES, &bytes, GROWTH_LIMIT);
+}
+
 /// Tree overwrite churn: repeatedly rewriting the SAME small set of paths.
 /// Disk must scale with op count, not op count x tree size.
 #[test]
