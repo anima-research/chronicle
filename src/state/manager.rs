@@ -7,7 +7,10 @@
 use crate::error::{Result, StoreError};
 use crate::records::RecordLog;
 use crate::state::operations::apply_operation;
-use crate::types::{BranchId, StateOperation, StateRegistration, StateStrategy, StateUpdateRecord};
+use crate::types::{
+    BranchId, StateOperation, StateRegistration, StateStrategy, StateUpdateRecord, TreeOp,
+    TreeState,
+};
 use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -65,6 +68,14 @@ pub struct ChainStats {
 }
 
 /// Tracks the chain head for a single state.
+///
+/// **Wire-format constraint:** heads are persisted via `rmp_serde::to_vec`
+/// (compact mode), which encodes structs as *positional arrays* — field order
+/// IS the on-disk format, and there are no field names to disambiguate.
+/// Append new fields at the END only, with `#[serde(default)]` (serde fills
+/// defaults for missing trailing elements); inserting or reordering fields
+/// silently misparses every existing store's index. See
+/// `test_state_chain_head_trailing_fields_default` for the compat guarantee.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateChainHead {
     /// File offset of the most recent update record.
@@ -88,10 +99,27 @@ pub struct StateChainHead {
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
-    /// Current number of items in the state (for O(1) length queries).
-    /// Updated on each Append (+1), Redact (-(end-start)), and Set/Snapshot (=value.len).
+    /// Current number of items in the state (for O(1) length queries via
+    /// `get_state_len`). Updated on each Append (+1), Redact (-(end-start)),
+    /// and Set/Snapshot (=value.len). Exact for AppendLog; for Tree states it
+    /// is an upper-bound estimate between full snapshots (overwrites count as
+    /// inserts) and is corrected from the snapshot bytes at each full.
+    /// Snapshot spacing does NOT read this field — it reads
+    /// `item_count_at_last_full`, which is always stamped from parsed
+    /// snapshot bytes and therefore exact.
     #[serde(default)]
     pub item_count: usize,
+
+    /// Item count captured at the most recent full snapshot, stamped from the
+    /// parsed snapshot bytes (exact — not the running estimate above).
+    /// Size-aware full-snapshot spacing compares ops-since-full against this
+    /// so that growing states snapshot on doubling (amortized-linear disk)
+    /// instead of on a fixed interval (quadratic disk, see issue #11).
+    /// Defaults to 0 on legacy indexes, leaving the configured-interval floor
+    /// in charge (the old cadence, to within one op at the boundary) until the
+    /// first full snapshot stamps a baseline.
+    #[serde(default)]
+    pub item_count_at_last_full: usize,
 }
 
 /// In-memory state index (small - just heads and strategies).
@@ -123,6 +151,14 @@ struct CachedItems {
     head_offset: u64, // To detect staleness (same discipline as CachedState)
 }
 
+/// Cached decoded form of a Tree state (path → entry map), so point reads
+/// (`tree_get`) and prefix lists stop paying a full-map JSON parse per call.
+#[derive(Clone)]
+struct CachedTree {
+    tree: Arc<TreeState>,
+    head_offset: u64, // To detect staleness (same discipline as CachedState)
+}
+
 /// State manager handles per-state chains and reconstruction.
 ///
 /// Uses disk-based chain traversal (no in-memory update storage)
@@ -141,6 +177,10 @@ pub struct StateManager {
     /// Populated lazily by `get_state_items`; invalidated in lockstep
     /// with `cache` (same key scheme, same head_offset validity check).
     items_cache: RwLock<LruCache<String, CachedItems>>,
+
+    /// LRU cache for decoded Tree states. Populated lazily by
+    /// `get_tree_state`; same key scheme and head_offset validity as above.
+    tree_cache: RwLock<LruCache<String, CachedTree>>,
 
     /// Reference to record log for disk-based chain traversal.
     log: Option<Arc<RecordLog>>,
@@ -162,6 +202,7 @@ impl StateManager {
             index: RwLock::new(StateIndex::default()),
             cache: RwLock::new(LruCache::new(cache_size)),
             items_cache: RwLock::new(LruCache::new(cache_size)),
+            tree_cache: RwLock::new(LruCache::new(cache_size)),
             log: None,
         })
     }
@@ -186,6 +227,7 @@ impl StateManager {
             index: RwLock::new(StateIndex::default()),
             cache: RwLock::new(LruCache::new(cache_size)),
             items_cache: RwLock::new(LruCache::new(cache_size)),
+            tree_cache: RwLock::new(LruCache::new(cache_size)),
             log: None,
         };
 
@@ -264,6 +306,7 @@ impl StateManager {
                 last_full_snapshot_offset: None,
                 has_non_append_since_snapshot: false,
                 item_count: 0,
+                item_count_at_last_full: 0,
             }
         });
 
@@ -277,10 +320,14 @@ impl StateManager {
                 head.last_full_snapshot_offset = Some(offset);
                 head.last_delta_snapshot_offset = None; // Full snapshot supersedes deltas
                 head.has_non_append_since_snapshot = false; // Reset the flag
-                // Update item count from snapshot
-                head.item_count = serde_json::from_slice::<Vec<serde_json::Value>>(data)
-                    .map(|arr| arr.len())
-                    .unwrap_or(0);
+                // Update item count from snapshot: array-shaped (AppendLog) states
+                // count elements, map-shaped (Tree) states count entries.
+                head.item_count = match serde_json::from_slice::<serde_json::Value>(data) {
+                    Ok(serde_json::Value::Array(arr)) => arr.len(),
+                    Ok(serde_json::Value::Object(map)) => map.len(),
+                    _ => 0,
+                };
+                head.item_count_at_last_full = head.item_count;
             }
             StateOperation::DeltaSnapshot(_) => {
                 // Delta snapshot resets op counter, increments delta counter
@@ -316,10 +363,29 @@ impl StateManager {
                     head.item_count = arr.len();
                 }
             }
-            StateOperation::TreeSet { .. } | StateOperation::TreeRemove { .. } | StateOperation::TreeBatch { .. } => {
+            StateOperation::TreeSet { .. } => {
                 head.ops_since_delta_snapshot += 1;
-                // Tree ops: item_count not accurately tracked per-op for trees.
-                // Count is set on full snapshot only.
+                // Upper-bound estimate: overwrites count as inserts (newness is
+                // unknown here without the tree contents). Corrected from the
+                // parsed snapshot bytes at each full snapshot. Consumed by
+                // `get_state_len` only; snapshot spacing reads the exact
+                // `item_count_at_last_full` instead.
+                head.item_count += 1;
+            }
+            StateOperation::TreeRemove { .. } => {
+                head.ops_since_delta_snapshot += 1;
+                head.item_count = head.item_count.saturating_sub(1);
+            }
+            StateOperation::TreeBatch { ops } => {
+                head.ops_since_delta_snapshot += 1;
+                for op in ops {
+                    match op {
+                        TreeOp::Set { .. } => head.item_count += 1,
+                        TreeOp::Remove { .. } => {
+                            head.item_count = head.item_count.saturating_sub(1)
+                        }
+                    }
+                }
             }
             StateOperation::TreeDeltaSnapshot(_) => {
                 head.ops_since_delta_snapshot = 0;
@@ -460,6 +526,72 @@ impl StateManager {
         Ok(Some(items))
     }
 
+    /// Get the current value of a Tree state as its decoded path→entry map.
+    ///
+    /// The map is parsed at most once per head_offset; the decoded form is
+    /// cached and shared out as `Arc`. This removes the per-call full-map
+    /// parse: point reads (`tree_get`) become O(log n), prefix lists
+    /// O(log n + matches) via `BTreeMap::range`, and unfiltered lists remain
+    /// O(n) by necessity. Note the memory trade: this is a third LRU (up to
+    /// `cache_size` decoded trees, bounded by entry count, not bytes) holding
+    /// decoded forms of states whose serialized bytes may also sit in the
+    /// byte cache — acceptable while trees stay bounded (they are also
+    /// eviction-managed by consumers), but worth revisiting if a byte-aware
+    /// cache budget ever lands. Validity follows the same
+    /// head_offset discipline as `get_state` — any write to the state (on this
+    /// branch) produces a new head_offset and the next read re-parses. No
+    /// caller-side invalidation exists.
+    pub fn get_tree_state(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<TreeState>>> {
+        let index = self.index.read();
+        let key = (branch_id, state_id.to_string());
+        let head = match index.heads.get(&key) {
+            Some(h) => h.clone(),
+            None => return Ok(None),
+        };
+        drop(index);
+
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+
+        // Check tree cache
+        {
+            let mut cache = self.tree_cache.write();
+            if let Some(cached) = cache.get(&cache_key) {
+                if cached.head_offset == head.head_offset {
+                    return Ok(Some(Arc::clone(&cached.tree)));
+                }
+                // Stale entry, will re-parse
+            }
+        }
+
+        // Materialize the state bytes once (served from the byte cache when
+        // warm), then decode the map once per head_offset.
+        let state = match self.get_state(branch_id, state_id)? {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+
+        let tree: TreeState = serde_json::from_slice(&state)
+            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+        let tree = Arc::new(tree);
+
+        {
+            let mut cache = self.tree_cache.write();
+            cache.put(
+                cache_key,
+                CachedTree {
+                    tree: Arc::clone(&tree),
+                    head_offset: head.head_offset,
+                },
+            );
+        }
+
+        Ok(Some(tree))
+    }
+
     /// Reconstruct state by traversing chain from disk.
     ///
     /// For AppendLog with incremental snapshots:
@@ -556,8 +688,20 @@ impl StateManager {
                 delta_snapshot_every,
                 full_snapshot_every,
             } => {
-                // Check if full snapshot is needed first
-                if head.delta_snapshots_since_full >= *full_snapshot_every {
+                // Check if full snapshot is needed first.
+                // Size-aware spacing: a full snapshot embeds the whole state, so
+                // fixed-interval fulls cost O(N²/interval) disk on growing states
+                // (issue #11). Grow the interval with the state: snapshot when the
+                // ops covered since the last full reach the state's size at that
+                // full (doubling), with the configured interval as the floor so
+                // small states keep the configured cadence.
+                let ops_covered_since_full = head.delta_snapshots_since_full
+                    * delta_snapshot_every
+                    + head.ops_since_delta_snapshot;
+                let full_interval = delta_snapshot_every
+                    .saturating_mul(*full_snapshot_every)
+                    .max(head.item_count_at_last_full as u64);
+                if ops_covered_since_full >= full_interval {
                     Some(SnapshotNeeded::Full)
                 } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
                     // If there are non-Append operations (Edit, Redact) since the last snapshot,
@@ -576,7 +720,17 @@ impl StateManager {
                 delta_snapshot_every,
                 full_snapshot_every,
             } => {
-                if head.delta_snapshots_since_full >= *full_snapshot_every {
+                // Same size-aware full spacing as AppendLog (issue #11). The
+                // baseline is `item_count_at_last_full`, stamped exactly from
+                // the parsed snapshot bytes — the per-op tree estimate is not
+                // consulted here.
+                let ops_covered_since_full = head.delta_snapshots_since_full
+                    * delta_snapshot_every
+                    + head.ops_since_delta_snapshot;
+                let full_interval = delta_snapshot_every
+                    .saturating_mul(*full_snapshot_every)
+                    .max(head.item_count_at_last_full as u64);
+                if ops_covered_since_full >= full_interval {
                     Some(SnapshotNeeded::Full)
                 } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
                     Some(SnapshotNeeded::Delta)
@@ -638,6 +792,11 @@ impl StateManager {
             last_full_snapshot_offset: None,
             has_non_append_since_snapshot: false,
             item_count,
+            // No record is written here — this head aliases into the parent's
+            // chain. The branch starts at size N with the parent's snapshots
+            // behind it; treating N as the spacing baseline keeps the doubling
+            // schedule (the branch's first full fires once it has grown by N).
+            item_count_at_last_full: item_count,
         };
 
         index.heads.insert((branch_id, state_id.to_string()), head);
@@ -1434,5 +1593,146 @@ mod tests {
 
         // No head yet, no snapshot needed
         assert!(manager.snapshot_needed(TEST_BRANCH, "items").is_none());
+    }
+
+    /// Table-driven check of the size-aware full-snapshot spacing (issue #11):
+    /// feed crafted heads, assert Full/Delta/None per arm.
+    #[test]
+    fn test_snapshot_needed_spacing_table() {
+        fn head(
+            osds: u64,
+            dsf: u64,
+            baseline: usize,
+            non_append: bool,
+        ) -> StateChainHead {
+            StateChainHead {
+                head_offset: 1,
+                ops_since_delta_snapshot: osds,
+                delta_snapshots_since_full: dsf,
+                last_delta_snapshot_offset: None,
+                last_full_snapshot_offset: None,
+                has_non_append_since_snapshot: non_append,
+                item_count: baseline,
+                item_count_at_last_full: baseline,
+            }
+        }
+
+        // (strategy-id, head, expected) — AppendLog D=100, F=20 → floor K=2000.
+        let append_log = StateStrategy::AppendLog {
+            delta_snapshot_every: 100,
+            full_snapshot_every: 20,
+        };
+        let tree = StateStrategy::Tree {
+            delta_snapshot_every: 100,
+            full_snapshot_every: 20,
+        };
+        // Saturation guard: D·F would overflow u64 (2^33 · 2^33 = 2^66);
+        // saturating_mul must yield "never" rather than a tiny wrapped
+        // interval that fulls on every op.
+        let huge = StateStrategy::AppendLog {
+            delta_snapshot_every: 1 << 33,
+            full_snapshot_every: 1 << 33,
+        };
+
+        let cases: Vec<(&str, &StateStrategy, StateChainHead, Option<SnapshotNeeded>)> = vec![
+            // Legacy index (baseline 0): floor K governs — full at ops_covered = 2000.
+            ("legacy_full", &append_log, head(100, 19, 0, false), Some(SnapshotNeeded::Full)),
+            // One op short of the floor and short of a delta boundary: nothing.
+            ("legacy_below", &append_log, head(99, 19, 0, false), None),
+            // Mid-interval delta boundary: delta.
+            ("delta_due", &append_log, head(100, 5, 0, false), Some(SnapshotNeeded::Delta)),
+            // Small state (baseline < K): configured cadence unchanged.
+            ("small_state_full", &append_log, head(100, 19, 500, false), Some(SnapshotNeeded::Full)),
+            // Grown state (baseline 5000 > K): full deferred until doubled...
+            ("doubling_full", &append_log, head(100, 49, 5000, false), Some(SnapshotNeeded::Full)),
+            // ...and a delta (not a full) where the old fixed interval would have fired.
+            ("doubling_defers_fixed_interval", &append_log, head(100, 19, 5000, false), Some(SnapshotNeeded::Delta)),
+            // Non-append ops force the due snapshot to be full (unchanged behavior).
+            ("non_append_forces_full", &append_log, head(100, 5, 0, true), Some(SnapshotNeeded::Full)),
+            // Tree arm mirrors AppendLog.
+            ("tree_doubling_full", &tree, head(100, 49, 5000, false), Some(SnapshotNeeded::Full)),
+            ("tree_doubling_defers", &tree, head(100, 19, 5000, false), Some(SnapshotNeeded::Delta)),
+            ("tree_below", &tree, head(50, 10, 5000, false), None),
+            // Overflow-prone config: no spurious full from a wrapped interval.
+            ("saturating_interval", &huge, head(1000, 0, 0, false), None),
+        ];
+
+        for (name, strategy, h, expected) in cases {
+            let (_dir, _log, manager) = setup_test();
+            manager
+                .register_state(StateRegistration {
+                    id: name.to_string(),
+                    strategy: (*strategy).clone(),
+                    initial_value: None,
+                })
+                .unwrap();
+            manager
+                .index
+                .write()
+                .heads
+                .insert((TEST_BRANCH, name.to_string()), h);
+            assert_eq!(
+                manager.snapshot_needed(TEST_BRANCH, name),
+                expected,
+                "case {}",
+                name
+            );
+        }
+    }
+
+    /// Wire-format compat: heads are persisted positionally (rmp_serde compact
+    /// mode), so fields appended with #[serde(default)] must deserialize to
+    /// their defaults when reading an index written before they existed.
+    /// Guards the append-only constraint documented on StateChainHead.
+    #[test]
+    fn test_state_chain_head_trailing_fields_default() {
+        /// The pre-#11 layout (through `item_count`), same field order.
+        #[derive(Serialize)]
+        struct HeadV2 {
+            head_offset: u64,
+            ops_since_delta_snapshot: u64,
+            delta_snapshots_since_full: u64,
+            last_delta_snapshot_offset: Option<u64>,
+            last_full_snapshot_offset: Option<u64>,
+            has_non_append_since_snapshot: bool,
+            item_count: usize,
+        }
+        /// The layout before `item_count` existed.
+        #[derive(Serialize)]
+        struct HeadV1 {
+            head_offset: u64,
+            ops_since_delta_snapshot: u64,
+            delta_snapshots_since_full: u64,
+            last_delta_snapshot_offset: Option<u64>,
+            last_full_snapshot_offset: Option<u64>,
+        }
+
+        let v2 = HeadV2 {
+            head_offset: 42,
+            ops_since_delta_snapshot: 7,
+            delta_snapshots_since_full: 3,
+            last_delta_snapshot_offset: Some(40),
+            last_full_snapshot_offset: Some(10),
+            has_non_append_since_snapshot: true,
+            item_count: 123,
+        };
+        let bytes = rmp_serde::to_vec(&v2).unwrap();
+        let head: StateChainHead = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(head.head_offset, 42);
+        assert_eq!(head.item_count, 123);
+        assert_eq!(head.item_count_at_last_full, 0, "new field must default");
+
+        let v1 = HeadV1 {
+            head_offset: 42,
+            ops_since_delta_snapshot: 7,
+            delta_snapshots_since_full: 3,
+            last_delta_snapshot_offset: None,
+            last_full_snapshot_offset: None,
+        };
+        let bytes = rmp_serde::to_vec(&v1).unwrap();
+        let head: StateChainHead = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(!head.has_non_append_since_snapshot);
+        assert_eq!(head.item_count, 0);
+        assert_eq!(head.item_count_at_last_full, 0);
     }
 }

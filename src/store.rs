@@ -1381,23 +1381,25 @@ impl Store {
 
     /// Get a single file entry from a tree state.
     pub fn tree_get(&self, state_id: &str, path: &str) -> Result<Option<TreeEntry>> {
-        let state = match self.get_state(state_id)? {
-            Some(s) if !s.is_empty() => s,
-            _ => return Ok(None),
+        let tree = match self
+            .state
+            .get_tree_state(self.branches.current_branch().id, state_id)?
+        {
+            Some(t) => t,
+            None => return Ok(None),
         };
-        let tree: TreeState = serde_json::from_slice(&state)
-            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
         Ok(tree.get(path).cloned())
     }
 
     /// List files in a tree state, optionally filtered by path prefix.
     pub fn tree_list(&self, state_id: &str, prefix: Option<&str>) -> Result<Vec<(String, TreeEntry)>> {
-        let state = match self.get_state(state_id)? {
-            Some(s) if !s.is_empty() => s,
-            _ => return Ok(Vec::new()),
+        let tree = match self
+            .state
+            .get_tree_state(self.branches.current_branch().id, state_id)?
+        {
+            Some(t) => t,
+            None => return Ok(Vec::new()),
         };
-        let tree: TreeState = serde_json::from_slice(&state)
-            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
         match prefix {
             Some(p) => {
@@ -1408,7 +1410,7 @@ impl Store {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect())
             }
-            None => Ok(tree.into_iter().collect()),
+            None => Ok(tree.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         }
     }
 
