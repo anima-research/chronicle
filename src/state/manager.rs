@@ -6,7 +6,6 @@
 
 use crate::error::{Result, StoreError};
 use crate::records::RecordLog;
-use crate::state::operations::apply_operation;
 use crate::types::{
     BranchId, StateOperation, StateRegistration, StateStrategy, StateUpdateRecord, TreeOp,
     TreeState,
@@ -636,15 +635,11 @@ impl StateManager {
             current_offset = update.prev_update_offset;
         }
 
-        // Apply operations in forward order (reverse of collection order)
+        // Apply operations in forward order (reverse of collection order),
+        // decoding once and encoding once — per-op application made cold
+        // reconstruction O(tail × N).
         operations.reverse();
-
-        let mut state = Vec::new();
-        for op in operations {
-            state = apply_operation(state, op)?;
-        }
-
-        Ok(state)
+        crate::state::materialize_operations(operations)
     }
 
     /// Get the chain head for a state.
@@ -704,11 +699,17 @@ impl StateManager {
                 if ops_covered_since_full >= full_interval {
                     Some(SnapshotNeeded::Full)
                 } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
-                    // If there are non-Append operations (Edit, Redact) since the last snapshot,
-                    // we need a full snapshot instead of a delta, because delta snapshots
-                    // only track Append operations.
+                    // Delta snapshots only track Append operations, so after a
+                    // non-Append op (Edit, Redact, Set) no delta may be taken
+                    // until a full resets the chain — a delta would walk past
+                    // the mutation and resurrect older values. We do NOT force
+                    // an early full for it (historically that meant a full
+                    // snapshot of the whole state every delta interval while
+                    // edits kept occurring — O(N²/D) disk): the raw tail just
+                    // grows until the size-aware full above fires, and
+                    // single-pass materialization keeps reading it O(N).
                     if head.has_non_append_since_snapshot {
-                        Some(SnapshotNeeded::Full)
+                        None
                     } else {
                         Some(SnapshotNeeded::Delta)
                     }
@@ -831,10 +832,18 @@ impl StateManager {
         let index = self.index.read();
         let key = (branch_id, state_id.to_string());
         let head = index.heads.get(&key)?;
+        // Each delta snapshot covers delta_snapshot_every ops; a strategy
+        // without delta snapshots never increments delta_snapshots_since_full,
+        // so the multiplier is moot there.
+        let delta_every = match index.strategies.get(state_id) {
+            Some(StateStrategy::AppendLog { delta_snapshot_every, .. })
+            | Some(StateStrategy::Tree { delta_snapshot_every, .. }) => *delta_snapshot_every,
+            _ => 1,
+        };
 
         Some(CompactionStats {
-            ops_since_last_full_snapshot: head.ops_since_delta_snapshot
-                + head.delta_snapshots_since_full,
+            ops_since_last_full_snapshot: head.delta_snapshots_since_full * delta_every
+                + head.ops_since_delta_snapshot,
             last_full_snapshot_offset: head.last_full_snapshot_offset,
             last_delta_snapshot_offset: head.last_delta_snapshot_offset,
             delta_snapshots_since_full: head.delta_snapshots_since_full,
@@ -1647,8 +1656,12 @@ mod tests {
             ("doubling_full", &append_log, head(100, 49, 5000, false), Some(SnapshotNeeded::Full)),
             // ...and a delta (not a full) where the old fixed interval would have fired.
             ("doubling_defers_fixed_interval", &append_log, head(100, 19, 5000, false), Some(SnapshotNeeded::Delta)),
-            // Non-append ops force the due snapshot to be full (unchanged behavior).
-            ("non_append_forces_full", &append_log, head(100, 5, 0, true), Some(SnapshotNeeded::Full)),
+            // Non-append ops block delta snapshots (a delta would resurrect
+            // pre-edit values) but do NOT force an early full — the raw tail
+            // rides until the size-aware full fires.
+            ("non_append_blocks_delta", &append_log, head(100, 5, 0, true), None),
+            // ...and the size-aware full still fires on schedule with the flag set.
+            ("non_append_full_on_schedule", &append_log, head(2000, 0, 0, true), Some(SnapshotNeeded::Full)),
             // Tree arm mirrors AppendLog.
             ("tree_doubling_full", &tree, head(100, 49, 5000, false), Some(SnapshotNeeded::Full)),
             ("tree_doubling_defers", &tree, head(100, 19, 5000, false), Some(SnapshotNeeded::Delta)),

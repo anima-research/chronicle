@@ -52,8 +52,8 @@ pub use branches::{
 pub use error::{Result, StoreError};
 pub use records::{RecordIndex, RecordLog, RecoveryReport};
 pub use state::{
-    apply_operation, ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex,
-    StateManager,
+    apply_operation, materialize_operations, ChainStats, CompactionStats, SnapshotNeeded,
+    StateChainHead, StateIndex, StateManager,
 };
 pub use store::{CompactionSummary, Store, StoreConfig};
 pub use subscriptions::{

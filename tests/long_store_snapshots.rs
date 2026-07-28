@@ -618,16 +618,43 @@ fn test_set_on_append_log_forces_full_snapshot_without_resurrection() {
         let messages: Vec<String> = serde_json::from_slice(&state).unwrap();
         assert_eq!(messages, vec!["kept"]);
 
+        // The Set blocks delta snapshots (a delta would walk past it and
+        // resurrect the replaced appends). It no longer forces an immediate
+        // full — the raw tail rides until the size-aware full fires.
         let stats = store.get_compaction_stats("messages").unwrap();
-        assert!(stats.last_full_snapshot_offset.is_some());
         assert!(stats.last_delta_snapshot_offset.is_none());
+
+        // Drive past the size-aware full threshold (delta 3 × full 100 = 300
+        // ops floor) and verify the scheduled full lands and content is right.
+        for i in 0..300 {
+            store
+                .update_state(
+                    "messages",
+                    StateOperation::Append(serde_json::to_vec(&format!("m{}", i)).unwrap()),
+                )
+                .unwrap();
+        }
+        let stats = store.get_compaction_stats("messages").unwrap();
+        assert!(
+            stats.last_full_snapshot_offset.is_some(),
+            "size-aware full snapshot should have fired after 300 ops"
+        );
+        let state = store.get_state("messages").unwrap().unwrap();
+        let messages: Vec<String> = serde_json::from_slice(&state).unwrap();
+        assert_eq!(messages[0], "kept");
+        assert_eq!(messages.len(), 301);
     }
 
     // Verify the durable reconstruction, not only the writer's cache.
     let reopened = open_store(&dir);
     let state = reopened.get_state("messages").unwrap().unwrap();
     let messages: Vec<String> = serde_json::from_slice(&state).unwrap();
-    assert_eq!(messages, vec!["kept"]);
+    assert_eq!(messages.len(), 301);
+    assert_eq!(messages[0], "kept");
+    assert!(
+        !messages.iter().any(|m| m.starts_with("removed_")),
+        "replaced appends resurrected across reopen"
+    );
 }
 
 /// Regression: between a Set and the next full snapshot, the optimized read

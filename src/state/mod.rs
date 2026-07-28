@@ -10,4 +10,4 @@ mod operations;
 pub use manager::{
     ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
 };
-pub use operations::apply_operation;
+pub use operations::{apply_operation, materialize_operations};
