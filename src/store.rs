@@ -644,7 +644,11 @@ impl Store {
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
             match &update.operation {
-                StateOperation::Snapshot(_) => {
+                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
+                    // Full-state terminal (Set replaces state exactly like
+                    // Snapshot in materialize_operations); stop the walk. Not
+                    // treating Set as terminal here made Snapshot-strategy
+                    // reconstruction O(full chain). Mirrors get_state_tail.
                     operations.push(update.operation.clone());
                     break;
                 }
@@ -715,7 +719,11 @@ impl Store {
 
             // Collect operations to compute item_count
             match &update.operation {
-                StateOperation::Snapshot(_) => {
+                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
+                    // Full-state terminal (Set replaces state exactly like
+                    // Snapshot in materialize_operations); stop the walk. Not
+                    // treating Set as terminal here made Snapshot-strategy
+                    // reconstruction O(full chain). Mirrors get_state_tail.
                     operations.push(update.operation.clone());
                     break;
                 }
@@ -2461,6 +2469,41 @@ mod tests {
             .map(|r| serde_json::from_value(r.unwrap()).unwrap())
             .collect();
         assert_eq!(collected, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn test_snapshot_strategy_reconstructs_from_newest_set() {
+        // Regression: Snapshot-strategy states are written via Set and never
+        // get a periodic Snapshot record (snapshot_needed -> None for the
+        // Snapshot strategy). Cold reconstruction must treat the newest Set as
+        // a full-state terminal and stop the backward walk there; walking to
+        // sequence 0 made boot O(full chain) for these states (Sol, 2026-07-31).
+        // This exercises reconstruct_from_disk on a long all-Set chain and
+        // asserts the reopened value is the last Set.
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let store = Store::create(config.clone()).unwrap();
+            store.register_state(StateRegistration {
+                id: "bookkeeping".to_string(),
+                strategy: crate::types::StateStrategy::Snapshot,
+                initial_value: None,
+            }).unwrap();
+            for i in 0..200 {
+                store.update_state("bookkeeping", StateOperation::Set(
+                    serde_json::to_vec(&json!({ "n": i })).unwrap()
+                )).unwrap();
+            }
+            store.sync().unwrap();
+        }
+        // Reopen: the in-memory cache is gone, so get_state hits
+        // reconstruct_from_disk over the full Set chain.
+        {
+            let store = Store::open(config).unwrap();
+            let raw = store.get_state("bookkeeping").unwrap().unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(parsed, json!({ "n": 199 }));
+        }
     }
 
     #[test]

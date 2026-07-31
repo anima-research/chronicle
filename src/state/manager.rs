@@ -613,8 +613,14 @@ impl StateManager {
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
             match &update.operation {
-                StateOperation::Snapshot(_) => {
-                    // Full snapshot - add it and stop completely
+                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
+                    // Full-state terminal: both Snapshot and Set replace the
+                    // entire state in materialize_operations, so anything older
+                    // is superseded. Add it and stop. Walking past a Set was the
+                    // bug that made cold reconstruction of Snapshot-strategy
+                    // states O(full chain) — those states are written via Set
+                    // and never get a periodic Snapshot, so the walk ran to
+                    // sequence 0. Mirrors get_state_tail's Set handling.
                     operations.push(update.operation.clone());
                     break;
                 }
