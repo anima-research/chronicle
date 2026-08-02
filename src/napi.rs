@@ -282,6 +282,23 @@ fn to_napi_error(e: StoreError) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
 
+/// Shared JsStateRegistration -> StateStrategy conversion for
+/// register_state and update_state_strategy.
+fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateStrategy> {
+    Ok(match registration.strategy.as_str() {
+        "snapshot" => StateStrategy::Snapshot,
+        "append_log" => StateStrategy::AppendLog {
+            delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(100) as u64,
+            full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
+        },
+        "tree" => StateStrategy::Tree {
+            delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
+            full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
+        },
+        _ => return Err(napi::Error::from_reason("Invalid strategy")),
+    })
+}
+
 #[napi]
 impl JsStore {
     /// Get the inner store, returning an error if closed.
@@ -550,18 +567,7 @@ impl JsStore {
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
-        let strategy = match registration.strategy.as_str() {
-            "snapshot" => StateStrategy::Snapshot,
-            "append_log" => StateStrategy::AppendLog {
-                delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(100) as u64,
-                full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
-            },
-            "tree" => StateStrategy::Tree {
-                delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
-                full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
-            },
-            _ => return Err(napi::Error::from_reason("Invalid strategy")),
-        };
+        let strategy = js_registration_strategy(&registration)?;
 
         let reg = StateRegistration {
             id: registration.id,
@@ -570,6 +576,22 @@ impl JsStore {
         };
 
         store.register_state(reg).map_err(to_napi_error)
+    }
+
+    /// Update the strategy parameters of an already-registered state.
+    /// Same strategy kind only; cadence fields (deltaSnapshotEvery /
+    /// fullSnapshotEvery) are free to change and steer future snapshot
+    /// scheduling. Use after registerState throws "State already exists"
+    /// so boot-time registration constants actually apply to existing
+    /// stores instead of being pinned to first-registration values.
+    /// `initialValue` is ignored (the state already has a chain).
+    #[napi]
+    pub fn update_state_strategy(&self, registration: JsStateRegistration) -> Result<()> {
+        let store = self.get_store()?;
+        let strategy = js_registration_strategy(&registration)?;
+        store
+            .update_state_strategy(&registration.id, strategy)
+            .map_err(to_napi_error)
     }
 
     /// Get state value.

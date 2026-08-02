@@ -398,6 +398,18 @@ impl Store {
         self.state.register_state(registration)
     }
 
+    /// Update the strategy parameters of an already-registered state (same
+    /// kind only — see `StateManager::update_state_strategy`). Lets boot-time
+    /// re-registration retune snapshot cadence on existing stores instead of
+    /// being permanently pinned to the values from first registration.
+    pub fn update_state_strategy(
+        &self,
+        state_id: &str,
+        strategy: crate::types::StateStrategy,
+    ) -> Result<()> {
+        self.state.update_state_strategy(state_id, strategy)
+    }
+
     /// Update a state and record it.
     ///
     /// The operation is validated by applying it to the current state before
