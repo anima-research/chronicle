@@ -283,6 +283,36 @@ impl StateManager {
         Ok(())
     }
 
+    /// Update the strategy parameters of an already-registered state.
+    ///
+    /// Registrations persist in `state.bin`, so a consumer that re-registers
+    /// on every boot (context-manager does) can never retune snapshot
+    /// cadence on an existing store — `register_state` errors with
+    /// `StateExists` and the persisted strategy wins forever (2026-08-01:
+    /// Mythos's messages state was stuck on `full_snapshot_every: 10`, a
+    /// full copy of the entire history every ~500 appends — 57% of the last
+    /// GB of its log). This is the upsert leg.
+    ///
+    /// Same strategy KIND only: swapping the kind out from under a live
+    /// chain (AppendLog -> Snapshot etc.) would change reconstruction
+    /// semantics for records already on disk. Cadence fields are free to
+    /// change; they only steer FUTURE snapshot scheduling.
+    pub fn update_state_strategy(&self, id: &str, strategy: StateStrategy) -> Result<()> {
+        let mut index = self.index.write();
+        let existing = index
+            .strategies
+            .get(id)
+            .ok_or_else(|| StoreError::StateNotRegistered(id.to_string()))?;
+        if std::mem::discriminant(existing) != std::mem::discriminant(&strategy) {
+            return Err(StoreError::InvalidOperation(format!(
+                "update_state_strategy('{}'): cannot change strategy kind ({:?} -> {:?})",
+                id, existing, strategy
+            )));
+        }
+        index.strategies.insert(id.to_string(), strategy);
+        Ok(())
+    }
+
     /// Record a state update (called when a state update record is appended).
     ///
     /// This only updates the chain head metadata - the actual update is in the log.

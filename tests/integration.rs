@@ -914,3 +914,78 @@ fn test_auto_snapshot_toggle_default_path_still_snapshots() {
         stats.total_operations,
     );
 }
+
+/// update_state_strategy: cadence retune on an EXISTING registration must
+/// take effect (registrations persist in state.bin, so boot-time
+/// re-registration alone can never change them — the 2026-08-01 Mythos
+/// full-snapshot-bloat lesson), and kind changes must be rejected.
+#[test]
+fn test_update_state_strategy_retunes_cadence() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    store
+        .register_state(StateRegistration {
+            id: "msgs".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 5,
+                full_snapshot_every: 1, // full snapshot every 5 appends
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Re-registration still errors — update is a distinct, explicit act.
+    assert!(store
+        .register_state(StateRegistration {
+            id: "msgs".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 5,
+                full_snapshot_every: 1,
+            },
+            initial_value: None,
+        })
+        .is_err());
+
+    // Retune: full snapshots effectively never (within this test's volume).
+    store
+        .update_state_strategy(
+            "msgs",
+            StateStrategy::AppendLog {
+                delta_snapshot_every: 5,
+                full_snapshot_every: 1000,
+            },
+        )
+        .unwrap();
+
+    for i in 0..30 {
+        store
+            .append_to_state_json_with_identity("msgs", json!({ "i": i }), "id", "sequence")
+            .unwrap();
+    }
+    let stats = store.get_chain_stats("msgs").unwrap().unwrap();
+    assert!(
+        !stats.has_full_snapshot,
+        "retuned cadence must govern future snapshots (full fired anyway)",
+    );
+
+    // Value integrity untouched by the retune.
+    let state = store.get_state("msgs").unwrap().unwrap();
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(arr.len(), 30);
+
+    // Kind change rejected.
+    assert!(store
+        .update_state_strategy("msgs", StateStrategy::Snapshot)
+        .is_err());
+
+    // Unregistered state rejected.
+    assert!(store
+        .update_state_strategy(
+            "nope",
+            StateStrategy::AppendLog {
+                delta_snapshot_every: 5,
+                full_snapshot_every: 10,
+            },
+        )
+        .is_err());
+}
