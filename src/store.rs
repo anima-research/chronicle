@@ -539,13 +539,16 @@ impl Store {
             timestamp: Timestamp::now(),
         };
 
-        // Serialize and append
-        let payload = serde_json::to_vec(&update)?;
-        let input = RecordInput::raw("state_update", payload);
+        // Serialize and append. MessagePack with a stamped encoding tag —
+        // StateUpdateRecord::decode gates on it, and pre-existing JSON
+        // records (encoding Raw/Json) keep decoding via the fallback arm.
+        let (payload, encoding) = update.encode()?;
+        let mut input = RecordInput::raw("state_update", payload);
+        input.encoding = encoding;
 
         let (record, offset) = self.log.append(input, branch.id, next_seq)?;
         // Tripwire: peek + append must agree because `write_lock` is held
-        // across both. If this ever fires, the JSON payload on disk would
+        // across both. If this ever fires, the payload on disk would
         // claim id X while the record envelope says Y — silent corruption.
         // Kept on in release builds for that reason.
         assert_eq!(
@@ -632,16 +635,14 @@ impl Store {
             // Skip if this record is after the target sequence
             if record.sequence > at_sequence {
                 // Parse just to get prev_update_offset
-                let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                let update = StateUpdateRecord::decode(&record)?;
                 current_offset = update.prev_update_offset;
                 continue;
             }
 
             found_any = true;
 
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
                 StateOperation::Snapshot(_) | StateOperation::Set(_) => {
@@ -703,8 +704,7 @@ impl Store {
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
 
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             // Skip if this record is after the target sequence
             if record.sequence > at_sequence {
@@ -829,11 +829,10 @@ impl Store {
     /// Returns `None` if the state doesn't exist or the index is out of range.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
-        let items = match self.state.get_state_items(branch_id, state_id)? {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        Ok(items.get(index).cloned())
+        // Delegates to the manager, which serves the just-appended last item
+        // from the head record in O(1) instead of re-materializing the whole
+        // state (see StateManager::get_state_item).
+        self.state.get_state_item(branch_id, state_id, index)
     }
 
     /// Get the last N items from an AppendLog state.
@@ -868,8 +867,7 @@ impl Store {
             }
 
             let record = self.log.read_at(offset)?;
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
                 StateOperation::Append(item) => {
@@ -971,8 +969,7 @@ impl Store {
 
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
                 StateOperation::Snapshot(_) | StateOperation::Set(_) => {
@@ -1238,8 +1235,7 @@ impl Store {
 
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
                 StateOperation::Append(item) => {
@@ -1284,8 +1280,7 @@ impl Store {
 
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             let mut push_if_unseen = |op: TreeOp| {
                 let path = match &op {
@@ -1936,8 +1931,7 @@ impl StateItemIterator {
         // Pass 1: Collect operations in reverse order
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
                 StateOperation::Snapshot(_) | StateOperation::Set(_) => {

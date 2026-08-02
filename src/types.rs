@@ -277,31 +277,46 @@ impl Default for StateStrategy {
 }
 
 /// Operation on state (stored in chain).
+///
+/// The `Vec<u8>` value fields carry `serde_bytes` so a bytes-aware format
+/// (MessagePack — see [`StateUpdateRecord::encode`]) stores them as raw
+/// `bin` payloads instead of per-byte integer sequences. JSON output is
+/// unchanged by the attribute (serde_json renders bytes as an integer
+/// array either way), so historical JSON-encoded records round-trip
+/// identically.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StateOperation {
     /// Set entire value (Snapshot strategy).
-    Set(Vec<u8>),
+    Set(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// Apply delta (Delta strategy).
-    Delta { old_hash: Hash, new_value: Vec<u8> },
+    Delta {
+        old_hash: Hash,
+        #[serde(with = "serde_bytes")]
+        new_value: Vec<u8>,
+    },
 
     /// Append to collection (AppendLog).
-    Append(Vec<u8>),
+    Append(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// Remove range from collection (AppendLog).
     Redact { start: usize, end: usize },
 
     /// Edit item at index (AppendLog).
-    Edit { index: usize, new_value: Vec<u8> },
+    Edit {
+        index: usize,
+        #[serde(with = "serde_bytes")]
+        new_value: Vec<u8>,
+    },
 
     /// Full snapshot (any strategy, periodic).
     /// For AppendLog, this stores the complete array.
-    Snapshot(Vec<u8>),
+    Snapshot(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// Delta snapshot for AppendLog strategy.
     /// Stores items added since last delta or full snapshot.
     /// During reconstruction, delta snapshots are concatenated.
-    DeltaSnapshot(Vec<u8>),
+    DeltaSnapshot(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// Set a single path in a tree state (Tree strategy).
     TreeSet { path: String, entry: TreeEntry },
@@ -345,6 +360,49 @@ pub struct StateUpdateRecord {
 
     /// Timestamp.
     pub timestamp: Timestamp,
+}
+
+impl StateUpdateRecord {
+    /// Encode for storage: MessagePack, so the operation's value bytes are
+    /// stored as raw `bin` payloads. The previous JSON encoding rendered
+    /// every value byte as a JSON integer (~4x size, per-byte parse cost) —
+    /// on large states this made each chain read/write CPU-bound in serde
+    /// (2026-08-01 Mythos turn-boundary stalls: 10-30s per boundary against
+    /// a 114 MB messages snapshot).
+    ///
+    /// Returns the payload together with the encoding tag to stamp on the
+    /// record, which is what [`Self::decode`] gates on.
+    ///
+    /// `to_vec_named` (map-keyed structs), not `to_vec` (positional arrays):
+    /// this is a forever on-disk format — field-name keying survives field
+    /// reordering and, like JSON, tolerates additive evolution. Serde's
+    /// derive accepts both shapes on read, so this is also the safer target
+    /// for any future re-encode. Cost is ~a hundred bytes of field names per
+    /// record against multi-KB payloads.
+    pub fn encode(&self) -> Result<(Vec<u8>, PayloadEncoding), crate::error::StoreError> {
+        let payload = rmp_serde::to_vec_named(self)
+            .map_err(|e| crate::error::StoreError::Serialization(e.to_string()))?;
+        Ok((payload, PayloadEncoding::MessagePack))
+    }
+
+    /// Decode from a stored record, gated on the record's encoding tag.
+    ///
+    /// Historical state_update records were written via `RecordInput::raw`,
+    /// so their encoding byte is `Raw` (and some test fixtures use `Json`)
+    /// while the payload is actually JSON — treat everything that is not
+    /// MessagePack as JSON. Once a store contains MessagePack state records
+    /// it can no longer be opened by chronicle versions predating this
+    /// method (forward-only migration).
+    pub fn decode(record: &Record) -> Result<Self, crate::error::StoreError> {
+        match record.encoding {
+            PayloadEncoding::MessagePack => rmp_serde::from_slice(&record.payload)
+                .map_err(|e| crate::error::StoreError::Deserialization(e.to_string())),
+            PayloadEncoding::Json | PayloadEncoding::Raw => {
+                serde_json::from_slice(&record.payload)
+                    .map_err(|e| crate::error::StoreError::Deserialization(e.to_string()))
+            }
+        }
+    }
 }
 
 /// Registration for a state slot.

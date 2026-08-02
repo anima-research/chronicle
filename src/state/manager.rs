@@ -525,6 +525,75 @@ impl StateManager {
         Ok(Some(items))
     }
 
+    /// Point lookup of a single AppendLog item.
+    ///
+    /// Fast path: by far the most common point lookup is the just-appended
+    /// LAST item — the context-manager's write-through fetches the canonical
+    /// serde form immediately after every append, i.e. immediately after the
+    /// write invalidated both caches. Before this method existed, that
+    /// lookup fell into `get_state_items` and re-materialized the entire
+    /// state on every single append (2026-08-01 Mythos: each materialization
+    /// re-parsed a 114 MB snapshot chain — 10-30s CPU stalls at every turn
+    /// boundary). When the head record is an `Append` and the caller asks
+    /// for the final index, the item is served from the head record alone:
+    /// O(one record read) regardless of state size, no cache churn.
+    ///
+    /// Byte fidelity: an Append record stores exactly the bytes that
+    /// materialization re-emits for that item — both sides serialize the
+    /// same `serde_json::Value`, and Value objects are BTreeMap-backed so
+    /// key order is canonical. Asserted by the fast/slow equivalence test.
+    ///
+    /// Fallbacks preserve the previous semantics: a warm items cache is
+    /// used when valid (same head_offset discipline as `get_state_items`),
+    /// and any non-Append head or non-final index takes the full
+    /// materialization path.
+    pub fn get_state_item(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        index: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let head = {
+            let idx = self.index.read();
+            match idx.heads.get(&(branch_id, state_id.to_string())) {
+                Some(h) => h.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        // Warm cache wins: O(1) and avoids even the head-record read.
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        {
+            let mut cache = self.items_cache.write();
+            if let Some(cached) = cache.get(&cache_key) {
+                if cached.head_offset == head.head_offset {
+                    return Ok(cached.items.get(index).cloned());
+                }
+            }
+        }
+
+        // Head-record fast path: last item + Append head.
+        if head.item_count > 0 && index == head.item_count - 1 {
+            let log = self
+                .log
+                .as_ref()
+                .ok_or_else(|| StoreError::NotInitialized)?;
+            let record = log.read_at(head.head_offset)?;
+            let update = StateUpdateRecord::decode(&record)?;
+            if let StateOperation::Append(item) = update.operation {
+                return Ok(Some(item));
+            }
+            // Non-Append head (Edit / Redact / snapshot / Set): the last
+            // item isn't recoverable from the head record alone.
+        }
+
+        // Slow path: full materialization (result cached for later reads).
+        match self.get_state_items(branch_id, state_id)? {
+            Some(items) => Ok(items.get(index).cloned()),
+            None => Ok(None),
+        }
+    }
+
     /// Get the current value of a Tree state as its decoded path→entry map.
     ///
     /// The map is parsed at most once per head_offset; the decoded form is
@@ -609,8 +678,7 @@ impl StateManager {
             let record = log.read_at(offset)?;
 
             // Parse the state update from the record payload
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
                 StateOperation::Snapshot(_) | StateOperation::Set(_) => {
@@ -885,8 +953,7 @@ impl StateManager {
             let record = log.read_at(offset)?;
             let record_size = record.payload.len() as u64;
 
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let update = StateUpdateRecord::decode(&record)?;
 
             total_ops += 1;
             total_bytes += record_size;

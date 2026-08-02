@@ -402,6 +402,33 @@ impl JsStore {
         Ok(record.map(Into::into))
     }
 
+    /// Decode a `state_update` record's payload to a JSON string, regardless
+    /// of its on-disk encoding (legacy JSON under a Raw/Json tag, or the
+    /// current MessagePack). JS consumers must use this instead of
+    /// `JSON.parse(record.payload)` — after the 2026-08 encoding migration
+    /// the raw payload is no longer guaranteed to be JSON. The operation's
+    /// value bytes are surfaced as JSON integer arrays (the legacy shape),
+    /// so existing shape-expectations keep holding.
+    #[napi]
+    pub fn get_state_update_json(&self, id: String) -> Result<Option<String>> {
+        let store = self.get_store()?;
+        let id: u64 = id
+            .parse()
+            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+        let record = match store.get_record(RecordId(id)).map_err(to_napi_error)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if record.record_type != "state_update" {
+            return Ok(None);
+        }
+        let update =
+            crate::types::StateUpdateRecord::decode(&record).map_err(to_napi_error)?;
+        let json = serde_json::to_string(&update)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        Ok(Some(json))
+    }
+
     /// Get record IDs by type.
     #[napi]
     pub fn get_record_ids_by_type(&self, record_type: String) -> Result<Vec<String>> {
