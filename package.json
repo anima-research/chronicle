@@ -19,7 +19,8 @@
   "scripts": {
     "build": "napi build --platform --release --features napi-bindings",
     "build:debug": "napi build --platform --features napi-bindings",
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"

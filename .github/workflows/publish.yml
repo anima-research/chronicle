@@ -31,16 +31,22 @@ jobs:
     name: Build - ${{ matrix.target }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          # Named explicitly: `stable` was a BRANCH ref, so the channel used to
+          # come from the ref itself. Pinned to a SHA, it would otherwise come
+          # from whichever branch's action.yml that SHA carries.
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (aarch64-linux)
@@ -60,7 +66,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Upload native module
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bindings-${{ matrix.target }}
           path: '*.node'
@@ -68,7 +74,7 @@ jobs:
 
       - name: Upload JS bindings (once)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: js-bindings
           path: |
@@ -80,6 +86,11 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs: build
+    # Gated on the ref, not the event, so a manual re-dispatch against an
+    # existing tag still publishes — but a dispatch against a branch cannot,
+    # which would otherwise publish whatever version package.json happened to
+    # carry, bypassing the changelog guard below.
+    if: startsWith(github.ref, 'refs/tags/v')
 
     # OIDC trusted publishing: GitHub mints a short-lived id-token, npm CLI
     # exchanges it for a publish credential. No long-lived NPM_TOKEN secret.
@@ -90,10 +101,21 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Require changelog section for this release
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          esc=$(printf '%s' "$ver" | sed 's/[.]/\\./g')
+          if ! grep -Eq "^## ${esc}([^0-9]|$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${ver}' section for tag ${GITHUB_REF_NAME}. Retitle the Unreleased section before tagging (see CONTRIBUTING.md)."
+            exit 1
+          fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # node 24 ships npm >= 11.5.1, required for OIDC publishing.
           node-version: 24
@@ -103,7 +125,7 @@ jobs:
         run: npm ci
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
 
@@ -130,3 +152,41 @@ jobs:
 
       - name: Publish
         run: npm publish --access public --provenance
+
+  github-release:
+    name: GitHub release notes
+    runs-on: ubuntu-latest
+    # Deliberately independent of the npm publish job — and of the native
+    # build matrix it needs: some consumers run github-clone checkouts, and
+    # release notes must exist even when the cross-build or publish fails.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Mirror changelog section into release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # Section header is '## X.Y.Z — YYYY-MM-DD'; match the version
+          # field exactly (string compare, no regex escaping needed).
+          awk -v ver="$ver" '
+            /^## / { if (in_section) exit; if ($2 == ver) { in_section = 1; next } }
+            in_section { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          if ! [ -s notes.md ]; then
+            echo "::error::No CHANGELOG.md section found for ${ver}."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md --verify-tag
+          fi
