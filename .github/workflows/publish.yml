@@ -129,4 +129,6 @@ jobs:
           node -e "if (require('./package.json').optionalDependencies) { throw new Error('optionalDependencies in manifest — would break npm ci for consumers') }"
 
       - name: Publish
-        run: npm publish --access public --provenance
+        # Maintenance line: never move the `latest` dist-tag (0.3.0+ owns
+        # it). Consumers resolve 0.2.x by version range as usual.
+        run: npm publish --access public --provenance --tag maintenance
