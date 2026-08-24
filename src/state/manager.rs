@@ -26,6 +26,12 @@ const STATE_INDEX_MAGIC: &[u8; 4] = b"STI\0";
 /// Current state index format version.
 const STATE_INDEX_VERSION: u8 = 2; // Bumped for new format
 
+/// Magic bytes for the baselines sidecar (`state.bin.baselines`).
+const BASELINES_MAGIC: &[u8; 4] = b"STB\0";
+
+/// Baselines sidecar format version.
+const BASELINES_VERSION: u8 = 1;
+
 /// Default cache size (number of states).
 const DEFAULT_CACHE_SIZE: usize = 1000;
 
@@ -75,6 +81,16 @@ pub struct ChainStats {
 /// defaults for missing trailing elements); inserting or reordering fields
 /// silently misparses every existing store's index. See
 /// `test_state_chain_head_trailing_fields_default` for the compat guarantee.
+///
+/// **0.2.x branch rule (issue #15):** trailing tolerance only covers *new
+/// code reading old indexes* — a 0.2.6 binary reading a head with extra
+/// trailing elements fails `Store::open` with "array had incorrect length,
+/// expected 7". So on this branch `save` persists heads in the legacy
+/// seven-element layout (`LegacyHeadWire`, byte-identical to 0.2.6) and
+/// `item_count_at_last_full` travels in the `state.bin.baselines` sidecar,
+/// which 0.2.6 never opens. Rolling back to 0.2.6 is a plain dependency
+/// downgrade; the stale sidecar it leaves behind only re-seeds snapshot
+/// cadence and is re-stamped at the next full snapshot.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateChainHead {
     /// File offset of the most recent update record.
@@ -117,6 +133,11 @@ pub struct StateChainHead {
     /// Defaults to 0 on legacy indexes, leaving the configured-interval floor
     /// in charge (the old cadence, to within one op at the boundary) until the
     /// first full snapshot stamps a baseline.
+    ///
+    /// 0.2.x branch: NOT persisted in `state.bin` (see the wire-format
+    /// constraint above) — `save` writes it to the baselines sidecar and
+    /// `load` patches it back in, defaulting to 0 when the sidecar is
+    /// missing or unreadable.
     #[serde(default)]
     pub item_count_at_last_full: usize,
 }
@@ -129,6 +150,43 @@ pub struct StateIndex {
 
     /// Registered state strategies.
     pub strategies: HashMap<String, StateStrategy>,
+}
+
+/// Serialize-only mirror of `StateIndex` in the 0.2.6 wire layout: same field
+/// order, heads in the legacy seven-element shape. What `save` actually
+/// writes into `state.bin` on the 0.2.x branch.
+#[derive(Serialize)]
+struct LegacyIndexWire<'a> {
+    heads: HashMap<&'a (BranchId, String), LegacyHeadWire>,
+    strategies: &'a HashMap<String, StateStrategy>,
+}
+
+/// The seven-element head layout every 0.2.x release reads and writes.
+/// `item_count_at_last_full` is deliberately absent — it goes to the
+/// baselines sidecar so `state.bin` stays openable by an unmodified 0.2.6.
+#[derive(Serialize)]
+struct LegacyHeadWire {
+    head_offset: u64,
+    ops_since_delta_snapshot: u64,
+    delta_snapshots_since_full: u64,
+    last_delta_snapshot_offset: Option<u64>,
+    last_full_snapshot_offset: Option<u64>,
+    has_non_append_since_snapshot: bool,
+    item_count: usize,
+}
+
+impl From<&StateChainHead> for LegacyHeadWire {
+    fn from(h: &StateChainHead) -> Self {
+        Self {
+            head_offset: h.head_offset,
+            ops_since_delta_snapshot: h.ops_since_delta_snapshot,
+            delta_snapshots_since_full: h.delta_snapshots_since_full,
+            last_delta_snapshot_offset: h.last_delta_snapshot_offset,
+            last_full_snapshot_offset: h.last_full_snapshot_offset,
+            has_non_append_since_snapshot: h.has_non_append_since_snapshot,
+            item_count: h.item_count,
+        }
+    }
 }
 
 /// Cached state value.
@@ -943,7 +1001,26 @@ impl StateManager {
     }
 
     /// Save state index to file.
+    ///
+    /// 0.2.x wire rule (issue #15): heads are written in the legacy
+    /// seven-element layout so `state.bin` stays byte-compatible with 0.2.6
+    /// readers; `item_count_at_last_full` travels in the baselines sidecar,
+    /// which 0.2.6 ignores. Rolling back is a plain dependency downgrade.
     pub fn save(&self) -> Result<()> {
+        let index = self.index.read();
+
+        // Serialize the 0.2.6-layout view with MessagePack
+        let wire = LegacyIndexWire {
+            heads: index
+                .heads
+                .iter()
+                .map(|(key, head)| (key, LegacyHeadWire::from(head)))
+                .collect(),
+            strategies: &index.strategies,
+        };
+        let encoded =
+            rmp_serde::to_vec(&wire).map_err(|e| StoreError::Serialization(e.to_string()))?;
+
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -956,17 +1033,94 @@ impl StateManager {
         // Write version
         file.write_all(&[STATE_INDEX_VERSION])?;
 
-        // Serialize index with MessagePack
-        let index = self.index.read();
-        let encoded =
-            rmp_serde::to_vec(&*index).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
         // Write length and data
         file.write_all(&(encoded.len() as u64).to_le_bytes())?;
         file.write_all(&encoded)?;
 
         file.sync_all()?;
+
+        self.save_baselines(&index)
+    }
+
+    /// Path of the baselines sidecar: `<state.bin path>.baselines`.
+    fn baselines_path(&self) -> PathBuf {
+        let mut os = self.path.as_os_str().to_owned();
+        os.push(".baselines");
+        PathBuf::from(os)
+    }
+
+    /// Persist per-head `item_count_at_last_full` to the sidecar. Zero
+    /// baselines are omitted — zero is the default `load` fills in.
+    fn save_baselines(&self, index: &StateIndex) -> Result<()> {
+        let baselines: HashMap<&(BranchId, String), u64> = index
+            .heads
+            .iter()
+            .filter(|(_, head)| head.item_count_at_last_full != 0)
+            .map(|(key, head)| (key, head.item_count_at_last_full as u64))
+            .collect();
+        let encoded = rmp_serde::to_vec(&baselines)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(self.baselines_path())?;
+        file.write_all(BASELINES_MAGIC)?;
+        file.write_all(&[BASELINES_VERSION])?;
+        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
         Ok(())
+    }
+
+    /// Read the baselines sidecar, if any.
+    ///
+    /// The baseline is derived cadence data (re-stamped at every full
+    /// snapshot), so any failure here degrades to the legacy cadence rather
+    /// than failing the open: a missing sidecar (store last written by
+    /// 0.2.6), stale keys, or a corrupt file all leave the affected
+    /// baselines at 0.
+    fn load_baselines(&self) -> Option<HashMap<(BranchId, String), u64>> {
+        let path = self.baselines_path();
+        if !path.exists() {
+            return None;
+        }
+        let read = || -> Result<HashMap<(BranchId, String), u64>> {
+            let mut file = File::open(&path)?;
+            let mut magic = [0u8; 4];
+            file.read_exact(&mut magic)?;
+            if &magic != BASELINES_MAGIC {
+                return Err(StoreError::InvalidFormat("Invalid baselines magic".into()));
+            }
+            let mut version = [0u8; 1];
+            file.read_exact(&mut version)?;
+            if version[0] != BASELINES_VERSION {
+                return Err(StoreError::InvalidFormat(format!(
+                    "Unsupported baselines version: {}",
+                    version[0]
+                )));
+            }
+            let mut len_bytes = [0u8; 8];
+            file.read_exact(&mut len_bytes)?;
+            let len = u64::from_le_bytes(len_bytes) as usize;
+            let mut encoded = vec![0u8; len];
+            file.read_exact(&mut encoded)?;
+            rmp_serde::from_slice(&encoded)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))
+        };
+        match read() {
+            Ok(map) => Some(map),
+            Err(e) => {
+                tracing::warn!(
+                    "ignoring unreadable baselines sidecar {} ({}); full-snapshot \
+                     spacing falls back to the configured interval until the next full",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// Load state index from file.
@@ -1000,8 +1154,22 @@ impl StateManager {
         let mut encoded = vec![0u8; len];
         file.read_exact(&mut encoded)?;
 
-        let index: StateIndex = rmp_serde::from_slice(&encoded)
+        let mut index: StateIndex = rmp_serde::from_slice(&encoded)
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+
+        // 0.2.x wire rule: `save` writes seven-element heads, so
+        // `item_count_at_last_full` deserializes to 0 above (trailing
+        // `#[serde(default)]`) and is restored from the sidecar. An index
+        // written by 0.3.0 carries the baseline in-band as an 8th element
+        // instead — it parses exactly, has no sidecar to override it, and
+        // the next `save` rewrites it in the legacy layout.
+        if let Some(baselines) = self.load_baselines() {
+            for (key, baseline) in baselines {
+                if let Some(head) = index.heads.get_mut(&key) {
+                    head.item_count_at_last_full = baseline as usize;
+                }
+            }
+        }
 
         *self.index.write() = index;
 
@@ -1783,5 +1951,188 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot);
         assert_eq!(head.item_count, 0);
         assert_eq!(head.item_count_at_last_full, 0);
+    }
+
+    /// Strict mirror of 0.2.6's `StateChainHead`: exactly seven fields, so
+    /// positional msgpack decoding rejects extra trailing elements the same
+    /// way a 0.2.6 binary does ("array had incorrect length, expected 7").
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    struct StrictHeadV2 {
+        head_offset: u64,
+        ops_since_delta_snapshot: u64,
+        delta_snapshots_since_full: u64,
+        last_delta_snapshot_offset: Option<u64>,
+        last_full_snapshot_offset: Option<u64>,
+        has_non_append_since_snapshot: bool,
+        item_count: usize,
+    }
+
+    /// Strict mirror of 0.2.6's `StateIndex`.
+    #[derive(Deserialize)]
+    struct StrictIndexV2 {
+        heads: HashMap<(BranchId, String), StrictHeadV2>,
+        strategies: HashMap<String, StateStrategy>,
+    }
+
+    /// A fully-populated head for wire tests.
+    fn wire_test_head(baseline: usize) -> StateChainHead {
+        StateChainHead {
+            head_offset: 42,
+            ops_since_delta_snapshot: 7,
+            delta_snapshots_since_full: 3,
+            last_delta_snapshot_offset: Some(40),
+            last_full_snapshot_offset: Some(10),
+            has_non_append_since_snapshot: true,
+            item_count: 123,
+            item_count_at_last_full: baseline,
+        }
+    }
+
+    /// Strip the magic/version/length framing off a state index file.
+    fn read_index_payload(path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0..4], STATE_INDEX_MAGIC);
+        assert_eq!(bytes[4], STATE_INDEX_VERSION);
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        bytes[13..13 + len].to_vec()
+    }
+
+    /// 0.2.x write guarantee (issue #15): `save` must produce a `state.bin`
+    /// an unmodified 0.2.6 binary can open. Strict-parsing the saved bytes
+    /// into the seven-field mirror IS that check.
+    #[test]
+    fn test_state_bin_stays_seven_element_legacy_layout() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        let manager = StateManager::new(&path).unwrap();
+        {
+            let mut index = manager.index.write();
+            index
+                .heads
+                .insert((TEST_BRANCH, "items".to_string()), wire_test_head(9000));
+            index.strategies.insert(
+                "items".to_string(),
+                StateStrategy::AppendLog {
+                    delta_snapshot_every: 3,
+                    full_snapshot_every: 2,
+                },
+            );
+        }
+        manager.save().unwrap();
+
+        let strict: StrictIndexV2 = rmp_serde::from_slice(&read_index_payload(&path))
+            .expect("state.bin must parse in the strict 0.2.6 seven-field layout");
+        let head = &strict.heads[&(TEST_BRANCH, "items".to_string())];
+        assert_eq!(head.head_offset, 42);
+        assert_eq!(head.item_count, 123);
+        assert!(strict.strategies.contains_key("items"));
+    }
+
+    /// The baseline survives a reopen via the sidecar even though
+    /// `state.bin` stays in the legacy layout.
+    #[test]
+    fn test_baseline_roundtrips_via_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        let manager = StateManager::new(&path).unwrap();
+        manager
+            .index
+            .write()
+            .heads
+            .insert((TEST_BRANCH, "items".to_string()), wire_test_head(9000));
+        manager.save().unwrap();
+        assert!(manager.baselines_path().exists());
+
+        let reloaded = StateManager::load(&path).unwrap();
+        let index = reloaded.index.read();
+        let head = &index.heads[&(TEST_BRANCH, "items".to_string())];
+        assert_eq!(head.item_count_at_last_full, 9000);
+        assert_eq!(head.item_count, 123);
+    }
+
+    /// A missing or corrupt sidecar must not fail the open — baselines
+    /// degrade to 0 (legacy cadence until the next full re-stamps them).
+    #[test]
+    fn test_missing_or_corrupt_sidecar_degrades_to_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        let manager = StateManager::new(&path).unwrap();
+        manager
+            .index
+            .write()
+            .heads
+            .insert((TEST_BRANCH, "items".to_string()), wire_test_head(9000));
+        manager.save().unwrap();
+
+        // Missing: a store last written by 0.2.6 has no sidecar.
+        std::fs::remove_file(manager.baselines_path()).unwrap();
+        let reloaded = StateManager::load(&path).unwrap();
+        assert_eq!(
+            reloaded.index.read().heads[&(TEST_BRANCH, "items".to_string())]
+                .item_count_at_last_full,
+            0
+        );
+
+        // Corrupt: garbage bytes are ignored, open still succeeds.
+        std::fs::write(manager.baselines_path(), b"not a sidecar").unwrap();
+        let reloaded = StateManager::load(&path).unwrap();
+        assert_eq!(
+            reloaded.index.read().heads[&(TEST_BRANCH, "items".to_string())]
+                .item_count_at_last_full,
+            0
+        );
+    }
+
+    /// An index written by 0.3.0 (eight-element heads, baseline in-band)
+    /// must open, keep its baseline, and be healed back to the legacy
+    /// layout by the next `save`.
+    #[test]
+    fn test_v030_written_index_opens_and_heals() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+
+        // Reproduce 0.3.0's save: the full eight-field index, in-band.
+        {
+            let mut index = StateIndex::default();
+            index
+                .heads
+                .insert((TEST_BRANCH, "items".to_string()), wire_test_head(9000));
+            let encoded = rmp_serde::to_vec(&index).unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(STATE_INDEX_MAGIC);
+            bytes.push(STATE_INDEX_VERSION);
+            bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+            std::fs::write(&path, bytes).unwrap();
+        }
+
+        // The eight-element layout is exactly what a 0.2.6 reader rejects —
+        // prove the crafted file reproduces the incompatibility...
+        assert!(
+            rmp_serde::from_slice::<StrictIndexV2>(&read_index_payload(&path)).is_err(),
+            "crafted 0.3.0-layout index should fail the strict 0.2.6 parse"
+        );
+
+        // ...then that this build opens it and keeps the in-band baseline.
+        let manager = StateManager::load(&path).unwrap();
+        assert_eq!(
+            manager.index.read().heads[&(TEST_BRANCH, "items".to_string())]
+                .item_count_at_last_full,
+            9000,
+            "in-band baseline survives"
+        );
+
+        // The next save heals the file back to the legacy layout + sidecar.
+        manager.save().unwrap();
+        rmp_serde::from_slice::<StrictIndexV2>(&read_index_payload(&path))
+            .expect("saved index must be back in the strict 0.2.6 layout");
+        assert!(manager.baselines_path().exists());
+        let reloaded = StateManager::load(&path).unwrap();
+        assert_eq!(
+            reloaded.index.read().heads[&(TEST_BRANCH, "items".to_string())]
+                .item_count_at_last_full,
+            9000
+        );
     }
 }
