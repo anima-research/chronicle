@@ -1336,6 +1336,83 @@ impl Store {
         Ok(ops)
     }
 
+    // --- State Field Indexes ---
+
+    /// Register (or refresh) a secondary index on a JSON field (by
+    /// JSON-pointer path) of every item in a state slot, on the current
+    /// branch. Idempotent — a no-op if the index is already registered and
+    /// fresh (same branch, same slot head) for the slot's current content.
+    /// See `StateManager::register_field_index`.
+    ///
+    /// Takes `write_lock` for the whole call, like every other
+    /// state-mutating path (`update_state_with_builder` et al.) — without
+    /// it, a concurrent `record_update` from an in-flight write could land
+    /// between this call's materialization read and its registration,
+    /// either double-counting that item (materialized once, then indexed
+    /// again by the concurrent `on_append`) or vanishing from the index
+    /// entirely, depending on interleaving.
+    pub fn register_state_field_index(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        kind: crate::state::FieldIndexKind,
+    ) -> Result<()> {
+        let _lock = self.write_lock.lock();
+        let branch_id = self.branches.current_branch().id;
+        self.state
+            .register_field_index(branch_id, state_id, field_path, kind)
+    }
+
+    /// Query ordinals of a registered `Number` field index within
+    /// `[gte, lte]` (either bound optional). Returns matching ordinals only
+    /// — fetch content separately via `get_state_item`/`get_state_slice`.
+    /// Returns `None` if no such index is currently registered (never
+    /// registered, wrong kind, or poisoned by a cross-branch write or a
+    /// parse failure) — distinct from `Some(vec![])`, an index that exists
+    /// but has no matches in range. Callers that get `None` for an index
+    /// they expect should re-`register_state_field_index` rather than
+    /// treating the empty result as "no data".
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_state_index_range(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        gte: Option<f64>,
+        lte: Option<f64>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        reverse: bool,
+    ) -> Option<Vec<u32>> {
+        self.state
+            .query_field_index_range(state_id, field_path, gte, lte, limit, offset, reverse)
+    }
+
+    /// Query ordinals of a registered `String` field index equal to `value`.
+    /// Returns `None` if no such index is currently registered — see
+    /// `query_state_index_range`'s doc for the `None` vs `Some(vec![])`
+    /// distinction.
+    pub fn query_state_index_eq(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        value: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Option<Vec<u32>> {
+        self.state
+            .query_field_index_eq(state_id, field_path, value, limit, offset)
+    }
+
+    /// Distinct values and ordinal counts for a registered `String` field
+    /// index. Returns `None` if no such index is currently registered.
+    pub fn get_state_index_value_counts(
+        &self,
+        state_id: &str,
+        field_path: &str,
+    ) -> Option<Vec<(String, u32)>> {
+        self.state.field_index_value_counts(state_id, field_path)
+    }
+
     // --- Tree Operations ---
 
     /// Validate a tree path: must be non-empty, relative, no null bytes, no `.` or `..` components.

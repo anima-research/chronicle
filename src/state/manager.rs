@@ -4,6 +4,7 @@
 //! eliminating the need to keep all updates in memory. An LRU cache
 //! stores recently reconstructed states for fast repeated access.
 
+use super::{FieldIndexKind, FieldIndexManager};
 use crate::error::{Result, StoreError};
 use crate::records::RecordLog;
 use crate::types::{
@@ -183,6 +184,24 @@ pub struct StateManager {
 
     /// Reference to record log for disk-based chain traversal.
     log: Option<Arc<RecordLog>>,
+
+    /// Secondary indexes on JSON fields of state-slot items, incrementally
+    /// maintained from every operation this manager records. Persisted to
+    /// its own file (`state-indexes.bin`) alongside `state.bin` — see
+    /// `save`/`load_from_file`.
+    field_indexes: RwLock<FieldIndexManager>,
+
+    /// Path to the persisted field-index file, derived once at construction
+    /// as a sibling of `path` (`state.bin` -> `state-indexes.bin`).
+    field_index_path: PathBuf,
+}
+
+/// Derive the field-index file path as a sibling of the state-index path.
+fn field_index_path_for(state_index_path: &Path) -> PathBuf {
+    match state_index_path.parent() {
+        Some(parent) => parent.join("state-indexes.bin"),
+        None => PathBuf::from("state-indexes.bin"),
+    }
 }
 
 impl StateManager {
@@ -195,6 +214,7 @@ impl StateManager {
     pub fn with_cache_size(path: impl AsRef<Path>, cache_size: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let cache_size = NonZeroUsize::new(cache_size.max(1)).unwrap();
+        let field_index_path = field_index_path_for(&path);
 
         Ok(Self {
             path,
@@ -203,6 +223,8 @@ impl StateManager {
             items_cache: RwLock::new(LruCache::new(cache_size)),
             tree_cache: RwLock::new(LruCache::new(cache_size)),
             log: None,
+            field_indexes: RwLock::new(FieldIndexManager::new()),
+            field_index_path,
         })
     }
 
@@ -220,6 +242,7 @@ impl StateManager {
     pub fn load_with_cache_size(path: impl AsRef<Path>, cache_size: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let cache_size = NonZeroUsize::new(cache_size.max(1)).unwrap();
+        let field_index_path = field_index_path_for(&path);
 
         let manager = Self {
             path: path.clone(),
@@ -228,6 +251,8 @@ impl StateManager {
             items_cache: RwLock::new(LruCache::new(cache_size)),
             tree_cache: RwLock::new(LruCache::new(cache_size)),
             log: None,
+            field_indexes: RwLock::new(FieldIndexManager::new()),
+            field_index_path,
         };
 
         if path.exists() {
@@ -432,6 +457,85 @@ impl StateManager {
         let cache_key = format!("{}:{}", branch_id.0, state_id);
         self.cache.write().pop(&cache_key);
         self.items_cache.write().pop(&cache_key);
+
+        // Incrementally maintain any registered field indexes for this state.
+        // Gated on `has_indexes_for` so states with nothing registered pay
+        // no parse cost at all on the hot append path.
+        //
+        // Parse failures poison (drop) every field index registered for this
+        // state_id rather than being silently skipped: skipping would leave
+        // `by_ordinal` one short forever, permanently misaligning every
+        // later ordinal against the real slot content with no signal to the
+        // caller. A poisoned index is simply gone — `register_field_index`
+        // rebuilds it from scratch — which is far safer than confidently
+        // returning wrong ordinals. Branch mismatches (a write on a branch
+        // other than the one an index was registered against) poison the
+        // same way; see `FieldIndexManager`'s "Branch scoping" docs.
+        if self.field_indexes.read().has_indexes_for(state_id) {
+            match operation {
+                StateOperation::Append(item) => {
+                    match serde_json::from_slice::<serde_json::Value>(item) {
+                        Ok(value) => self
+                            .field_indexes
+                            .write()
+                            .on_append(state_id, branch_id, offset, &value),
+                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                    }
+                }
+                StateOperation::DeltaSnapshot(_) => {
+                    // A DeltaSnapshot consolidates Append operations ALREADY
+                    // recorded (and already indexed via their own Append
+                    // hooks above) into one record — it introduces no new
+                    // items and changes no existing ordinal. Exactly
+                    // mirrors `head.item_count` a few lines up in this same
+                    // function, which is deliberately left untouched by
+                    // DeltaSnapshot for the same reason. Treating this as a
+                    // fresh batch of appends (the bug this comment replaces)
+                    // double-indexed every item covered by the delta.
+                }
+                StateOperation::Edit { index, new_value } => {
+                    match serde_json::from_slice::<serde_json::Value>(new_value) {
+                        Ok(value) => self.field_indexes.write().on_edit(
+                            state_id,
+                            branch_id,
+                            offset,
+                            *index as u32,
+                            &value,
+                        ),
+                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                    }
+                }
+                StateOperation::Redact { start, end } => {
+                    self.field_indexes.write().on_redact(
+                        state_id,
+                        branch_id,
+                        offset,
+                        *start as u32,
+                        *end as u32,
+                    );
+                }
+                StateOperation::Set(data) | StateOperation::Snapshot(data) => {
+                    match serde_json::from_slice::<Vec<serde_json::Value>>(data) {
+                        Ok(items) => self.field_indexes.write().on_full_replace(
+                            state_id,
+                            branch_id,
+                            offset,
+                            items.iter(),
+                        ),
+                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                    }
+                }
+                // Tree ops (path->entry maps) and Struct Delta/Field ops are
+                // not ordinal arrays — field indexing (built on `by_ordinal`)
+                // doesn't apply to them.
+                StateOperation::TreeSet { .. }
+                | StateOperation::TreeRemove { .. }
+                | StateOperation::TreeBatch { .. }
+                | StateOperation::TreeDeltaSnapshot(_)
+                | StateOperation::Delta { .. }
+                | StateOperation::Field { .. } => {}
+            }
+        }
 
         Ok(())
     }
@@ -907,6 +1011,91 @@ impl StateManager {
         index.heads.insert((branch_id, state_id.to_string()), head);
     }
 
+    /// Register (or refresh) a secondary index on a JSON field of every item
+    /// currently in `state_id` (materialized on `branch_id`), extracted via
+    /// the JSON-pointer `field_path`. Idempotent: a no-op if an index for
+    /// this `(state_id, field_path)` is already registered, fresh (same
+    /// `branch_id` and the slot's current `head_offset`), and of the same
+    /// `kind` — see `FieldIndexManager::register`. Registering from a
+    /// different branch than whatever last held this `(state_id,
+    /// field_path)` index replaces it outright (only one branch's index can
+    /// be live per field at a time — see `FieldIndexManager`'s module docs).
+    ///
+    /// Callers must hold `Store::write_lock` across this call (as every
+    /// other state-mutating path already does) so it can't race a
+    /// concurrent `record_update` and double-count the in-flight item.
+    pub fn register_field_index(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        field_path: &str,
+        kind: FieldIndexKind,
+    ) -> Result<()> {
+        let head_offset = self.get_head(branch_id, state_id).map(|h| h.head_offset);
+        let items: Vec<serde_json::Value> = match self.get_state(branch_id, state_id)? {
+            Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?,
+            _ => Vec::new(),
+        };
+
+        self.field_indexes.write().register(
+            state_id,
+            field_path,
+            kind,
+            branch_id,
+            head_offset,
+            items.iter(),
+        )
+    }
+
+    /// Query ordinals of a registered `Number` field index within
+    /// `[gte, lte]` (either bound optional). Returns `None` if no such index
+    /// is currently registered (never registered, wrong kind, or poisoned by
+    /// a cross-branch write or a parse failure) — distinct from
+    /// `Some(vec![])`, an index that exists but has no matches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_field_index_range(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        gte: Option<f64>,
+        lte: Option<f64>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        reverse: bool,
+    ) -> Option<Vec<u32>> {
+        self.field_indexes
+            .read()
+            .query_range(state_id, field_path, gte, lte, limit, offset, reverse)
+    }
+
+    /// Query ordinals of a registered `String` field index equal to `value`.
+    /// Returns `None` if no such index is currently registered — see
+    /// `query_field_index_range`'s doc for the `None` vs `Some(vec![])`
+    /// distinction.
+    pub fn query_field_index_eq(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        value: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Option<Vec<u32>> {
+        self.field_indexes
+            .read()
+            .query_eq(state_id, field_path, value, limit, offset)
+    }
+
+    /// Distinct values and ordinal counts for a registered `String` field
+    /// index. Returns `None` if no such index is currently registered.
+    pub fn field_index_value_counts(
+        &self,
+        state_id: &str,
+        field_path: &str,
+    ) -> Option<Vec<(String, u32)>> {
+        self.field_indexes.read().value_counts(state_id, field_path)
+    }
+
     /// Get all registered state IDs.
     pub fn state_ids(&self) -> Vec<String> {
         self.index.read().strategies.keys().cloned().collect()
@@ -1033,6 +1222,34 @@ impl StateManager {
         file.write_all(&encoded)?;
 
         file.sync_all()?;
+        drop(index);
+
+        // Field indexes live in their own file (`state-indexes.bin`), kept
+        // separate from `state.bin`'s format on purpose: `state.bin` missing
+        // or version-mismatched is a hard-fail (chain-head offsets are load-
+        // bearing), while a missing/stale field-index file is recoverable
+        // (derived data — `load` returns `None` for it, never an error).
+        //
+        // Written AFTER `state.bin` is already durably synced above, and its
+        // own failure is deliberately swallowed (logged, not propagated):
+        // `state.bin` is the real durable data this function exists to
+        // protect, and a disk-full/permission failure writing the derived
+        // index must not make `Store::sync()` report failure for data that
+        // in fact synced fine — callers reading `sync()`'s `Result` as "did
+        // my durable data make it to disk" would otherwise get a false
+        // negative. The next successful `save()` (or a fresh
+        // `register_field_index`) recovers it; nothing is lost except the
+        // index itself, which is always rebuildable.
+        if let Err(e) = self.field_indexes.read().save(&self.field_index_path) {
+            tracing::warn!(
+                error = %e,
+                path = %self.field_index_path.display(),
+                "failed to persist state field indexes; state.bin (the durable data) synced \
+                 successfully regardless — the field index will be stale until the next \
+                 successful save or a fresh register_field_index call"
+            );
+        }
+
         Ok(())
     }
 
@@ -1071,6 +1288,15 @@ impl StateManager {
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
         *self.index.write() = index;
+
+        // Field indexes: missing/stale/corrupt is NOT fatal (unlike the
+        // state index above) — `FieldIndexManager::load` already returns
+        // `None` for all of those cases, and an absent field-index file
+        // (e.g. a store written before this feature existed) just starts
+        // with nothing registered.
+        if let Some(field_indexes) = FieldIndexManager::load(&self.field_index_path)? {
+            *self.field_indexes.write() = field_indexes;
+        }
 
         Ok(())
     }
