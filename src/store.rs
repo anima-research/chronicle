@@ -1364,14 +1364,19 @@ impl Store {
     }
 
     /// Query ordinals of a registered `Number` field index within
-    /// `[gte, lte]` (either bound optional). Returns matching ordinals only
-    /// — fetch content separately via `get_state_item`/`get_state_slice`.
-    /// Returns `None` if no such index is currently registered (never
-    /// registered, wrong kind, or poisoned by a cross-branch write or a
-    /// parse failure) — distinct from `Some(vec![])`, an index that exists
-    /// but has no matches in range. Callers that get `None` for an index
-    /// they expect should re-`register_state_field_index` rather than
-    /// treating the empty result as "no data".
+    /// `[gte, lte]` (either bound optional), scoped to the CURRENT branch.
+    /// Returns matching ordinals only — fetch content separately via
+    /// `get_state_item`/`get_state_slice`.
+    ///
+    /// Returns `None` if no such index is currently registered for the
+    /// current branch (never registered, wrong kind, poisoned by a
+    /// cross-branch write or a parse failure, or — the case a pure
+    /// `switch_branch` with no follow-up write hits — registered against a
+    /// *different* branch than the one you're on now) — distinct from
+    /// `Some(vec![])`, an index that exists, matches this branch, and has
+    /// no matches in range. Callers that get `None` for an index they
+    /// expect should re-`register_state_field_index` rather than treating
+    /// the empty result as "no data".
     #[allow(clippy::too_many_arguments)]
     pub fn query_state_index_range(
         &self,
@@ -1383,14 +1388,16 @@ impl Store {
         offset: Option<usize>,
         reverse: bool,
     ) -> Option<Vec<u32>> {
+        let branch_id = self.branches.current_branch().id;
         self.state
-            .query_field_index_range(state_id, field_path, gte, lte, limit, offset, reverse)
+            .query_field_index_range(branch_id, state_id, field_path, gte, lte, limit, offset, reverse)
     }
 
-    /// Query ordinals of a registered `String` field index equal to `value`.
-    /// Returns `None` if no such index is currently registered — see
+    /// Query ordinals of a registered `String` field index equal to `value`,
+    /// scoped to the CURRENT branch. Returns `None` if no such index is
+    /// currently registered for the current branch — see
     /// `query_state_index_range`'s doc for the `None` vs `Some(vec![])`
-    /// distinction.
+    /// distinction and the branch check.
     pub fn query_state_index_eq(
         &self,
         state_id: &str,
@@ -1399,18 +1406,21 @@ impl Store {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Option<Vec<u32>> {
+        let branch_id = self.branches.current_branch().id;
         self.state
-            .query_field_index_eq(state_id, field_path, value, limit, offset)
+            .query_field_index_eq(branch_id, state_id, field_path, value, limit, offset)
     }
 
     /// Distinct values and ordinal counts for a registered `String` field
-    /// index. Returns `None` if no such index is currently registered.
+    /// index, scoped to the CURRENT branch. Returns `None` if no such index
+    /// is currently registered for the current branch.
     pub fn get_state_index_value_counts(
         &self,
         state_id: &str,
         field_path: &str,
     ) -> Option<Vec<(String, u32)>> {
-        self.state.field_index_value_counts(state_id, field_path)
+        let branch_id = self.branches.current_branch().id;
+        self.state.field_index_value_counts(branch_id, state_id, field_path)
     }
 
     // --- Tree Operations ---

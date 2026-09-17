@@ -1049,13 +1049,17 @@ impl StateManager {
     }
 
     /// Query ordinals of a registered `Number` field index within
-    /// `[gte, lte]` (either bound optional). Returns `None` if no such index
-    /// is currently registered (never registered, wrong kind, or poisoned by
-    /// a cross-branch write or a parse failure) — distinct from
-    /// `Some(vec![])`, an index that exists but has no matches.
+    /// `[gte, lte]` (either bound optional), scoped to `branch_id`. Returns
+    /// `None` if no such index is currently registered FOR `branch_id`
+    /// (never registered, wrong kind, poisoned by a cross-branch write or a
+    /// parse failure, or registered against a *different* branch — a pure
+    /// read after `switch_branch` with no intervening write must never
+    /// serve another branch's ordinals) — distinct from `Some(vec![])`, an
+    /// index that exists, matches this branch, and has no matches.
     #[allow(clippy::too_many_arguments)]
     pub fn query_field_index_range(
         &self,
+        branch_id: BranchId,
         state_id: &str,
         field_path: &str,
         gte: Option<f64>,
@@ -1066,15 +1070,16 @@ impl StateManager {
     ) -> Option<Vec<u32>> {
         self.field_indexes
             .read()
-            .query_range(state_id, field_path, gte, lte, limit, offset, reverse)
+            .query_range(state_id, field_path, branch_id, gte, lte, limit, offset, reverse)
     }
 
-    /// Query ordinals of a registered `String` field index equal to `value`.
-    /// Returns `None` if no such index is currently registered — see
-    /// `query_field_index_range`'s doc for the `None` vs `Some(vec![])`
-    /// distinction.
+    /// Query ordinals of a registered `String` field index equal to `value`,
+    /// scoped to `branch_id`. Returns `None` if no such index is currently
+    /// registered for `branch_id` — see `query_field_index_range`'s doc for
+    /// the `None` vs `Some(vec![])` distinction and the branch check.
     pub fn query_field_index_eq(
         &self,
+        branch_id: BranchId,
         state_id: &str,
         field_path: &str,
         value: &str,
@@ -1083,17 +1088,19 @@ impl StateManager {
     ) -> Option<Vec<u32>> {
         self.field_indexes
             .read()
-            .query_eq(state_id, field_path, value, limit, offset)
+            .query_eq(state_id, field_path, branch_id, value, limit, offset)
     }
 
     /// Distinct values and ordinal counts for a registered `String` field
-    /// index. Returns `None` if no such index is currently registered.
+    /// index, scoped to `branch_id`. Returns `None` if no such index is
+    /// currently registered for `branch_id`.
     pub fn field_index_value_counts(
         &self,
+        branch_id: BranchId,
         state_id: &str,
         field_path: &str,
     ) -> Option<Vec<(String, u32)>> {
-        self.field_indexes.read().value_counts(state_id, field_path)
+        self.field_indexes.read().value_counts(state_id, field_path, branch_id)
     }
 
     /// Get all registered state IDs.
@@ -1289,12 +1296,33 @@ impl StateManager {
 
         *self.index.write() = index;
 
-        // Field indexes: missing/stale/corrupt is NOT fatal (unlike the
-        // state index above) — `FieldIndexManager::load` already returns
-        // `None` for all of those cases, and an absent field-index file
-        // (e.g. a store written before this feature existed) just starts
-        // with nothing registered.
-        if let Some(field_indexes) = FieldIndexManager::load(&self.field_index_path)? {
+        // Field indexes: missing/unparseable/version-mismatched is NOT
+        // fatal (unlike the state index above) — `FieldIndexManager::load`
+        // already returns `None` for all of those cases, and an absent
+        // field-index file (e.g. a store written before this feature
+        // existed) just starts with nothing registered.
+        //
+        // A file that DOES parse can still be stale: `save()` writes
+        // `state.bin` first and deliberately swallows a later field-index
+        // save failure, so a crash in that window — or a structurally valid
+        // but older `state-indexes.bin` restored from a backup — parses
+        // fine while no longer matching the chain `self.index` above was
+        // just reconstructed from. `load()` alone can't catch that (it has
+        // no view of the real chain); `prune_stale` closes the gap here,
+        // dropping any index whose stored head_offset doesn't match what
+        // the just-loaded `StateIndex` reports right now for that
+        // `(state_id, branch_id)` — the promise that "a stale index starts
+        // empty" only holds if this runs before the loaded manager is
+        // trusted.
+        if let Some(mut field_indexes) = FieldIndexManager::load(&self.field_index_path)? {
+            let current_index = self.index.read();
+            field_indexes.prune_stale(|state_id, branch_id| {
+                current_index
+                    .heads
+                    .get(&(branch_id, state_id.to_string()))
+                    .map(|h| h.head_offset)
+            });
+            drop(current_index);
             *self.field_indexes.write() = field_indexes;
         }
 

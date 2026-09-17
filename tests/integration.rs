@@ -1585,3 +1585,193 @@ fn test_field_index_create_branch_at_does_not_contaminate() {
         .unwrap();
     assert_eq!(main_after, vec![0, 1, 2, 3], "main's index must reflect only main's own 4 items");
 }
+
+// --- Regression: pure read after switch_branch must not serve the other
+// branch's index (bug 1, round 2) ---
+
+#[test]
+fn test_field_index_pure_read_after_switch_does_not_leak_other_branch() {
+    // Distinct from `test_field_index_cross_branch_writes_do_not_contaminate`
+    // above: THAT test writes on the side branch after registration and
+    // relies on the write-time poison. This test does the divergence and
+    // the append BEFORE registration, registers only on main, and then the
+    // ONLY operation afterward is `switch_branch` — no write on either
+    // branch post-registration. The write-time poison from last round
+    // cannot fire here (there's no write to trigger it); only a query-time
+    // branch check catches this.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // 3 items on main.
+    for i in 0..3 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    // Branch off (side inherits main's 3 items), switch, diverge by
+    // appending a 4th item on side ONLY — all before any registration.
+    store.create_branch("side", None).unwrap();
+    store.switch_branch("side").unwrap();
+    store
+        .update_state(
+            "messages",
+            StateOperation::Append(serde_json::to_vec(&json!({"v": 999})).unwrap()),
+        )
+        .unwrap();
+    let side_len = store.get_state_len("messages").unwrap().unwrap();
+    assert_eq!(side_len, 4, "side must have diverged to 4 items before registration");
+
+    // Back to main (still 3 items) and register there.
+    store.switch_branch("main").unwrap();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 3);
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let main_registered = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_registered, vec![0, 1, 2]);
+
+    // The ONLY operation from here is switch_branch — no further writes on
+    // either branch.
+    store.switch_branch("side").unwrap();
+
+    // Side's slot is 4 items long; the index was built for main's 3. A pure
+    // read here — no append, no edit, no redact happened on side after the
+    // switch — must not serve main's index/ordinals, and must not answer
+    // with an ordinal (3) that doesn't even exist on main.
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        result, None,
+        "a pure read after switch_branch, with no intervening write, must never serve the \
+         other branch's index — this is the case the write-time-only poison misses"
+    );
+
+    // Switching back to main still serves main's own, correct index.
+    store.switch_branch("main").unwrap();
+    let main_again = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_again, vec![0, 1, 2]);
+}
+
+// --- Regression: a structurally-valid but stale persisted index must not
+// be served on load (bug 2, round 2) ---
+
+#[test]
+fn test_field_index_stale_but_parseable_persisted_file_is_not_served() {
+    // Distinct from `test_field_index_missing_or_stale_file_starts_empty`
+    // above: THAT test corrupts the file so it fails to PARSE. This test
+    // uses a `state-indexes.bin` that parses perfectly fine — it's simply
+    // one head behind the real state.bin, simulating either the swallowed
+    // field-index-save-failure crash window `StateManager::save` documents,
+    // or an older backup being restored over a newer one.
+    let dir = TempDir::new().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: true,
+    };
+    let index_path = dir.path().join("store").join("state-indexes.bin");
+
+    // Session 1: 1 item, register, sync — state-indexes.bin now reflects
+    // exactly 1 item. Stash a copy of this "1-item-fresh" file.
+    let stale_snapshot = {
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": 0})).unwrap()),
+            )
+            .unwrap();
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(
+            store
+                .query_state_index_range("messages", "/v", None, None, None, None, false)
+                .unwrap(),
+            vec![0]
+        );
+
+        std::fs::read(&index_path).unwrap()
+    };
+
+    // Session 2: advance to 2 items and sync — state.bin AND
+    // state-indexes.bin both now correctly reflect 2 items.
+    {
+        let store = Store::open(config.clone()).unwrap();
+        assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 1);
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": 1})).unwrap()),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 2);
+        // Sanity: the (still-fresh, in-session) index already reflects 2.
+        assert_eq!(
+            store
+                .query_state_index_range("messages", "/v", None, None, None, None, false)
+                .unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    // Restore the STALE (1-item) state-indexes.bin over the current
+    // (correct, 2-item) one. It parses fine — it's simply one head behind
+    // the real chain, which state.bin (never touched here) still reports
+    // correctly at 2 items.
+    std::fs::write(&index_path, &stale_snapshot).unwrap();
+
+    // Session 3: reopen. The real slot has 2 items; the stale-but-valid
+    // index file claims to reflect the state as of 1 item. It must be
+    // dropped on load (head_offset mismatch), not served as if current.
+    let store = Store::open(config).unwrap();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 2);
+
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        result, None,
+        "a structurally-valid-but-stale index (head_offset behind the real chain) must not \
+         be served — confidently answering Some([0]) here would silently miss ordinal 1"
+    );
+
+    // Re-registering after the stale file is dropped recovers a correct,
+    // fully up-to-date index.
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let rebuilt = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(rebuilt, vec![0, 1]);
+}

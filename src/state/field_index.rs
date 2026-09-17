@@ -453,14 +453,18 @@ impl FieldIndexManager {
 
     /// Ordinals with a `Number` field in `[gte, lte]` (either bound
     /// optional), in ascending (or, if `reverse`, descending) value order.
-    /// Returns `None` if no such `Number` index is currently registered
-    /// (never registered, wrong kind, or poisoned) — distinct from
-    /// `Some(vec![])`, which means the index exists and genuinely has no
-    /// matches in range.
+    /// Returns `None` if no such `Number` index is currently registered for
+    /// `branch_id` (never registered, wrong kind, poisoned, OR registered
+    /// against a *different* branch — a pure read after `switch_branch`
+    /// with no intervening write must never serve another branch's
+    /// ordinals) — distinct from `Some(vec![])`, which means the index
+    /// exists, matches this branch, and genuinely has no matches in range.
+    #[allow(clippy::too_many_arguments)]
     pub fn query_range(
         &self,
         state_id: &str,
         field_path: &str,
+        branch_id: BranchId,
         gte: Option<f64>,
         lte: Option<f64>,
         limit: Option<usize>,
@@ -468,7 +472,7 @@ impl FieldIndexManager {
         reverse: bool,
     ) -> Option<Vec<u32>> {
         let index = self.indexes.get(&(state_id.to_string(), field_path.to_string()))?;
-        if index.kind != FieldIndexKind::Number {
+        if index.kind != FieldIndexKind::Number || index.branch_id != branch_id {
             return None;
         }
 
@@ -493,18 +497,20 @@ impl FieldIndexManager {
     }
 
     /// Ordinals with a `String` field equal to `value`. Returns `None` if no
-    /// such `String` index is currently registered — see `query_range`'s
-    /// doc for the `None` vs `Some(vec![])` distinction.
+    /// such `String` index is currently registered for `branch_id` — see
+    /// `query_range`'s doc for the `None` vs `Some(vec![])` distinction and
+    /// why `branch_id` is checked here too.
     pub fn query_eq(
         &self,
         state_id: &str,
         field_path: &str,
+        branch_id: BranchId,
         value: &str,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Option<Vec<u32>> {
         let index = self.indexes.get(&(state_id.to_string(), field_path.to_string()))?;
-        if index.kind != FieldIndexKind::String {
+        if index.kind != FieldIndexKind::String || index.branch_id != branch_id {
             return None;
         }
 
@@ -514,10 +520,17 @@ impl FieldIndexManager {
 
     /// Distinct values and their ordinal counts for a registered `String`
     /// field index, sorted by value. O(index size) — no content decoding.
-    /// Returns `None` if no such `String` index is currently registered.
-    pub fn value_counts(&self, state_id: &str, field_path: &str) -> Option<Vec<(String, u32)>> {
+    /// Returns `None` if no such `String` index is currently registered for
+    /// `branch_id` (see `query_range`'s doc for why branch is checked here
+    /// too).
+    pub fn value_counts(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        branch_id: BranchId,
+    ) -> Option<Vec<(String, u32)>> {
         let index = self.indexes.get(&(state_id.to_string(), field_path.to_string()))?;
-        if index.kind != FieldIndexKind::String {
+        if index.kind != FieldIndexKind::String || index.branch_id != branch_id {
             return None;
         }
 
@@ -594,6 +607,38 @@ impl FieldIndexManager {
             Err(_) => Ok(None),
         }
     }
+
+    /// Drop every index whose stored `(branch_id, head_offset)` doesn't
+    /// exactly match what `current_head_offset(state_id, branch_id)`
+    /// reports right now. `load()` only rejects a file that fails to parse
+    /// — it has no way to know whether the *content* it successfully parsed
+    /// is still current, since `state.bin` and `state-indexes.bin` are
+    /// separate, non-atomically-written files (`save()` writes `state.bin`
+    /// first and swallows a later field-index save failure). A crash in
+    /// that window, or a structurally-valid-but-older `state-indexes.bin`
+    /// restored from a backup, parses fine but is stale relative to the
+    /// real chain — this is the check that must run before a freshly loaded
+    /// manager is trusted, closing the gap `load()` alone leaves open.
+    ///
+    /// Call this once right after `load()` succeeds, passing a closure that
+    /// reads the just-reconstructed `StateIndex`'s current head_offset for
+    /// `(state_id, branch_id)` (`None` for a slot with no head yet).
+    pub fn prune_stale<F>(&mut self, mut current_head_offset: F)
+    where
+        F: FnMut(&str, BranchId) -> Option<u64>,
+    {
+        let stale_keys: Vec<(String, String)> = self
+            .indexes
+            .iter()
+            .filter(|((state_id, _), index)| {
+                current_head_offset(state_id, index.branch_id) != index.head_offset
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            self.indexes.remove(&key);
+        }
+    }
 }
 
 fn apply_offset_limit(values: Vec<u32>, offset: Option<usize>, limit: Option<usize>) -> Vec<u32> {
@@ -630,12 +675,12 @@ mod tests {
             .unwrap();
 
         let result = mgr
-            .query_range("messages", "/timestamp", Some(15.0), Some(30.0), None, None, false)
+            .query_range("messages", "/timestamp", MAIN, Some(15.0), Some(30.0), None, None, false)
             .unwrap();
         assert_eq!(result, vec![1, 2]);
 
         let result_rev = mgr
-            .query_range("messages", "/timestamp", Some(15.0), Some(30.0), None, None, true)
+            .query_range("messages", "/timestamp", MAIN, Some(15.0), Some(30.0), None, None, true)
             .unwrap();
         assert_eq!(result_rev, vec![2, 1]);
     }
@@ -643,9 +688,9 @@ mod tests {
     #[test]
     fn test_query_unregistered_returns_none() {
         let mgr = FieldIndexManager::new();
-        assert_eq!(mgr.query_range("s", "/v", None, None, None, None, false), None);
-        assert_eq!(mgr.query_eq("s", "/v", "x", None, None), None);
-        assert_eq!(mgr.value_counts("s", "/v"), None);
+        assert_eq!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false), None);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "x", None, None), None);
+        assert_eq!(mgr.value_counts("s", "/v", MAIN), None);
     }
 
     #[test]
@@ -657,9 +702,41 @@ mod tests {
 
         // Registered as String; a Number-shaped query must say "no such
         // index" rather than silently reading nothing.
-        assert_eq!(mgr.query_range("s", "/v", None, None, None, None, false), None);
+        assert_eq!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false), None);
         // The right kind returns Some(...), even if empty.
-        assert!(mgr.query_eq("s", "/v", "nope", None, None).is_some());
+        assert!(mgr.query_eq("s", "/v", MAIN, "nope", None, None).is_some());
+    }
+
+    #[test]
+    fn test_query_wrong_branch_returns_none() {
+        // Regression for the read-after-switch bug: a pure query on a
+        // branch other than the one the index was built against must say
+        // "no such index" — never serve the other branch's ordinals, and
+        // never require a write to have happened on the querying branch
+        // first (the old write-time-only poison missed exactly this case).
+        let mut mgr = FieldIndexManager::new();
+        let data = items(&[json!({"v": 1}), json!({"v": 2}), json!({"v": 3})]);
+        mgr.register("messages", "/v", FieldIndexKind::Number, MAIN, Some(30), data.iter())
+            .unwrap();
+
+        // Registered on MAIN: querying MAIN works.
+        assert_eq!(
+            mgr.query_range("messages", "/v", MAIN, None, None, None, None, false).unwrap(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            mgr.value_counts("messages", "/v", MAIN),
+            None,
+            "wrong kind (Number index queried as String) already returns None regardless of branch"
+        );
+
+        // Querying SIDE — a pure read, no write ever happened on SIDE —
+        // must return None, not MAIN's ordinals.
+        assert_eq!(
+            mgr.query_range("messages", "/v", SIDE, None, None, None, None, false),
+            None,
+            "querying a different branch than the index was built on must never serve its ordinals"
+        );
     }
 
     #[test]
@@ -672,14 +749,14 @@ mod tests {
         // Re-register with the same branch + head_offset: no-op.
         mgr.register("s", "/v", FieldIndexKind::Number, MAIN, Some(100), data.iter())
             .unwrap();
-        let result = mgr.query_range("s", "/v", None, None, None, None, false).unwrap();
+        let result = mgr.query_range("s", "/v", MAIN, None, None, None, None, false).unwrap();
         assert_eq!(result, vec![0, 1]);
 
         // Different head_offset (even same length): rebuilds.
         let data2 = items(&[json!({"v": 5}), json!({"v": 6})]);
         mgr.register("s", "/v", FieldIndexKind::Number, MAIN, Some(200), data2.iter())
             .unwrap();
-        let result = mgr.query_range("s", "/v", Some(6.0), None, None, None, false).unwrap();
+        let result = mgr.query_range("s", "/v", MAIN, Some(6.0), None, None, None, false).unwrap();
         assert_eq!(result, vec![1]);
     }
 
@@ -693,10 +770,10 @@ mod tests {
         mgr.on_append("s", MAIN, 20, &json!({"channelId": "c2"}));
         mgr.on_append("s", MAIN, 30, &json!({"channelId": "c1"}));
 
-        let mut result = mgr.query_eq("s", "/channelId", "c1", None, None).unwrap();
+        let mut result = mgr.query_eq("s", "/channelId", MAIN, "c1", None, None).unwrap();
         result.sort();
         assert_eq!(result, vec![0, 2]);
-        assert_eq!(mgr.query_eq("s", "/channelId", "c2", None, None).unwrap(), vec![1]);
+        assert_eq!(mgr.query_eq("s", "/channelId", MAIN, "c2", None, None).unwrap(), vec![1]);
     }
 
     #[test]
@@ -716,7 +793,7 @@ mod tests {
         for i in 0..10 {
             mgr.on_append("s", MAIN, i, &json!({"v": i}));
         }
-        let all = mgr.query_range("s", "/v", None, None, None, None, false).unwrap();
+        let all = mgr.query_range("s", "/v", MAIN, None, None, None, None, false).unwrap();
         assert_eq!(all.len(), 10, "10 appends must yield exactly 10 indexed ordinals");
     }
 
@@ -727,17 +804,17 @@ mod tests {
         mgr.register("s", "/v", FieldIndexKind::String, MAIN, Some(1), data.iter())
             .unwrap();
 
-        assert_eq!(mgr.query_eq("s", "/v", "a", None, None).unwrap(), vec![0, 2]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "a", None, None).unwrap(), vec![0, 2]);
 
         // Edit ordinal 0 from "a" to "c".
         mgr.on_edit("s", MAIN, 2, 0, &json!({"v": "c"}));
 
         // Old value "a" no longer includes ordinal 0.
-        assert_eq!(mgr.query_eq("s", "/v", "a", None, None).unwrap(), vec![2]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "a", None, None).unwrap(), vec![2]);
         // New value "c" includes ordinal 0.
-        assert_eq!(mgr.query_eq("s", "/v", "c", None, None).unwrap(), vec![0]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "c", None, None).unwrap(), vec![0]);
         // "b" unaffected.
-        assert_eq!(mgr.query_eq("s", "/v", "b", None, None).unwrap(), vec![1]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "b", None, None).unwrap(), vec![1]);
     }
 
     #[test]
@@ -748,7 +825,11 @@ mod tests {
             .unwrap();
 
         mgr.on_edit("s", MAIN, 2, 5, &json!({"v": "z"})); // ordinal 5 doesn't exist
-        assert_eq!(mgr.query_eq("s", "/v", "a", None, None), None, "desynced index must be poisoned, not left stale");
+        assert_eq!(
+            mgr.query_eq("s", "/v", MAIN, "a", None, None),
+            None,
+            "desynced index must be poisoned, not left stale"
+        );
     }
 
     #[test]
@@ -767,11 +848,11 @@ mod tests {
         // Redact [1, 3) removes "b" and "c"; "d" (was 3) -> 1, "e" (was 4) -> 2.
         mgr.on_redact("s", MAIN, 2, 1, 3);
 
-        assert_eq!(mgr.query_eq("s", "/v", "b", None, None).unwrap(), Vec::<u32>::new());
-        assert_eq!(mgr.query_eq("s", "/v", "c", None, None).unwrap(), Vec::<u32>::new());
-        assert_eq!(mgr.query_eq("s", "/v", "a", None, None).unwrap(), vec![0]);
-        assert_eq!(mgr.query_eq("s", "/v", "d", None, None).unwrap(), vec![1]);
-        assert_eq!(mgr.query_eq("s", "/v", "e", None, None).unwrap(), vec![2]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "b", None, None).unwrap(), Vec::<u32>::new());
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "c", None, None).unwrap(), Vec::<u32>::new());
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "a", None, None).unwrap(), vec![0]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "d", None, None).unwrap(), vec![1]);
+        assert_eq!(mgr.query_eq("s", "/v", MAIN, "e", None, None).unwrap(), vec![2]);
     }
 
     #[test]
@@ -790,15 +871,15 @@ mod tests {
 
         // Only "300" (now ordinal 0) and "400" (now ordinal 1) remain.
         assert_eq!(
-            mgr.query_range("s", "/v", None, None, None, None, false).unwrap(),
+            mgr.query_range("s", "/v", MAIN, None, None, None, None, false).unwrap(),
             vec![0, 1]
         );
         assert_eq!(
-            mgr.query_range("s", "/v", Some(300.0), Some(300.0), None, None, false).unwrap(),
+            mgr.query_range("s", "/v", MAIN, Some(300.0), Some(300.0), None, None, false).unwrap(),
             vec![0]
         );
         assert_eq!(
-            mgr.query_range("s", "/v", Some(400.0), Some(400.0), None, None, false).unwrap(),
+            mgr.query_range("s", "/v", MAIN, Some(400.0), Some(400.0), None, None, false).unwrap(),
             vec![1]
         );
     }
@@ -813,10 +894,10 @@ mod tests {
         let new_data = items(&[json!({"v": 10}), json!({"v": 20}), json!({"v": 30})]);
         mgr.on_full_replace("s", MAIN, 2, new_data.iter());
 
-        let result = mgr.query_range("s", "/v", Some(15.0), None, None, None, false).unwrap();
+        let result = mgr.query_range("s", "/v", MAIN, Some(15.0), None, None, None, false).unwrap();
         assert_eq!(result, vec![1, 2]);
         assert_eq!(
-            mgr.query_range("s", "/v", None, None, None, None, false).unwrap().len(),
+            mgr.query_range("s", "/v", MAIN, None, None, None, None, false).unwrap().len(),
             3
         );
     }
@@ -833,7 +914,7 @@ mod tests {
         mgr.register("s", "/v", FieldIndexKind::String, MAIN, Some(1), data.iter())
             .unwrap();
 
-        let counts = mgr.value_counts("s", "/v").unwrap();
+        let counts = mgr.value_counts("s", "/v", MAIN).unwrap();
         assert_eq!(counts, vec![("x".to_string(), 3), ("y".to_string(), 1)]);
     }
 
@@ -846,14 +927,14 @@ mod tests {
         let data = items(&[json!({"v": 1}), json!({"v": 2}), json!({"v": 3})]);
         mgr.register("messages", "/v", FieldIndexKind::Number, MAIN, Some(30), data.iter())
             .unwrap();
-        assert!(mgr.query_range("messages", "/v", None, None, None, None, false).is_some());
+        assert!(mgr.query_range("messages", "/v", MAIN, None, None, None, None, false).is_some());
 
         // A write on a different branch for the same state_id.
         mgr.on_append("messages", SIDE, 40, &json!({"v": 4}));
 
         // MAIN's index is gone, not silently extended with SIDE's item.
         assert_eq!(
-            mgr.query_range("messages", "/v", None, None, None, None, false),
+            mgr.query_range("messages", "/v", MAIN, None, None, None, None, false),
             None,
             "cross-branch write must poison, never contaminate, the other branch's index"
         );
@@ -869,10 +950,10 @@ mod tests {
         let data = items(&[json!({"v": 1})]);
         mgr.register("s", "/v", FieldIndexKind::Number, MAIN, Some(1), data.iter())
             .unwrap();
-        assert!(mgr.query_range("s", "/v", None, None, None, None, false).is_some());
+        assert!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false).is_some());
 
         mgr.poison_state("s");
-        assert_eq!(mgr.query_range("s", "/v", None, None, None, None, false), None);
+        assert_eq!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false), None);
     }
 
     #[test]
@@ -895,12 +976,12 @@ mod tests {
         let loaded = FieldIndexManager::load(&path).unwrap().unwrap();
         assert_eq!(
             loaded
-                .query_range("messages", "/timestamp", Some(2.0), None, None, None, false)
+                .query_range("messages", "/timestamp", MAIN, Some(2.0), None, None, None, false)
                 .unwrap(),
             vec![1, 2]
         );
         assert_eq!(
-            loaded.query_eq("messages", "/channel", "a", None, None).unwrap(),
+            loaded.query_eq("messages", "/channel", MAIN, "a", None, None).unwrap(),
             vec![0, 2]
         );
     }
@@ -934,6 +1015,59 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_stale_drops_mismatched_head_offset() {
+        // Regression for the load-time-freshness bug: a structurally-valid
+        // (parses fine) but stale persisted index — its stored head_offset
+        // no longer matches what the real chain reports for that
+        // (state_id, branch_id) — must be dropped, not served.
+        let mut mgr = FieldIndexManager::new();
+        let data = items(&[json!({"v": 1})]);
+        mgr.register("messages", "/v", FieldIndexKind::Number, MAIN, Some(100), data.iter())
+            .unwrap();
+        // A second, still-fresh index on a different state_id must survive
+        // pruning untouched — prune_stale only removes what's actually stale.
+        mgr.register("other", "/v", FieldIndexKind::Number, MAIN, Some(50), data.iter())
+            .unwrap();
+
+        // Simulate the real chain having advanced past what this index
+        // reflects: "messages" is now at head_offset 200, not 100; "other"
+        // is unchanged at 50.
+        mgr.prune_stale(|state_id, _branch| match state_id {
+            "messages" => Some(200),
+            "other" => Some(50),
+            _ => None,
+        });
+
+        assert_eq!(
+            mgr.query_range("messages", "/v", MAIN, None, None, None, None, false),
+            None,
+            "stale index (head_offset mismatch) must be dropped, not served as current"
+        );
+        assert!(
+            mgr.query_range("other", "/v", MAIN, None, None, None, None, false).is_some(),
+            "an index that IS still fresh must survive prune_stale"
+        );
+    }
+
+    #[test]
+    fn test_prune_stale_keeps_matching_empty_head() {
+        // An index registered against an empty slot (head_offset = None)
+        // stays fresh as long as the slot is STILL empty (current head is
+        // also None) — None == None must count as fresh, not stale.
+        let mut mgr = FieldIndexManager::new();
+        mgr.register("s", "/v", FieldIndexKind::Number, MAIN, None, std::iter::empty())
+            .unwrap();
+
+        mgr.prune_stale(|_, _| None);
+        assert!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false).is_some());
+
+        // But once the slot has actually been written to (current head is
+        // now Some), the None-headed registration is stale.
+        mgr.prune_stale(|_, _| Some(1));
+        assert_eq!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false), None);
+    }
+
+    #[test]
     fn test_limit_offset() {
         let mut mgr = FieldIndexManager::new();
         let data = items(&(0..10).map(|i| json!({"v": i})).collect::<Vec<_>>());
@@ -941,7 +1075,7 @@ mod tests {
             .unwrap();
 
         let page = mgr
-            .query_range("s", "/v", None, None, Some(3), Some(2), false)
+            .query_range("s", "/v", MAIN, None, None, Some(3), Some(2), false)
             .unwrap();
         assert_eq!(page, vec![2, 3, 4]);
     }
@@ -953,6 +1087,6 @@ mod tests {
         mgr.on_append("s", MAIN, 1, &json!({"v": 1}));
         mgr.on_edit("s", MAIN, 2, 0, &json!({"v": 2}));
         mgr.on_redact("s", MAIN, 3, 0, 1);
-        assert_eq!(mgr.query_range("s", "/v", None, None, None, None, false), None);
+        assert_eq!(mgr.query_range("s", "/v", MAIN, None, None, None, None, false), None);
     }
 }
