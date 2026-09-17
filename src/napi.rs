@@ -7,8 +7,8 @@ use crate::{
         SubscriptionHandle, SubscriptionId,
     },
     types::{TreeChange, TreeEntry, TreeOp},
-    CompactionSummary, Record, RecordId, Sequence, StateOperation, StateRegistration,
-    StateStrategy, Store, StoreConfig,
+    CompactionSummary, FieldIndexKind, Record, RecordId, Sequence, StateOperation,
+    StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -147,6 +147,33 @@ pub struct JsQueryFilter {
     pub offset: Option<i64>,
     /// If true, return records in descending sequence order (newest first).
     pub reverse: Option<bool>,
+}
+
+/// Options for a numeric range query against a registered state field index
+/// (see `registerStateFieldIndex`). Either bound may be omitted for an
+/// open-ended range.
+#[napi(object)]
+pub struct JsIndexRangeQuery {
+    pub gte: Option<f64>,
+    pub lte: Option<f64>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    /// If true, return ordinals in descending value order.
+    pub reverse: Option<bool>,
+}
+
+/// Options for an equality query against a registered state field index.
+#[napi(object)]
+pub struct JsIndexEqQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// A distinct string field-index value and how many ordinals carry it.
+#[napi(object)]
+pub struct JsValueCount {
+    pub value: String,
+    pub count: u32,
 }
 
 /// State info returned to JavaScript.
@@ -1402,5 +1429,116 @@ impl JsStore {
         let store = self.get_store()?;
         let record = store.tree_snapshot(&state_id).map_err(to_napi_error)?;
         Ok(record.map(|r| r.into()))
+    }
+
+    // --- State Field Indexes ---
+
+    /// Register (or refresh) a secondary index on a JSON field of every item
+    /// in a state slot (state slots are JSON arrays, e.g. context-manager's
+    /// `messages` slot). `field` is a JSON-pointer path (e.g. `/timestamp` or
+    /// `/metadata/external/channelId`). `kind` is `"number"` or `"string"`.
+    ///
+    /// Idempotent — a no-op if an index for this `(stateId, field)` is
+    /// already registered, fresh (same branch, same slot head), and of the
+    /// same kind. Incrementally maintained thereafter as the slot mutates
+    /// (append, edit, redact, set/snapshot) on the branch it was registered
+    /// on, and persisted alongside the store. A write on a *different*
+    /// branch for the same `stateId` drops (poisons) this index rather than
+    /// mixing the two branches' ordinals — re-call this to rebuild it for
+    /// whichever branch you're now on.
+    #[napi]
+    pub fn register_state_field_index(
+        &self,
+        state_id: String,
+        field: String,
+        kind: String,
+    ) -> Result<()> {
+        let store = self.get_store()?;
+        let kind = match kind.as_str() {
+            "number" => FieldIndexKind::Number,
+            "string" => FieldIndexKind::String,
+            _ => {
+                return Err(napi::Error::from_reason(format!(
+                    "Invalid field index kind '{}': expected \"number\" or \"string\"",
+                    kind
+                )))
+            }
+        };
+        store
+            .register_state_field_index(&state_id, &field, kind)
+            .map_err(to_napi_error)
+    }
+
+    /// Query ordinals of a registered numeric field index within
+    /// `[opts.gte, opts.lte]` (either bound optional). Returns matching
+    /// ordinals (array indices), not content — fetch items separately via
+    /// `getStateItemJson`/`getStateSlice`.
+    ///
+    /// Returns `null` if no such `"number"` index is currently registered
+    /// (never registered, registered as `"string"` instead, or dropped by a
+    /// cross-branch write or a parse failure) — distinct from `[]`, an index
+    /// that exists but has no matches in range. Treat `null` as "call
+    /// `registerStateFieldIndex` again", not as "empty range".
+    #[napi]
+    pub fn query_state_index_range(
+        &self,
+        state_id: String,
+        field: String,
+        opts: JsIndexRangeQuery,
+    ) -> Result<Option<Vec<u32>>> {
+        let store = self.get_store()?;
+        Ok(store.query_state_index_range(
+            &state_id,
+            &field,
+            opts.gte,
+            opts.lte,
+            opts.limit.map(|l| l as usize),
+            opts.offset.map(|o| o as usize),
+            opts.reverse.unwrap_or(false),
+        ))
+    }
+
+    /// Query ordinals of a registered string field index equal to `value`.
+    /// Returns matching ordinals only.
+    ///
+    /// Returns `null` if no such `"string"` index is currently registered —
+    /// see `queryStateIndexRange`'s doc for the `null` vs `[]` distinction.
+    #[napi]
+    pub fn query_state_index_eq(
+        &self,
+        state_id: String,
+        field: String,
+        value: String,
+        opts: JsIndexEqQuery,
+    ) -> Result<Option<Vec<u32>>> {
+        let store = self.get_store()?;
+        Ok(store.query_state_index_eq(
+            &state_id,
+            &field,
+            &value,
+            opts.limit.map(|l| l as usize),
+            opts.offset.map(|o| o as usize),
+        ))
+    }
+
+    /// Distinct values and ordinal counts for a registered string field
+    /// index — O(index size), no content decoding.
+    ///
+    /// Returns `null` if no such `"string"` index is currently registered.
+    #[napi]
+    pub fn get_state_index_value_counts(
+        &self,
+        state_id: String,
+        field: String,
+    ) -> Result<Option<Vec<JsValueCount>>> {
+        let store = self.get_store()?;
+        Ok(store
+            .get_state_index_value_counts(&state_id, &field)
+            .map(|counts| {
+                counts
+                    .into_iter()
+                    .map(|(value, count)| JsValueCount { value, count })
+                    .collect()
+            }))
     }
 }

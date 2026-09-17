@@ -4,9 +4,11 @@
 //! reconstruction where k = updates since last snapshot, regardless
 //! of total events in the store.
 
+mod field_index;
 mod manager;
 mod operations;
 
+pub use field_index::{FieldIndexKind, FieldIndexManager};
 pub use manager::{
     ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
 };

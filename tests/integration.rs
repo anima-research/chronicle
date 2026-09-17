@@ -1,7 +1,8 @@
 //! Integration tests for the record store.
 
 use chronicle::{
-    RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
+    FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy,
+    Store, StoreConfig,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -988,4 +989,999 @@ fn test_update_state_strategy_retunes_cadence() {
             },
         )
         .is_err());
+}
+
+// --- State Field Index Tests ---
+
+fn item_at(store: &Store, state_id: &str, ordinal: usize) -> serde_json::Value {
+    let bytes = store
+        .get_state_item(state_id, ordinal)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no item at ordinal {}", ordinal));
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn test_field_index_incremental_maintenance() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Append 5 messages with a numeric timestamp and a string channelId.
+    for (i, channel) in [("c1"), ("c2"), ("c1"), ("c3"), ("c1")].into_iter().enumerate() {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(
+                    serde_json::to_vec(&json!({
+                        "timestamp": (i as i64 + 1) * 10,
+                        "channelId": channel,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+
+    store
+        .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+        .unwrap();
+    store
+        .register_state_field_index("messages", "/channelId", FieldIndexKind::String)
+        .unwrap();
+
+    // Range query: timestamp in [20, 40] -> ordinals 1, 2, 3.
+    let range = store
+        .query_state_index_range("messages", "/timestamp", Some(20.0), Some(40.0), None, None, false)
+        .unwrap();
+    assert_eq!(range, vec![1, 2, 3]);
+
+    // Equality query: channelId == "c1" -> ordinals 0, 2, 4.
+    let eq = store
+        .query_state_index_eq("messages", "/channelId", "c1", None, None)
+        .unwrap();
+    assert_eq!(eq, vec![0, 2, 4]);
+
+    // Value counts.
+    let mut counts = store.get_state_index_value_counts("messages", "/channelId").unwrap();
+    counts.sort();
+    assert_eq!(
+        counts,
+        vec![
+            ("c1".to_string(), 3),
+            ("c2".to_string(), 1),
+            ("c3".to_string(), 1),
+        ]
+    );
+
+    // Append one more item, incrementally maintained without re-registering.
+    store
+        .update_state(
+            "messages",
+            StateOperation::Append(
+                serde_json::to_vec(&json!({"timestamp": 60, "channelId": "c2"})).unwrap(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        store.query_state_index_eq("messages", "/channelId", "c2", None, None).unwrap(),
+        vec![1, 5]
+    );
+
+    // Edit ordinal 1 (was channel "c2") to channel "c1".
+    store
+        .update_state(
+            "messages",
+            StateOperation::Edit {
+                index: 1,
+                new_value: serde_json::to_vec(&json!({"timestamp": 20, "channelId": "c1"}))
+                    .unwrap(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.query_state_index_eq("messages", "/channelId", "c2", None, None).unwrap(),
+        vec![5]
+    );
+    assert_eq!(
+        store.query_state_index_eq("messages", "/channelId", "c1", None, None).unwrap(),
+        vec![0, 1, 2, 4]
+    );
+
+    // Redact ordinals [0, 2): drops old 0 ("c1") and old 1 ("c1", just
+    // edited), shifting the rest down by 2.
+    store
+        .update_state("messages", StateOperation::Redact { start: 0, end: 2 })
+        .unwrap();
+
+    // Content after redact: [old2 (c1,ts30), old3 (c3,ts40), old4 (c1,ts50), old5 (c2,ts60)]
+    // at new ordinals [0, 1, 2, 3].
+    assert_eq!(item_at(&store, "messages", 0)["channelId"], "c1");
+    assert_eq!(item_at(&store, "messages", 3)["channelId"], "c2");
+
+    let mut c1_after = store
+        .query_state_index_eq("messages", "/channelId", "c1", None, None)
+        .unwrap();
+    c1_after.sort();
+    assert_eq!(c1_after, vec![0, 2]);
+    assert_eq!(
+        store.query_state_index_eq("messages", "/channelId", "c2", None, None).unwrap(),
+        vec![3]
+    );
+    assert_eq!(
+        store.query_state_index_eq("messages", "/channelId", "c3", None, None).unwrap(),
+        vec![1]
+    );
+
+    // Number index shifted the same way: ts=30 now at ordinal 0, ts=60 at ordinal 3.
+    assert_eq!(
+        store
+            .query_state_index_range("messages", "/timestamp", Some(30.0), Some(30.0), None, None, false)
+            .unwrap(),
+        vec![0]
+    );
+    assert_eq!(
+        store
+            .query_state_index_range("messages", "/timestamp", Some(60.0), Some(60.0), None, None, false)
+            .unwrap(),
+        vec![3]
+    );
+}
+
+#[test]
+fn test_field_index_survives_snapshot_compaction() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    for i in 0..5 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(
+                    serde_json::to_vec(&json!({"timestamp": i * 10})).unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+
+    store
+        .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+        .unwrap();
+
+    // Compaction writes a `Snapshot` op with the same content/ordinals.
+    store.compact_state("messages").unwrap();
+
+    let result = store
+        .query_state_index_range("messages", "/timestamp", Some(10.0), Some(30.0), None, None, false)
+        .unwrap();
+    assert_eq!(result, vec![1, 2, 3]);
+
+    // Further appends after compaction still maintain the index.
+    store
+        .update_state(
+            "messages",
+            StateOperation::Append(serde_json::to_vec(&json!({"timestamp": 999})).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .query_state_index_range("messages", "/timestamp", Some(999.0), None, None, None, false)
+            .unwrap(),
+        vec![5]
+    );
+}
+
+#[test]
+fn test_field_index_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: true,
+    };
+
+    // First session: create, write, register an index, sync.
+    {
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        for (i, channel) in ["a", "b", "a"].into_iter().enumerate() {
+            store
+                .update_state(
+                    "messages",
+                    StateOperation::Append(
+                        serde_json::to_vec(&json!({"timestamp": i * 100, "channelId": channel}))
+                            .unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+
+        store
+            .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+            .unwrap();
+        store
+            .register_state_field_index("messages", "/channelId", FieldIndexKind::String)
+            .unwrap();
+
+        store.sync().unwrap();
+    }
+
+    // Second session: reopen. The persisted index file should already
+    // reflect the 3 items without re-registering.
+    {
+        let store = Store::open(config.clone()).unwrap();
+
+        let eq = store.query_state_index_eq("messages", "/channelId", "a", None, None).unwrap();
+        assert_eq!(eq, vec![0, 2]);
+        let range = store
+            .query_state_index_range("messages", "/timestamp", Some(50.0), None, None, None, false)
+            .unwrap();
+        assert_eq!(range, vec![1, 2]);
+
+        // Re-registering is idempotent (matching branch + head_offset ->
+        // no-op, but must not error and must leave results unchanged).
+        store
+            .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+            .unwrap();
+        let range_again = store
+            .query_state_index_range("messages", "/timestamp", Some(50.0), None, None, None, false)
+            .unwrap();
+        assert_eq!(range_again, vec![1, 2]);
+
+        // Appending after reopen keeps incrementally maintaining the index.
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(
+                    serde_json::to_vec(&json!({"timestamp": 500, "channelId": "a"})).unwrap(),
+                ),
+            )
+            .unwrap();
+        let eq_after_append = store
+            .query_state_index_eq("messages", "/channelId", "a", None, None)
+            .unwrap();
+        assert_eq!(eq_after_append, vec![0, 2, 3]);
+
+        store.sync().unwrap();
+    }
+
+    // Third session: confirm the appended item survived the second sync
+    // and the index still reflects it without any re-registration at all.
+    {
+        let store = Store::open(config).unwrap();
+        let eq = store.query_state_index_eq("messages", "/channelId", "a", None, None).unwrap();
+        assert_eq!(eq, vec![0, 2, 3]);
+    }
+}
+
+#[test]
+fn test_field_index_missing_or_stale_file_starts_empty() {
+    // A store whose `state-indexes.bin` is missing or corrupt (e.g. a store
+    // written before this feature existed, or a partial/corrupted write)
+    // must still open cleanly — the field index is derived data, so a
+    // missing/unreadable file just means "nothing registered yet", not an
+    // open failure.
+    let dir = TempDir::new().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: true,
+    };
+
+    {
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"timestamp": 1})).unwrap()),
+            )
+            .unwrap();
+        store
+            .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+            .unwrap();
+        store.sync().unwrap();
+    }
+
+    let index_path = dir.path().join("store").join("state-indexes.bin");
+    assert!(index_path.exists(), "sync() should have written state-indexes.bin");
+
+    // Corrupt it in place (simulates a torn/partial write or bit rot).
+    std::fs::write(&index_path, b"not a valid chronicle field index file").unwrap();
+
+    // Reopening must not error. The corrupt file yields no persisted
+    // registration, which the caller sees as `None` ("no such index"), not
+    // an empty `Some(vec![])`.
+    {
+        let store = Store::open(config.clone()).unwrap();
+        let result =
+            store.query_state_index_range("messages", "/timestamp", None, None, None, None, false);
+        assert_eq!(result, None);
+
+        // Re-registering after a corrupt-file open works normally.
+        store
+            .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+            .unwrap();
+        let result = store
+            .query_state_index_range("messages", "/timestamp", None, None, None, None, false)
+            .unwrap();
+        assert_eq!(result, vec![0]);
+
+        store.sync().unwrap();
+    }
+
+    // Deleting the file entirely (rather than corrupting it) behaves the
+    // same way.
+    std::fs::remove_file(&index_path).unwrap();
+    let store = Store::open(config).unwrap();
+    let result =
+        store.query_state_index_range("messages", "/timestamp", None, None, None, None, false);
+    assert_eq!(result, None);
+}
+
+// --- Regression: DeltaSnapshot must not double-index (bug #1) ---
+
+#[test]
+fn test_field_index_delta_snapshot_does_not_double_index() {
+    // A DeltaSnapshot consolidates Appends already recorded (and already
+    // indexed via their own Append hooks) — it must never be treated as a
+    // fresh batch of new items. `delta_snapshot_every: 4` with >=10 appends
+    // guarantees at least one DeltaSnapshot fires during this test; the old
+    // (buggy) behavior called `on_append` again for every item the delta
+    // consolidated, inflating `by_ordinal` past the slot's real length and
+    // scrambling ordinals.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 4,
+                full_snapshot_every: 1000, // keep this test on the delta path only
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    store
+        .register_state_field_index("messages", "/ts", FieldIndexKind::Number)
+        .unwrap();
+
+    for i in 0..12u32 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"ts": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    // At delta_snapshot_every=4 with 12 appends, at least 2 DeltaSnapshots
+    // fire along the way — confirm the chain stats actually exercised that
+    // path (otherwise this regression test would pass vacuously).
+    let stats = store.get_chain_stats("messages").unwrap().unwrap();
+    assert!(
+        !stats.has_full_snapshot,
+        "full_snapshot_every is set high enough that only deltas should have fired"
+    );
+
+    let slot_len = store.get_state_len("messages").unwrap().unwrap();
+    assert_eq!(slot_len, 12);
+
+    // The index must track the slot exactly: 12 items in, 12 ordinals out,
+    // one per distinct timestamp — never 18 (12 real + 6 double-indexed by
+    // the two deltas), and no ordinal must appear twice.
+    let all = store
+        .query_state_index_range("messages", "/ts", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(
+        all.len(),
+        slot_len,
+        "field index length must track the slot's real length exactly through delta snapshots"
+    );
+    let mut unique = all.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), all.len(), "no ordinal may appear more than once");
+
+    // Spot-check specific values land on exactly one ordinal apiece, not
+    // duplicated onto [i, i+4] the way the bug produced.
+    for i in [0u32, 4, 8, 11] {
+        let matches = store
+            .query_state_index_range(
+                "messages",
+                "/ts",
+                Some(i as f64),
+                Some(i as f64),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(matches, vec![i], "ts={} must map to exactly ordinal {}, not a duplicate", i, i);
+    }
+}
+
+// --- Regression: cross-branch writes must not corrupt a field index (bug #2) ---
+
+#[test]
+fn test_field_index_cross_branch_writes_do_not_contaminate() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // 3 items on main.
+    for i in 0..3 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let main_before = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_before, vec![0, 1, 2]);
+
+    // Branch off, switch to it, append on the side branch.
+    store.create_branch("side", None).unwrap();
+    store.switch_branch("side").unwrap();
+    for i in 100..102 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+    // Side branch's own view is unindexed (index was registered on main) —
+    // querying it returns None, never side's ordinals mislabeled as main's.
+    assert_eq!(
+        store.query_state_index_range("messages", "/v", None, None, None, None, false),
+        None,
+        "writing on a branch that never registered this index must not manufacture one"
+    );
+
+    // Switch back to main: the index registered there must be gone
+    // (poisoned by the side-branch writes above), not silently reporting
+    // ordinals 3/4 that don't exist on main.
+    store.switch_branch("main").unwrap();
+    let after_side_writes =
+        store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        after_side_writes, None,
+        "a cross-branch write must poison the index rather than leave it silently wrong"
+    );
+
+    // Re-registering on main recovers a correct, main-only index.
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let main_after = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_after, vec![0, 1, 2], "re-registered index must reflect ONLY main's 3 items");
+
+    // A further redact on main must never touch anything derived from the
+    // side branch's phantom ordinals.
+    store
+        .update_state("messages", StateOperation::Redact { start: 0, end: 1 })
+        .unwrap();
+    let main_final = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_final, vec![0, 1], "redact on main must only ever see main's own 2 remaining items");
+}
+
+#[test]
+fn test_field_index_create_branch_at_does_not_contaminate() {
+    // Same corruption family as the branch/switch test above, but via
+    // `create_branch_at` (time-travel branching) instead of `create_branch`.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    for i in 0..4 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+
+    // Branch at sequence 2 (partway through main's history), switch, append.
+    store.create_branch_at("time-travel", "main", Sequence(2)).unwrap();
+    store.switch_branch("time-travel").unwrap();
+    store
+        .update_state(
+            "messages",
+            StateOperation::Append(serde_json::to_vec(&json!({"v": 999})).unwrap()),
+        )
+        .unwrap();
+
+    // Back on main, the index registered before branching must be poisoned
+    // by the time-travel branch's append, not silently retained with a
+    // phantom extra ordinal.
+    store.switch_branch("main").unwrap();
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(result, None);
+
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let main_after = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_after, vec![0, 1, 2, 3], "main's index must reflect only main's own 4 items");
+}
+
+// --- Regression: pure read after switch_branch must not serve the other
+// branch's index (bug 1, round 2) ---
+
+#[test]
+fn test_field_index_pure_read_after_switch_does_not_leak_other_branch() {
+    // Distinct from `test_field_index_cross_branch_writes_do_not_contaminate`
+    // above: THAT test writes on the side branch after registration and
+    // relies on the write-time poison. This test does the divergence and
+    // the append BEFORE registration, registers only on main, and then the
+    // ONLY operation afterward is `switch_branch` — no write on either
+    // branch post-registration. The write-time poison from last round
+    // cannot fire here (there's no write to trigger it); only a query-time
+    // branch check catches this.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // 3 items on main.
+    for i in 0..3 {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    // Branch off (side inherits main's 3 items), switch, diverge by
+    // appending a 4th item on side ONLY — all before any registration.
+    store.create_branch("side", None).unwrap();
+    store.switch_branch("side").unwrap();
+    store
+        .update_state(
+            "messages",
+            StateOperation::Append(serde_json::to_vec(&json!({"v": 999})).unwrap()),
+        )
+        .unwrap();
+    let side_len = store.get_state_len("messages").unwrap().unwrap();
+    assert_eq!(side_len, 4, "side must have diverged to 4 items before registration");
+
+    // Back to main (still 3 items) and register there.
+    store.switch_branch("main").unwrap();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 3);
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let main_registered = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_registered, vec![0, 1, 2]);
+
+    // The ONLY operation from here is switch_branch — no further writes on
+    // either branch.
+    store.switch_branch("side").unwrap();
+
+    // Side's slot is 4 items long; the index was built for main's 3. A pure
+    // read here — no append, no edit, no redact happened on side after the
+    // switch — must not serve main's index/ordinals, and must not answer
+    // with an ordinal (3) that doesn't even exist on main.
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        result, None,
+        "a pure read after switch_branch, with no intervening write, must never serve the \
+         other branch's index — this is the case the write-time-only poison misses"
+    );
+
+    // Switching back to main still serves main's own, correct index.
+    store.switch_branch("main").unwrap();
+    let main_again = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(main_again, vec![0, 1, 2]);
+}
+
+// --- Regression: a structurally-valid but stale persisted index must not
+// be served on load (bug 2, round 2) ---
+
+#[test]
+fn test_field_index_stale_but_parseable_persisted_file_is_not_served() {
+    // Distinct from `test_field_index_missing_or_stale_file_starts_empty`
+    // above: THAT test corrupts the file so it fails to PARSE. This test
+    // uses a `state-indexes.bin` that parses perfectly fine — it's simply
+    // one head behind the real state.bin, simulating either the swallowed
+    // field-index-save-failure crash window `StateManager::save` documents,
+    // or an older backup being restored over a newer one.
+    let dir = TempDir::new().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: true,
+    };
+    let index_path = dir.path().join("store").join("state-indexes.bin");
+
+    // Session 1: 1 item, register, sync — state-indexes.bin now reflects
+    // exactly 1 item. Stash a copy of this "1-item-fresh" file.
+    let stale_snapshot = {
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": 0})).unwrap()),
+            )
+            .unwrap();
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+        store.sync().unwrap();
+
+        assert_eq!(
+            store
+                .query_state_index_range("messages", "/v", None, None, None, None, false)
+                .unwrap(),
+            vec![0]
+        );
+
+        std::fs::read(&index_path).unwrap()
+    };
+
+    // Session 2: advance to 2 items and sync — state.bin AND
+    // state-indexes.bin both now correctly reflect 2 items.
+    {
+        let store = Store::open(config.clone()).unwrap();
+        assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 1);
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": 1})).unwrap()),
+            )
+            .unwrap();
+        store.sync().unwrap();
+        assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 2);
+        // Sanity: the (still-fresh, in-session) index already reflects 2.
+        assert_eq!(
+            store
+                .query_state_index_range("messages", "/v", None, None, None, None, false)
+                .unwrap(),
+            vec![0, 1]
+        );
+    }
+
+    // Restore the STALE (1-item) state-indexes.bin over the current
+    // (correct, 2-item) one. It parses fine — it's simply one head behind
+    // the real chain, which state.bin (never touched here) still reports
+    // correctly at 2 items.
+    std::fs::write(&index_path, &stale_snapshot).unwrap();
+
+    // Session 3: reopen. The real slot has 2 items; the stale-but-valid
+    // index file claims to reflect the state as of 1 item. It must be
+    // dropped on load (head_offset mismatch), not served as if current.
+    let store = Store::open(config).unwrap();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 2);
+
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        result, None,
+        "a structurally-valid-but-stale index (head_offset behind the real chain) must not \
+         be served — confidently answering Some([0]) here would silently miss ordinal 1"
+    );
+
+    // Re-registering after the stale file is dropped recovers a correct,
+    // fully up-to-date index.
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    let rebuilt = store
+        .query_state_index_range("messages", "/v", None, None, None, None, false)
+        .unwrap();
+    assert_eq!(rebuilt, vec![0, 1]);
+}
+
+// --- Regression: `StateOperation::Delta` (Delta-strategy whole-state
+// replace) must rebuild the index, not leave it silently stale ---
+
+#[test]
+fn test_field_index_delta_operation_rebuilds_index_live() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "cfg".to_string(),
+            strategy: StateStrategy::Delta { snapshot_every: 1000 },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Seed the slot via a Delta op (old_hash isn't validated — see
+    // materialize_operations's Delta arm and tests/materialize_equivalence.rs).
+    store
+        .update_state(
+            "cfg",
+            StateOperation::Delta {
+                old_hash: chronicle::Hash::from_bytes(b"seed"),
+                new_value: serde_json::to_vec(&json!([{"v": 1}])).unwrap(),
+            },
+        )
+        .unwrap();
+
+    store
+        .register_state_field_index("cfg", "/v", FieldIndexKind::Number)
+        .unwrap();
+    assert_eq!(
+        store
+            .query_state_index_range("cfg", "/v", Some(1.0), Some(1.0), None, None, false)
+            .unwrap(),
+        vec![0]
+    );
+
+    // Replace the whole slot via Delta — DIFFERENT from `DeltaSnapshot`,
+    // which consolidates existing Appends; `Delta` is a Delta-strategy
+    // whole-state replace, semantically identical to `Set`/`Snapshot`
+    // (see `apply_operation`'s `Delta` arm).
+    store
+        .update_state(
+            "cfg",
+            StateOperation::Delta {
+                old_hash: chronicle::Hash::from_bytes(b"next"),
+                new_value: serde_json::to_vec(&json!([{"v": 2}])).unwrap(),
+            },
+        )
+        .unwrap();
+
+    // Live, no reopen: the OLD value must no longer match, and the NEW
+    // value must be found immediately — before this fix, `Delta` fell
+    // through the "not an ordinal array" catch-all and the index kept
+    // confidently answering against the pre-Delta content.
+    assert_eq!(
+        store
+            .query_state_index_range("cfg", "/v", Some(1.0), Some(1.0), None, None, false)
+            .unwrap(),
+        Vec::<u32>::new(),
+        "old value must no longer match after a Delta replace"
+    );
+    assert_eq!(
+        store
+            .query_state_index_range("cfg", "/v", Some(2.0), Some(2.0), None, None, false)
+            .unwrap(),
+        vec![0],
+        "new value must be found immediately after a Delta replace, live, no reopen"
+    );
+}
+
+// --- Regression: an index untouched except by a DeltaSnapshot must survive
+// reopen (prune_stale must not treat it as stale) ---
+
+#[test]
+fn test_field_index_survives_reopen_after_delta_snapshot_only() {
+    let dir = TempDir::new().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: true,
+    };
+
+    {
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 4,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+
+        for i in 0..4u32 {
+            store
+                .update_state(
+                    "messages",
+                    StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+                )
+                .unwrap();
+        }
+
+        // Confirm a delta snapshot actually fired — otherwise this test
+        // would pass vacuously without ever exercising the bug.
+        let stats = store.get_compaction_stats("messages").unwrap();
+        assert!(
+            stats.last_delta_snapshot_offset.is_some(),
+            "delta_snapshot_every=4 with 4 appends must have triggered a delta snapshot"
+        );
+
+        // Live, the index is already correct (this part worked before this
+        // round's fix too).
+        assert_eq!(
+            store
+                .query_state_index_range("messages", "/v", None, None, None, None, false)
+                .unwrap(),
+            vec![0, 1, 2, 3]
+        );
+
+        store.sync().unwrap();
+    }
+
+    // Reopen with NO further mutation on either branch. Before this fix,
+    // the DeltaSnapshot's no-op (correctly not touching by_ordinal/reverse
+    // index) ALSO left the index's tracked head_offset behind the real
+    // chain's current head (now the DeltaSnapshot record) — so
+    // `prune_stale`, run on this very reopen, would wrongly discard an
+    // otherwise 100% correct index.
+    let store = Store::open(config).unwrap();
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        result,
+        Some(vec![0, 1, 2, 3]),
+        "an index that's still correct must survive reopen even though a DeltaSnapshot \
+         (which doesn't change indexed content) happened after its last content-changing update"
+    );
+}
+
+// --- Regression: idempotent re-registration must not re-materialize the
+// whole slot ---
+
+#[test]
+fn test_register_field_index_idempotent_reregistration_skips_materialization() {
+    // Proves the freshness check runs BEFORE `get_state`/JSON-parsing the
+    // slot, not after: times a batch of no-op re-registrations against a
+    // large slot and asserts they stay cheap. If the freshness check ran
+    // after materialization (the pre-fix ordering), each of these would
+    // pay for a full chain reconstruction + JSON parse of the whole slot —
+    // the reviewer measured ~110ms for a single such call on a 20k-item/
+    // ~21MB slot. The threshold below is deliberately generous (a small
+    // constant total for 50 calls) so it fails hard on a regression to that
+    // behavior while staying robust to normal CI timing noise.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1_000_000,
+                full_snapshot_every: 1_000_000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    let n = 20_000usize;
+    for i in 0..n {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    // First registration: cold, legitimately pays full materialization cost.
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), n);
+
+    // 50 idempotent re-registrations, all against the SAME head_offset —
+    // every one of them should be a no-op that never touches the slot.
+    let start = std::time::Instant::now();
+    for _ in 0..50 {
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "50 idempotent re-registrations against a {}-item slot took {:?} — the freshness \
+         check must short-circuit before materializing/parsing the slot; this looks like \
+         the pre-fix behavior of paying full materialization cost on every no-op call",
+        n,
+        elapsed
+    );
 }
