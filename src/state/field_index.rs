@@ -208,6 +208,21 @@ impl FieldIndex {
     }
 }
 
+/// Fold `-0.0` to `0.0`. `total_cmp` (what orders `OrderedF64`, below)
+/// distinguishes the two — unlike ordinary `==` and `<`/`>`, which treat
+/// them equal — so without this, an item indexed at `-0.0` would sort just
+/// below `0.0` in the reverse index and an inclusive `[0, 0]` range query
+/// would silently miss it. Applied both when indexing a value and when
+/// evaluating a query's bounds, so either side landing on `-0.0` still
+/// matches the other.
+fn normalize_zero(v: f64) -> f64 {
+    if v == 0.0 {
+        0.0
+    } else {
+        v
+    }
+}
+
 fn extract_indexed_value(
     item: &serde_json::Value,
     field_path: &str,
@@ -215,7 +230,9 @@ fn extract_indexed_value(
 ) -> Option<IndexedValue> {
     let value = item.pointer(field_path)?;
     match kind {
-        FieldIndexKind::Number => value.as_f64().map(IndexedValue::Number),
+        FieldIndexKind::Number => value
+            .as_f64()
+            .map(|n| IndexedValue::Number(normalize_zero(n))),
         FieldIndexKind::String => match value {
             serde_json::Value::String(s) => Some(IndexedValue::Str(s.clone())),
             _ => None,
@@ -268,10 +285,47 @@ impl FieldIndexManager {
         self.indexes.get(key).map(|i| i.branch_id) == Some(branch_id)
     }
 
+    /// Whether a `register` call with these exact `(kind, branch_id,
+    /// head_offset)` would be a no-op — i.e. an index for `(state_id,
+    /// field_path)` is already registered and matches all three.
+    ///
+    /// Exposed separately from `register` (which also takes this same
+    /// no-op path internally) so a caller that would otherwise have to
+    /// materialize and fully JSON-parse the whole slot just to build the
+    /// `current_items` iterator can check freshness FIRST and skip that
+    /// work entirely on the already-fresh path — `head_offset` alone is
+    /// enough to answer the question. Materializing a large slot isn't
+    /// free (~110ms measured for 20k items vs ~12us for a query), and
+    /// registration is commonly called unconditionally on every boot
+    /// (context-manager's `MessageStore` does), so an idempotent
+    /// already-registered call staying cheap is load-bearing, not a nicety.
+    pub fn is_fresh(
+        &self,
+        state_id: &str,
+        field_path: &str,
+        kind: FieldIndexKind,
+        branch_id: BranchId,
+        head_offset: Option<u64>,
+    ) -> bool {
+        match self.indexes.get(&(state_id.to_string(), field_path.to_string())) {
+            Some(existing) => {
+                existing.kind == kind
+                    && existing.branch_id == branch_id
+                    && existing.head_offset == head_offset
+            }
+            None => false,
+        }
+    }
+
     /// Register a field index, building it fresh from `current_items` if
     /// it isn't already registered and fresh for `branch_id` — same `kind`,
     /// same `branch_id`, AND the same `head_offset` as last maintained
     /// (idempotent no-op only in that exact case; see module docs).
+    ///
+    /// `current_items` is only consumed on the non-fresh (rebuild) path —
+    /// see `is_fresh`'s doc if you can check freshness before your caller
+    /// even materializes the iterator's source; `StateManager::register_field_index`
+    /// does exactly that.
     pub fn register<'a>(
         &mut self,
         state_id: &str,
@@ -282,20 +336,13 @@ impl FieldIndexManager {
         current_items: impl Iterator<Item = &'a serde_json::Value>,
     ) -> Result<()> {
         validate_field_path(field_path)?;
-        let key = (state_id.to_string(), field_path.to_string());
-        let items: Vec<&serde_json::Value> = current_items.collect();
-
-        if let Some(existing) = self.indexes.get(&key) {
-            if existing.kind == kind
-                && existing.branch_id == branch_id
-                && existing.head_offset == head_offset
-            {
-                return Ok(()); // already fresh
-            }
+        if self.is_fresh(state_id, field_path, kind, branch_id, head_offset) {
+            return Ok(()); // already fresh
         }
 
+        let key = (state_id.to_string(), field_path.to_string());
         let mut index = FieldIndex::new(kind, branch_id, head_offset);
-        index.rebuild(field_path, items.into_iter());
+        index.rebuild(field_path, current_items);
         self.indexes.insert(key, index);
         Ok(())
     }
@@ -309,6 +356,29 @@ impl FieldIndexManager {
     pub fn poison_state(&mut self, state_id: &str) {
         for key in self.matching_keys(state_id) {
             self.indexes.remove(&key);
+        }
+    }
+
+    /// Advance the tracked `head_offset` for every index registered for
+    /// `state_id` on `branch_id` to `offset`, WITHOUT touching `by_ordinal`
+    /// or either reverse index. For an op that moves the chain's head
+    /// record but changes no indexed content — currently only
+    /// `DeltaSnapshot`, which consolidates Appends already reflected in the
+    /// index via their own `on_append` calls. Without this, `prune_stale`
+    /// (which compares a loaded index's stored `head_offset` against the
+    /// real chain's current one) would treat an otherwise still-correct
+    /// index as stale — and discard it — purely because a DeltaSnapshot
+    /// happened since it was last touched. A branch mismatch still poisons,
+    /// same as every other op.
+    pub fn touch_head_offset(&mut self, state_id: &str, branch_id: BranchId, offset: u64) {
+        for key in self.matching_keys(state_id) {
+            if !self.branch_matches(&key, branch_id) {
+                self.indexes.remove(&key);
+                continue;
+            }
+            if let Some(index) = self.indexes.get_mut(&key) {
+                index.head_offset = Some(offset);
+            }
         }
     }
 
@@ -476,8 +546,8 @@ impl FieldIndexManager {
             return None;
         }
 
-        let lo = OrderedF64(gte.unwrap_or(f64::NEG_INFINITY));
-        let hi = OrderedF64(lte.unwrap_or(f64::INFINITY));
+        let lo = OrderedF64(normalize_zero(gte.unwrap_or(f64::NEG_INFINITY)));
+        let hi = OrderedF64(normalize_zero(lte.unwrap_or(f64::INFINITY)));
         if lo > hi {
             return Some(Vec::new());
         }
@@ -595,7 +665,30 @@ impl FieldIndexManager {
         if file.read_exact(&mut len_bytes).is_err() {
             return Ok(None);
         }
-        let len = u64::from_le_bytes(len_bytes) as usize;
+        let len = u64::from_le_bytes(len_bytes);
+
+        // Validate the persisted length against the file's actual remaining
+        // bytes BEFORE allocating anything based on it. A corrupt, torn, or
+        // adversarially-crafted file (valid magic+version, garbage length —
+        // e.g. `u64::MAX`) must fail exactly like any other corrupt-file
+        // case here (`Ok(None)`), not panic. `vec![0u8; len]` on an
+        // unvalidated `len` is a capacity-overflow / OOM panic waiting to
+        // happen, and this file is read during `Store::open` — a panic here
+        // would take down the whole store open, not just this derived,
+        // supposed-to-be-safely-discardable index.
+        let file_len = match file.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return Ok(None),
+        };
+        // Bytes already consumed: magic (4) + version (1) + len field (8).
+        let already_read: u64 = 4 + 1 + 8;
+        let remaining = file_len.saturating_sub(already_read);
+        if len > remaining {
+            return Ok(None);
+        }
+        // `len <= remaining <= file_len`, so this cast and allocation are
+        // bounded by the real file size on disk, not attacker-controlled.
+        let len = len as usize;
 
         let mut encoded = vec![0u8; len];
         if file.read_exact(&mut encoded).is_err() {
@@ -1012,6 +1105,72 @@ mod tests {
         let path = dir.path().join("garbage.bin");
         std::fs::write(&path, b"not a chronicle field index file at all").unwrap();
         assert!(FieldIndexManager::load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_oversized_length_field_does_not_panic() {
+        // Regression: valid magic + valid version + a length field that
+        // claims far more bytes than the file actually has (here:
+        // u64::MAX, the adversarial/corrupt extreme) must fail exactly
+        // like any other corrupt-file case (`Ok(None)`) — not panic via an
+        // unvalidated `vec![0u8; len]` capacity overflow. This file is read
+        // during `Store::open`, so a panic here would take down the whole
+        // store open over a derived, supposed-to-be-safely-discardable
+        // index file.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state-indexes.bin");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(FIELD_INDEX_MAGIC).unwrap();
+        file.write_all(&[FIELD_INDEX_VERSION]).unwrap();
+        file.write_all(&u64::MAX.to_le_bytes()).unwrap(); // wildly oversized length
+        drop(file);
+
+        assert!(FieldIndexManager::load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_length_field_exceeding_remaining_bytes_does_not_panic() {
+        // Less extreme than u64::MAX: a length that's merely larger than
+        // what's actually left in the file (e.g. a torn/truncated write)
+        // must also be rejected before allocating, not panic or read past
+        // EOF into whatever `read_exact` happens to do.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state-indexes.bin");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(FIELD_INDEX_MAGIC).unwrap();
+        file.write_all(&[FIELD_INDEX_VERSION]).unwrap();
+        file.write_all(&100u64.to_le_bytes()).unwrap(); // claims 100 bytes follow
+        file.write_all(b"only ten!!").unwrap(); // but only 10 are actually there
+        drop(file);
+
+        assert!(FieldIndexManager::load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_negative_zero_matches_positive_zero_in_range_query() {
+        // Regression: `total_cmp` (which orders the reverse-index BTreeMap)
+        // distinguishes -0.0 from 0.0, unlike ordinary numeric equality —
+        // without normalization, an item indexed at -0.0 would sort just
+        // below 0.0 and an inclusive [0, 0] query would silently miss it.
+        let mut mgr = FieldIndexManager::new();
+        let data = items(&[json!({"v": -0.0}), json!({"v": 0.0}), json!({"v": 1.0})]);
+        mgr.register("s", "/v", FieldIndexKind::Number, MAIN, Some(1), data.iter())
+            .unwrap();
+
+        let zero_range = mgr
+            .query_range("s", "/v", MAIN, Some(0.0), Some(0.0), None, None, false)
+            .unwrap();
+        assert_eq!(
+            zero_range,
+            vec![0, 1],
+            "both the -0.0 and 0.0 items must match an inclusive [0, 0] query"
+        );
+
+        // A query bound that's itself -0.0 must behave identically.
+        let neg_zero_bound = mgr
+            .query_range("s", "/v", MAIN, Some(-0.0), Some(-0.0), None, None, false)
+            .unwrap();
+        assert_eq!(neg_zero_bound, vec![0, 1]);
     }
 
     #[test]

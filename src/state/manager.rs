@@ -492,6 +492,16 @@ impl StateManager {
                     // DeltaSnapshot for the same reason. Treating this as a
                     // fresh batch of appends (the bug this comment replaces)
                     // double-indexed every item covered by the delta.
+                    //
+                    // It DOES move the chain's head record, though — advance
+                    // the index's tracked head_offset to match (content
+                    // unchanged), or a later `prune_stale` (on the next
+                    // load) would wrongly discard an otherwise still-correct
+                    // index purely because a DeltaSnapshot happened since it
+                    // was last touched.
+                    self.field_indexes
+                        .write()
+                        .touch_head_offset(state_id, branch_id, offset);
                 }
                 StateOperation::Edit { index, new_value } => {
                     match serde_json::from_slice::<serde_json::Value>(new_value) {
@@ -514,7 +524,18 @@ impl StateManager {
                         *end as u32,
                     );
                 }
-                StateOperation::Set(data) | StateOperation::Snapshot(data) => {
+                StateOperation::Set(data)
+                | StateOperation::Snapshot(data)
+                | StateOperation::Delta { new_value: data, .. } => {
+                    // `Delta` (the Delta-strategy whole-state replace — NOT
+                    // `DeltaSnapshot`, handled above) replaces the entire
+                    // materialized value exactly like `Set`/`Snapshot` does
+                    // (see `apply_operation`'s `Delta` arm: `Ok(new_value)`,
+                    // same as `Set`). Left unhandled, a registered index
+                    // would keep confidently answering queries against the
+                    // value BEFORE the Delta — stale-but-confident, worse
+                    // than an honest `None`. Same full-rebuild path as
+                    // Set/Snapshot; same poison-on-parse-failure fallback.
                     match serde_json::from_slice::<Vec<serde_json::Value>>(data) {
                         Ok(items) => self.field_indexes.write().on_full_replace(
                             state_id,
@@ -525,14 +546,13 @@ impl StateManager {
                         Err(_) => self.field_indexes.write().poison_state(state_id),
                     }
                 }
-                // Tree ops (path->entry maps) and Struct Delta/Field ops are
-                // not ordinal arrays — field indexing (built on `by_ordinal`)
+                // Tree ops (path->entry maps) and Struct Field ops are not
+                // ordinal arrays — field indexing (built on `by_ordinal`)
                 // doesn't apply to them.
                 StateOperation::TreeSet { .. }
                 | StateOperation::TreeRemove { .. }
                 | StateOperation::TreeBatch { .. }
                 | StateOperation::TreeDeltaSnapshot(_)
-                | StateOperation::Delta { .. }
                 | StateOperation::Field { .. } => {}
             }
         }
@@ -1021,6 +1041,14 @@ impl StateManager {
     /// field_path)` index replaces it outright (only one branch's index can
     /// be live per field at a time — see `FieldIndexManager`'s module docs).
     ///
+    /// The freshness check runs BEFORE this materializes/parses the slot's
+    /// JSON — `head_offset` alone (already cheap: an index lookup, not a
+    /// chain walk) is enough to answer "already fresh", so the common
+    /// already-registered case (callers, e.g. context-manager's
+    /// `MessageStore`, that call this unconditionally on every boot) never
+    /// pays for decoding a large slot just to throw the result away. Only a
+    /// genuine rebuild reaches `get_state`/`serde_json::from_slice` below.
+    ///
     /// Callers must hold `Store::write_lock` across this call (as every
     /// other state-mutating path already does) so it can't race a
     /// concurrent `record_update` and double-count the in-flight item.
@@ -1032,6 +1060,15 @@ impl StateManager {
         kind: FieldIndexKind,
     ) -> Result<()> {
         let head_offset = self.get_head(branch_id, state_id).map(|h| h.head_offset);
+
+        if self
+            .field_indexes
+            .read()
+            .is_fresh(state_id, field_path, kind, branch_id, head_offset)
+        {
+            return Ok(());
+        }
+
         let items: Vec<serde_json::Value> = match self.get_state(branch_id, state_id)? {
             Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?,

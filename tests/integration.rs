@@ -1775,3 +1775,213 @@ fn test_field_index_stale_but_parseable_persisted_file_is_not_served() {
         .unwrap();
     assert_eq!(rebuilt, vec![0, 1]);
 }
+
+// --- Regression: `StateOperation::Delta` (Delta-strategy whole-state
+// replace) must rebuild the index, not leave it silently stale ---
+
+#[test]
+fn test_field_index_delta_operation_rebuilds_index_live() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "cfg".to_string(),
+            strategy: StateStrategy::Delta { snapshot_every: 1000 },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Seed the slot via a Delta op (old_hash isn't validated — see
+    // materialize_operations's Delta arm and tests/materialize_equivalence.rs).
+    store
+        .update_state(
+            "cfg",
+            StateOperation::Delta {
+                old_hash: chronicle::Hash::from_bytes(b"seed"),
+                new_value: serde_json::to_vec(&json!([{"v": 1}])).unwrap(),
+            },
+        )
+        .unwrap();
+
+    store
+        .register_state_field_index("cfg", "/v", FieldIndexKind::Number)
+        .unwrap();
+    assert_eq!(
+        store
+            .query_state_index_range("cfg", "/v", Some(1.0), Some(1.0), None, None, false)
+            .unwrap(),
+        vec![0]
+    );
+
+    // Replace the whole slot via Delta — DIFFERENT from `DeltaSnapshot`,
+    // which consolidates existing Appends; `Delta` is a Delta-strategy
+    // whole-state replace, semantically identical to `Set`/`Snapshot`
+    // (see `apply_operation`'s `Delta` arm).
+    store
+        .update_state(
+            "cfg",
+            StateOperation::Delta {
+                old_hash: chronicle::Hash::from_bytes(b"next"),
+                new_value: serde_json::to_vec(&json!([{"v": 2}])).unwrap(),
+            },
+        )
+        .unwrap();
+
+    // Live, no reopen: the OLD value must no longer match, and the NEW
+    // value must be found immediately — before this fix, `Delta` fell
+    // through the "not an ordinal array" catch-all and the index kept
+    // confidently answering against the pre-Delta content.
+    assert_eq!(
+        store
+            .query_state_index_range("cfg", "/v", Some(1.0), Some(1.0), None, None, false)
+            .unwrap(),
+        Vec::<u32>::new(),
+        "old value must no longer match after a Delta replace"
+    );
+    assert_eq!(
+        store
+            .query_state_index_range("cfg", "/v", Some(2.0), Some(2.0), None, None, false)
+            .unwrap(),
+        vec![0],
+        "new value must be found immediately after a Delta replace, live, no reopen"
+    );
+}
+
+// --- Regression: an index untouched except by a DeltaSnapshot must survive
+// reopen (prune_stale must not treat it as stale) ---
+
+#[test]
+fn test_field_index_survives_reopen_after_delta_snapshot_only() {
+    let dir = TempDir::new().unwrap();
+    let config = StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: true,
+    };
+
+    {
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "messages".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 4,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+
+        for i in 0..4u32 {
+            store
+                .update_state(
+                    "messages",
+                    StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+                )
+                .unwrap();
+        }
+
+        // Confirm a delta snapshot actually fired — otherwise this test
+        // would pass vacuously without ever exercising the bug.
+        let stats = store.get_compaction_stats("messages").unwrap();
+        assert!(
+            stats.last_delta_snapshot_offset.is_some(),
+            "delta_snapshot_every=4 with 4 appends must have triggered a delta snapshot"
+        );
+
+        // Live, the index is already correct (this part worked before this
+        // round's fix too).
+        assert_eq!(
+            store
+                .query_state_index_range("messages", "/v", None, None, None, None, false)
+                .unwrap(),
+            vec![0, 1, 2, 3]
+        );
+
+        store.sync().unwrap();
+    }
+
+    // Reopen with NO further mutation on either branch. Before this fix,
+    // the DeltaSnapshot's no-op (correctly not touching by_ordinal/reverse
+    // index) ALSO left the index's tracked head_offset behind the real
+    // chain's current head (now the DeltaSnapshot record) — so
+    // `prune_stale`, run on this very reopen, would wrongly discard an
+    // otherwise 100% correct index.
+    let store = Store::open(config).unwrap();
+    let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
+    assert_eq!(
+        result,
+        Some(vec![0, 1, 2, 3]),
+        "an index that's still correct must survive reopen even though a DeltaSnapshot \
+         (which doesn't change indexed content) happened after its last content-changing update"
+    );
+}
+
+// --- Regression: idempotent re-registration must not re-materialize the
+// whole slot ---
+
+#[test]
+fn test_register_field_index_idempotent_reregistration_skips_materialization() {
+    // Proves the freshness check runs BEFORE `get_state`/JSON-parsing the
+    // slot, not after: times a batch of no-op re-registrations against a
+    // large slot and asserts they stay cheap. If the freshness check ran
+    // after materialization (the pre-fix ordering), each of these would
+    // pay for a full chain reconstruction + JSON parse of the whole slot —
+    // the reviewer measured ~110ms for a single such call on a 20k-item/
+    // ~21MB slot. The threshold below is deliberately generous (a small
+    // constant total for 50 calls) so it fails hard on a regression to that
+    // behavior while staying robust to normal CI timing noise.
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 1_000_000,
+                full_snapshot_every: 1_000_000,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    let n = 20_000usize;
+    for i in 0..n {
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&json!({"v": i})).unwrap()),
+            )
+            .unwrap();
+    }
+
+    // First registration: cold, legitimately pays full materialization cost.
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), n);
+
+    // 50 idempotent re-registrations, all against the SAME head_offset —
+    // every one of them should be a no-op that never touches the slot.
+    let start = std::time::Instant::now();
+    for _ in 0..50 {
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "50 idempotent re-registrations against a {}-item slot took {:?} — the freshness \
+         check must short-circuit before materializing/parsing the slot; this looks like \
+         the pre-fix behavior of paying full materialization cost on every no-op call",
+        n,
+        elapsed
+    );
+}
