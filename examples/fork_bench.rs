@@ -19,6 +19,8 @@
 //!     past; plus the first read on such a branch;
 //!   - resident memory growth per additional child, after the child has read
 //!     the state and again after it has appended to it (10 children);
+//!   - registering a field index on the big state: on the parent, on a child
+//!     that has not written (copies the parent's), on one that has;
 //!   - how many times anything was rebuilt from the log along the way.
 //!
 //! Two layouts of the big state are measured, because the first write after
@@ -302,6 +304,25 @@ fn measure(path: &Path, n: usize, layout: &str) {
     store.compact_state("messages").unwrap();
     let (_, hist_past_snapshot) = time(|| store.create_branch_at_with_states("hist-s-sel", "main", changed_at, &sel).unwrap());
     println!("historical fork, a full snapshot SINCE the point ..... {} (selective)", us(hist_past_snapshot));
+
+    // --- field indexes are per branch --------------------------------------
+    use chronicle::FieldIndexKind;
+    let rss = rss_kb();
+    let (_, parent_index) = time(|| store.register_state_field_index("messages", "/timestamp", FieldIndexKind::Number).unwrap());
+    let rss_parent_index = rss_kb();
+    let fresh = store.create_branch_with_states("idx-fresh", Some("main"), &sel).unwrap().id;
+    let (_, sibling_index) = time(|| store.register_state_field_index_on(fresh, "messages", "/timestamp", FieldIndexKind::Number).unwrap());
+    let rss_sibling_index = rss_kb();
+    let written = store.create_branch_with_states("idx-written", Some("main"), &sel).unwrap().id;
+    append_one(&store, written, n + 9000);
+    let (_, own_index) = time(|| store.register_state_field_index_on(written, "messages", "/timestamp", FieldIndexKind::Number).unwrap());
+    let rss_own_index = rss_kb();
+    println!("field index on the big state: parent builds .......... {} (resident {:+.1} MB)",
+        us(parent_index), (rss_parent_index as f64 - rss as f64) / 1024.0);
+    println!("  child registers before writing (copies parent's) ... {} (resident {:+.1} MB)",
+        us(sibling_index), (rss_sibling_index as f64 - rss_parent_index as f64) / 1024.0);
+    println!("  child registers after writing (builds its own) ..... {} (resident {:+.1} MB)",
+        us(own_index), (rss_own_index as f64 - rss_sibling_index as f64) / 1024.0);
 
     let (_, synced) = time(|| store.sync().unwrap());
     println!("sync ................................................. {}", us(synced));
