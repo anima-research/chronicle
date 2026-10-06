@@ -306,6 +306,12 @@ pub struct StateManager {
     /// as a sibling of `path` (`state.bin` -> `state-indexes.bin`).
     field_index_path: PathBuf,
 
+    /// Branches that were deleted since the last `purge_retired_branches`.
+    /// Their chain heads stay in `index` (and so in the next `state.bin`)
+    /// until the store has durably recorded the deletion — see
+    /// `retire_branch`.
+    retired_branches: parking_lot::Mutex<Vec<BranchId>>,
+
     /// Number of times a state value was rebuilt from the log
     /// (`reconstruct_from_disk`). Everything served from a cache — this
     /// branch's own entry or one shared with another branch — leaves it
@@ -343,6 +349,7 @@ impl StateManager {
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            retired_branches: parking_lot::Mutex::new(Vec::new()),
             reconstructions: AtomicU64::new(0),
         })
     }
@@ -372,6 +379,7 @@ impl StateManager {
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            retired_branches: parking_lot::Mutex::new(Vec::new()),
             reconstructions: AtomicU64::new(0),
         };
 
@@ -1499,13 +1507,49 @@ impl StateManager {
         self.cache.read().len()
     }
 
-    /// Drop every cached value held for `branch_id`. Values other branches
-    /// still reference stay alive for them.
-    pub fn drop_branch_caches(&self, branch_id: BranchId) {
+    /// Release what is held for a branch that has just been deleted.
+    ///
+    /// Derived data goes at once: the branch's cache entries (values other
+    /// branches still reference stay alive for them) and its field indexes.
+    ///
+    /// Its chain heads are only MARKED here and removed by
+    /// `purge_retired_branches`, which the store calls after it has saved
+    /// the branch list. `state.bin` and `branches.bin` are separate files
+    /// written one after the other; if the heads left `state.bin` first, a
+    /// crash between the two writes would bring the branch back (still
+    /// listed in `branches.bin`) with every state empty. Keeping them until
+    /// the deletion itself is durable means a crash can only bring the
+    /// branch back whole, or leave unreferenced heads behind — never a
+    /// branch stripped of its state.
+    pub fn retire_branch(&self, branch_id: BranchId) {
         let prefix = format!("{}:", branch_id.0);
         self.cache.write().pop_prefix(&prefix);
         self.items_cache.write().pop_prefix(&prefix);
         self.tree_cache.write().pop_prefix(&prefix);
+        self.field_indexes.write().drop_branch(branch_id);
+        self.retired_branches.lock().push(branch_id);
+    }
+
+    /// Remove the chain heads of every branch retired so far. Call only
+    /// once the deletion of those branches has been durably saved. Returns
+    /// the number of heads removed. The next `save` writes a `state.bin`
+    /// without them.
+    pub fn purge_retired_branches(&self) -> usize {
+        let retired: Vec<BranchId> = std::mem::take(&mut *self.retired_branches.lock());
+        if retired.is_empty() {
+            return 0;
+        }
+        let mut index = self.index.write();
+        retired
+            .into_iter()
+            .filter_map(|branch_id| index.heads.remove_branch(branch_id))
+            .map(|heads| heads.len())
+            .sum()
+    }
+
+    /// Total number of chain heads held, across all branches.
+    pub fn head_count(&self) -> usize {
+        self.index.read().heads.len()
     }
 
     /// Get compaction statistics for a state.

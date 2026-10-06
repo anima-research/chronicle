@@ -2282,8 +2282,22 @@ impl Store {
     }
 
     /// Delete a branch.
+    ///
+    /// Besides removing the branch, this releases what the store held for
+    /// it: its cached state values and field indexes immediately, and its
+    /// chain heads once the deletion has been saved (the next `sync`), so
+    /// neither memory nor `state.bin` keeps growing with branches that no
+    /// longer exist. Records the branch wrote stay in the append-only log.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
+        // Serialized with writes, so a write that has already resolved this
+        // branch finishes before the branch disappears under it.
+        let _lock = self.write_lock.lock();
+
+        let branch_id = self.branches.get_branch(name).map(|b| b.id);
         self.branches.delete_branch(name)?;
+        if let Some(branch_id) = branch_id {
+            self.state.retire_branch(branch_id);
+        }
 
         // Broadcast branch deleted
         self.subscriptions.broadcast_branch_deleted(name);
@@ -2316,6 +2330,10 @@ impl Store {
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
         self.branches.save()?;
+        // Deleted branches are now gone from branches.bin, so their chain
+        // heads can go too (see `StateManager::retire_branch` for why not
+        // before). They drop out of state.bin at the next sync.
+        self.state.purge_retired_branches();
         Ok(())
     }
 
@@ -3594,5 +3612,155 @@ mod tests {
             got.item_count = expected.item_count;
             assert_eq!(format!("{got:?}"), format!("{expected:?}"), "sequence {}", seq.0);
         }
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn register_log(store: &Store, id: &str) {
+        store
+            .register_state(crate::types::StateRegistration {
+                id: id.to_string(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 4,
+                    full_snapshot_every: 3,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+    }
+
+    /// Deleting a branch releases its chain heads, caches and field indexes,
+    /// so a store that forks and deletes many short-lived branches does not
+    /// accumulate them in memory or in state.bin.
+    #[test]
+    fn test_delete_branch_releases_its_state() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        for i in 0..6 {
+            let id = format!("s{i}");
+            register_log(&store, &id);
+            for n in 0..5 {
+                store
+                    .update_state(&id, StateOperation::Append(format!("{{\"n\":{n}}}").into_bytes()))
+                    .unwrap();
+            }
+        }
+        let baseline_heads = store.state.head_count();
+        assert_eq!(baseline_heads, 6);
+        store.sync().unwrap();
+        let state_bin = store.path().join("state.bin");
+        let indexes_bin = store.path().join("state-indexes.bin");
+        let baseline_size = fs::metadata(&state_bin).unwrap().len();
+        let baseline_indexes = fs::metadata(&indexes_bin).unwrap().len();
+
+        let mut ids = Vec::new();
+        for round in 0..20 {
+            let name = format!("child-{round}");
+            let child = store.create_branch(&name, None).unwrap().id;
+            store
+                .update_state_on(child, "s0", StateOperation::Append(b"{\"n\":99}".to_vec()))
+                .unwrap();
+            store
+                .register_state_field_index_on(child, "s0", "/n", crate::state::FieldIndexKind::Number)
+                .unwrap();
+            assert!(store.state_items_on(child, "s1").unwrap().is_some());
+            ids.push((name, child));
+        }
+        assert_eq!(store.state.head_count(), baseline_heads * 21);
+        store.sync().unwrap();
+        assert!(fs::metadata(&state_bin).unwrap().len() > baseline_size * 10);
+        assert!(fs::metadata(&indexes_bin).unwrap().len() > baseline_indexes + 20 * 20);
+
+        for (name, child) in &ids {
+            store.delete_branch(name).unwrap();
+            assert_eq!(
+                store.query_state_index_range_on(*child, "s0", "/n", None, None, None, None, false),
+                None
+            );
+        }
+        // The heads stay until the deletion has been saved...
+        assert_eq!(store.state.head_count(), baseline_heads * 21);
+        store.sync().unwrap();
+        assert_eq!(store.state.head_count(), baseline_heads);
+        // ...the field indexes (derived data) were dropped at once, so that
+        // same sync already wrote a file without them...
+        assert_eq!(fs::metadata(&indexes_bin).unwrap().len(), baseline_indexes);
+        // ...and state.bin is back to its size at the following sync.
+        store.sync().unwrap();
+        assert_eq!(fs::metadata(&state_bin).unwrap().len(), baseline_size);
+
+        // The parent is intact, in memory and after a reopen.
+        let expected = store.get_state("s0").unwrap().unwrap();
+        assert_eq!(store.get_state_len("s0").unwrap(), Some(5));
+        drop(store);
+        let store = Store::open(test_config(&dir)).unwrap();
+        assert_eq!(store.get_state("s0").unwrap().unwrap(), expected);
+        assert_eq!(store.state.head_count(), baseline_heads);
+        assert_eq!(store.list_branches().len(), 1);
+    }
+
+    /// state.bin and branches.bin are written one after the other. A crash
+    /// between the two writes of the sync that follows a delete must bring
+    /// the branch back whole — never listed but stripped of its state.
+    #[test]
+    fn test_crash_between_metadata_writes_after_delete_keeps_branch_whole() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        register_log(&store, "log");
+        for n in 0..7 {
+            store
+                .update_state("log", StateOperation::Append(format!("{n}").into_bytes()))
+                .unwrap();
+        }
+        let child = store.create_branch("child", None).unwrap().id;
+        for n in 100..103 {
+            store
+                .update_state_on(child, "log", StateOperation::Append(format!("{n}").into_bytes()))
+                .unwrap();
+        }
+        store.sync().unwrap();
+        let child_value = store.get_state_on(child, "log").unwrap().unwrap();
+
+        store.delete_branch("child").unwrap();
+
+        // The first half of the next sync: the log and state.bin are
+        // written, branches.bin is not yet. Freeze the files as a crash at
+        // this point would leave them.
+        store.log.sync().unwrap();
+        store.state.save().unwrap();
+        let crashed = dir.path().join("crashed");
+        copy_dir(store.path(), &crashed);
+
+        let recovered = Store::open(StoreConfig {
+            path: crashed,
+            blob_cache_size: 100,
+            create_if_missing: false,
+        })
+        .unwrap();
+        let back = recovered.get_branch("child").expect("branches.bin still lists the branch");
+        assert_eq!(back.id, child);
+        assert_eq!(
+            recovered.get_state_on(back.id, "log").unwrap().unwrap(),
+            child_value,
+            "a branch that survives the crash must still have its state"
+        );
+
+        // Without the crash the sync completes and the branch is gone for good.
+        store.sync().unwrap();
+        drop(store);
+        let store = Store::open(test_config(&dir)).unwrap();
+        assert!(store.get_branch("child").is_none());
+        assert_eq!(store.get_state_len("log").unwrap(), Some(7));
     }
 }
