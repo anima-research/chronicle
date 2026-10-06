@@ -8,9 +8,15 @@
   log offsets; applies when the sequence is one the parent branch itself
   wrote, and not to tree states, whose historical entry count stays exact).
   For an append-log state copied this way `getStateLen` is the parent's
-  running count, exactly as `createBranch` gives it. States that did change
-  still walk back to their last full snapshot — that cost is proportional to
-  the state's size, not to the store's.
+  running count, exactly as `createBranch` gives it. An append-log state
+  that did change is walked back only as far as the parent's last full
+  snapshot, which is no longer read when it predates the branch point (its
+  position and length are already on the parent's chain head), so the cost
+  is the number of records written to that state since the snapshot. The
+  walk still reads a full snapshot — cost proportional to the state's size —
+  when the parent took one after the branch point, when the sequence is one
+  the parent inherited rather than wrote, for tree states, and for parent
+  heads written before 0.4.0 recorded the snapshot's length.
 - `createBranch` / `createBranchAt` now hold the store's write lock while
   they capture the branch point and the chain heads, so the two always
   describe the same instant. `createBranchAt` validates the branch name and

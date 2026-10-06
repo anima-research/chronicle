@@ -16,4 +16,6 @@ pub use manager::{
     StateManager, StateSelection,
 };
 pub use operations::{apply_operation, materialize_operations};
-pub(crate) use operations::{array_len_after, materialize_operations_tagged, snapshot_item_count};
+pub(crate) use operations::{
+    array_len_after, array_len_from, materialize_operations_tagged, snapshot_item_count,
+};

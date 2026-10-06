@@ -236,11 +236,17 @@ pub(crate) fn snapshot_item_count(data: &[u8]) -> usize {
 /// the end). Callers then fall back to real materialization, which either
 /// yields the count or surfaces the same error it always did.
 pub(crate) fn array_len_after(ops: &[StateOperation]) -> Option<usize> {
+    array_len_from(0, ops)
+}
+
+/// `array_len_after` for ops applied on top of an array already holding
+/// `base` items (a full snapshot whose length is known without its bytes).
+pub(crate) fn array_len_from(base: usize, ops: &[StateOperation]) -> Option<usize> {
     fn is_json(bytes: &[u8]) -> bool {
         serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok()
     }
 
-    let mut len = 0usize;
+    let mut len = base;
     for op in ops {
         match op {
             StateOperation::Set(value) | StateOperation::Snapshot(value) => {

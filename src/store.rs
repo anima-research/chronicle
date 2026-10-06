@@ -860,11 +860,23 @@ impl Store {
     /// states are written by `Set` alone and never schedule a snapshot, so
     /// for them the walk stops at the first `Set` as before — their
     /// accounting fields are reporting-only and cover just the ops seen.
+    ///
+    /// `known_full` lets the walk stop WITHOUT reading the full snapshot it
+    /// ends at: `(offset, item_count)` of a full snapshot the caller knows
+    /// lies on this chain at or before `at_sequence`, and how many items it
+    /// holds (the parent head's `last_full_snapshot_offset` and
+    /// `item_count_at_last_full`). A full snapshot record carries the whole
+    /// state, so reading it is what makes a historical fork cost in
+    /// proportion to the state's size; with it known, the walk reads only
+    /// the records written since. Applies to array-shaped states, whose
+    /// item count follows from lengths; if the count cannot be decided that
+    /// way the walk is redone in full.
     fn find_chain_head_at(
         &self,
         branch_id: crate::types::BranchId,
         state_id: &str,
         at_sequence: Sequence,
+        known_full: Option<(u64, usize)>,
     ) -> Result<Option<crate::state::StateChainHead>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
@@ -886,6 +898,9 @@ impl Store {
         let mut operations = Vec::new();
         let mut hit_snapshot = false;
         let mut value_complete = false;
+        // Length of the array the collected operations apply on top of, when
+        // the value's base is a known full snapshot that was not read.
+        let mut known_base_len: Option<usize> = None;
 
         // Snapshot accounting, gathered newest-to-oldest.
         let mut ops_since_delta_snapshot = 0u64;
@@ -896,6 +911,21 @@ impl Store {
         let mut has_non_append_since_snapshot = false;
 
         while let Some(offset) = current_offset {
+            if let Some((full_offset, full_len)) = known_full {
+                if offset == full_offset {
+                    // A full snapshot at or before the target, of known
+                    // length: everything the walk needs from it.
+                    if found_offset.is_none() {
+                        found_offset = Some(offset);
+                    }
+                    last_full_snapshot = Some((offset, full_len));
+                    if !value_complete {
+                        known_base_len = Some(full_len);
+                    }
+                    break;
+                }
+            }
+
             let record = self.log.read_at(offset)?;
 
             let update = StateUpdateRecord::decode(&record)?;
@@ -985,10 +1015,18 @@ impl Store {
         let counted = if is_tree {
             None
         } else {
-            crate::state::array_len_after(&operations)
+            match known_base_len {
+                Some(base) => crate::state::array_len_from(base, &operations),
+                None => crate::state::array_len_after(&operations),
+            }
         };
         let item_count = match counted {
             Some(n) => n,
+            None if known_full.is_some() => {
+                // Not decidable from lengths: redo the walk reading the
+                // snapshot, so the value can be materialized.
+                return self.find_chain_head_at(branch_id, state_id, at_sequence, None);
+            }
             None => {
                 let state = crate::state::materialize_operations(operations)?;
                 if state.is_empty() {
@@ -2236,15 +2274,35 @@ impl Store {
         // cannot leave a half-populated branch behind.
         let mut heads = Vec::new();
         for (state_id, parent_head) in self.state.selected_heads(parent.id, selection) {
-            let is_tree = matches!(
-                self.state.get_strategy(&state_id),
-                Some(crate::types::StateStrategy::Tree { .. })
-            );
+            let strategy = self.state.get_strategy(&state_id);
+            let is_tree = matches!(strategy, Some(crate::types::StateStrategy::Tree { .. }));
             let head = match at_offset {
                 Some(offset) if !is_tree && parent_head.head_offset <= offset => {
                     Some(parent_head)
                 }
-                _ => self.find_chain_head_at(parent.id, &state_id, at)?,
+                _ => {
+                    // The parent's last full snapshot, if it predates the
+                    // branch point and its length is on record, bounds the
+                    // walk without being read. `item_count_at_last_full` is
+                    // 0 on heads written before that field existed (and on
+                    // an empty snapshot, which costs nothing to read), so 0
+                    // means "not on record".
+                    let known_full = match (
+                        at_offset,
+                        parent_head.last_full_snapshot_offset,
+                        &strategy,
+                    ) {
+                        (
+                            Some(at_offset),
+                            Some(full_offset),
+                            Some(crate::types::StateStrategy::AppendLog { .. }),
+                        ) if full_offset <= at_offset && parent_head.item_count_at_last_full > 0 => {
+                            Some((full_offset, parent_head.item_count_at_last_full))
+                        }
+                        _ => None,
+                    };
+                    self.find_chain_head_at(parent.id, &state_id, at, known_full)?
+                }
             };
             if let Some(head) = head {
                 heads.push((state_id, head));
@@ -3762,5 +3820,54 @@ mod tests {
         let store = Store::open(test_config(&dir)).unwrap();
         assert!(store.get_branch("child").is_none());
         assert_eq!(store.get_state_len("log").unwrap(), Some(7));
+    }
+
+    /// A parent head written before `item_count_at_last_full` existed has 0
+    /// there. The historical fork must not take that for the length of the
+    /// parent's last full snapshot.
+    #[test]
+    fn test_create_branch_at_with_legacy_parent_head_counts_items() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        register_log(&store, "log");
+        for n in 0..9 {
+            store
+                .update_state("log", StateOperation::Append(format!("{n}").into_bytes()))
+                .unwrap();
+        }
+        store.compact_state("log").unwrap();
+        for n in 9..12 {
+            store
+                .update_state("log", StateOperation::Append(format!("{n}").into_bytes()))
+                .unwrap();
+        }
+        let at = store.current_branch().head;
+        store
+            .update_state("log", StateOperation::Append(b"12".to_vec()))
+            .unwrap();
+
+        let main = store.current_branch().id;
+        let mut legacy = store.state.get_head(main, "log").unwrap();
+        assert_eq!(legacy.item_count_at_last_full, 9);
+        assert!(legacy.last_full_snapshot_offset.is_some());
+
+        // With the length on record the snapshot is not needed...
+        let modern = store.create_branch_at("modern", "main", at).unwrap();
+        assert_eq!(store.get_state_len_on(modern.id, "log").unwrap(), Some(12));
+
+        // ...and without it the walk reads the snapshot and still counts right.
+        legacy.item_count_at_last_full = 0;
+        store.state.insert_head_for_branch(main, "log", legacy);
+        let from_legacy = store.create_branch_at("from-legacy", "main", at).unwrap();
+        assert_eq!(store.get_state_len_on(from_legacy.id, "log").unwrap(), Some(12));
+        assert_eq!(
+            store.state.get_head(from_legacy.id, "log").unwrap().item_count_at_last_full,
+            9
+        );
+        for branch in [modern.id, from_legacy.id] {
+            let items: Vec<u64> =
+                serde_json::from_slice(&store.get_state_on(branch, "log").unwrap().unwrap()).unwrap();
+            assert_eq!(items, (0..12).collect::<Vec<u64>>());
+        }
     }
 }
