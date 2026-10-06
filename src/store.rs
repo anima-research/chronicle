@@ -691,27 +691,73 @@ impl Store {
         Ok(Some(state))
     }
 
-    /// Find the chain head info (offset and item count) at a historical sequence.
+    /// Rebuild the chain head a state had on `branch_id` at a historical
+    /// sequence: the offset of the last update at or before `at_sequence`,
+    /// plus the item count and snapshot accounting the chain carried there.
     ///
-    /// Used by `create_branch_at` to point a new branch at an existing chain position
-    /// without writing new records. Returns `(head_offset, item_count)` or None if
-    /// no state existed at that sequence.
-    fn find_chain_info_at(
+    /// Used by `create_branch_at` to point a new branch at an existing chain
+    /// position without writing new records. Returns `None` if the state had
+    /// no update at or before that sequence.
+    ///
+    /// The accounting is derived from the walk itself and mirrors what
+    /// `StateManager::record_update` accumulates going forward, so a branch
+    /// created at a historical point schedules its next snapshot exactly as
+    /// the parent did when it stood there (and exactly as an ordinary
+    /// `create_branch` taken at that moment would have). A full `Snapshot`
+    /// resets every accounting field, so walking back to the newest one (or
+    /// to the start of the chain) is enough to reproduce them all:
+    ///
+    /// - `ops_since_delta_snapshot`: ops newer than the newest snapshot of
+    ///   either kind;
+    /// - `delta_snapshots_since_full` / `last_delta_snapshot_offset`: delta
+    ///   snapshots newer than the newest full one;
+    /// - `has_non_append_since_snapshot`: any Edit/Redact/Set newer than the
+    ///   newest full snapshot. This is the field that guards correctness —
+    ///   while it is set no append-only delta snapshot may be taken;
+    /// - `last_full_snapshot_offset` / `item_count_at_last_full`: that newest
+    ///   full snapshot and the number of items it holds.
+    ///
+    /// A `Set` ends the walk for the VALUE (it replaces the state) but not
+    /// for the accounting (`record_update` counts it as an ordinary
+    /// non-append op), so for strategies that schedule snapshots the walk
+    /// continues past it to the previous full snapshot. `Snapshot`-strategy
+    /// states are written by `Set` alone and never schedule a snapshot, so
+    /// for them the walk stops at the first `Set` as before — their
+    /// accounting fields are reporting-only and cover just the ops seen.
+    fn find_chain_head_at(
         &self,
         branch_id: crate::types::BranchId,
         state_id: &str,
         at_sequence: Sequence,
-    ) -> Result<Option<(u64, usize)>> {
+    ) -> Result<Option<crate::state::StateChainHead>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
         };
 
+        let strategy = self.state.get_strategy(state_id);
+        let schedules_snapshots = !matches!(
+            strategy,
+            None | Some(crate::types::StateStrategy::Snapshot)
+        );
+
         // Walk chain to find the last update at or before target sequence
         let mut current_offset = Some(head.head_offset);
         let mut found_offset: Option<u64> = None;
+
+        // Value reconstruction (same collection rule as reconstruct_from_disk),
+        // used only to count items.
         let mut operations = Vec::new();
         let mut hit_snapshot = false;
+        let mut value_complete = false;
+
+        // Snapshot accounting, gathered newest-to-oldest.
+        let mut ops_since_delta_snapshot = 0u64;
+        let mut seen_snapshot = false;
+        let mut delta_snapshots_since_full = 0u64;
+        let mut last_delta_snapshot_offset: Option<u64> = None;
+        let mut last_full_snapshot: Option<(u64, usize)> = None;
+        let mut has_non_append_since_snapshot = false;
 
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
@@ -729,25 +775,60 @@ impl Store {
                 found_offset = Some(offset);
             }
 
-            // Collect operations to compute item_count
+            let is_full_snapshot = matches!(update.operation, StateOperation::Snapshot(_));
+
+            // Accounting.
             match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Full-state terminal (Set replaces state exactly like
-                    // Snapshot in materialize_operations); stop the walk. Not
-                    // treating Set as terminal here made Snapshot-strategy
-                    // reconstruction O(full chain). Mirrors get_state_tail.
-                    operations.push(update.operation.clone());
-                    break;
+                StateOperation::Snapshot(data) => {
+                    last_full_snapshot =
+                        Some((offset, crate::state::snapshot_item_count(data)));
                 }
                 StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
+                    if last_delta_snapshot_offset.is_none() {
+                        last_delta_snapshot_offset = Some(offset);
+                    }
+                    delta_snapshots_since_full += 1;
+                    seen_snapshot = true;
                 }
-                _ => {
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
+                other => {
+                    if !seen_snapshot {
+                        ops_since_delta_snapshot += 1;
+                    }
+                    if matches!(
+                        other,
+                        StateOperation::Edit { .. }
+                            | StateOperation::Redact { .. }
+                            | StateOperation::Set(_)
+                    ) {
+                        has_non_append_since_snapshot = true;
                     }
                 }
+            }
+
+            // Collect operations to compute item_count
+            if !value_complete {
+                match &update.operation {
+                    StateOperation::Snapshot(_) | StateOperation::Set(_) => {
+                        // Full-state terminal (Set replaces state exactly like
+                        // Snapshot in materialize_operations); nothing older
+                        // contributes to the value.
+                        operations.push(update.operation.clone());
+                        value_complete = true;
+                    }
+                    StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
+                        operations.push(update.operation.clone());
+                        hit_snapshot = true;
+                    }
+                    _ => {
+                        if !hit_snapshot {
+                            operations.push(update.operation.clone());
+                        }
+                    }
+                }
+            }
+
+            if is_full_snapshot || (value_complete && !schedules_snapshots) {
+                break;
             }
 
             current_offset = update.prev_update_offset;
@@ -758,21 +839,29 @@ impl Store {
             None => return Ok(None), // No state at that sequence
         };
 
-        // Reconstruct state to count items (single materialization pass)
         operations.reverse();
-        let state = crate::state::materialize_operations(operations)?;
+        let is_tree = matches!(strategy, Some(crate::types::StateStrategy::Tree { .. }));
 
-        // Count items in the resulting state using strategy-aware parsing
-        let item_count = if state.is_empty() {
-            0
+        // Count items in the resulting state. Array-shaped states are counted
+        // from lengths alone; anything that cannot be decided that way (tree
+        // states, non-array values, ops materialization would reject) takes
+        // the materializing path, which also surfaces any chain error.
+        let counted = if is_tree {
+            None
         } else {
-            match self.state.get_strategy(state_id) {
-                Some(crate::types::StateStrategy::Tree { .. }) => {
+            crate::state::array_len_after(&operations)
+        };
+        let item_count = match counted {
+            Some(n) => n,
+            None => {
+                let state = crate::state::materialize_operations(operations)?;
+                if state.is_empty() {
+                    0
+                } else if is_tree {
                     serde_json::from_slice::<TreeState>(&state)
                         .map(|t| t.len())
                         .unwrap_or(0)
-                }
-                _ => {
+                } else {
                     serde_json::from_slice::<Vec<serde_json::Value>>(&state)
                         .map(|arr| arr.len())
                         .unwrap_or(0)
@@ -780,7 +869,16 @@ impl Store {
             }
         };
 
-        Ok(Some((head_offset, item_count)))
+        Ok(Some(crate::state::StateChainHead {
+            head_offset,
+            ops_since_delta_snapshot,
+            delta_snapshots_since_full,
+            last_delta_snapshot_offset,
+            last_full_snapshot_offset: last_full_snapshot.map(|(offset, _)| offset),
+            has_non_append_since_snapshot,
+            item_count,
+            item_count_at_last_full: last_full_snapshot.map(|(_, n)| n).unwrap_or(0),
+        }))
     }
 
     /// Get the length of an AppendLog state without loading all items.
@@ -1666,11 +1764,9 @@ impl Store {
         // Point the new branch's state heads at the parent's chain at the branch point.
         // No new records are written - the branch shares the existing chain up to this point.
         for state_id in self.state.state_ids() {
-            if let Some((head_offset, item_count)) =
-                self.find_chain_info_at(parent.id, &state_id, at)?
-            {
+            if let Some(head) = self.find_chain_head_at(parent.id, &state_id, at)? {
                 self.state
-                    .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+                    .insert_head_for_branch(new_branch.id, &state_id, head);
             }
         }
 
@@ -2853,5 +2949,137 @@ mod tests {
         // No more events
         let result = handle.recv_timeout(Duration::from_millis(50));
         assert!(result.is_err());
+    }
+    /// A head rebuilt by `create_branch_at` must equal the head the parent
+    /// carried when it stood at that sequence — every accounting field, not
+    /// just the offset. Recorded live after each write and compared against a
+    /// historical branch created afterwards at the same sequence.
+    #[test]
+    fn test_create_branch_at_reproduces_parent_head() {
+        use crate::types::{StateRegistration, StateStrategy};
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "log".to_string(),
+                // Floor of 3 * 4 = 12 ops between fulls: the script below
+                // crosses delta and full boundaries several times.
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 3,
+                    full_snapshot_every: 4,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        let mut script: Vec<StateOperation> = Vec::new();
+        for i in 0..10 {
+            script.push(StateOperation::Append(format!("{i}").into_bytes()));
+        }
+        script.push(StateOperation::Edit { index: 2, new_value: b"\"edited\"".to_vec() });
+        for i in 10..14 {
+            script.push(StateOperation::Append(format!("{i}").into_bytes()));
+        }
+        script.push(StateOperation::Redact { start: 0, end: 2 });
+        for i in 14..30 {
+            script.push(StateOperation::Append(format!("{i}").into_bytes()));
+        }
+        script.push(StateOperation::Set(b"[100,101,102]".to_vec()));
+        for i in 30..36 {
+            script.push(StateOperation::Append(format!("{i}").into_bytes()));
+        }
+        script.push(StateOperation::Edit { index: 1, new_value: b"\"again\"".to_vec() });
+        for i in 36..60 {
+            script.push(StateOperation::Append(format!("{i}").into_bytes()));
+        }
+
+        let main = store.current_branch().id;
+        let mut history = Vec::new();
+        let mut kinds_seen = (false, false, false); // (delta, full, flag set)
+        for op in script {
+            store.update_state("log", op).unwrap();
+            let head = store.state.get_head(main, "log").unwrap();
+            kinds_seen.0 |= head.last_delta_snapshot_offset.is_some();
+            kinds_seen.1 |= head.last_full_snapshot_offset.is_some();
+            kinds_seen.2 |= head.has_non_append_since_snapshot;
+            history.push((store.current_branch().head, head));
+        }
+        assert_eq!(
+            kinds_seen,
+            (true, true, true),
+            "script must exercise delta snapshots, full snapshots and the non-append flag"
+        );
+
+        for (i, (seq, expected)) in history.iter().enumerate() {
+            let name = format!("at-{i}");
+            let branch = store.create_branch_at(&name, "main", *seq).unwrap();
+            let got = store.state.get_head(branch.id, "log").unwrap();
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{expected:?}"),
+                "historical head at sequence {} differs from the parent's head then",
+                seq.0
+            );
+        }
+
+        // Branching at the head is the same as an ordinary fork.
+        let seq = store.current_branch().head;
+        let at_head = store.create_branch_at("at-head", "main", seq).unwrap();
+        let forked = store.create_branch("forked", None).unwrap();
+        assert_eq!(
+            format!("{:?}", store.state.get_head(at_head.id, "log").unwrap()),
+            format!("{:?}", store.state.get_head(forked.id, "log").unwrap()),
+        );
+    }
+
+    /// Same property for Tree states. `item_count` is excluded: the live head
+    /// carries the documented upper-bound estimate (overwrites count as
+    /// inserts) while the historical head counts the real entries.
+    #[test]
+    fn test_create_branch_at_reproduces_tree_accounting() {
+        use crate::types::{StateRegistration, StateStrategy};
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "tree".to_string(),
+                strategy: StateStrategy::Tree {
+                    delta_snapshot_every: 3,
+                    full_snapshot_every: 3,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        let entry = |n: u64| TreeEntry { blob_hash: format!("h{n}"), size: n, mode: 0o644 };
+        let main = store.current_branch().id;
+        let mut history = Vec::new();
+        for i in 0..25u64 {
+            if i % 7 == 6 {
+                store.tree_remove("tree", &format!("f{}", i - 1)).unwrap();
+            } else {
+                // Every third write overwrites an existing path.
+                let path = if i % 3 == 2 { format!("f{}", i - 1) } else { format!("f{i}") };
+                store.tree_set("tree", &path, &entry(i)).unwrap();
+            }
+            history.push((store.current_branch().head, store.state.get_head(main, "tree").unwrap()));
+        }
+        assert!(history.iter().any(|(_, h)| h.last_full_snapshot_offset.is_some()));
+        assert!(history.iter().any(|(_, h)| h.delta_snapshots_since_full > 0));
+
+        for (i, (seq, expected)) in history.iter().enumerate() {
+            let branch = store.create_branch_at(&format!("at-{i}"), "main", *seq).unwrap();
+            let mut got = store.state.get_head(branch.id, "tree").unwrap();
+            let actual_len = store
+                .get_state_at_for_branch(main, "tree", *seq)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice::<TreeState>(&bytes).unwrap().len())
+                .unwrap();
+            assert_eq!(got.item_count, actual_len, "historical tree count is exact");
+            got.item_count = expected.item_count;
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"), "sequence {}", seq.0);
+        }
     }
 }

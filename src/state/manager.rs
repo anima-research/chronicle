@@ -999,36 +999,21 @@ impl StateManager {
         }
     }
 
-    /// Set a state chain head for a branch at a specific offset.
+    /// Install a complete chain head for a branch.
     ///
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
-    pub fn set_head_for_branch(
-        &self,
-        branch_id: BranchId,
-        state_id: &str,
-        head_offset: u64,
-        item_count: usize,
-    ) {
-        let mut index = self.index.write();
-
-        let head = StateChainHead {
-            head_offset,
-            // Fresh snapshot accounting - the branch starts its own tracking
-            ops_since_delta_snapshot: 0,
-            delta_snapshots_since_full: 0,
-            last_delta_snapshot_offset: None,
-            last_full_snapshot_offset: None,
-            has_non_append_since_snapshot: false,
-            item_count,
-            // No record is written here — this head aliases into the parent's
-            // chain. The branch starts at size N with the parent's snapshots
-            // behind it; treating N as the spacing baseline keeps the doubling
-            // schedule (the branch's first full fires once it has grown by N).
-            item_count_at_last_full: item_count,
-        };
-
-        index.heads.insert((branch_id, state_id.to_string()), head);
+    /// The caller supplies the whole head — including the snapshot accounting
+    /// the chain had at that position — because the accounting decides which
+    /// kind of snapshot the branch may take next: starting a branch with
+    /// "no non-append ops since the last snapshot" while its inherited chain
+    /// holds an uncovered Edit/Redact/Set lets an append-only delta snapshot
+    /// walk past that mutation and lose it.
+    pub fn insert_head_for_branch(&self, branch_id: BranchId, state_id: &str, head: StateChainHead) {
+        self.index
+            .write()
+            .heads
+            .insert((branch_id, state_id.to_string()), head);
     }
 
     /// Register (or refresh) a secondary index on a JSON field of every item

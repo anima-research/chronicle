@@ -155,6 +155,113 @@ pub fn materialize_operations(ops: Vec<StateOperation>) -> Result<Vec<u8>> {
     acc.into_bytes()
 }
 
+/// Number of top-level elements of a JSON array or entries of a JSON object,
+/// counted without building a `Value` tree. `is_array` reports which it was.
+struct TopLevelLen {
+    len: usize,
+    is_array: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for TopLevelLen {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+        struct LenVisitor;
+
+        impl<'de> Visitor<'de> for LenVisitor {
+            type Value = TopLevelLen;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON array or object")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<TopLevelLen, A::Error> {
+                let mut len = 0;
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    len += 1;
+                }
+                Ok(TopLevelLen { len, is_array: true })
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<TopLevelLen, A::Error> {
+                let mut len = 0;
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                    len += 1;
+                }
+                Ok(TopLevelLen { len, is_array: false })
+            }
+        }
+
+        deserializer.deserialize_any(LenVisitor)
+    }
+}
+
+/// Length of a JSON array given as bytes, or `None` if `data` is not a
+/// well-formed JSON array. A boundary scan only: no `Value` tree is built, so
+/// counting a large snapshot costs a pass over its bytes and no allocation.
+pub(crate) fn json_array_len(data: &[u8]) -> Option<usize> {
+    match serde_json::from_slice::<TopLevelLen>(data) {
+        Ok(t) if t.is_array => Some(t.len),
+        _ => None,
+    }
+}
+
+/// The item count a full `Snapshot` stamps on a chain head: array elements
+/// for array-shaped states, entries for map-shaped ones, 0 for anything else.
+/// Same result as the `Value`-based count in `StateManager::record_update`
+/// for every payload this store writes, without building the tree.
+pub(crate) fn snapshot_item_count(data: &[u8]) -> usize {
+    serde_json::from_slice::<TopLevelLen>(data)
+        .map(|t| t.len)
+        .unwrap_or(0)
+}
+
+/// Item count of the array-shaped state that `materialize_operations(ops)`
+/// would produce, computed without materializing it.
+///
+/// Returns `None` whenever the count cannot be decided from lengths alone —
+/// a non-array base value, a tree or struct operation, or anything that
+/// `materialize_operations` would reject (an unparseable item, an Edit past
+/// the end). Callers then fall back to real materialization, which either
+/// yields the count or surfaces the same error it always did.
+pub(crate) fn array_len_after(ops: &[StateOperation]) -> Option<usize> {
+    fn is_json(bytes: &[u8]) -> bool {
+        serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok()
+    }
+
+    let mut len = 0usize;
+    for op in ops {
+        match op {
+            StateOperation::Set(value) | StateOperation::Snapshot(value) => {
+                len = json_array_len(value)?;
+            }
+            StateOperation::Append(item) => {
+                if !is_json(item) {
+                    return None;
+                }
+                len += 1;
+            }
+            StateOperation::DeltaSnapshot(items) => {
+                len += json_array_len(items)?;
+            }
+            StateOperation::Redact { start, end } => {
+                let start = (*start).min(len);
+                let end = (*end).min(len);
+                if start < end {
+                    len -= end - start;
+                }
+            }
+            StateOperation::Edit { index, new_value } => {
+                if *index >= len || !is_json(new_value) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(len)
+}
+
 /// Apply a state operation to a value.
 ///
 /// The value is expected to be JSON-encoded for structured operations.
@@ -573,5 +680,76 @@ mod tests {
 
         let arr: Vec<i32> = serde_json::from_slice(&state).unwrap();
         assert_eq!(arr, vec![1, 2, 3, 4, 5]);
+    }
+    /// `array_len_after` must agree with real materialization wherever it
+    /// answers, and decline (`None`) wherever materialization would not
+    /// produce a plain array.
+    #[test]
+    fn test_array_len_after_matches_materialization() {
+        let arr = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+        let cases: Vec<Vec<StateOperation>> = vec![
+            vec![],
+            vec![StateOperation::Append(b"1".to_vec()), StateOperation::Append(b"{\"a\":[1,2]}".to_vec())],
+            vec![
+                StateOperation::Snapshot(arr(json!([1, [2, 3], {"k": [4]}, "x,y"]))),
+                StateOperation::DeltaSnapshot(arr(json!([5, 6]))),
+                StateOperation::Append(b"7".to_vec()),
+                StateOperation::Edit { index: 0, new_value: b"9".to_vec() },
+                StateOperation::Redact { start: 1, end: 3 },
+                StateOperation::Redact { start: 50, end: 60 },
+                StateOperation::Redact { start: 3, end: 1 },
+            ],
+            vec![
+                StateOperation::Append(b"1".to_vec()),
+                StateOperation::Set(arr(json!(["a", "b"]))),
+                StateOperation::Append(b"2".to_vec()),
+            ],
+            vec![StateOperation::Set(arr(json!([])))],
+        ];
+        for ops in cases {
+            let expected: Vec<serde_json::Value> = {
+                let bytes = materialize_operations(ops.clone()).unwrap();
+                if bytes.is_empty() { vec![] } else { serde_json::from_slice(&bytes).unwrap() }
+            };
+            assert_eq!(array_len_after(&ops), Some(expected.len()), "{:?}", ops);
+        }
+
+        let declined: Vec<Vec<StateOperation>> = vec![
+            // Non-array base value.
+            vec![StateOperation::Set(arr(json!({"a": 1})))],
+            vec![StateOperation::Set(Vec::new())],
+            // Materialization rejects these; the caller must see that error.
+            vec![StateOperation::Append(b"not json".to_vec())],
+            vec![StateOperation::Append(b"1".to_vec()), StateOperation::Edit { index: 1, new_value: b"2".to_vec() }],
+            vec![StateOperation::Append(b"1".to_vec()), StateOperation::Edit { index: 0, new_value: b"{".to_vec() }],
+            // Tree ops are not length-decidable.
+            vec![StateOperation::TreeRemove { path: "a".to_string() }],
+        ];
+        for ops in declined {
+            assert_eq!(array_len_after(&ops), None, "{:?}", ops);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_item_count_matches_value_count() {
+        for payload in [
+            json!([]),
+            json!([1, 2, 3]),
+            json!({"a": {"x": 1}, "b": [1, 2]}),
+            json!("scalar"),
+            json!(7),
+        ] {
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let expected = match &payload {
+                serde_json::Value::Array(a) => a.len(),
+                serde_json::Value::Object(m) => m.len(),
+                _ => 0,
+            };
+            assert_eq!(snapshot_item_count(&bytes), expected, "{payload}");
+        }
+        assert_eq!(snapshot_item_count(b""), 0);
+        assert_eq!(snapshot_item_count(b"[1, 2"), 0);
+        assert_eq!(json_array_len(b"{\"a\":1}"), None);
+        assert_eq!(json_array_len(b"[1,2] trailing"), None);
     }
 }

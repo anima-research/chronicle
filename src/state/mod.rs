@@ -13,3 +13,4 @@ pub use manager::{
     ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
 };
 pub use operations::{apply_operation, materialize_operations};
+pub(crate) use operations::{array_len_after, snapshot_item_count};
