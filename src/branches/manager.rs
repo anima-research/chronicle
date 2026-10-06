@@ -273,6 +273,12 @@ impl BranchManager {
             .expect("Current branch should always exist")
     }
 
+    /// Id of the current branch (the store-wide cursor), without cloning the
+    /// branch record.
+    pub fn current_id(&self) -> BranchId {
+        *self.current.read()
+    }
+
     /// Switch to a different branch.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
         let index = self.index.read();

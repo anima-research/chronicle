@@ -7,7 +7,7 @@ use crate::records::{RecordIndex, RecordLog, RecoveryReport};
 use crate::state::{StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
-    Blob, Branch, Hash, Record, RecordId, RecordInput, Sequence,
+    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence,
     StateOperation, StateRegistration, StateUpdateRecord, StoreStats, Timestamp,
     TreeChange, TreeEntry, TreeOp, TreeState,
 };
@@ -261,11 +261,56 @@ impl Store {
 
     // --- Record Operations ---
 
+    // --- Branch targeting ---
+    //
+    // Every branch-dependent operation exists in two forms. `foo(..)` targets
+    // the store-wide cursor (`switch_branch` / `current_branch`) and is a
+    // one-line delegation to `foo_on(cursor, ..)`. `foo_on(branch_id, ..)`
+    // targets an explicitly chosen branch and never reads or moves the
+    // cursor, so any number of callers can work on different branches of the
+    // same open store at once — the basis of branch-bound handles ("views").
+    //
+    // One `_on` call resolves to ONE branch from start to finish: the write,
+    // the auto-snapshot that may follow it, delta computation, compaction,
+    // tree operations, field-index maintenance and every read inside it all
+    // receive the same `branch_id`. Nothing inside re-reads the cursor.
+    //
+    // A `branch_id` whose branch has been deleted is an error
+    // (`BranchNotFound`), or `None`/`false` for the few `_on` queries whose
+    // return type has no error channel.
+
+    /// Look up a branch by id, failing if it does not (or no longer) exist.
+    fn branch_by_id(&self, branch_id: BranchId) -> Result<Branch> {
+        self.branches.get_branch_by_id(branch_id).ok_or_else(|| {
+            StoreError::BranchNotFound(format!("branch id {} (deleted?)", branch_id.0))
+        })
+    }
+
+    /// Whether a branch with this id currently exists.
+    pub fn branch_exists(&self, branch_id: BranchId) -> bool {
+        self.branches.get_branch_by_id(branch_id).is_some()
+    }
+
+    /// A branch by id, or `None` if it does not (or no longer) exist.
+    pub fn get_branch_by_id(&self, branch_id: BranchId) -> Option<Branch> {
+        self.branches.get_branch_by_id(branch_id)
+    }
+
+    /// A branch by name.
+    pub fn get_branch(&self, name: &str) -> Option<Branch> {
+        self.branches.get_branch(name)
+    }
+
     /// Append a record to the current branch.
     pub fn append(&self, input: RecordInput) -> Result<Record> {
+        self.append_on(self.branches.current_id(), input)
+    }
+
+    /// Append a record to the given branch.
+    pub fn append_on(&self, branch_id: BranchId, input: RecordInput) -> Result<Record> {
         let _lock = self.write_lock.lock();
 
-        let branch = self.branches.current_branch();
+        let branch = self.branch_by_id(branch_id)?;
         let next_seq = branch.head.next();
 
         let (record, offset) = self.log.append(input, branch.id, next_seq)?;
@@ -307,10 +352,19 @@ impl Store {
 
     /// Iterate records from a sequence.
     pub fn iter_from(&self, seq: Sequence) -> impl Iterator<Item = Result<(u64, Record)>> + '_ {
-        let branch = self.branches.current_branch();
+        self.iter_from_on(self.branches.current_id(), seq)
+    }
+
+    /// Iterate the log from the given branch's record at `seq` (from the
+    /// start of the log if that branch has no record at `seq`).
+    pub fn iter_from_on(
+        &self,
+        branch_id: BranchId,
+        seq: Sequence,
+    ) -> impl Iterator<Item = Result<(u64, Record)>> + '_ {
         let offset = self
             .index
-            .get_offset(branch.id, seq)
+            .get_offset(branch_id, seq)
             .unwrap_or(0);
         self.log.iter_from(offset)
     }
@@ -333,7 +387,22 @@ impl Store {
         reverse: bool,
         types: Option<&[String]>,
     ) -> Result<Vec<Record>> {
-        let branch = self.branches.current_branch();
+        self.query_range_on(self.branches.current_id(), from, to, limit, reverse, types)
+    }
+
+    /// `query_range` against the given branch. Like `query_range`, this
+    /// returns the records written ON that branch; records a branch inherited
+    /// from its parent belong to the parent.
+    pub fn query_range_on(
+        &self,
+        branch_id: BranchId,
+        from: Option<Sequence>,
+        to: Option<Sequence>,
+        limit: usize,
+        reverse: bool,
+        types: Option<&[String]>,
+    ) -> Result<Vec<Record>> {
+        let branch = self.branch_by_id(branch_id)?;
 
         // Get offsets from index
         // Note: We may need to fetch more than `limit` if filtering by type
@@ -421,17 +490,30 @@ impl Store {
         state_id: &str,
         operation: StateOperation,
     ) -> Result<Record> {
-        self.update_state_internal(state_id, operation, false)
+        self.update_state_on(self.branches.current_id(), state_id, operation)
+    }
+
+    /// `update_state` against the given branch.
+    pub fn update_state_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        operation: StateOperation,
+    ) -> Result<Record> {
+        self.update_state_internal(branch_id, state_id, operation, false)
     }
 
     /// Internal update_state with option to skip auto-snapshot.
     fn update_state_internal(
         &self,
+        branch_id: BranchId,
         state_id: &str,
         operation: StateOperation,
         skip_auto_snapshot: bool,
     ) -> Result<Record> {
-        self.update_state_with_builder(state_id, skip_auto_snapshot, move |_, _| Ok(operation))
+        self.update_state_with_builder(branch_id, state_id, skip_auto_snapshot, move |_, _| {
+            Ok(operation)
+        })
     }
 
     /// Append a JSON object to an AppendLog state, injecting the assigned
@@ -452,7 +534,25 @@ impl Store {
         id_field: &str,
         sequence_field: &str,
     ) -> Result<Record> {
-        self.update_state_with_builder(state_id, false, move |id, seq| {
+        self.append_to_state_json_with_identity_on(
+            self.branches.current_id(),
+            state_id,
+            item,
+            id_field,
+            sequence_field,
+        )
+    }
+
+    /// `append_to_state_json_with_identity` against the given branch.
+    pub fn append_to_state_json_with_identity_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        item: serde_json::Value,
+        id_field: &str,
+        sequence_field: &str,
+    ) -> Result<Record> {
+        self.update_state_with_builder(branch_id, state_id, false, move |id, seq| {
             let mut item = item;
             let map = match &mut item {
                 serde_json::Value::Object(map) => map,
@@ -484,6 +584,7 @@ impl Store {
     /// `append_to_state_json_with_identity`).
     fn update_state_with_builder<F>(
         &self,
+        branch_id: BranchId,
         state_id: &str,
         skip_auto_snapshot: bool,
         operation_builder: F,
@@ -493,7 +594,7 @@ impl Store {
     {
         let _lock = self.write_lock.lock();
 
-        let branch = self.branches.current_branch();
+        let branch = self.branch_by_id(branch_id)?;
         let prev_update_offset = self.state.get_head(branch.id, state_id).map(|h| h.head_offset);
         let next_seq = branch.head.next();
         // `peek_next_id` is only valid while `write_lock` is held — nothing
@@ -509,7 +610,11 @@ impl Store {
         // - Set/Snapshot/DeltaSnapshot: No validation needed
         match &operation {
             StateOperation::Edit { index, .. } => {
-                let len = self.get_state_len(state_id)?.unwrap_or(0);
+                let len = self
+                    .state
+                    .get_head(branch.id, state_id)
+                    .map(|h| h.item_count)
+                    .unwrap_or(0);
                 if *index >= len {
                     return Err(StoreError::InvalidOperation(format!(
                         "Edit index {} out of bounds (len={})",
@@ -594,7 +699,9 @@ impl Store {
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(_lock);
-            self.auto_snapshot_if_needed(state_id)?;
+            // Same branch as the write above — never the cursor, which may
+            // point elsewhere (or have moved) by now.
+            self.auto_snapshot_if_needed(branch.id, state_id)?;
         }
 
         Ok(record)
@@ -602,7 +709,12 @@ impl Store {
 
     /// Get the current value of a state.
     pub fn get_state(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
+        self.get_state_on(self.branches.current_id(), state_id)
+    }
+
+    /// `get_state` against the given branch.
+    pub fn get_state_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Vec<u8>>> {
+        self.branch_by_id(branch_id)?;
         self.state.get_state(branch_id, state_id)
     }
 
@@ -616,20 +728,19 @@ impl Store {
     ///
     /// Returns None if the state didn't exist at that sequence.
     pub fn get_state_at(&self, state_id: &str, at_sequence: Sequence) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
-        self.get_state_at_for_branch(branch_id, state_id, at_sequence)
+        self.get_state_at_on(self.branches.current_id(), state_id, at_sequence)
     }
 
     /// Get the value of a state at a specific sequence on a specific branch.
     ///
     /// This is like `get_state_at` but allows querying a branch other than the current one.
-    /// Used internally for branch state materialization.
-    fn get_state_at_for_branch(
+    pub fn get_state_at_on(
         &self,
-        branch_id: crate::types::BranchId,
+        branch_id: BranchId,
         state_id: &str,
         at_sequence: Sequence,
     ) -> Result<Option<Vec<u8>>> {
+        self.branch_by_id(branch_id)?;
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
@@ -886,7 +997,12 @@ impl Store {
     /// This is O(1) - the count is tracked in the state chain head.
     /// Returns None if state doesn't exist, Some(0) for empty state.
     pub fn get_state_len(&self, state_id: &str) -> Result<Option<usize>> {
-        let branch_id = self.branches.current_branch().id;
+        self.get_state_len_on(self.branches.current_id(), state_id)
+    }
+
+    /// `get_state_len` against the given branch.
+    pub fn get_state_len_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<usize>> {
+        self.branch_by_id(branch_id)?;
         match self.state.get_head(branch_id, state_id) {
             Some(head) => Ok(Some(head.item_count)),
             None => Ok(None),
@@ -910,7 +1026,18 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
+        self.get_state_slice_on(self.branches.current_id(), state_id, offset, limit)
+    }
+
+    /// `get_state_slice` against the given branch.
+    pub fn get_state_slice_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.branch_by_id(branch_id)?;
         let items = match self.state.get_state_items(branch_id, state_id)? {
             Some(i) => i,
             None => return Ok(None),
@@ -938,7 +1065,17 @@ impl Store {
     /// O(item size) once the per-item cache is warm (see `get_state_slice`).
     /// Returns `None` if the state doesn't exist or the index is out of range.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
+        self.get_state_item_on(self.branches.current_id(), state_id, index)
+    }
+
+    /// `get_state_item` against the given branch.
+    pub fn get_state_item_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        index: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.branch_by_id(branch_id)?;
         // Delegates to the manager, which serves the just-appended last item
         // from the head record in O(1) instead of re-materializing the whole
         // state (see StateManager::get_state_item).
@@ -950,7 +1087,17 @@ impl Store {
     /// This is O(count + recent_ops) - only traverses as far back as needed.
     /// For states with many items but few recent changes, this is very fast.
     pub fn get_state_tail(&self, state_id: &str, count: usize) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
+        self.get_state_tail_on(self.branches.current_id(), state_id, count)
+    }
+
+    /// `get_state_tail` against the given branch.
+    pub fn get_state_tail_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        count: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.branch_by_id(branch_id)?;
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
@@ -962,7 +1109,7 @@ impl Store {
 
         // Fast path: if requesting more items than exist, use full reconstruction
         if count >= head.item_count {
-            return self.get_state(state_id);
+            return self.get_state_on(branch_id, state_id);
         }
 
         // Collect items walking backwards until we have enough
@@ -1041,7 +1188,7 @@ impl Store {
 
         if need_full_reconstruct {
             // Fall back to full reconstruction and slice
-            let state = self.get_state(state_id)?.unwrap_or_default();
+            let state = self.get_state_on(branch_id, state_id)?.unwrap_or_default();
             if state.is_empty() {
                 return Ok(Some(serde_json::to_vec(&Vec::<serde_json::Value>::new())?));
             }
@@ -1153,7 +1300,17 @@ impl Store {
         &self,
         state_id: &str,
     ) -> Result<Option<StateItemIterator>> {
-        let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
+        self.iter_state_items_on(self.branches.current_id(), state_id)
+    }
+
+    /// `iter_state_items` against the given branch.
+    pub fn iter_state_items_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<StateItemIterator>> {
+        self.branch_by_id(branch_id)?;
+        let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
         };
@@ -1166,12 +1323,24 @@ impl Store {
 
     /// Check if a state needs a snapshot.
     pub fn state_needs_snapshot(&self, state_id: &str) -> bool {
-        self.state.needs_snapshot(self.branches.current_branch().id, state_id)
+        self.snapshot_needed(state_id).is_some()
     }
 
     /// Get what type of snapshot is needed (if any).
     pub fn snapshot_needed(&self, state_id: &str) -> Option<crate::state::SnapshotNeeded> {
-        self.state.snapshot_needed(self.branches.current_branch().id, state_id)
+        self.snapshot_needed_on(self.branches.current_id(), state_id)
+    }
+
+    /// `snapshot_needed` against the given branch (`None` if it was deleted).
+    pub fn snapshot_needed_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Option<crate::state::SnapshotNeeded> {
+        if !self.branch_exists(branch_id) {
+            return None;
+        }
+        self.state.snapshot_needed(branch_id, state_id)
     }
 
     /// Get compaction statistics for a state.
@@ -1181,7 +1350,19 @@ impl Store {
         &self,
         state_id: &str,
     ) -> Option<crate::state::CompactionStats> {
-        self.state.get_compaction_stats(self.branches.current_branch().id, state_id)
+        self.get_compaction_stats_on(self.branches.current_id(), state_id)
+    }
+
+    /// `get_compaction_stats` against the given branch (`None` if it was deleted).
+    pub fn get_compaction_stats_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Option<crate::state::CompactionStats> {
+        if !self.branch_exists(branch_id) {
+            return None;
+        }
+        self.state.get_compaction_stats(branch_id, state_id)
     }
 
     /// Get detailed chain statistics for a state.
@@ -1191,7 +1372,17 @@ impl Store {
         &self,
         state_id: &str,
     ) -> Result<Option<crate::state::ChainStats>> {
-        self.state.count_chain_operations(self.branches.current_branch().id, state_id)
+        self.get_chain_stats_on(self.branches.current_id(), state_id)
+    }
+
+    /// `get_chain_stats` against the given branch.
+    pub fn get_chain_stats_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<crate::state::ChainStats>> {
+        self.branch_by_id(branch_id)?;
+        self.state.count_chain_operations(branch_id, state_id)
     }
 
     /// Compact a state by creating a full snapshot.
@@ -1203,13 +1394,18 @@ impl Store {
     /// For maximum compaction benefit, this creates a full snapshot regardless
     /// of the configured snapshot strategy.
     pub fn compact_state(&self, state_id: &str) -> Result<Option<Record>> {
-        let current = match self.get_state(state_id)? {
+        self.compact_state_on(self.branches.current_id(), state_id)
+    }
+
+    /// `compact_state` against the given branch.
+    pub fn compact_state_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Record>> {
+        let current = match self.get_state_on(branch_id, state_id)? {
             Some(s) => s,
             None => return Ok(None),
         };
 
         // Create a full snapshot with the current state
-        let record = self.update_state(state_id, StateOperation::Snapshot(current))?;
+        let record = self.update_state_on(branch_id, state_id, StateOperation::Snapshot(current))?;
         Ok(Some(record))
     }
 
@@ -1217,11 +1413,16 @@ impl Store {
     ///
     /// Returns the number of states compacted.
     pub fn compact_all_states(&self) -> Result<usize> {
+        self.compact_all_states_on(self.branches.current_id())
+    }
+
+    /// `compact_all_states` against the given branch.
+    pub fn compact_all_states_on(&self, branch_id: BranchId) -> Result<usize> {
         let state_ids = self.state.state_ids();
         let mut compacted = 0;
 
         for state_id in state_ids {
-            if self.compact_state(&state_id)?.is_some() {
+            if self.compact_state_on(branch_id, &state_id)?.is_some() {
                 compacted += 1;
             }
         }
@@ -1233,6 +1434,11 @@ impl Store {
     ///
     /// Returns total operations and bytes that could be skipped after compaction.
     pub fn get_compaction_summary(&self) -> Result<CompactionSummary> {
+        self.get_compaction_summary_on(self.branches.current_id())
+    }
+
+    /// `get_compaction_summary` against the given branch.
+    pub fn get_compaction_summary_on(&self, branch_id: BranchId) -> Result<CompactionSummary> {
         let state_ids = self.state.state_ids();
         let mut total_operations = 0u64;
         let mut compactable_operations = 0u64;
@@ -1241,7 +1447,7 @@ impl Store {
         let mut states_with_history = 0usize;
 
         for state_id in state_ids {
-            if let Some(stats) = self.get_chain_stats(&state_id)? {
+            if let Some(stats) = self.get_chain_stats_on(branch_id, &state_id)? {
                 total_operations += stats.total_operations;
                 total_bytes += stats.total_bytes;
 
@@ -1274,22 +1480,34 @@ impl Store {
     /// Note: This is now called automatically by `update_state()`. You only need
     /// to call this manually if you want to force a snapshot check at a specific time.
     pub fn create_snapshot_if_needed(&self, state_id: &str) -> Result<Option<Record>> {
-        self.create_snapshot_if_needed_internal(state_id, false)
+        self.create_snapshot_if_needed_on(self.branches.current_id(), state_id)
+    }
+
+    /// `create_snapshot_if_needed` against the given branch.
+    pub fn create_snapshot_if_needed_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Record>> {
+        self.create_snapshot_if_needed_internal(branch_id, state_id, false)
     }
 
     /// Internal snapshot creation that can skip auto-snapshot to avoid recursion.
     fn create_snapshot_if_needed_internal(
         &self,
+        branch_id: BranchId,
         state_id: &str,
         skip_auto: bool,
     ) -> Result<Option<Record>> {
         use crate::state::SnapshotNeeded;
 
-        match self.state.snapshot_needed(self.branches.current_branch().id, state_id) {
+        self.branch_by_id(branch_id)?;
+        match self.state.snapshot_needed(branch_id, state_id) {
             None => Ok(None),
             Some(SnapshotNeeded::Full) => {
-                let current = self.get_state(state_id)?.unwrap_or_default();
+                let current = self.get_state_on(branch_id, state_id)?.unwrap_or_default();
                 let record = self.update_state_internal(
+                    branch_id,
                     state_id,
                     StateOperation::Snapshot(current),
                     skip_auto,
@@ -1303,16 +1521,18 @@ impl Store {
                     Some(crate::types::StateStrategy::Tree { .. })
                 );
                 if is_tree {
-                    let delta_ops = self.compute_tree_delta_ops(state_id)?;
+                    let delta_ops = self.compute_tree_delta_ops(branch_id, state_id)?;
                     let record = self.update_state_internal(
+                        branch_id,
                         state_id,
                         StateOperation::TreeDeltaSnapshot(delta_ops),
                         skip_auto,
                     )?;
                     Ok(Some(record))
                 } else {
-                    let delta_items = self.compute_delta_items(state_id)?;
+                    let delta_items = self.compute_delta_items(branch_id, state_id)?;
                     let record = self.update_state_internal(
+                        branch_id,
                         state_id,
                         StateOperation::DeltaSnapshot(delta_items),
                         skip_auto,
@@ -1325,16 +1545,16 @@ impl Store {
 
     /// Auto-snapshot helper called by update_state. Skips auto-snapshot on the
     /// snapshot operation itself to avoid infinite recursion.
-    fn auto_snapshot_if_needed(&self, state_id: &str) -> Result<()> {
-        self.create_snapshot_if_needed_internal(state_id, true)?;
+    fn auto_snapshot_if_needed(&self, branch_id: BranchId, state_id: &str) -> Result<()> {
+        self.create_snapshot_if_needed_internal(branch_id, state_id, true)?;
         Ok(())
     }
 
     /// Compute items added since the last delta or full snapshot.
     ///
     /// This walks the chain collecting Append operations until hitting a snapshot.
-    fn compute_delta_items(&self, state_id: &str) -> Result<Vec<u8>> {
-        let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
+    fn compute_delta_items(&self, branch_id: BranchId, state_id: &str) -> Result<Vec<u8>> {
+        let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(serde_json::to_vec(&Vec::<serde_json::Value>::new())?),
         };
@@ -1376,8 +1596,8 @@ impl Store {
     ///
     /// Walks the chain collecting TreeSet/TreeRemove/TreeBatch operations until hitting a snapshot.
     /// Returns Vec<TreeOp> directly (no serialization).
-    fn compute_tree_delta_ops(&self, state_id: &str) -> Result<Vec<TreeOp>> {
-        let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
+    fn compute_tree_delta_ops(&self, branch_id: BranchId, state_id: &str) -> Result<Vec<TreeOp>> {
+        let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(Vec::new()),
         };
@@ -1455,8 +1675,19 @@ impl Store {
         field_path: &str,
         kind: crate::state::FieldIndexKind,
     ) -> Result<()> {
+        self.register_state_field_index_on(self.branches.current_id(), state_id, field_path, kind)
+    }
+
+    /// `register_state_field_index` against the given branch.
+    pub fn register_state_field_index_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        field_path: &str,
+        kind: crate::state::FieldIndexKind,
+    ) -> Result<()> {
         let _lock = self.write_lock.lock();
-        let branch_id = self.branches.current_branch().id;
+        self.branch_by_id(branch_id)?;
         self.state
             .register_field_index(branch_id, state_id, field_path, kind)
     }
@@ -1486,7 +1717,35 @@ impl Store {
         offset: Option<usize>,
         reverse: bool,
     ) -> Option<Vec<u32>> {
-        let branch_id = self.branches.current_branch().id;
+        self.query_state_index_range_on(
+            self.branches.current_id(),
+            state_id,
+            field_path,
+            gte,
+            lte,
+            limit,
+            offset,
+            reverse,
+        )
+    }
+
+    /// `query_state_index_range` against the given branch (`None` if it was
+    /// deleted, as for any branch without a registered index).
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_state_index_range_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        field_path: &str,
+        gte: Option<f64>,
+        lte: Option<f64>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        reverse: bool,
+    ) -> Option<Vec<u32>> {
+        if !self.branch_exists(branch_id) {
+            return None;
+        }
         self.state
             .query_field_index_range(branch_id, state_id, field_path, gte, lte, limit, offset, reverse)
     }
@@ -1504,7 +1763,29 @@ impl Store {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Option<Vec<u32>> {
-        let branch_id = self.branches.current_branch().id;
+        self.query_state_index_eq_on(
+            self.branches.current_id(),
+            state_id,
+            field_path,
+            value,
+            limit,
+            offset,
+        )
+    }
+
+    /// `query_state_index_eq` against the given branch.
+    pub fn query_state_index_eq_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        field_path: &str,
+        value: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Option<Vec<u32>> {
+        if !self.branch_exists(branch_id) {
+            return None;
+        }
         self.state
             .query_field_index_eq(branch_id, state_id, field_path, value, limit, offset)
     }
@@ -1517,7 +1798,19 @@ impl Store {
         state_id: &str,
         field_path: &str,
     ) -> Option<Vec<(String, u32)>> {
-        let branch_id = self.branches.current_branch().id;
+        self.get_state_index_value_counts_on(self.branches.current_id(), state_id, field_path)
+    }
+
+    /// `get_state_index_value_counts` against the given branch.
+    pub fn get_state_index_value_counts_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        field_path: &str,
+    ) -> Option<Vec<(String, u32)>> {
+        if !self.branch_exists(branch_id) {
+            return None;
+        }
         self.state.field_index_value_counts(branch_id, state_id, field_path)
     }
 
@@ -1540,8 +1833,20 @@ impl Store {
 
     /// Set a single file in a tree state.
     pub fn tree_set(&self, state_id: &str, path: &str, entry: &TreeEntry) -> Result<Record> {
+        self.tree_set_on(self.branches.current_id(), state_id, path, entry)
+    }
+
+    /// `tree_set` against the given branch.
+    pub fn tree_set_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        path: &str,
+        entry: &TreeEntry,
+    ) -> Result<Record> {
         Self::validate_tree_path(path)?;
-        self.update_state(
+        self.update_state_on(
+            branch_id,
             state_id,
             StateOperation::TreeSet {
                 path: path.to_string(),
@@ -1552,8 +1857,14 @@ impl Store {
 
     /// Remove a single file from a tree state.
     pub fn tree_remove(&self, state_id: &str, path: &str) -> Result<Record> {
+        self.tree_remove_on(self.branches.current_id(), state_id, path)
+    }
+
+    /// `tree_remove` against the given branch.
+    pub fn tree_remove_on(&self, branch_id: BranchId, state_id: &str, path: &str) -> Result<Record> {
         Self::validate_tree_path(path)?;
-        self.update_state(
+        self.update_state_on(
+            branch_id,
             state_id,
             StateOperation::TreeRemove {
                 path: path.to_string(),
@@ -1563,6 +1874,11 @@ impl Store {
 
     /// Apply a batch of tree operations atomically.
     pub fn tree_batch(&self, state_id: &str, ops: &[TreeOp]) -> Result<Record> {
+        self.tree_batch_on(self.branches.current_id(), state_id, ops)
+    }
+
+    /// `tree_batch` against the given branch.
+    pub fn tree_batch_on(&self, branch_id: BranchId, state_id: &str, ops: &[TreeOp]) -> Result<Record> {
         for op in ops {
             match op {
                 TreeOp::Set { path, .. } | TreeOp::Remove { path } => {
@@ -1570,15 +1886,23 @@ impl Store {
                 }
             }
         }
-        self.update_state(state_id, StateOperation::TreeBatch { ops: ops.to_vec() })
+        self.update_state_on(branch_id, state_id, StateOperation::TreeBatch { ops: ops.to_vec() })
     }
 
     /// Get a single file entry from a tree state.
     pub fn tree_get(&self, state_id: &str, path: &str) -> Result<Option<TreeEntry>> {
-        let tree = match self
-            .state
-            .get_tree_state(self.branches.current_branch().id, state_id)?
-        {
+        self.tree_get_on(self.branches.current_id(), state_id, path)
+    }
+
+    /// `tree_get` against the given branch.
+    pub fn tree_get_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        path: &str,
+    ) -> Result<Option<TreeEntry>> {
+        self.branch_by_id(branch_id)?;
+        let tree = match self.state.get_tree_state(branch_id, state_id)? {
             Some(t) => t,
             None => return Ok(None),
         };
@@ -1587,10 +1911,18 @@ impl Store {
 
     /// List files in a tree state, optionally filtered by path prefix.
     pub fn tree_list(&self, state_id: &str, prefix: Option<&str>) -> Result<Vec<(String, TreeEntry)>> {
-        let tree = match self
-            .state
-            .get_tree_state(self.branches.current_branch().id, state_id)?
-        {
+        self.tree_list_on(self.branches.current_id(), state_id, prefix)
+    }
+
+    /// `tree_list` against the given branch.
+    pub fn tree_list_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, TreeEntry)>> {
+        self.branch_by_id(branch_id)?;
+        let tree = match self.state.get_tree_state(branch_id, state_id)? {
             Some(t) => t,
             None => return Ok(Vec::new()),
         };
@@ -1617,8 +1949,19 @@ impl Store {
         from_seq: Sequence,
         to_seq: Sequence,
     ) -> Result<Vec<TreeChange>> {
-        let from_state = self.get_state_at(state_id, from_seq)?;
-        let to_state = self.get_state_at(state_id, to_seq)?;
+        self.tree_diff_on(self.branches.current_id(), state_id, from_seq, to_seq)
+    }
+
+    /// `tree_diff` against the given branch.
+    pub fn tree_diff_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        from_seq: Sequence,
+        to_seq: Sequence,
+    ) -> Result<Vec<TreeChange>> {
+        let from_state = self.get_state_at_on(branch_id, state_id, from_seq)?;
+        let to_state = self.get_state_at_on(branch_id, state_id, to_seq)?;
 
         let from_tree: TreeState = match from_state {
             Some(s) if !s.is_empty() => serde_json::from_slice(&s)
@@ -1691,11 +2034,17 @@ impl Store {
 
     /// Force a full snapshot of a tree state (compaction).
     pub fn tree_snapshot(&self, state_id: &str) -> Result<Option<Record>> {
-        let current = match self.get_state(state_id)? {
+        self.tree_snapshot_on(self.branches.current_id(), state_id)
+    }
+
+    /// `tree_snapshot` against the given branch.
+    pub fn tree_snapshot_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Record>> {
+        let current = match self.get_state_on(branch_id, state_id)? {
             Some(s) => s,
             None => return Ok(None),
         };
         let record = self.update_state_internal(
+            branch_id,
             state_id,
             StateOperation::Snapshot(current),
             true, // skip auto-snapshot
@@ -2004,6 +2353,13 @@ impl Store {
     /// After catch-up completes, the subscription is marked as caught up
     /// and will receive live events.
     pub fn catch_up_subscription(&self, id: SubscriptionId) -> Result<()> {
+        self.catch_up_subscription_on(self.branches.current_id(), id)
+    }
+
+    /// `catch_up_subscription`, replaying the given branch's states and
+    /// records instead of the current branch's.
+    pub fn catch_up_subscription_on(&self, branch_id: BranchId, id: SubscriptionId) -> Result<()> {
+        let current_branch = self.branch_by_id(branch_id)?;
         let config = self
             .subscriptions
             .get_config(id)
@@ -2026,12 +2382,12 @@ impl Store {
 
             for state_id in state_ids {
                 // Get state at the starting sequence, or current state if it didn't exist then
-                let (state_data, snapshot_seq) = match self.get_state_at(&state_id, from_seq)? {
+                let (state_data, snapshot_seq) = match self.get_state_at_on(branch_id, &state_id, from_seq)? {
                     Some(data) => (data, from_seq),
                     None => {
                         // State didn't exist at from_seq, try current state
-                        match self.get_state(&state_id)? {
-                            Some(data) => (data, self.current_branch().head),
+                        match self.get_state_on(branch_id, &state_id)? {
+                            Some(data) => (data, current_branch.head),
                             None => continue, // State doesn't exist at all
                         }
                     }
@@ -2095,10 +2451,9 @@ impl Store {
 
         // Replay historical records
         if config.filter.include_records {
-            let current_branch = self.branches.current_branch();
             let payload_threshold = 4096; // Same as manager default
 
-            for result in self.iter_from(from_seq) {
+            for result in self.iter_from_on(branch_id, from_seq) {
                 let (_offset, record) = result?;
 
                 // Skip records not on current branch
@@ -3173,7 +3528,7 @@ mod tests {
             let branch = store.create_branch_at(&format!("at-{i}"), "main", *seq).unwrap();
             let mut got = store.state.get_head(branch.id, "tree").unwrap();
             let actual_len = store
-                .get_state_at_for_branch(main, "tree", *seq)
+                .get_state_at_on(main, "tree", *seq)
                 .unwrap()
                 .map(|bytes| serde_json::from_slice::<TreeState>(&bytes).unwrap().len())
                 .unwrap();

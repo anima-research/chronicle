@@ -2,26 +2,60 @@
 
 use crate::{
     error::StoreError,
+    state::StateSelection,
     subscriptions::{
         DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
         SubscriptionHandle, SubscriptionId,
     },
     types::{TreeChange, TreeEntry, TreeOp},
-    CompactionSummary, FieldIndexKind, Record, RecordId, Sequence, StateOperation,
+    Branch, BranchId, CompactionSummary, FieldIndexKind, Record, RecordId, Sequence, StateOperation,
     StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// JavaScript-friendly Store wrapper.
+///
+/// There are two kinds of handle onto one open store:
+///
+/// - the **root** handle, returned by `create` / `open` / `openOrCreate`.
+///   Its branch-dependent methods follow the store-wide current branch
+///   (`switchBranch` / `currentBranch`), exactly as before views existed;
+/// - **views**, returned by `view(branchName)`. A view shares the root's
+///   underlying store — same log, same caches, same lock file — but every
+///   branch-dependent method on it targets the one branch it is pinned to. A
+///   view never reads or moves the current branch, so any number of views
+///   (and the root) can be used side by side on different branches.
+///
+/// Lifetime: the root owns the store. `close()` on the root closes the store
+/// for every view at once (they throw "Store has been closed" from then on)
+/// and releases the lock file immediately, however many views are still
+/// referenced. `close()` on a view only detaches that view.
 #[napi]
 pub struct JsStore {
-    inner: Option<Arc<Store>>,
+    /// The open store, shared by the root handle and every view made from
+    /// it. The root's `close()` empties the slot, which is what closes the
+    /// store for all of them and lets the `Store` (and its lock file) drop
+    /// even while views are still alive.
+    shared: Arc<RwLock<Option<Arc<Store>>>>,
+    /// The branch this handle is pinned to; `None` on the root handle.
+    pinned: Option<PinnedBranch>,
+    /// Set once `close()` has been called on a view.
+    detached: bool,
     /// Active subscription handles, stored by ID.
     subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
+}
+
+/// The branch a view is bound to. Bound by id: ids are never reused, so a
+/// view cannot be silently re-pointed at a different branch that later takes
+/// the same name. The name is kept for `pinnedBranch()` and error messages
+/// (branches cannot be renamed).
+struct PinnedBranch {
+    id: BranchId,
+    name: String,
 }
 
 /// Record returned to JavaScript.
@@ -59,6 +93,41 @@ pub struct JsBranch {
     pub parent_id: Option<String>,
     pub branch_point: Option<i64>,
     pub created: i64,
+}
+
+impl From<Branch> for JsBranch {
+    fn from(branch: Branch) -> Self {
+        JsBranch {
+            id: branch.id.0.to_string(),
+            name: branch.name,
+            head: branch.head.0 as i64,
+            parent_id: branch.parent.map(|p| p.0.to_string()),
+            branch_point: branch.branch_point.map(|s| s.0 as i64),
+            created: branch.created.0,
+        }
+    }
+}
+
+/// Which of the parent's states a selective fork inherits
+/// (`createBranchWithStates` / `createBranchAtWithStates`).
+///
+/// A state is inherited if its id equals one of `stateIds` or starts with one
+/// of `statePrefixes` (a plain string prefix of the id). Omitting both — or
+/// passing two empty arrays — inherits nothing. Ids and prefixes that match
+/// no state are ignored.
+#[napi(object)]
+pub struct JsStateFilter {
+    pub state_ids: Option<Vec<String>>,
+    pub state_prefixes: Option<Vec<String>>,
+}
+
+impl From<JsStateFilter> for StateSelection {
+    fn from(filter: JsStateFilter) -> Self {
+        StateSelection {
+            state_ids: filter.state_ids.unwrap_or_default(),
+            state_prefixes: filter.state_prefixes.unwrap_or_default(),
+        }
+    }
 }
 
 /// Store statistics.
@@ -329,10 +398,44 @@ fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateS
 #[napi]
 impl JsStore {
     /// Get the inner store, returning an error if closed.
-    fn get_store(&self) -> Result<&Arc<Store>> {
-        self.inner
-            .as_ref()
+    fn get_store(&self) -> Result<Arc<Store>> {
+        if self.detached {
+            return Err(napi::Error::from_reason("View has been closed"));
+        }
+        self.shared
+            .read()
+            .clone()
             .ok_or_else(|| napi::Error::from_reason("Store has been closed"))
+    }
+
+    /// The store plus the branch this handle's branch-dependent methods act
+    /// on: the pinned branch for a view, the store's current branch for the
+    /// root. Fails if a view's branch has been deleted.
+    fn target(&self) -> Result<(Arc<Store>, BranchId)> {
+        let store = self.get_store()?;
+        let branch = match &self.pinned {
+            Some(pinned) => {
+                if !store.branch_exists(pinned.id) {
+                    return Err(napi::Error::from_reason(format!(
+                        "Branch not found: '{}' (the branch this view is pinned to has been deleted)",
+                        pinned.name
+                    )));
+                }
+                pinned.id
+            }
+            None => store.current_branch().id,
+        };
+        Ok((store, branch))
+    }
+
+    /// Wrap a freshly opened store in a root handle.
+    fn root(store: Store) -> JsStore {
+        JsStore {
+            shared: Arc::new(RwLock::new(Some(Arc::new(store)))),
+            pinned: None,
+            detached: false,
+            subscription_handles: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Create a new store at the given path.
@@ -344,10 +447,7 @@ impl JsStore {
             create_if_missing: false,
         };
         let store = Store::create(store_config).map_err(to_napi_error)?;
-        Ok(JsStore {
-            inner: Some(Arc::new(store)),
-            subscription_handles: Mutex::new(HashMap::new()),
-        })
+        Ok(Self::root(store))
     }
 
     /// Open an existing store.
@@ -359,10 +459,7 @@ impl JsStore {
             create_if_missing: false,
         };
         let store = Store::open(store_config).map_err(to_napi_error)?;
-        Ok(JsStore {
-            inner: Some(Arc::new(store)),
-            subscription_handles: Mutex::new(HashMap::new()),
-        })
+        Ok(Self::root(store))
     }
 
     /// Open or create a store.
@@ -374,29 +471,102 @@ impl JsStore {
             create_if_missing: true,
         };
         let store = Store::open_or_create(store_config).map_err(to_napi_error)?;
-        Ok(JsStore {
-            inner: Some(Arc::new(store)),
-            subscription_handles: Mutex::new(HashMap::new()),
-        })
+        Ok(Self::root(store))
     }
 
     /// Close the store, releasing the lock and any resources.
     /// After closing, all operations on this store will fail.
+    ///
+    /// On the root handle this closes the store itself: it is synced, every
+    /// view made from this handle stops working ("Store has been closed"),
+    /// and the lock file is released before `close()` returns — live views
+    /// do not keep the store or its lock alive.
+    ///
+    /// On a view this only detaches the view: its subscriptions are removed
+    /// and its methods throw "View has been closed". The store stays open,
+    /// nothing is synced, and the root and other views are unaffected. A
+    /// view never needs to be closed; dropping it is enough.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
-        if let Some(store) = self.inner.take() {
+        if self.pinned.is_some() {
+            if !self.detached {
+                let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
+                if let Some(store) = self.shared.read().as_ref() {
+                    for id in handles {
+                        store.unsubscribe(SubscriptionId(id));
+                    }
+                }
+                self.detached = true;
+            }
+            return Ok(());
+        }
+
+        let store = self.shared.write().take();
+        if let Some(store) = store {
             // Sync before closing
             store.sync().map_err(to_napi_error)?;
-            // Drop the Arc - if this is the last reference, the store will be dropped
+            // Drop the Arc. The slot was the only long-lived reference (views
+            // hold the slot, not the store), so the store is dropped here.
             drop(store);
         }
         Ok(())
     }
 
     /// Check if the store has been closed.
+    ///
+    /// On a view: true once the view itself was closed OR the root closed
+    /// the store.
     #[napi]
     pub fn is_closed(&self) -> bool {
-        self.inner.is_none()
+        self.detached || self.shared.read().is_none()
+    }
+
+    /// Open a view: a handle onto this same store whose branch-dependent
+    /// methods all act on `branchName`, whatever the current branch is and
+    /// wherever it moves afterwards.
+    ///
+    /// On a view:
+    /// - records, states, trees, queries, field indexes, compaction,
+    ///   `listStates()` item counts, `currentSequence()` and subscription
+    ///   catch-up use the pinned branch; `currentBranch()` returns it;
+    /// - `switchBranch` throws (the root's cursor is the only cursor);
+    /// - `createBranch(name)` / `createBranchWithStates(name, undefined, ..)`
+    ///   / `createEmptyBranch(name)` with `from` omitted use the pinned
+    ///   branch as the parent;
+    /// - everything else (blobs, `registerState`, `getRecord`, `sync`,
+    ///   `stats`, `listBranches`, `setAutoSnapshot`, ...) is store-wide and
+    ///   behaves as on the root handle.
+    ///
+    /// Creating a view is O(1): it allocates nothing per state and reads
+    /// nothing from the log. Views share the store's caches, so a state the
+    /// view's branch inherited unchanged is served from the value already
+    /// materialized for the parent. All handles of one store must be used
+    /// from the thread that opened it, like the root handle.
+    ///
+    /// If the pinned branch is deleted, every branch-dependent method of the
+    /// view throws "Branch not found". See `close()` for lifetime.
+    #[napi]
+    pub fn view(&self, branch_name: String) -> Result<JsStore> {
+        let store = self.get_store()?;
+        let branch = store
+            .get_branch(&branch_name)
+            .ok_or_else(|| to_napi_error(StoreError::BranchNotFound(branch_name.clone())))?;
+        Ok(JsStore {
+            shared: Arc::clone(&self.shared),
+            pinned: Some(PinnedBranch {
+                id: branch.id,
+                name: branch.name,
+            }),
+            detached: false,
+            subscription_handles: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Name of the branch this handle is pinned to, or `null` on the root
+    /// handle (which follows the current branch).
+    #[napi]
+    pub fn pinned_branch(&self) -> Option<String> {
+        self.pinned.as_ref().map(|p| p.name.clone())
     }
 
     /// Torn-tail recovery the log performed on open, if any.
@@ -419,19 +589,19 @@ impl JsStore {
     /// Append a record to the store.
     #[napi]
     pub fn append(&self, record_type: String, payload: Buffer) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let input = crate::RecordInput::raw(&record_type, payload.to_vec());
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
     /// Append a JSON record.
     #[napi]
     pub fn append_json(&self, record_type: String, data: serde_json::Value) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let input =
             crate::RecordInput::json(&record_type, &data).map_err(|e| to_napi_error(e.into()))?;
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
@@ -508,10 +678,27 @@ impl JsStore {
 
     // --- Branches ---
 
+    /// The parent a fork uses when `from` is omitted: the pinned branch on a
+    /// view (which must still exist), `None` on the root so the store falls
+    /// back to its own default.
+    fn default_parent(&self, from: Option<String>) -> Result<Option<String>> {
+        match (&from, &self.pinned) {
+            (None, Some(pinned)) => {
+                self.target()?;
+                Ok(Some(pinned.name.clone()))
+            }
+            _ => Ok(from),
+        }
+    }
+
     /// Create a new branch.
+    ///
+    /// With `from` omitted the parent is the current branch — on a view, the
+    /// branch the view is pinned to.
     #[napi]
     pub fn create_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
+        let from = self.default_parent(from)?;
         let branch = store
             .create_branch(&name, from.as_deref())
             .map_err(to_napi_error)?;
@@ -523,6 +710,58 @@ impl JsStore {
             branch_point: branch.branch_point.map(|s| s.0 as i64),
             created: branch.created.0,
         })
+    }
+
+    /// Create a new branch that inherits only the states `filter` selects
+    /// (exact `stateIds` and/or `statePrefixes`; see `JsStateFilter`).
+    ///
+    /// Selected states are inherited exactly as `createBranch` inherits
+    /// them. Every other state has no value on the new branch — it reads
+    /// there as a registered state does on a `createEmptyBranch` branch
+    /// (`getState` → null, `getStateLen` → null) — and a write to it starts a
+    /// fresh chain that shares nothing with the parent's.
+    ///
+    /// The cost is proportional to the number of states inherited, not to
+    /// how many states the parent has, how many branches exist, or how much
+    /// history the store holds. With `from` omitted the parent is the
+    /// current branch (on a view, the pinned branch).
+    #[napi]
+    pub fn create_branch_with_states(
+        &self,
+        name: String,
+        from: Option<String>,
+        filter: JsStateFilter,
+    ) -> Result<JsBranch> {
+        let store = self.get_store()?;
+        let from = self.default_parent(from)?;
+        let branch = store
+            .create_branch_with_states(&name, from.as_deref(), &filter.into())
+            .map_err(to_napi_error)?;
+        Ok(branch.into())
+    }
+
+    /// Create a new branch at a specific sequence point of `from`, inheriting
+    /// only the states `filter` selects. The historical counterpart of
+    /// `createBranchWithStates`: selected states read as they did on `from`
+    /// at `atSequence`, the others have no value.
+    #[napi]
+    pub fn create_branch_at_with_states(
+        &self,
+        name: String,
+        from: String,
+        at_sequence: i64,
+        filter: JsStateFilter,
+    ) -> Result<JsBranch> {
+        let store = self.get_store()?;
+        let branch = store
+            .create_branch_at_with_states(
+                &name,
+                &from,
+                Sequence(at_sequence as u64),
+                &filter.into(),
+            )
+            .map_err(to_napi_error)?;
+        Ok(branch.into())
     }
 
     /// Create a new branch at a specific sequence point.
@@ -547,6 +786,7 @@ impl JsStore {
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
+        let from = self.default_parent(from)?;
         let branch = store
             .create_empty_branch(&name, from.as_deref())
             .map_err(to_napi_error)?;
@@ -561,9 +801,20 @@ impl JsStore {
     }
 
     /// Switch to a branch.
+    ///
+    /// Root handle only. A view is pinned to its branch for life and throws:
+    /// moving the store-wide current branch from a view would silently
+    /// redirect the root handle.
     #[napi]
     pub fn switch_branch(&self, name: String) -> Result<JsBranch> {
         let store = self.get_store()?;
+        if let Some(pinned) = &self.pinned {
+            return Err(napi::Error::from_reason(format!(
+                "switchBranch is not available on a view (pinned to branch '{}'); \
+                 call view('{}') on the store for a handle on that branch instead",
+                pinned.name, name
+            )));
+        }
         let branch = store.switch_branch(&name).map_err(to_napi_error)?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
@@ -575,11 +826,13 @@ impl JsStore {
         })
     }
 
-    /// Get the current branch.
+    /// Get the current branch. On a view: the branch it is pinned to.
     #[napi]
     pub fn current_branch(&self) -> Result<JsBranch> {
-        let store = self.get_store()?;
-        let branch = store.current_branch();
+        let (store, branch) = self.target()?;
+        let branch = store
+            .get_branch_by_id(branch)
+            .ok_or_else(|| napi::Error::from_reason("Branch not found"))?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
             name: branch.name,
@@ -609,9 +862,22 @@ impl JsStore {
     }
 
     /// Delete a branch.
+    ///
+    /// The main branch and the current branch cannot be deleted; nor can a
+    /// view delete the branch it is itself pinned to. A branch that OTHER
+    /// views are pinned to can be deleted — those views then throw
+    /// "Branch not found" from every branch-dependent method.
     #[napi]
     pub fn delete_branch(&self, name: String) -> Result<()> {
         let store = self.get_store()?;
+        if let Some(pinned) = &self.pinned {
+            if pinned.name == name && store.branch_exists(pinned.id) {
+                return Err(napi::Error::from_reason(format!(
+                    "Branch not found: Cannot delete the branch this view is pinned to ('{}')",
+                    name
+                )));
+            }
+        }
         store.delete_branch(&name).map_err(to_napi_error)
     }
 
@@ -651,16 +917,16 @@ impl JsStore {
     /// Get state value.
     #[napi]
     pub fn get_state(&self, state_id: String) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
-        let state = store.get_state(&state_id).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let state = store.get_state_on(branch, &state_id).map_err(to_napi_error)?;
         Ok(state.map(Buffer::from))
     }
 
     /// Get state as JSON.
     #[napi]
     pub fn get_state_json(&self, state_id: String) -> Result<Option<serde_json::Value>> {
-        let store = self.get_store()?;
-        let state = store.get_state(&state_id).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let state = store.get_state_on(branch, &state_id).map_err(to_napi_error)?;
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -674,9 +940,9 @@ impl JsStore {
     /// Set state value (for Snapshot strategy).
     #[napi]
     pub fn set_state(&self, state_id: String, value: Buffer) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(&state_id, StateOperation::Set(value.to_vec()))
+            .update_state_on(branch, &state_id, StateOperation::Set(value.to_vec()))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -684,11 +950,11 @@ impl JsStore {
     /// Set state as JSON.
     #[napi]
     pub fn set_state_json(&self, state_id: String, value: serde_json::Value) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let bytes =
             serde_json::to_vec(&value).map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let record = store
-            .update_state(&state_id, StateOperation::Set(bytes))
+            .update_state_on(branch, &state_id, StateOperation::Set(bytes))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -696,9 +962,9 @@ impl JsStore {
     /// Append to an AppendLog state.
     #[napi]
     pub fn append_to_state(&self, state_id: String, item: Buffer) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(&state_id, StateOperation::Append(item.to_vec()))
+            .update_state_on(branch, &state_id, StateOperation::Append(item.to_vec()))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -710,11 +976,11 @@ impl JsStore {
         state_id: String,
         item: serde_json::Value,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let bytes =
             serde_json::to_vec(&item).map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let record = store
-            .update_state(&state_id, StateOperation::Append(bytes))
+            .update_state_on(branch, &state_id, StateOperation::Append(bytes))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -736,9 +1002,9 @@ impl JsStore {
         id_field: String,
         sequence_field: String,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .append_to_state_json_with_identity(&state_id, item, &id_field, &sequence_field)
+            .append_to_state_json_with_identity_on(branch, &state_id, item, &id_field, &sequence_field)
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -751,9 +1017,10 @@ impl JsStore {
         index: i64,
         new_value: Buffer,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(
+            .update_state_on(
+                branch,
                 &state_id,
                 StateOperation::Edit {
                     index: index as usize,
@@ -772,9 +1039,10 @@ impl JsStore {
         start: i64,
         end: i64,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(
+            .update_state_on(
+                branch,
                 &state_id,
                 StateOperation::Redact {
                     start: start as usize,
@@ -788,9 +1056,9 @@ impl JsStore {
     /// Get the length of an AppendLog state.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let len = store
-            .get_state_len(&state_id)
+            .get_state_len_on(branch, &state_id)
             .map_err(to_napi_error)?;
         Ok(len.map(|l| l as i64))
     }
@@ -803,9 +1071,9 @@ impl JsStore {
         offset: i64,
         limit: i64,
     ) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let slice = store
-            .get_state_slice(&state_id, offset as usize, limit as usize)
+            .get_state_slice_on(branch, &state_id, offset as usize, limit as usize)
             .map_err(to_napi_error)?;
         Ok(slice.map(Buffer::from))
     }
@@ -825,9 +1093,9 @@ impl JsStore {
         if index < 0 {
             return Ok(None);
         }
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let item = store
-            .get_state_item(&state_id, index as usize)
+            .get_state_item_on(branch, &state_id, index as usize)
             .map_err(to_napi_error)?;
         match item {
             Some(bytes) => {
@@ -842,9 +1110,9 @@ impl JsStore {
     /// Get the last N items from an AppendLog state.
     #[napi]
     pub fn get_state_tail(&self, state_id: String, count: i64) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let tail = store
-            .get_state_tail(&state_id, count as usize)
+            .get_state_tail_on(branch, &state_id, count as usize)
             .map_err(to_napi_error)?;
         Ok(tail.map(Buffer::from))
     }
@@ -874,9 +1142,9 @@ impl JsStore {
     /// Compact a state by creating a full snapshot.
     #[napi]
     pub fn compact_state(&self, state_id: String) -> Result<Option<JsRecord>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .compact_state(&state_id)
+            .compact_state_on(branch, &state_id)
             .map_err(to_napi_error)?;
         Ok(record.map(Into::into))
     }
@@ -884,17 +1152,17 @@ impl JsStore {
     /// Compact all states.
     #[napi]
     pub fn compact_all_states(&self) -> Result<i64> {
-        let store = self.get_store()?;
-        let count = store.compact_all_states().map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let count = store.compact_all_states_on(branch).map_err(to_napi_error)?;
         Ok(count as i64)
     }
 
     /// Get compaction summary.
     #[napi]
     pub fn get_compaction_summary(&self) -> Result<JsCompactionSummary> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let summary = store
-            .get_compaction_summary()
+            .get_compaction_summary_on(branch)
             .map_err(to_napi_error)?;
         Ok(summary.into())
     }
@@ -926,7 +1194,7 @@ impl JsStore {
         payload: Buffer,
         options: JsRecordOptions,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let caused_by: Vec<RecordId> = options
             .caused_by
             .unwrap_or_default()
@@ -943,7 +1211,7 @@ impl JsStore {
         let input = crate::RecordInput::raw(&record_type, payload.to_vec())
             .with_caused_by(caused_by)
             .with_linked_to(linked_to);
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
@@ -955,7 +1223,7 @@ impl JsStore {
         data: serde_json::Value,
         options: JsRecordOptions,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let caused_by: Vec<RecordId> = options
             .caused_by
             .unwrap_or_default()
@@ -973,7 +1241,7 @@ impl JsStore {
             .map_err(|e| to_napi_error(e.into()))?
             .with_caused_by(caused_by)
             .with_linked_to(linked_to);
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
@@ -988,7 +1256,7 @@ impl JsStore {
     /// - `types`: Filter by record types
     #[napi]
     pub fn query(&self, filter: JsQueryFilter) -> Result<Vec<JsRecord>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let from_seq = filter.from_sequence.map(|s| Sequence(s as u64));
         let to_seq = filter.to_sequence.map(|s| Sequence(s as u64));
         // Default limit to 10,000 to avoid capacity overflow panics
@@ -1006,7 +1274,8 @@ impl JsStore {
         };
 
         let records = store
-            .query_range(
+            .query_range_on(
+                branch,
                 from_seq,
                 to_seq,
                 fetch_limit,
@@ -1029,8 +1298,7 @@ impl JsStore {
     /// List all registered states with their info.
     #[napi]
     pub fn list_states(&self) -> Result<Vec<JsStateInfo>> {
-        let store = self.get_store()?;
-        let branch_id = store.current_branch().id;
+        let (store, branch_id) = self.target()?;
         Ok(store
             .state
             .state_ids()
@@ -1067,16 +1335,19 @@ impl JsStore {
     /// Get the current sequence number (head of current branch).
     #[napi]
     pub fn current_sequence(&self) -> Result<i64> {
-        let store = self.get_store()?;
-        Ok(store.current_branch().head.0 as i64)
+        let (store, branch) = self.target()?;
+        let branch = store
+            .get_branch_by_id(branch)
+            .ok_or_else(|| napi::Error::from_reason("Branch not found"))?;
+        Ok(branch.head.0 as i64)
     }
 
     /// Get state value at a specific sequence (historical access).
     #[napi]
     pub fn get_state_at(&self, state_id: String, at_sequence: i64) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let state = store
-            .get_state_at(&state_id, Sequence(at_sequence as u64))
+            .get_state_at_on(branch, &state_id, Sequence(at_sequence as u64))
             .map_err(to_napi_error)?;
         Ok(state.map(Buffer::from))
     }
@@ -1088,9 +1359,9 @@ impl JsStore {
         state_id: String,
         at_sequence: i64,
     ) -> Result<Option<serde_json::Value>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let state = store
-            .get_state_at(&state_id, Sequence(at_sequence as u64))
+            .get_state_at_on(branch, &state_id, Sequence(at_sequence as u64))
             .map_err(to_napi_error)?;
         match state {
             Some(bytes) => {
@@ -1197,13 +1468,13 @@ impl JsStore {
     /// subscription's `from_sequence` setting.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let id: u64 = subscription_id
             .parse()
             .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
 
         store
-            .catch_up_subscription(SubscriptionId(id))
+            .catch_up_subscription_on(branch, SubscriptionId(id))
             .map_err(to_napi_error)
     }
 
@@ -1275,14 +1546,14 @@ impl JsStore {
         path: String,
         entry: JsTreeEntry,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let tree_entry = TreeEntry {
             blob_hash: entry.blob_hash,
             size: entry.size as u64,
             mode: entry.mode as u32,
         };
         let record = store
-            .tree_set(&state_id, &path, &tree_entry)
+            .tree_set_on(branch, &state_id, &path, &tree_entry)
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -1290,15 +1561,15 @@ impl JsStore {
     /// Remove a single file from a tree state.
     #[napi]
     pub fn tree_remove(&self, state_id: String, path: String) -> Result<JsRecord> {
-        let store = self.get_store()?;
-        let record = store.tree_remove(&state_id, &path).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let record = store.tree_remove_on(branch, &state_id, &path).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
     /// Apply a batch of tree operations atomically.
     #[napi]
     pub fn tree_batch(&self, state_id: String, ops: Vec<JsTreeOp>) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let tree_ops: Vec<TreeOp> = ops
             .into_iter()
             .map(|op| match op.op.as_str() {
@@ -1324,7 +1595,7 @@ impl JsStore {
             .collect::<Result<Vec<_>>>()?;
 
         let record = store
-            .tree_batch(&state_id, &tree_ops)
+            .tree_batch_on(branch, &state_id, &tree_ops)
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -1332,9 +1603,9 @@ impl JsStore {
     /// Get a single file entry from a tree state.
     #[napi]
     pub fn tree_get(&self, state_id: String, path: String) -> Result<Option<JsTreeEntry>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let entry = store
-            .tree_get(&state_id, &path)
+            .tree_get_on(branch, &state_id, &path)
             .map_err(to_napi_error)?;
         Ok(entry.map(|e| JsTreeEntry {
             blob_hash: e.blob_hash,
@@ -1350,9 +1621,9 @@ impl JsStore {
         state_id: String,
         prefix: Option<String>,
     ) -> Result<Vec<JsTreeListEntry>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let entries = store
-            .tree_list(&state_id, prefix.as_deref())
+            .tree_list_on(branch, &state_id, prefix.as_deref())
             .map_err(to_napi_error)?;
         Ok(entries
             .into_iter()
@@ -1373,9 +1644,10 @@ impl JsStore {
         from_sequence: i64,
         to_sequence: i64,
     ) -> Result<Vec<JsTreeChange>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let changes = store
-            .tree_diff(
+            .tree_diff_on(
+                branch,
                 &state_id,
                 Sequence(from_sequence as u64),
                 Sequence(to_sequence as u64),
@@ -1426,8 +1698,8 @@ impl JsStore {
     /// Force a full snapshot of a tree state (compaction).
     #[napi]
     pub fn tree_snapshot(&self, state_id: String) -> Result<Option<JsRecord>> {
-        let store = self.get_store()?;
-        let record = store.tree_snapshot(&state_id).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let record = store.tree_snapshot_on(branch, &state_id).map_err(to_napi_error)?;
         Ok(record.map(|r| r.into()))
     }
 
@@ -1453,7 +1725,7 @@ impl JsStore {
         field: String,
         kind: String,
     ) -> Result<()> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let kind = match kind.as_str() {
             "number" => FieldIndexKind::Number,
             "string" => FieldIndexKind::String,
@@ -1465,7 +1737,7 @@ impl JsStore {
             }
         };
         store
-            .register_state_field_index(&state_id, &field, kind)
+            .register_state_field_index_on(branch, &state_id, &field, kind)
             .map_err(to_napi_error)
     }
 
@@ -1486,8 +1758,9 @@ impl JsStore {
         field: String,
         opts: JsIndexRangeQuery,
     ) -> Result<Option<Vec<u32>>> {
-        let store = self.get_store()?;
-        Ok(store.query_state_index_range(
+        let (store, branch) = self.target()?;
+        Ok(store.query_state_index_range_on(
+            branch,
             &state_id,
             &field,
             opts.gte,
@@ -1511,8 +1784,9 @@ impl JsStore {
         value: String,
         opts: JsIndexEqQuery,
     ) -> Result<Option<Vec<u32>>> {
-        let store = self.get_store()?;
-        Ok(store.query_state_index_eq(
+        let (store, branch) = self.target()?;
+        Ok(store.query_state_index_eq_on(
+            branch,
             &state_id,
             &field,
             &value,
@@ -1531,9 +1805,9 @@ impl JsStore {
         state_id: String,
         field: String,
     ) -> Result<Option<Vec<JsValueCount>>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         Ok(store
-            .get_state_index_value_counts(&state_id, &field)
+            .get_state_index_value_counts_on(branch, &state_id, &field)
             .map(|counts| {
                 counts
                     .into_iter()
