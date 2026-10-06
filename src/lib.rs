@@ -53,8 +53,8 @@ pub use error::{Result, StoreError};
 pub use records::{RecordIndex, RecordLog, RecoveryReport};
 pub use state::{
     apply_operation, materialize_operations, BranchHeads, ChainStats, CompactionStats,
-    FieldIndexKind, FieldIndexManager, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
-    StateSelection,
+    FieldIndexKind, FieldIndexManager, SnapshotNeeded, StateChainHead, StateIndex, StateItems,
+    StateManager, StateSelection,
 };
 pub use store::{CompactionSummary, Store, StoreConfig};
 pub use subscriptions::{

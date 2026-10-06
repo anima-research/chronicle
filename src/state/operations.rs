@@ -93,6 +93,16 @@ impl Materialized {
 /// re-serialize per op. Ops with no fast path (`Field`) fall back to
 /// `apply_operation` for that op only.
 pub fn materialize_operations(ops: Vec<StateOperation>) -> Result<Vec<u8>> {
+    materialize_operations_tagged(ops).map(|(bytes, _)| bytes)
+}
+
+/// `materialize_operations`, also reporting whether the returned bytes are
+/// this crate's own serialization of the decoded value (`true`) or a payload
+/// passed through verbatim from a `Set`/`Snapshot`/`Delta` operation, or
+/// nothing at all (`false`). Verbatim bytes may spell the same JSON
+/// differently from how a later re-materialization would (key order,
+/// whitespace, number form).
+pub(crate) fn materialize_operations_tagged(ops: Vec<StateOperation>) -> Result<(Vec<u8>, bool)> {
     let mut acc = Materialized::Raw(Vec::new());
 
     for op in ops {
@@ -152,7 +162,8 @@ pub fn materialize_operations(ops: Vec<StateOperation>) -> Result<Vec<u8>> {
         }
     }
 
-    acc.into_bytes()
+    let reserialized = !matches!(acc, Materialized::Raw(_));
+    Ok((acc.into_bytes()?, reserialized))
 }
 
 /// Number of top-level elements of a JSON array or entries of a JSON object,

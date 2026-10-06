@@ -500,20 +500,29 @@ impl Store {
         state_id: &str,
         operation: StateOperation,
     ) -> Result<Record> {
-        self.update_state_internal(branch_id, state_id, operation, false)
+        self.update_state_internal(branch_id, state_id, operation, false, None)
     }
 
     /// Internal update_state with option to skip auto-snapshot.
+    ///
+    /// `snapshot_of` is for the snapshots the store writes itself: the chain
+    /// head offset the snapshot's content was read at. See
+    /// `update_state_with_builder`.
     fn update_state_internal(
         &self,
         branch_id: BranchId,
         state_id: &str,
         operation: StateOperation,
         skip_auto_snapshot: bool,
+        snapshot_of: Option<u64>,
     ) -> Result<Record> {
-        self.update_state_with_builder(branch_id, state_id, skip_auto_snapshot, move |_, _| {
-            Ok(operation)
-        })
+        self.update_state_with_builder(
+            branch_id,
+            state_id,
+            skip_auto_snapshot,
+            snapshot_of,
+            move |_, _| Ok(operation),
+        )
     }
 
     /// Append a JSON object to an AppendLog state, injecting the assigned
@@ -552,7 +561,7 @@ impl Store {
         id_field: &str,
         sequence_field: &str,
     ) -> Result<Record> {
-        self.update_state_with_builder(branch_id, state_id, false, move |id, seq| {
+        self.update_state_with_builder(branch_id, state_id, false, None, move |id, seq| {
             let mut item = item;
             let map = match &mut item {
                 serde_json::Value::Object(map) => map,
@@ -582,11 +591,20 @@ impl Store {
     /// actually assigns. Validation runs after the builder, so the builder
     /// can also surface `InvalidOperation` (e.g. for non-object payloads in
     /// `append_to_state_json_with_identity`).
+    ///
+    /// `snapshot_of` is `Some(offset)` when the operation is a snapshot whose
+    /// content the caller read from this state while its chain head was at
+    /// `offset`. If the head is still there once the write lock is held, the
+    /// snapshot provably restates the current value, and the state manager
+    /// keeps its cached values across it instead of dropping them. If
+    /// another write got in between, the snapshot is recorded exactly as
+    /// before and the caches are dropped as for any other write.
     fn update_state_with_builder<F>(
         &self,
         branch_id: BranchId,
         state_id: &str,
         skip_auto_snapshot: bool,
+        snapshot_of: Option<u64>,
         operation_builder: F,
     ) -> Result<Record>
     where
@@ -674,7 +692,14 @@ impl Store {
         );
 
         // Update the state manager with the offset
-        self.state.record_update(branch.id, state_id, offset, &operation)?;
+        let content_preserving = snapshot_of.is_some() && snapshot_of == prev_update_offset;
+        self.state.record_update_with(
+            branch.id,
+            state_id,
+            offset,
+            &operation,
+            content_preserving,
+        )?;
 
         // Update indices
         self.index.add(
@@ -1046,18 +1071,20 @@ impl Store {
         let start = offset.min(items.len());
         let end = offset.saturating_add(limit).min(items.len());
 
-        let slice = &items[start..end];
-        let total: usize = slice.iter().map(|i| i.len()).sum();
-        let mut out = Vec::with_capacity(total + slice.len() + 2);
-        out.push(b'[');
-        for (i, item) in slice.iter().enumerate() {
-            if i > 0 {
-                out.push(b',');
-            }
-            out.extend_from_slice(item);
-        }
-        out.push(b']');
-        Ok(Some(out))
+        Ok(Some(StateManager::join_items(&items, start, end)))
+    }
+
+    /// The items of an AppendLog state on the given branch, each as its raw
+    /// JSON bytes, without copying them: the returned value is the cached
+    /// one, shared with every other reader and with any other branch whose
+    /// chain head for this state is at the same log offset.
+    pub fn state_items_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<crate::state::StateItems>>> {
+        self.branch_by_id(branch_id)?;
+        self.state.get_state_items(branch_id, state_id)
     }
 
     /// Get a single item of an AppendLog state by index, as raw JSON bytes.
@@ -1399,13 +1426,20 @@ impl Store {
 
     /// `compact_state` against the given branch.
     pub fn compact_state_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Record>> {
+        let read_at = self.state.get_head(branch_id, state_id).map(|h| h.head_offset);
         let current = match self.get_state_on(branch_id, state_id)? {
             Some(s) => s,
             None => return Ok(None),
         };
 
         // Create a full snapshot with the current state
-        let record = self.update_state_on(branch_id, state_id, StateOperation::Snapshot(current))?;
+        let record = self.update_state_internal(
+            branch_id,
+            state_id,
+            StateOperation::Snapshot(current),
+            false,
+            read_at,
+        )?;
         Ok(Some(record))
     }
 
@@ -1502,6 +1536,8 @@ impl Store {
         use crate::state::SnapshotNeeded;
 
         self.branch_by_id(branch_id)?;
+        // The head the snapshot's content is read at (see `snapshot_of`).
+        let read_at = self.state.get_head(branch_id, state_id).map(|h| h.head_offset);
         match self.state.snapshot_needed(branch_id, state_id) {
             None => Ok(None),
             Some(SnapshotNeeded::Full) => {
@@ -1511,6 +1547,7 @@ impl Store {
                     state_id,
                     StateOperation::Snapshot(current),
                     skip_auto,
+                    read_at,
                 )?;
                 Ok(Some(record))
             }
@@ -1527,6 +1564,7 @@ impl Store {
                         state_id,
                         StateOperation::TreeDeltaSnapshot(delta_ops),
                         skip_auto,
+                        read_at,
                     )?;
                     Ok(Some(record))
                 } else {
@@ -1536,6 +1574,7 @@ impl Store {
                         state_id,
                         StateOperation::DeltaSnapshot(delta_items),
                         skip_auto,
+                        read_at,
                     )?;
                     Ok(Some(record))
                 }
@@ -2039,6 +2078,7 @@ impl Store {
 
     /// `tree_snapshot` against the given branch.
     pub fn tree_snapshot_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Record>> {
+        let read_at = self.state.get_head(branch_id, state_id).map(|h| h.head_offset);
         let current = match self.get_state_on(branch_id, state_id)? {
             Some(s) => s,
             None => return Ok(None),
@@ -2048,6 +2088,7 @@ impl Store {
             state_id,
             StateOperation::Snapshot(current),
             true, // skip auto-snapshot
+            read_at,
         )?;
         Ok(Some(record))
     }

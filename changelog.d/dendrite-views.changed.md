@@ -42,3 +42,30 @@
     `register_from_sibling` and `drop_branch`; `on_append` / `on_edit` /
     `on_redact` / `on_full_replace` / `touch_head_offset` act only on the
     branch they are given.
+- Materialized state is shared across branches. A state's value is a
+  function of its chain head, so two branches whose head for a state sits at
+  the same log offset hold the same value. All three state caches (serialized
+  bytes, per-item array form, decoded tree) now find a value another branch
+  already holds for the same head instead of walking the log again, and
+  share it by reference rather than copying. A fork also takes a reference to
+  the parent's cached per-item and tree values for the states it inherits, so
+  a child's first read of an inherited state is served from memory even if
+  the parent has written since the fork.
+- Writes no longer throw away the per-item cache of an array state. After an
+  append, edit or redact (and after the snapshots the store itself takes),
+  the cached items are advanced to the new value by copying a few pointers —
+  the new version shares every untouched item with the old one and with any
+  other branch still holding it. Previously each write dropped the cache and
+  the next `getStateSlice` / `getStateItemJson` re-materialized the whole
+  state from the log. `getState` on a state whose items are cached is now
+  assembled from them rather than rebuilt.
+  - The first write to an array whose cached value was read back verbatim
+    from a full snapshot or a `setState` payload makes one pass over the
+    items to bring them into the store's own JSON spelling (what a
+    re-materialization would produce). The pass is done once per value and
+    shared by every branch deriving from it; later writes are O(1).
+  - Returned bytes are unchanged: every cached read equals a rebuild from the
+    log byte for byte.
+  - Rust: `StateManager::get_state_items` now returns `Arc<StateItems>` (was
+    `Arc<Vec<Vec<u8>>>`); `StateItems` indexes and iterates as `&[u8]`.
+    `Store::state_items_on` exposes it per branch.
