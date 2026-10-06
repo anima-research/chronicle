@@ -19,6 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Magic bytes for state index file.
@@ -326,6 +327,13 @@ pub struct StateManager {
     /// Path to the persisted field-index file, derived once at construction
     /// as a sibling of `path` (`state.bin` -> `state-indexes.bin`).
     field_index_path: PathBuf,
+
+    /// Number of times a state value was rebuilt from the log
+    /// (`reconstruct_from_disk`). Everything served from a cache — this
+    /// branch's own entry or one shared with another branch — leaves it
+    /// untouched, which makes it the observable for "this read did not
+    /// re-materialize".
+    reconstructions: AtomicU64,
 }
 
 /// Derive the field-index file path as a sibling of the state-index path.
@@ -357,6 +365,7 @@ impl StateManager {
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            reconstructions: AtomicU64::new(0),
         })
     }
 
@@ -385,6 +394,7 @@ impl StateManager {
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            reconstructions: AtomicU64::new(0),
         };
 
         if path.exists() {
@@ -593,20 +603,21 @@ impl StateManager {
         self.cache.write().pop(&cache_key);
         self.items_cache.write().pop(&cache_key);
 
-        // Incrementally maintain any registered field indexes for this state.
-        // Gated on `has_indexes_for` so states with nothing registered pay
-        // no parse cost at all on the hot append path.
+        // Incrementally maintain the field indexes registered for this state
+        // ON THIS BRANCH. Gated on `has_indexes_on` so a slot with nothing
+        // registered on the branch being written pays no parse cost at all
+        // on the hot append path — including when other branches do index it.
         //
-        // Parse failures poison (drop) every field index registered for this
-        // state_id rather than being silently skipped: skipping would leave
-        // `by_ordinal` one short forever, permanently misaligning every
-        // later ordinal against the real slot content with no signal to the
-        // caller. A poisoned index is simply gone — `register_field_index`
-        // rebuilds it from scratch — which is far safer than confidently
-        // returning wrong ordinals. Branch mismatches (a write on a branch
-        // other than the one an index was registered against) poison the
-        // same way; see `FieldIndexManager`'s "Branch scoping" docs.
-        if self.field_indexes.read().has_indexes_for(state_id) {
+        // Parse failures poison (drop) every field index this branch holds
+        // for this state_id rather than being silently skipped: skipping
+        // would leave `by_ordinal` one short forever, permanently
+        // misaligning every later ordinal against the real slot content with
+        // no signal to the caller. A poisoned index is simply gone —
+        // `register_field_index` rebuilds it from scratch — which is far
+        // safer than confidently returning wrong ordinals. Indexes other
+        // branches hold for the same state_id are never touched by this
+        // write; see `FieldIndexManager`'s "Branch scoping" docs.
+        if self.field_indexes.read().has_indexes_on(state_id, branch_id) {
             match operation {
                 StateOperation::Append(item) => {
                     match serde_json::from_slice::<serde_json::Value>(item) {
@@ -614,7 +625,7 @@ impl StateManager {
                             .field_indexes
                             .write()
                             .on_append(state_id, branch_id, offset, &value),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::DeltaSnapshot(_) => {
@@ -647,7 +658,7 @@ impl StateManager {
                             *index as u32,
                             &value,
                         ),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::Redact { start, end } => {
@@ -678,7 +689,7 @@ impl StateManager {
                             offset,
                             items.iter(),
                         ),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 // Tree ops (path->entry maps) and Struct Field ops are not
@@ -955,6 +966,7 @@ impl StateManager {
     ///
     /// Reconstruction: base_snapshot + delta_snapshots + recent_ops
     fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<Vec<u8>> {
+        self.reconstructions.fetch_add(1, Ordering::Relaxed);
         let mut operations = Vec::new();
         let mut current_offset = Some(head_offset);
         let mut hit_snapshot = false; // Once we hit any snapshot, stop collecting regular ops
@@ -1218,12 +1230,16 @@ impl StateManager {
     /// Register (or refresh) a secondary index on a JSON field of every item
     /// currently in `state_id` (materialized on `branch_id`), extracted via
     /// the JSON-pointer `field_path`. Idempotent: a no-op if an index for
-    /// this `(state_id, field_path)` is already registered, fresh (same
-    /// `branch_id` and the slot's current `head_offset`), and of the same
-    /// `kind` — see `FieldIndexManager::register`. Registering from a
-    /// different branch than whatever last held this `(state_id,
-    /// field_path)` index replaces it outright (only one branch's index can
-    /// be live per field at a time — see `FieldIndexManager`'s module docs).
+    /// this `(state_id, field_path)` is already registered on `branch_id`,
+    /// fresh (the slot's current `head_offset`), and of the same `kind` —
+    /// see `FieldIndexManager::register`. Each branch holds its own index:
+    /// registering here neither replaces nor disturbs one another branch
+    /// holds for the same field (see `FieldIndexManager`'s module docs).
+    ///
+    /// When another branch already holds this index at the very `head_offset`
+    /// this branch's slot is at — a branch that has not written to a slot it
+    /// inherited, registering what its parent registered — that index is
+    /// copied instead of rebuilt: no materialization, no JSON decode.
     ///
     /// The freshness check runs BEFORE this materializes/parses the slot's
     /// JSON — `head_offset` alone (already cheap: an index lookup, not a
@@ -1253,6 +1269,16 @@ impl StateManager {
             return Ok(());
         }
 
+        if self.field_indexes.write().register_from_sibling(
+            state_id,
+            field_path,
+            kind,
+            branch_id,
+            head_offset,
+        )? {
+            return Ok(());
+        }
+
         let items: Vec<serde_json::Value> = match self.get_state(branch_id, state_id)? {
             Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?,
@@ -1272,10 +1298,10 @@ impl StateManager {
     /// Query ordinals of a registered `Number` field index within
     /// `[gte, lte]` (either bound optional), scoped to `branch_id`. Returns
     /// `None` if no such index is currently registered FOR `branch_id`
-    /// (never registered, wrong kind, poisoned by a cross-branch write or a
-    /// parse failure, or registered against a *different* branch — a pure
-    /// read after `switch_branch` with no intervening write must never
-    /// serve another branch's ordinals) — distinct from `Some(vec![])`, an
+    /// (never registered there, wrong kind, or poisoned by a parse failure;
+    /// an index another branch holds is never served — a pure read after
+    /// `switch_branch` with no intervening write must never see another
+    /// branch's ordinals) — distinct from `Some(vec![])`, an
     /// index that exists, matches this branch, and has no matches.
     #[allow(clippy::too_many_arguments)]
     pub fn query_field_index_range(
@@ -1338,6 +1364,13 @@ impl StateManager {
     pub fn clear_cache(&self) {
         self.cache.write().clear();
         self.items_cache.write().clear();
+        self.tree_cache.write().clear();
+    }
+
+    /// How many times a state value has been rebuilt from the log since this
+    /// manager was created. A read served from a cache does not count.
+    pub fn reconstruction_count(&self) -> u64 {
+        self.reconstructions.load(Ordering::Relaxed)
     }
 
     /// Get cache statistics.

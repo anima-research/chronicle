@@ -1498,15 +1498,22 @@ fn test_field_index_cross_branch_writes_do_not_contaminate() {
         "writing on a branch that never registered this index must not manufacture one"
     );
 
-    // Switch back to main: the index registered there must be gone
-    // (poisoned by the side-branch writes above), not silently reporting
-    // ordinals 3/4 that don't exist on main.
+    // Switch back to main: the index registered there must be untouched by
+    // the side-branch writes above — still present (indexes are per branch;
+    // a cross-branch write used to drop it) and still exactly main's three
+    // ordinals, not reporting ordinals 3/4 that don't exist on main.
     store.switch_branch("main").unwrap();
     let after_side_writes =
         store.query_state_index_range("messages", "/v", None, None, None, None, false);
     assert_eq!(
-        after_side_writes, None,
-        "a cross-branch write must poison the index rather than leave it silently wrong"
+        after_side_writes,
+        Some(vec![0, 1, 2]),
+        "a cross-branch write must leave the index neither dropped nor silently wrong"
+    );
+    assert_eq!(
+        store.query_state_index_range("messages", "/v", Some(100.0), None, None, None, false),
+        Some(vec![]),
+        "side's values must not be visible through main's index"
     );
 
     // Re-registering on main recovers a correct, main-only index.
@@ -1570,12 +1577,16 @@ fn test_field_index_create_branch_at_does_not_contaminate() {
         )
         .unwrap();
 
-    // Back on main, the index registered before branching must be poisoned
-    // by the time-travel branch's append, not silently retained with a
-    // phantom extra ordinal.
+    // Back on main, the index registered before branching must be untouched
+    // by the time-travel branch's append: still present (per-branch indexes;
+    // it used to be dropped here) and without a phantom extra ordinal.
     store.switch_branch("main").unwrap();
     let result = store.query_state_index_range("messages", "/v", None, None, None, None, false);
-    assert_eq!(result, None);
+    assert_eq!(result, Some(vec![0, 1, 2, 3]));
+    assert_eq!(
+        store.query_state_index_range("messages", "/v", Some(999.0), None, None, None, false),
+        Some(vec![])
+    );
 
     store
         .register_state_field_index("messages", "/v", FieldIndexKind::Number)

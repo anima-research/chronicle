@@ -1698,10 +1698,10 @@ impl Store {
     /// `get_state_item`/`get_state_slice`.
     ///
     /// Returns `None` if no such index is currently registered for the
-    /// current branch (never registered, wrong kind, poisoned by a
-    /// cross-branch write or a parse failure, or — the case a pure
-    /// `switch_branch` with no follow-up write hits — registered against a
-    /// *different* branch than the one you're on now) — distinct from
+    /// current branch (never registered there, wrong kind, poisoned by a
+    /// parse failure, or — the case a pure `switch_branch` hits —
+    /// registered only on a *different* branch than the one you're on now;
+    /// indexes are per branch and a new branch starts with none) — distinct from
     /// `Some(vec![])`, an index that exists, matches this branch, and has
     /// no matches in range. Callers that get `None` for an index they
     /// expect should re-`register_state_field_index` rather than treating
@@ -2276,6 +2276,23 @@ impl Store {
         self.state.save()?;
         self.branches.save()?;
         Ok(())
+    }
+
+    /// How many times a state value has been rebuilt from the log (walked
+    /// back to its last full snapshot and re-materialized) since this store
+    /// was opened. Reads served from the state caches — including a value
+    /// another branch materialized at the same chain head — do not count.
+    /// A diagnostic counter: use it to confirm that a read was (or was not)
+    /// served from memory instead of timing it.
+    pub fn state_reconstruction_count(&self) -> u64 {
+        self.state.reconstruction_count()
+    }
+
+    /// Drop every cached materialized state value. The next read of each
+    /// state rebuilds it from the log. For tests and memory pressure; never
+    /// needed for correctness.
+    pub fn clear_state_caches(&self) {
+        self.state.clear_cache()
     }
 
     /// Get the store path.

@@ -46,3 +46,7 @@
   registered state does on a `createEmptyBranch` branch — and a write to it
   starts a fresh chain. Rust: `Store::create_branch_with_states`,
   `Store::create_branch_at_with_states`, `StateSelection`.
+- `Store::state_reconstruction_count()` (Rust) counts how often a state value
+  was rebuilt from the log, so tests and diagnostics can tell a cached read
+  from a re-materialization without timing it; `Store::clear_state_caches()`
+  drops the cached values.

@@ -1714,10 +1714,15 @@ impl JsStore {
     /// already registered, fresh (same branch, same slot head), and of the
     /// same kind. Incrementally maintained thereafter as the slot mutates
     /// (append, edit, redact, set/snapshot) on the branch it was registered
-    /// on, and persisted alongside the store. A write on a *different*
-    /// branch for the same `stateId` drops (poisons) this index rather than
-    /// mixing the two branches' ordinals — re-call this to rebuild it for
-    /// whichever branch you're now on.
+    /// on, and persisted alongside the store.
+    ///
+    /// Indexes are per branch (the current branch; on a view, the pinned
+    /// branch). Writes on other branches to the same `stateId` neither
+    /// update nor drop this index, and a branch that has not registered the
+    /// index has none: queries there return `null` until it registers its
+    /// own. Registering on a branch whose slot is unchanged since it forked
+    /// copies the parent's index instead of rebuilding it; either way each
+    /// branch's index costs memory proportional to the slot's length.
     #[napi]
     pub fn register_state_field_index(
         &self,
@@ -1747,8 +1752,8 @@ impl JsStore {
     /// `getStateItemJson`/`getStateSlice`.
     ///
     /// Returns `null` if no such `"number"` index is currently registered
-    /// (never registered, registered as `"string"` instead, or dropped by a
-    /// cross-branch write or a parse failure) — distinct from `[]`, an index
+    /// on this branch (never registered there, registered as `"string"`
+    /// instead, or dropped by a parse failure) — distinct from `[]`, an index
     /// that exists but has no matches in range. Treat `null` as "call
     /// `registerStateFieldIndex` again", not as "empty range".
     #[napi]

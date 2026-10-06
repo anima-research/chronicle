@@ -631,3 +631,138 @@ fn subscription_catch_up_replays_the_named_branch() {
         store.unsubscribe(handle.id);
     }
 }
+
+// =============================================================================
+// PER-BRANCH FIELD INDEXES
+// =============================================================================
+
+fn ts_range(store: &Store, branch: BranchId, gte: f64, lte: f64) -> Option<Vec<u32>> {
+    store.query_state_index_range_on(branch, "messages", "/ts", Some(gte), Some(lte), None, None, false)
+}
+
+fn by_channel(store: &Store, branch: BranchId, channel: &str) -> Option<Vec<u32>> {
+    store.query_state_index_eq_on(branch, "messages", "/channel", channel, None, None)
+}
+
+#[test]
+fn parent_field_index_survives_child_writes() {
+    use chronicle::FieldIndexKind;
+
+    let dir = TempDir::new().unwrap();
+    let (main, child);
+    {
+        let store = Store::create(config(&dir)).unwrap();
+        register_all(&store);
+        main = store.current_branch().id;
+        for i in 0..10u32 {
+            append_on(&store, main, json!({ "ts": i * 10, "channel": if i % 2 == 0 { "even" } else { "odd" } }));
+        }
+        store.register_state_field_index("messages", "/ts", FieldIndexKind::Number).unwrap();
+        store.register_state_field_index("messages", "/channel", FieldIndexKind::String).unwrap();
+        assert_eq!(ts_range(&store, main, 20.0, 40.0), Some(vec![2, 3, 4]));
+
+        child = store.create_branch("child", None).unwrap().id;
+        // Nothing is built for the new branch.
+        assert_eq!(ts_range(&store, child, 0.0, 1000.0), None);
+        assert_eq!(by_channel(&store, child, "even"), None);
+
+        // The child writes every kind of op to the indexed slot, without an
+        // index of its own. Before indexes were per branch, the first of
+        // these dropped the parent's.
+        for i in 0..7u32 {
+            append_on(&store, child, json!({ "ts": 1000 + i, "channel": "child" }));
+        }
+        store
+            .update_state_on(child, "messages", StateOperation::Edit {
+                index: 0,
+                new_value: serde_json::to_vec(&json!({ "ts": 5555, "channel": "child-edit" })).unwrap(),
+            })
+            .unwrap();
+        store.update_state_on(child, "messages", StateOperation::Redact { start: 1, end: 4 }).unwrap();
+        store.compact_state_on(child, "messages").unwrap();
+
+        // The parent's indexes are still there and still exactly the parent's.
+        assert_eq!(ts_range(&store, main, 20.0, 40.0), Some(vec![2, 3, 4]));
+        assert_eq!(ts_range(&store, main, 0.0, 1e9), Some((0..10).collect()));
+        assert_eq!(ts_range(&store, main, 1000.0, 1e9), Some(vec![]));
+        assert_eq!(by_channel(&store, main, "even"), Some(vec![0, 2, 4, 6, 8]));
+        assert_eq!(by_channel(&store, main, "child"), Some(vec![]));
+        assert_eq!(
+            store.get_state_index_value_counts_on(main, "messages", "/channel"),
+            Some(vec![("even".to_string(), 5), ("odd".to_string(), 5)])
+        );
+        // The child still has none: its writes did not manufacture one.
+        assert_eq!(ts_range(&store, child, 0.0, 1e9), None);
+
+        // The parent keeps maintaining its own index as it writes.
+        append_on(&store, main, json!({ "ts": 100, "channel": "even" }));
+        assert_eq!(ts_range(&store, main, 90.0, 100.0), Some(vec![9, 10]));
+
+        // The child registers its own: built from the child's content.
+        store.register_state_field_index_on(child, "messages", "/ts", FieldIndexKind::Number).unwrap();
+        store.register_state_field_index_on(child, "messages", "/channel", FieldIndexKind::String).unwrap();
+        let child_items = messages_on(&store, child);
+        assert_eq!(child_items.len(), 10 + 7 - 3);
+        let expected: Vec<u32> = child_items
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v["ts"].as_f64().unwrap() >= 1000.0)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let mut got = ts_range(&store, child, 1000.0, 1e9).unwrap();
+        got.sort();
+        assert_eq!(got, expected);
+        assert_eq!(by_channel(&store, child, "child-edit"), Some(vec![0]));
+        assert_eq!(by_channel(&store, child, "child").map(|v| v.len()), Some(7));
+
+        // Both live side by side and stay independent as both keep writing.
+        append_on(&store, child, json!({ "ts": 7, "channel": "odd" }));
+        append_on(&store, main, json!({ "ts": 8, "channel": "odd" }));
+        assert_eq!(ts_range(&store, child, 7.0, 8.0), Some(vec![child_items.len() as u32]));
+        assert_eq!(ts_range(&store, main, 7.0, 8.0), Some(vec![11]));
+        store.sync().unwrap();
+    }
+
+    // Both branches' indexes persist and reload against their own branch.
+    let store = Store::open(config(&dir)).unwrap();
+    assert_eq!(ts_range(&store, main, 7.0, 8.0), Some(vec![11]));
+    assert_eq!(by_channel(&store, main, "even"), Some(vec![0, 2, 4, 6, 8, 10]));
+    assert_eq!(by_channel(&store, child, "child-edit"), Some(vec![0]));
+    assert_eq!(ts_range(&store, child, 7.0, 8.0), Some(vec![14]));
+}
+
+#[test]
+fn a_child_registering_before_it_writes_reuses_the_parents_index() {
+    use chronicle::FieldIndexKind;
+
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(&dir)).unwrap();
+    register_all(&store);
+    let main = store.current_branch().id;
+    for i in 0..40u32 {
+        append_on(&store, main, json!({ "ts": i, "channel": "c" }));
+    }
+    store.register_state_field_index("messages", "/ts", FieldIndexKind::Number).unwrap();
+
+    let child = store.create_branch("child", None).unwrap().id;
+    store.clear_state_caches();
+    let before = store.state_reconstruction_count();
+    store.register_state_field_index_on(child, "messages", "/ts", FieldIndexKind::Number).unwrap();
+    assert_eq!(
+        store.state_reconstruction_count(),
+        before,
+        "registering an index the parent holds at the same chain head must not decode the slot"
+    );
+    assert_eq!(ts_range(&store, child, 10.0, 12.0), Some(vec![10, 11, 12]));
+
+    // A different field has no donor and is built from the child's content.
+    store.register_state_field_index_on(child, "messages", "/channel", FieldIndexKind::String).unwrap();
+    assert_eq!(store.state_reconstruction_count(), before + 1);
+    assert_eq!(by_channel(&store, child, "c").map(|v| v.len()), Some(40));
+    assert_eq!(by_channel(&store, main, "c"), None, "the parent never registered /channel");
+
+    // The copies are independent from here on.
+    append_on(&store, child, json!({ "ts": 11, "channel": "c" }));
+    assert_eq!(ts_range(&store, child, 11.0, 11.0), Some(vec![11, 40]));
+    assert_eq!(ts_range(&store, main, 11.0, 11.0), Some(vec![11]));
+}
