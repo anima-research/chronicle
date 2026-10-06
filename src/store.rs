@@ -4,7 +4,7 @@ use crate::blobs::BlobStorage;
 use crate::branches::BranchManager;
 use crate::error::{Result, StoreError};
 use crate::records::{RecordIndex, RecordLog, RecoveryReport};
-use crate::state::StateManager;
+use crate::state::{StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
     Blob, Branch, Hash, Record, RecordId, RecordInput, Sequence,
@@ -1707,6 +1707,39 @@ impl Store {
 
     /// Create a new branch from the current branch head.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
+        self.create_branch_inheriting(name, from, None)
+    }
+
+    /// Create a new branch from a branch head, inheriting only the states
+    /// `selection` covers (see [`StateSelection`]).
+    ///
+    /// Selected states are inherited exactly as `create_branch` inherits them
+    /// (the parent's chain head is copied verbatim, snapshot accounting
+    /// included). Every other state has no value on the new branch: it reads
+    /// there as a registered-but-empty state does on a `create_empty_branch`
+    /// branch, and a write starts a fresh chain.
+    ///
+    /// Cost is proportional to the number of states inherited, not to the
+    /// number of states the parent holds or to the number of branches.
+    pub fn create_branch_with_states(
+        &self,
+        name: &str,
+        from: Option<&str>,
+        selection: &StateSelection,
+    ) -> Result<Branch> {
+        self.create_branch_inheriting(name, from, Some(selection))
+    }
+
+    fn create_branch_inheriting(
+        &self,
+        name: &str,
+        from: Option<&str>,
+        selection: Option<&StateSelection>,
+    ) -> Result<Branch> {
+        // Held so the branch point and the copied chain heads describe the
+        // same instant: no write can land on the parent between the two.
+        let _lock = self.write_lock.lock();
+
         let parent = if let Some(from_name) = from {
             self.branches.get_branch(from_name).ok_or_else(|| {
                 StoreError::BranchNotFound(from_name.to_string())
@@ -1719,7 +1752,8 @@ impl Store {
         let new_branch = self.branches.create_branch(name, Some(&parent_name))?;
 
         // Copy state chain heads from parent to child
-        self.state.copy_heads_for_branch(parent.id, new_branch.id);
+        self.state
+            .copy_heads_for_branch(parent.id, new_branch.id, selection);
 
         // Broadcast branch created
         self.subscriptions.broadcast_branch_created(&new_branch, Some(parent_name));
@@ -1754,20 +1788,86 @@ impl Store {
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
+        self.create_branch_at_inheriting(name, from, at, None)
+    }
+
+    /// Create a branch at a specific sequence, inheriting only the states
+    /// `selection` covers. The historical counterpart of
+    /// [`Store::create_branch_with_states`]; unselected states have no value
+    /// on the new branch.
+    pub fn create_branch_at_with_states(
+        &self,
+        name: &str,
+        from: &str,
+        at: Sequence,
+        selection: &StateSelection,
+    ) -> Result<Branch> {
+        self.create_branch_at_inheriting(name, from, at, Some(selection))
+    }
+
+    fn create_branch_at_inheriting(
+        &self,
+        name: &str,
+        from: &str,
+        at: Sequence,
+        selection: Option<&StateSelection>,
+    ) -> Result<Branch> {
+        let _lock = self.write_lock.lock();
+
         let parent = self
             .branches
             .get_branch(from)
             .ok_or_else(|| StoreError::BranchNotFound(from.to_string()))?;
 
+        // Checked up front (in the order the branch manager reports them) so
+        // a doomed call fails before any chain is walked.
+        if self.branches.get_branch(name).is_some() {
+            return Err(StoreError::BranchExists(name.to_string()));
+        }
+        if at > parent.head {
+            return Err(StoreError::InvalidSequence(at, parent.head));
+        }
+
+        // The log is append-only, so when `at` names a record written on the
+        // parent itself, "at or before `at` on this chain" is the same as
+        // "at or before that record's offset": everything older in the chain
+        // (the parent's earlier records and whatever it inherited when it was
+        // created) was written before it, everything newer after it. A state
+        // whose head already sits at or before that offset has not changed
+        // since `at`, and its current head IS its historical head — taken
+        // verbatim, with no chain walk and no record read. `None` when `at`
+        // is not one of the parent's own sequences (at or before its own
+        // branch point); every state then takes the walk. Tree states always
+        // take it: their live `item_count` is an upper-bound estimate, and a
+        // historical branch has always been given the exact entry count.
+        let at_offset = self.index.get_offset(parent.id, at);
+
+        // Rebuild the heads before creating the branch, so a chain error
+        // cannot leave a half-populated branch behind.
+        let mut heads = Vec::new();
+        for (state_id, parent_head) in self.state.selected_heads(parent.id, selection) {
+            let is_tree = matches!(
+                self.state.get_strategy(&state_id),
+                Some(crate::types::StateStrategy::Tree { .. })
+            );
+            let head = match at_offset {
+                Some(offset) if !is_tree && parent_head.head_offset <= offset => {
+                    Some(parent_head)
+                }
+                _ => self.find_chain_head_at(parent.id, &state_id, at)?,
+            };
+            if let Some(head) = head {
+                heads.push((state_id, head));
+            }
+        }
+
         let new_branch = self.branches.create_branch_at(name, from, at)?;
 
         // Point the new branch's state heads at the parent's chain at the branch point.
         // No new records are written - the branch shares the existing chain up to this point.
-        for state_id in self.state.state_ids() {
-            if let Some(head) = self.find_chain_head_at(parent.id, &state_id, at)? {
-                self.state
-                    .insert_head_for_branch(new_branch.id, &state_id, head);
-            }
+        for (state_id, head) in heads {
+            self.state
+                .insert_head_for_branch(new_branch.id, &state_id, head);
         }
 
         self.subscriptions

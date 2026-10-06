@@ -14,7 +14,7 @@ use crate::types::{
 use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
@@ -122,11 +122,143 @@ pub struct StateChainHead {
     pub item_count_at_last_full: usize,
 }
 
+/// Chain heads for every `(branch, state)` pair, grouped by branch.
+///
+/// Grouping by branch is what keeps branch operations proportional to the
+/// branch involved rather than to the whole store: forking copies one
+/// branch's map (or just the selected entries of it), dropping a branch
+/// removes one entry, and neither scans the heads of any other branch. The
+/// per-branch map is ordered so that a state-id prefix selects a contiguous
+/// range.
+///
+/// **On-disk format:** unchanged. This serializes as the flat
+/// `(branch_id, state_id) -> head` map that `state.bin` has always held
+/// (the format a `HashMap<(BranchId, String), StateChainHead>` produces), and
+/// deserializes from it — see `test_state_index_wire_format_is_flat_map`.
+#[derive(Clone, Debug, Default)]
+pub struct BranchHeads {
+    by_branch: HashMap<BranchId, BTreeMap<String, StateChainHead>>,
+}
+
+impl BranchHeads {
+    /// Head of `state_id` on `branch`, if it has one.
+    pub fn get(&self, branch: BranchId, state_id: &str) -> Option<&StateChainHead> {
+        self.by_branch.get(&branch)?.get(state_id)
+    }
+
+    /// Mutable head of `state_id` on `branch`, if it has one.
+    pub fn get_mut(&mut self, branch: BranchId, state_id: &str) -> Option<&mut StateChainHead> {
+        self.by_branch.get_mut(&branch)?.get_mut(state_id)
+    }
+
+    /// Insert or replace the head for `(branch, state_id)`.
+    pub fn insert(
+        &mut self,
+        (branch, state_id): (BranchId, String),
+        head: StateChainHead,
+    ) -> Option<StateChainHead> {
+        self.by_branch.entry(branch).or_default().insert(state_id, head)
+    }
+
+    /// All heads of one branch, ordered by state id.
+    pub fn branch(&self, branch: BranchId) -> Option<&BTreeMap<String, StateChainHead>> {
+        self.by_branch.get(&branch)
+    }
+
+    /// Remove every head of `branch`, returning them.
+    pub fn remove_branch(&mut self, branch: BranchId) -> Option<BTreeMap<String, StateChainHead>> {
+        self.by_branch.remove(&branch)
+    }
+
+    /// Every head in the index.
+    pub fn iter(&self) -> impl Iterator<Item = ((BranchId, &String), &StateChainHead)> {
+        self.by_branch.iter().flat_map(|(branch, heads)| {
+            heads.iter().map(move |(state_id, head)| ((*branch, state_id), head))
+        })
+    }
+
+    /// Total number of heads across all branches.
+    pub fn len(&self) -> usize {
+        self.by_branch.values().map(|heads| heads.len()).sum()
+    }
+
+    /// Whether the index holds no heads at all.
+    pub fn is_empty(&self) -> bool {
+        self.by_branch.values().all(|heads| heads.is_empty())
+    }
+}
+
+impl Serialize for BranchHeads {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Entry-by-entry this makes the same serializer calls as
+        // `HashMap<(BranchId, String), StateChainHead>`. The entry count is
+        // passed explicitly: the nested iterator has no exact size hint, and
+        // MessagePack needs the map length up front.
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (key, head) in self.iter() {
+            map.serialize_entry(&key, head)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BranchHeads {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct HeadsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeadsVisitor {
+            type Value = BranchHeads;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of (branch_id, state_id) to chain head")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<BranchHeads, A::Error> {
+                let mut heads = BranchHeads::default();
+                while let Some((key, head)) =
+                    map.next_entry::<(BranchId, String), StateChainHead>()?
+                {
+                    heads.insert(key, head);
+                }
+                Ok(heads)
+            }
+        }
+
+        deserializer.deserialize_map(HeadsVisitor)
+    }
+}
+
+/// Which of a parent branch's states a new branch inherits.
+///
+/// A state is selected if its id equals one of `state_ids` or starts with one
+/// of `state_prefixes`. An empty selection selects nothing. Ids that name no
+/// state, or a state with no value on the parent, are ignored: there is
+/// nothing to inherit and the state reads as empty on the child either way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateSelection {
+    /// Exact state ids to inherit.
+    pub state_ids: Vec<String>,
+    /// State-id prefixes to inherit.
+    pub state_prefixes: Vec<String>,
+}
+
+impl StateSelection {
+    /// Whether `state_id` is covered by this selection.
+    pub fn matches(&self, state_id: &str) -> bool {
+        self.state_ids.iter().any(|id| id == state_id)
+            || self.state_prefixes.iter().any(|p| state_id.starts_with(p.as_str()))
+    }
+}
+
 /// In-memory state index (small - just heads and strategies).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StateIndex {
     /// Chain heads per (branch_id, state_id).
-    pub heads: HashMap<(BranchId, String), StateChainHead>,
+    pub heads: BranchHeads,
 
     /// Registered state strategies.
     pub strategies: HashMap<String, StateStrategy>,
@@ -350,9 +482,9 @@ impl StateManager {
     ) -> Result<()> {
         let mut index = self.index.write();
 
-        let key = (branch_id, state_id.to_string());
-        let head = index.heads.entry(key.clone()).or_insert_with(|| {
-            StateChainHead {
+        let branch_heads = index.heads.by_branch.entry(branch_id).or_default();
+        if !branch_heads.contains_key(state_id) {
+            branch_heads.insert(state_id.to_string(), StateChainHead {
                 head_offset: offset,
                 ops_since_delta_snapshot: 0,
                 delta_snapshots_since_full: 0,
@@ -361,8 +493,11 @@ impl StateManager {
                 has_non_append_since_snapshot: false,
                 item_count: 0,
                 item_count_at_last_full: 0,
-            }
-        });
+            });
+        }
+        let head = branch_heads
+            .get_mut(state_id)
+            .expect("head inserted above");
 
         head.head_offset = offset;
 
@@ -567,8 +702,7 @@ impl StateManager {
     pub fn get_state(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Vec<u8>>> {
         let index = self.index.read();
 
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -629,8 +763,7 @@ impl StateManager {
         state_id: &str,
     ) -> Result<Option<Arc<Vec<Vec<u8>>>>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -709,7 +842,7 @@ impl StateManager {
     ) -> Result<Option<Vec<u8>>> {
         let head = {
             let idx = self.index.read();
-            match idx.heads.get(&(branch_id, state_id.to_string())) {
+            match idx.heads.get(branch_id, state_id) {
                 Some(h) => h.clone(),
                 None => return Ok(None),
             }
@@ -769,8 +902,7 @@ impl StateManager {
         state_id: &str,
     ) -> Result<Option<Arc<TreeState>>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -872,8 +1004,7 @@ impl StateManager {
 
     /// Get the chain head for a state.
     pub fn get_head(&self, branch_id: BranchId, state_id: &str) -> Option<StateChainHead> {
-        let key = (branch_id, state_id.to_string());
-        self.index.read().heads.get(&key).cloned()
+        self.index.read().heads.get(branch_id, state_id).cloned()
     }
 
     /// Get the strategy for a state.
@@ -887,8 +1018,7 @@ impl StateManager {
     pub fn snapshot_needed(&self, branch_id: BranchId, state_id: &str) -> Option<SnapshotNeeded> {
         let index = self.index.read();
 
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h,
             None => return None,
         };
@@ -984,18 +1114,87 @@ impl StateManager {
     }
 
     /// Copy state chain heads from one branch to another (for branching).
-    pub fn copy_heads_for_branch(&self, from_branch: BranchId, to_branch: BranchId) {
+    ///
+    /// Heads are copied verbatim, snapshot accounting included, so the new
+    /// branch schedules snapshots exactly as its parent would have. With
+    /// `selection` only the selected states are copied; the others have no
+    /// head on the new branch and read there as registered-but-empty.
+    ///
+    /// Cost is proportional to the heads copied (plus a `log n` lookup per
+    /// exact id or prefix), never to the number of branches or to the heads
+    /// other branches hold. Returns the number of heads copied.
+    pub fn copy_heads_for_branch(
+        &self,
+        from_branch: BranchId,
+        to_branch: BranchId,
+        selection: Option<&StateSelection>,
+    ) -> usize {
         let mut index = self.index.write();
 
-        // Find all heads for the source branch
-        let heads_to_copy: Vec<_> = index.heads.iter()
-            .filter(|((branch_id, _), _)| *branch_id == from_branch)
-            .map(|((_, state_id), head)| (state_id.clone(), head.clone()))
-            .collect();
+        let copied: BTreeMap<String, StateChainHead> = match index.heads.branch(from_branch) {
+            None => return 0,
+            Some(parent) => match selection {
+                None => parent.clone(),
+                // Collecting into a map dedups a state named twice (by id
+                // and by prefix, or by overlapping prefixes).
+                Some(selection) => Self::select_heads(parent, selection)
+                    .map(|(state_id, head)| (state_id.clone(), head.clone()))
+                    .collect(),
+            },
+        };
 
-        // Copy them to the new branch
-        for (state_id, head) in heads_to_copy {
-            index.heads.insert((to_branch, state_id), head);
+        let count = copied.len();
+        if count > 0 {
+            index
+                .heads
+                .by_branch
+                .entry(to_branch)
+                .or_default()
+                .extend(copied);
+        }
+        count
+    }
+
+    /// The entries of one branch's head map that `selection` covers. A state
+    /// covered more than once is yielded more than once; callers dedup.
+    fn select_heads<'a>(
+        heads: &'a BTreeMap<String, StateChainHead>,
+        selection: &'a StateSelection,
+    ) -> impl Iterator<Item = (&'a String, &'a StateChainHead)> + 'a {
+        let exact = selection
+            .state_ids
+            .iter()
+            .filter_map(move |id| heads.get_key_value(id.as_str()));
+        let prefixed = selection.state_prefixes.iter().flat_map(move |prefix| {
+            heads
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(move |(id, _)| id.starts_with(prefix.as_str()))
+        });
+        exact.chain(prefixed)
+    }
+
+    /// The heads of `branch_id` covered by `selection` (all of them when
+    /// `selection` is `None`), each state once, ordered by state id.
+    pub fn selected_heads(
+        &self,
+        branch_id: BranchId,
+        selection: Option<&StateSelection>,
+    ) -> Vec<(String, StateChainHead)> {
+        let index = self.index.read();
+        let heads = match index.heads.branch(branch_id) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        match selection {
+            None => heads.iter().map(|(id, h)| (id.clone(), h.clone())).collect(),
+            Some(selection) => Self::select_heads(heads, selection)
+                .map(|(id, h)| (id.clone(), h.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1152,8 +1351,7 @@ impl StateManager {
     /// and the offset of the oldest operation that's still needed.
     pub fn get_compaction_stats(&self, branch_id: BranchId, state_id: &str) -> Option<CompactionStats> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = index.heads.get(&key)?;
+        let head = index.heads.get(branch_id, state_id)?;
         // Each delta snapshot covers delta_snapshot_every ops; a strategy
         // without delta snapshots never increments delta_snapshots_since_full,
         // so the multiplier is moot there.
@@ -1178,8 +1376,7 @@ impl StateManager {
     /// by creating a full snapshot at the current head.
     pub fn count_chain_operations(&self, branch_id: BranchId, state_id: &str) -> Result<Option<ChainStats>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -1341,7 +1538,7 @@ impl StateManager {
             field_indexes.prune_stale(|state_id, branch_id| {
                 current_index
                     .heads
-                    .get(&(branch_id, state_id.to_string()))
+                    .get(branch_id, state_id)
                     .map(|h| h.head_offset)
             });
             drop(current_index);
@@ -2126,5 +2323,144 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot);
         assert_eq!(head.item_count, 0);
         assert_eq!(head.item_count_at_last_full, 0);
+    }
+    /// `state.bin` compatibility: `BranchHeads` must read the flat
+    /// `(branch_id, state_id) -> head` map every existing store holds, and
+    /// write a map the previous in-memory layout reads back unchanged.
+    #[test]
+    fn test_state_index_wire_format_is_flat_map() {
+        /// `StateIndex` exactly as it was declared through 0.4.0.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyStateIndex {
+            heads: HashMap<(BranchId, String), StateChainHead>,
+            strategies: HashMap<String, StateStrategy>,
+        }
+
+        fn head(n: u64) -> StateChainHead {
+            StateChainHead {
+                head_offset: n,
+                ops_since_delta_snapshot: n + 1,
+                delta_snapshots_since_full: n + 2,
+                last_delta_snapshot_offset: Some(n + 3),
+                last_full_snapshot_offset: if n % 2 == 0 { Some(n + 4) } else { None },
+                has_non_append_since_snapshot: n % 2 == 1,
+                item_count: (n + 5) as usize,
+                item_count_at_last_full: (n + 6) as usize,
+            }
+        }
+
+        let mut legacy = LegacyStateIndex {
+            heads: HashMap::new(),
+            strategies: HashMap::new(),
+        };
+        let mut n = 0;
+        for branch in [1u64, 2, 7, 300] {
+            for state in ["messages", "agent/a/tree", "", "ünïcode"] {
+                legacy.heads.insert((BranchId(branch), state.to_string()), head(n));
+                n += 1;
+            }
+        }
+        legacy.strategies.insert("messages".to_string(), StateStrategy::Snapshot);
+        legacy.strategies.insert(
+            "agent/a/tree".to_string(),
+            StateStrategy::Tree { delta_snapshot_every: 5, full_snapshot_every: 3 },
+        );
+
+        // Old bytes -> new layout.
+        let legacy_bytes = rmp_serde::to_vec(&legacy).unwrap();
+        let index: StateIndex = rmp_serde::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(index.heads.len(), legacy.heads.len());
+        for ((branch, state), expected) in &legacy.heads {
+            let got = index.heads.get(*branch, state).expect("head survived");
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        }
+        assert_eq!(index.strategies.len(), 2);
+
+        // New bytes -> old layout.
+        let new_bytes = rmp_serde::to_vec(&index).unwrap();
+        assert_eq!(
+            new_bytes.len(),
+            legacy_bytes.len(),
+            "same encoding, entry order aside"
+        );
+        let back: LegacyStateIndex = rmp_serde::from_slice(&new_bytes).unwrap();
+        assert_eq!(back.heads.len(), legacy.heads.len());
+        for (key, expected) in &legacy.heads {
+            assert_eq!(format!("{:?}", back.heads[key]), format!("{expected:?}"));
+        }
+        assert_eq!(back.strategies.len(), 2);
+
+        // An empty index round-trips too (a store with no state writes yet).
+        let empty = rmp_serde::to_vec(&StateIndex::default()).unwrap();
+        let legacy_empty = rmp_serde::to_vec(&LegacyStateIndex {
+            heads: HashMap::new(),
+            strategies: HashMap::new(),
+        })
+        .unwrap();
+        assert_eq!(empty, legacy_empty);
+        assert!(rmp_serde::from_slice::<StateIndex>(&legacy_empty).unwrap().heads.is_empty());
+    }
+
+    #[test]
+    fn test_copy_heads_selection() {
+        let (_dir, _log, manager) = setup_test();
+        let parent = BranchId(1);
+        let other = BranchId(9);
+        let head = |n: u64| StateChainHead {
+            head_offset: n,
+            ops_since_delta_snapshot: 3,
+            delta_snapshots_since_full: 2,
+            last_delta_snapshot_offset: Some(n),
+            last_full_snapshot_offset: Some(1),
+            has_non_append_since_snapshot: true,
+            item_count: 10,
+            item_count_at_last_full: 4,
+        };
+        for (i, id) in ["a/1", "a/2", "a0", "ab", "b/1", "shared"].iter().enumerate() {
+            manager.insert_head_for_branch(parent, id, head(100 + i as u64));
+            manager.insert_head_for_branch(other, id, head(900 + i as u64));
+        }
+
+        let ids = |branch| -> Vec<String> {
+            manager.selected_heads(branch, None).into_iter().map(|(id, _)| id).collect()
+        };
+
+        // Everything.
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(2), None), 6);
+        assert_eq!(ids(BranchId(2)), ids(parent));
+
+        // Exact ids and prefixes, overlapping, plus names that match nothing.
+        let selection = StateSelection {
+            state_ids: vec!["shared".into(), "a/1".into(), "missing".into()],
+            state_prefixes: vec!["a/".into(), "a/1".into(), "zzz".into()],
+        };
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(3), Some(&selection)), 3);
+        assert_eq!(ids(BranchId(3)), vec!["a/1", "a/2", "shared"]);
+        // Verbatim, accounting included, and taken from the parent — not
+        // from another branch holding the same state ids.
+        for (id, got) in manager.selected_heads(BranchId(3), None) {
+            let expected = manager.get_head(parent, &id).unwrap();
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        }
+        assert_eq!(
+            manager
+                .selected_heads(parent, Some(&selection))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["a/1", "a/2", "shared"]
+        );
+
+        // Empty selection inherits nothing; so does an unknown parent.
+        assert_eq!(
+            manager.copy_heads_for_branch(parent, BranchId(4), Some(&StateSelection::default())),
+            0
+        );
+        assert!(ids(BranchId(4)).is_empty());
+        assert_eq!(manager.copy_heads_for_branch(BranchId(77), BranchId(5), None), 0);
+
+        // The empty prefix selects every state.
+        let all = StateSelection { state_ids: vec![], state_prefixes: vec![String::new()] };
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(6), Some(&all)), 6);
     }
 }
