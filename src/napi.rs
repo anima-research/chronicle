@@ -1063,6 +1063,22 @@ impl JsStore {
         Ok(len.map(|l| l as i64))
     }
 
+    /// Revision key for a state's value on this handle's branch: the log
+    /// offset of its newest chain record, or `null` if the state has no
+    /// value there. It changes on every write to that state on that branch
+    /// (append, edit, redact, set, and the store's own snapshots) and on
+    /// nothing else, so a cached copy of the value is current exactly while
+    /// this number is unchanged — including across several handles on the
+    /// same branch, which a per-handle counter cannot see. O(1).
+    #[napi]
+    pub fn state_head_offset(&self, state_id: String) -> Result<Option<i64>> {
+        let (store, branch) = self.target()?;
+        let offset = store
+            .state_head_offset_on(branch, &state_id)
+            .map_err(to_napi_error)?;
+        Ok(offset.map(|o| o as i64))
+    }
+
     /// Get a slice of an AppendLog state.
     #[napi]
     pub fn get_state_slice(

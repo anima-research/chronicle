@@ -119,6 +119,22 @@ try {
   assert.equal(texts(vb)[1], 'm1');
   ok('snapshot, tree, edit and redact through views are isolated in both directions');
 
+  // --- stateHeadOffset: a revision key shared by every handle on a branch -
+  {
+    const again = store.view('main');
+    const key = store.stateHeadOffset('messages');
+    assert.equal(again.stateHeadOffset('messages'), key, 'two handles on one branch agree');
+    assert.equal(store.stateHeadOffset('no-such-state'), null);
+    store.setStateJson('cfg/model', { name: 'parent-model' }); // another state: no change
+    assert.equal(store.stateHeadOffset('messages'), key);
+    again.editStateItem('messages', 0, Buffer.from(JSON.stringify({ text: 'm0-again' }))); // count-preserving edit
+    assert.notEqual(store.stateHeadOffset('messages'), key, 'an edit through the other handle moves the key');
+    assert.notEqual(va.stateHeadOffset('messages'), store.stateHeadOffset('messages'), 'branches that diverged differ');
+    // Put m0 back so the later steps see the value they expect.
+    again.editStateItem('messages', 0, Buffer.from(JSON.stringify({ text: 'm0-main-edit' })));
+    ok('stateHeadOffset is an exact, handle-independent revision key');
+  }
+
   // --- what a view refuses / redirects ----------------------------------
   assert.throws(() => va.switchBranch('main'), /not available on a view/);
   assert.equal(store.currentBranch().name, 'main');

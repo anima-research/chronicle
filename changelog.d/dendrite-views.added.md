@@ -50,3 +50,4 @@
   was rebuilt from the log, so tests and diagnostics can tell a cached read
   from a re-materialization without timing it; `Store::clear_state_caches()`
   drops the cached values.
+- `stateHeadOffset(stateId)`: the log offset of a state's newest chain record on the handle's branch, or `null` — an O(1) revision key that changes on every write to that state on that branch (including count-preserving edits and the store's own snapshots) and on nothing else, equal for every handle on the same branch. Lets a cache above the store revalidate exactly instead of by item count.

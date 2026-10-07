@@ -1072,6 +1072,27 @@ impl Store {
         }
     }
 
+    /// The log offset of a state's newest chain record on the current
+    /// branch, or `None` if the state has no value there. See
+    /// [`Store::state_head_offset_on`].
+    pub fn state_head_offset(&self, state_id: &str) -> Result<Option<u64>> {
+        self.state_head_offset_on(self.branches.current_id(), state_id)
+    }
+
+    /// `state_head_offset` against the given branch.
+    ///
+    /// The head offset changes on every write to that state on that branch
+    /// — append, edit, redact, set, and the snapshots the store adds after
+    /// them — and on nothing else, so it is an exact, O(1) revision key for
+    /// a cached copy of the value. Two branches that share an unchanged
+    /// inherited value report the same offset. Unlike an item count it
+    /// cannot be fooled by a count-preserving edit; unlike the store's
+    /// sequence it does not move when other states are written.
+    pub fn state_head_offset_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<u64>> {
+        self.branch_by_id(branch_id)?;
+        Ok(self.state.get_head(branch_id, state_id).map(|head| head.head_offset))
+    }
+
     /// Get a slice of an AppendLog state.
     ///
     /// Served from the state manager's per-item cache: the full state is

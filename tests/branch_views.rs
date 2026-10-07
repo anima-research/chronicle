@@ -766,3 +766,45 @@ fn a_child_registering_before_it_writes_reuses_the_parents_index() {
     assert_eq!(ts_range(&store, child, 11.0, 11.0), Some(vec![11, 40]));
     assert_eq!(ts_range(&store, main, 11.0, 11.0), Some(vec![11]));
 }
+
+/// `state_head_offset_on` is an exact revision key for a state's value on a
+/// branch: equal across handles and across branches that share the value
+/// unchanged, changed by every write to that state (including a
+/// count-preserving edit), and unmoved by writes to other states.
+#[test]
+fn state_head_offset_is_an_exact_revision_key() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(&dir)).unwrap();
+    let main = seed(&store);
+
+    let before = store.state_head_offset_on(main, "messages").unwrap().unwrap();
+    assert_eq!(store.state_head_offset("messages").unwrap(), Some(before), "cursor and explicit branch agree");
+    assert_eq!(store.state_head_offset_on(main, "never-registered").unwrap(), None);
+
+    // A write to ANOTHER state leaves this state's key alone.
+    store
+        .update_state("config", StateOperation::Set(b"{\"v\":1}".to_vec()))
+        .unwrap();
+    assert_eq!(store.state_head_offset_on(main, "messages").unwrap(), Some(before));
+
+    // A count-preserving edit changes it.
+    store
+        .update_state_on(main, "messages", StateOperation::Edit { index: 0, new_value: b"\"edited\"".to_vec() })
+        .unwrap();
+    let after_edit = store.state_head_offset_on(main, "messages").unwrap().unwrap();
+    assert_ne!(after_edit, before);
+    assert_eq!(store.get_state_len_on(main, "messages").unwrap(), Some(6), "the count did not move; the key did");
+
+    // An append changes it again.
+    append_on(&store, main, json!({ "from": "main", "i": 6 }));
+    let after_append = store.state_head_offset_on(main, "messages").unwrap().unwrap();
+    assert_ne!(after_append, after_edit);
+
+    // A child forked at the head shares the unchanged value and its key;
+    // its own write moves only its key.
+    let child = store.create_branch("child", None).unwrap().id;
+    assert_eq!(store.state_head_offset_on(child, "messages").unwrap(), Some(after_append));
+    append_on(&store, child, json!({ "from": "child" }));
+    assert_ne!(store.state_head_offset_on(child, "messages").unwrap(), Some(after_append));
+    assert_eq!(store.state_head_offset_on(main, "messages").unwrap(), Some(after_append));
+}
