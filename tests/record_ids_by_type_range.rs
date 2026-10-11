@@ -4,9 +4,11 @@
 //! can reorder or reissue IDs: interleaved types, a reopen, and a torn tail
 //! whose truncated IDs are handed out again.
 
+use chronicle::types::{StateOperation, StateRegistration, StateStrategy};
 use chronicle::{RecordId, RecordInput, Store, StoreConfig};
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn config(path: &Path) -> StoreConfig {
@@ -151,4 +153,115 @@ fn ranges_match_the_type_list_after_a_torn_tail_reissues_ids() {
         1,
         "only the layout appended after the reissued ID"
     );
+}
+
+#[test]
+fn concurrent_appends_keep_each_type_list_in_order() {
+    // The order rests on the store's write lock, held across the log append
+    // and the index add at both append sites: appends from many threads must
+    // still leave each type's list ascending, and its ranges right.
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(Store::create(config(&dir.path().join("store"))).unwrap());
+    let threads: Vec<_> = (0..4u64)
+        .map(|t| {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 0..12u64 {
+                    append(
+                        &store,
+                        if (t + i) % 2 == 0 {
+                            "layout"
+                        } else {
+                            "message"
+                        },
+                        t * 100 + i,
+                    );
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(
+        store.get_records_by_type("layout").len() + store.get_records_by_type("message").len(),
+        48
+    );
+    assert_ranges_match_the_list(&store, "layout");
+    assert_ranges_match_the_list(&store, "message");
+}
+
+#[test]
+fn ranges_cover_state_updates_before_and_after_a_reopen() {
+    // State updates reach the type index through their own append path.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = Store::create(config(&path)).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "log".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        for i in 0..8u64 {
+            store
+                .update_state(
+                    "log",
+                    StateOperation::Append(format!("{{\"i\":{i}}}").into_bytes()),
+                )
+                .unwrap();
+            append(&store, "message", i);
+        }
+        assert!(store.get_records_by_type("state_update").len() >= 8);
+        assert_ranges_match_the_list(&store, "state_update");
+        store.sync().unwrap();
+    }
+    let store = Store::open_or_create(config(&path)).unwrap();
+    assert_ranges_match_the_list(&store, "state_update");
+    assert_ranges_match_the_list(&store, "message");
+}
+
+#[test]
+fn a_cursor_kept_across_a_torn_tail_skips_the_record_that_reuses_its_id() {
+    // IDs lost to a torn tail are issued again. A reader that kept a cursor
+    // at a lost ID, for the same type, passes over the record that reuses it:
+    // the hazard the changelog names for cursors kept across a crash.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let lost = {
+        let store = Store::create(config(&path)).unwrap();
+        for i in 0..4 {
+            append(&store, "layout", i);
+        }
+        store.sync().unwrap();
+        append(&store, "layout", 4)
+    };
+    // A reader paging layouts saw the last one and kept it as its cursor.
+    let cursor = lost;
+    let log_path = path.join("records.log");
+    let len = std::fs::metadata(&log_path).unwrap().len();
+    let file = OpenOptions::new().write(true).open(&log_path).unwrap();
+    file.set_len(len - 5).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let store = Store::open_or_create(config(&path)).unwrap();
+    assert!(store.recovery().is_some(), "the torn tail was recovered");
+    let reissued = append(&store, "layout", 5);
+    assert_eq!(
+        reissued, lost,
+        "the lost ID is issued again, to the same type"
+    );
+    let next = append(&store, "layout", 6);
+    assert_eq!(
+        store.get_records_by_type_range("layout", Some(cursor), None, None, false),
+        vec![next],
+        "the record that reused the cursor's ID is passed over"
+    );
+    assert_ranges_match_the_list(&store, "layout");
 }

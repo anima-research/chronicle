@@ -83,6 +83,12 @@ impl RecordIndex {
     }
 
     /// Add an entry to the index.
+    ///
+    /// Within a record type, IDs must be added in ascending order: every
+    /// append path and the rebuild at open add them so (see `type_index`), and
+    /// `get_by_type_range` binary-searches on it. A debug build asserts it;
+    /// a release build trusts it, and an out-of-order add would leave that
+    /// type's ranges wrong.
     pub fn add(
         &self,
         id: RecordId,
@@ -323,6 +329,19 @@ mod tests {
 
         let code = index.get_by_type("code");
         assert_eq!(code.len(), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "indexed out of ID order")]
+    fn test_type_index_refuses_an_out_of_order_add_in_debug() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+        index.add(RecordId(5), branch, Sequence(1), 0, "message", &[], &[]);
+        // Another type's lower ID is fine; this type's lower ID is not.
+        index.add(RecordId(3), branch, Sequence(2), 10, "code", &[], &[]);
+        index.add(RecordId(4), branch, Sequence(3), 20, "message", &[], &[]);
     }
 
     #[test]
