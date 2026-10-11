@@ -6,7 +6,8 @@
   IDs are kept in ascending order, so the bounds are found by binary search,
   and paging through a large type or asking for its newest record costs what
   it returns rather than a copy of every ID. A malformed bound is rejected
-  with `Invalid record ID for after` (or `before`). Without options the call
+  with `Invalid record ID for after` (or `before`), and a `limit` that isn't
+  a non-negative integer with `Invalid limit`. Without options the call
   is unchanged: every ID of the type, oldest first. In Rust, the same query is
   `Store::get_records_by_type_range`. Nothing about stores changes, so stores
   open as before in either direction.

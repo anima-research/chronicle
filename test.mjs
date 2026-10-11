@@ -70,7 +70,20 @@ try {
 if (!rejected || !/Invalid record ID for after/.test(rejected.message)) {
   throw new Error(`getRecordIdsByType should reject a malformed bound, got ${rejected}`);
 }
-console.log('✓ Bounds, limit and order work; a malformed bound is rejected');
+// A limit that isn't a non-negative integer is rejected, not wrapped as a u32 would be (-1 to every ID, 2^32 + 1 to one).
+for (const limit of [-1, 2.5, 4294967297.5, NaN, Infinity]) {
+  let refused = null;
+  try {
+    store.getRecordIdsByType('test.range', { limit });
+  } catch (e) {
+    refused = e;
+  }
+  if (!refused || !/Invalid limit/.test(refused.message)) {
+    throw new Error(`getRecordIdsByType should reject limit ${limit}, got ${refused}`);
+  }
+}
+same(store.getRecordIdsByType('test.range', { limit: 4294967297 }), rangeIds, 'a limit past 2^32');
+console.log('✓ Bounds, limit and order work; a malformed bound or limit is rejected');
 
 // Test 8: Register and use state (AppendLog)
 console.log('\n8. Registering AppendLog state...');

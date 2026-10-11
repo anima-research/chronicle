@@ -92,8 +92,10 @@ pub struct JsRecordIdsByTypeOptions {
     pub after: Option<String>,
     /// Only IDs less than this one.
     pub before: Option<String>,
-    /// At most this many: the oldest within the bounds, or the newest with `reverse`.
-    pub limit: Option<u32>,
+    /// At most this many: the oldest within the bounds, or the newest with
+    /// `reverse`. A non-negative integer; anything else is rejected rather
+    /// than wrapped the way a `u32` conversion would wrap it.
+    pub limit: Option<f64>,
     /// Newest first.
     pub reverse: Option<bool>,
 }
@@ -513,11 +515,23 @@ impl JsStore {
                         })
                         .transpose()
                 };
+                let limit = options
+                    .limit
+                    .map(|limit| {
+                        if limit.is_finite() && limit >= 0.0 && limit.fract() == 0.0 {
+                            Ok(limit as usize)
+                        } else {
+                            Err(napi::Error::from_reason(format!(
+                                "Invalid limit: {limit} (a non-negative integer)"
+                            )))
+                        }
+                    })
+                    .transpose()?;
                 store.get_records_by_type_range(
                     &record_type,
                     bound(options.after, "after")?,
                     bound(options.before, "before")?,
-                    options.limit.map(|limit| limit as usize),
+                    limit,
                     options.reverse.unwrap_or(false),
                 )
             }
