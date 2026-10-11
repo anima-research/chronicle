@@ -10,8 +10,12 @@
   `Store::get_records_by_type_range`.
   - **A type spans branches.** The type index isn't per branch, so
     `{ reverse: true, limit: 1 }` is the type's newest record on any branch.
-    A branch's newest is read back in reverse pages (`reverse`, a `limit` and a
-    `before` cursor), filtered by branch.
+    A record read from JS doesn't carry its branch, so a caller that wants a
+    branch's newest records the branch in its own payload, reads the type
+    back in reverse pages (`reverse`, a `limit` and a `before` cursor), and
+    filters on that. Deleting a branch removes only its entry in the branch
+    list: its records stay in the log and stay listed by type, so a reverse
+    page can still return them.
   - **Refusals.** A bound string that isn't a record ID is rejected with
     `Invalid record ID for after` (or `before`), and a `limit` that isn't a
     non-negative integer with `Invalid limit`; a limit past what an index can
