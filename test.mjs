@@ -43,6 +43,35 @@ console.log('\n7. Getting records by type...');
 const recordIds = store.getRecordIdsByType('test.message');
 console.log('✓ Found', recordIds.length, 'record(s) of type test.message');
 
+// Test 7b: Record IDs by type within bounds
+console.log('\n7b. Getting record IDs by type within bounds...');
+const rangeIds = [];
+for (let i = 0; i < 5; i++) {
+  rangeIds.push(store.appendJson('test.range', { i }).id);
+  store.appendJson('test.other', { i }); // another type's IDs between them
+}
+const same = (got, want, what) => {
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`getRecordIdsByType ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  }
+};
+same(store.getRecordIdsByType('test.range'), rangeIds, 'with no options');
+same(store.getRecordIdsByType('test.range', { after: rangeIds[1] }), rangeIds.slice(2), 'after');
+same(store.getRecordIdsByType('test.range', { before: rangeIds[3] }), rangeIds.slice(0, 3), 'before');
+same(store.getRecordIdsByType('test.range', { after: rangeIds[0], before: rangeIds[4], limit: 2 }), rangeIds.slice(1, 3), 'within bounds, limited');
+same(store.getRecordIdsByType('test.range', { reverse: true, limit: 1 }), [rangeIds[4]], 'the newest');
+same(store.getRecordIdsByType('test.range', { before: rangeIds[4], reverse: true, limit: 2 }), [rangeIds[3], rangeIds[2]], 'newest first below a bound');
+let rejected = null;
+try {
+  store.getRecordIdsByType('test.range', { after: 'not-an-id' });
+} catch (e) {
+  rejected = e;
+}
+if (!rejected || !/Invalid record ID for after/.test(rejected.message)) {
+  throw new Error(`getRecordIdsByType should reject a malformed bound, got ${rejected}`);
+}
+console.log('✓ Bounds, limit and order work; a malformed bound is rejected');
+
 // Test 8: Register and use state (AppendLog)
 console.log('\n8. Registering AppendLog state...');
 store.registerState({
