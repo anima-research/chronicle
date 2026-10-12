@@ -158,8 +158,9 @@ fn ranges_match_the_type_list_after_a_torn_tail_reissues_ids() {
 #[test]
 fn concurrent_appends_keep_each_type_list_in_order() {
     // The order rests on the store's write lock, held across the log append
-    // and the index add at both append sites: appends from many threads must
-    // still leave each type's list ascending, and its ranges right.
+    // and the index add at both append sites (`append` and `update_state`).
+    // This test races `append`: appends from many threads must still leave
+    // each type's list ascending, and its ranges right.
     let dir = TempDir::new().unwrap();
     let store = Arc::new(Store::create(config(&dir.path().join("store"))).unwrap());
     let threads: Vec<_> = (0..4u64)

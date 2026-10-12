@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "indexed out of ID order")]
+    #[should_panic(expected = "record 4 of type \"message\" indexed out of ID order")]
     fn test_type_index_refuses_an_out_of_order_add_in_debug() {
         let dir = TempDir::new().unwrap();
         let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
