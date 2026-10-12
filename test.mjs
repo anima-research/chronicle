@@ -43,6 +43,53 @@ console.log('\n7. Getting records by type...');
 const recordIds = store.getRecordIdsByType('test.message');
 console.log('✓ Found', recordIds.length, 'record(s) of type test.message');
 
+// Test 7b: Record IDs by type within bounds
+console.log('\n7b. Getting record IDs by type within bounds...');
+const rangeIds = [];
+for (let i = 0; i < 5; i++) {
+  rangeIds.push(store.appendJson('test.range', { i }).id);
+  store.appendJson('test.other', { i }); // another type's IDs between them
+}
+const same = (got, want, what) => {
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(`getRecordIdsByType ${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  }
+};
+same(store.getRecordIdsByType('test.range'), rangeIds, 'with no options');
+same(store.getRecordIdsByType('test.range', { after: rangeIds[1] }), rangeIds.slice(2), 'after');
+same(store.getRecordIdsByType('test.range', { before: rangeIds[3] }), rangeIds.slice(0, 3), 'before');
+same(store.getRecordIdsByType('test.range', { after: rangeIds[0], before: rangeIds[4], limit: 2 }), rangeIds.slice(1, 3), 'within bounds, limited');
+same(store.getRecordIdsByType('test.range', { reverse: true, limit: 1 }), [rangeIds[4]], 'the newest');
+same(store.getRecordIdsByType('test.range', { before: rangeIds[4], reverse: true, limit: 2 }), [rangeIds[3], rangeIds[2]], 'newest first below a bound');
+// A malformed bound is rejected, each with its own label.
+for (const bound of ['after', 'before']) {
+  let rejected = null;
+  try {
+    store.getRecordIdsByType('test.range', { [bound]: 'not-an-id' });
+  } catch (e) {
+    rejected = e;
+  }
+  if (!rejected || !new RegExp(`Invalid record ID for ${bound}`).test(rejected.message)) {
+    throw new Error(`getRecordIdsByType should reject a malformed ${bound}, got ${rejected}`);
+  }
+}
+same(store.getRecordIdsByType('test.range', { limit: 0 }), [], 'a limit of 0');
+// A limit that isn't a non-negative integer is rejected, not wrapped as a u32 would be (-1 to every ID, 2^32 + 1 to one).
+for (const limit of [-1, 2.5, 4294967297.5, NaN, Infinity]) {
+  let refused = null;
+  try {
+    store.getRecordIdsByType('test.range', { limit });
+  } catch (e) {
+    refused = e;
+  }
+  if (!refused || !/Invalid limit/.test(refused.message)) {
+    throw new Error(`getRecordIdsByType should reject limit ${limit}, got ${refused}`);
+  }
+}
+same(store.getRecordIdsByType('test.range', { limit: 4294967297 }), rangeIds, 'a limit past 2^32');
+same(store.getRecordIdsByType('test.range', { limit: 1e20 }), rangeIds, 'a limit past usize');
+console.log('✓ Bounds, limit and order work; a malformed bound or limit is rejected');
+
 // Test 8: Register and use state (AppendLog)
 console.log('\n8. Registering AppendLog state...');
 store.registerState({
