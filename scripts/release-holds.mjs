@@ -1,3 +1,7 @@
+// A copy of agent-framework's scripts/release-holds.mjs
+// (https://github.com/anima-research/agent-framework), which it follows apart
+// from this opening comment: a fix to the check belongs there, and then here.
+//
 // Runs as npm's `preversion` lifecycle hook (see package.json), before
 // `npm version` bumps anything; as `prepublishOnly`, before `npm publish`;
 // and in both of the publish workflow's releasing jobs for the pushed tag.

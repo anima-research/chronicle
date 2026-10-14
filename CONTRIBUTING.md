@@ -155,8 +155,10 @@ never do.
   `npm version` stops before it bumps anything, `npm publish` refuses,
   and the publish workflow refuses both its npm publish and its GitHub
   release notes. The check also stops a release when it can't read the
-  holds from GitHub, and says why. npm's `--ignore-scripts` skips it, as
-  it skips every lifecycle script.
+  holds from GitHub, and says why. Closing the hold is the way past it:
+  npm's `--ignore-scripts` would skip the check, but on `npm version` it
+  skips the changelog fold too, and the tag then fails the publish
+  workflow's changelog check.
 
 ## Building and testing
 
