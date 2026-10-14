@@ -148,6 +148,17 @@ never do.
   checkouts, so release notes must exist even when npm publish fails.
   Version bumps are a maintainer release-time action, not part of feature
   PRs.
+- **Release holds.** When releasing `main` as it stands would harm
+  someone running it, open an issue that says what has to happen first
+  and label it `release-hold`, or ask a maintainer to label it. Close it
+  once that's happened, or if it no longer applies. While one is open,
+  `npm version` stops before it bumps anything, `npm publish` refuses,
+  and the publish workflow refuses both its npm publish and its GitHub
+  release notes. The check also stops a release when it can't read the
+  holds from GitHub, and says why. Closing the hold is the way past it:
+  npm's `--ignore-scripts` would skip the check, but on `npm version` it
+  skips the changelog fold too, and the tag then fails the publish
+  workflow's changelog check.
 
 ## Building and testing
 
@@ -155,7 +166,7 @@ never do.
 npm ci                                          # strict lockfile install
 cargo test                                      # Rust suite
 npx napi build --platform --features napi-bindings   # native module (debug)
-npm test                                        # node smoke test (test.mjs)
+npm test                                        # node smoke test (test.mjs), release scripts' tests
 npm run build                                   # release build of the above
 ```
 

@@ -19,8 +19,10 @@
   "scripts": {
     "build": "napi build --platform --release --features napi-bindings",
     "build:debug": "napi build --platform --features napi-bindings",
-    "test": "node test.mjs && node test-views.mjs && node --test scripts/release-changelog.test.mjs",
-    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d"
+    "test": "node test.mjs && node test-views.mjs && node --test scripts/release-changelog.test.mjs scripts/release-holds.test.mjs",
+    "preversion": "node scripts/release-holds.mjs",
+    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
+    "prepublishOnly": "node scripts/release-holds.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"

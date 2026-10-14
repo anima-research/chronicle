@@ -350,6 +350,22 @@ impl Store {
         self.index.get_by_type(record_type)
     }
 
+    /// Get the IDs of a type's records greater than `after` and less than
+    /// `before` (both exclusive, either optional), at most `limit` of them,
+    /// oldest first or with `reverse` newest first. Found by binary search, so
+    /// a page or the newest record costs what it returns, not the type's size.
+    pub fn get_records_by_type_range(
+        &self,
+        record_type: &str,
+        after: Option<RecordId>,
+        before: Option<RecordId>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<RecordId> {
+        self.index
+            .get_by_type_range(record_type, after, before, limit, reverse)
+    }
+
     /// Iterate records from a sequence.
     pub fn iter_from(&self, seq: Sequence) -> impl Iterator<Item = Result<(u64, Record)>> + '_ {
         self.iter_from_on(self.branches.current_id(), seq)
