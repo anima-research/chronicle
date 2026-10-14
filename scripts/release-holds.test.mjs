@@ -395,10 +395,11 @@ function wiredProject() {
  *  and the stand-in for its registry and GitHub's API. Under `npm test`,
  *  npm names its own CLI script in npm_execpath, and this Node runs it: a
  *  bare `npm` is npm.cmd on Windows, which execFile can't start without a
- *  shell. Run outside npm, the `npm` on PATH is used. */
+ *  shell. Another package manager names its own script or binary there, so
+ *  only npm's is run this way; otherwise the `npm` on PATH is used. */
 function npm(dir, args, api) {
   const cli = process.env.npm_execpath;
-  const [file, argv] = cli ? [process.execPath, [cli, ...args]] : ["npm", args];
+  const [file, argv] = cli && /npm-cli\.c?js$/.test(cli) ? [process.execPath, [cli, ...args]] : ["npm", args];
   return exec(file, argv, dir, {
     HOME: dir,
     npm_config_cache: join(dir, ".npm-cache"),
