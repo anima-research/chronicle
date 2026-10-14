@@ -16,14 +16,16 @@ const SCRIPT = fileURLToPath(new URL("./release-holds.mjs", import.meta.url));
 const PACKAGE_JSON = fileURLToPath(new URL("../package.json", import.meta.url));
 
 /** Answers every request with `status` and `body`, or with what `body`
- *  gives for the request's URL, recording each request. */
-async function github(status, body) {
+ *  gives for the request's URL, recording each request. A `raw` body is
+ *  sent as it is, not as JSON. */
+async function github(status, body, raw = false) {
   const seen = [];
   const server = createServer((req, res) => {
     const url = req.url ?? "";
     seen.push({ url, headers: req.headers });
     res.writeHead(status, { "content-type": "application/json" });
-    res.end(JSON.stringify(typeof body === "function" ? body(url) : body));
+    const answer = typeof body === "function" ? body(url) : body;
+    res.end(raw ? String(answer) : JSON.stringify(answer));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
@@ -89,7 +91,7 @@ test("an open hold stops the release and names it; a labelled pull request isn't
   try {
     const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /^Release held: an open issue is labelled release-hold in owner\/repo\./);
+    assert.match(result.stderr, /^Release held: an open issue is labelled release-hold in owner\/repo \(named by package\.json's repository field\)\./);
     assert.match(result.stderr, /\n  #300 Recovery drops a valid record after a torn tail\n/);
     assert.doesNotMatch(result.stderr, /#301/);
     assert.match(result.stderr, /then run this again\. https:\/\/github\.com\/owner\/repo\/issues\?q=/);
@@ -153,6 +155,17 @@ test("package.json names the repository, though GITHUB_REPOSITORY names another,
   }
 });
 
+test("GH_TOKEN is sent when both tokens are set", async () => {
+  const gh = await github(200, []);
+  try {
+    const result = await run(project(PKG), { GITHUB_API_URL: gh.url, GH_TOKEN: "f1rst", GITHUB_TOKEN: "act1ons" });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(gh.seen[0].headers.authorization, "Bearer f1rst");
+  } finally {
+    await gh.close();
+  }
+});
+
 test("GITHUB_TOKEN alone is sent too", async () => {
   const gh = await github(200, []);
   try {
@@ -167,10 +180,15 @@ test("GITHUB_TOKEN alone is sent too", async () => {
 test("each form npm reads in the repository field names the same repository", async () => {
   const forms = [
     "github:owner/repo",
+    "github:owner/repo#v1",
     "owner/repo",
     "https://github.com/owner/repo",
+    "https://github.com/owner/repo#readme",
+    "https://github.com/owner/repo?tab=readme",
+    "https://github.com/owner/repo/tree/main/packages/fixture",
     "git@github.com:owner/repo.git",
     { type: "git", url: "git+ssh://git@github.com/owner/repo.git" },
+    { type: "git", url: "git+https://github.com/owner/repo.git#main" },
   ];
   const gh = await github(200, []);
   try {
@@ -196,15 +214,18 @@ test("a repository field that names no GitHub repository stops the release, what
   assert.match(result.stderr, /package\.json's repository field \(gitlab:owner\/repo\) names no GitHub repository this check can ask/);
 });
 
-test("GITHUB_REPOSITORY names the repository when package.json names none", async () => {
+test("GITHUB_REPOSITORY names the repository when package.json names none, or can't be read", async () => {
   const gh = await github(200, []);
   try {
-    const result = await run(project({ name: "fixture" }), {
-      GITHUB_API_URL: gh.url,
-      GITHUB_REPOSITORY: "other/place",
-    });
-    assert.equal(result.code, 0, result.stderr);
-    assert.match(gh.seen[0].url, /^\/repos\/other\/place\/issues\?/);
+    // No field, a blank one, and a package.json that isn't JSON.
+    for (const pkg of [{ name: "fixture" }, { name: "fixture", repository: "" }, { name: "fixture", repository: { url: " " } }, "{ not json"]) {
+      const result = await run(project(pkg), {
+        GITHUB_API_URL: gh.url,
+        GITHUB_REPOSITORY: "other/place",
+      });
+      assert.equal(result.code, 0, `${JSON.stringify(pkg)}: ${result.stderr}`);
+      assert.match(gh.seen.at(-1).url, /^\/repos\/other\/place\/issues\?/, JSON.stringify(pkg));
+    }
   } finally {
     await gh.close();
   }
@@ -251,6 +272,9 @@ test("each refusal says what to do, with and without a token", async () => {
     { status: 403, env: { GH_TOKEN: "narrow" }, says: /answered 403 Forbidden .*the token in GH_TOKEN or GITHUB_TOKEN can't read this repository's issues/ },
     { status: 404, env: {}, says: /answered 404 Not Found .*no repository owner\/repo is visible without a token; check package\.json's repository field, or set GH_TOKEN/ },
     { status: 404, env: { GH_TOKEN: "narrow" }, says: /answered 404 Not Found .*no repository owner\/repo is visible to the token in GH_TOKEN or GITHUB_TOKEN/ },
+    { status: 410, env: {}, says: /answered 410 Gone .*issues are turned off for owner\/repo, so no hold can be filed or read there; turn them on, or point package\.json's repository field at the repository that tracks them/ },
+    { status: 429, env: {}, says: /answered 429 Too Many Requests .*rate limit for requests without a token; set GH_TOKEN/ },
+    { status: 429, env: { GH_TOKEN: "busy" }, says: /answered 429 Too Many Requests .*or its rate limit is spent/ },
     { status: 418, env: {}, says: /answered 418 I'm a Teapot .*this check doesn't know that answer/ },
   ];
   for (const { status, env, says } of cases) {
@@ -259,6 +283,39 @@ test("each refusal says what to do, with and without a token", async () => {
       const result = await run(project(PKG), { GITHUB_API_URL: gh.url, ...env });
       assert.equal(result.code, 1, `${status}`);
       assert.match(result.stderr, says);
+    } finally {
+      await gh.close();
+    }
+  }
+});
+
+test("an answer that isn't JSON stops the release, saying how to go on", async () => {
+  const gh = await github(200, "<html>not json</html>", true);
+  try {
+    const result = await run(project(PKG), { GITHUB_API_URL: gh.url, npm_lifecycle_event: "preversion" });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /^release-holds: couldn't read GitHub's answer \(.+\)\. Check https:\/\/github\.com\/owner\/repo\/issues\?q=\S+, and run npm version again\./);
+  } finally {
+    await gh.close();
+  }
+});
+
+test("exactly the most it reads, five thousand labelled items, is read whole; one more stops the release", async () => {
+  const full = (from) => Array.from({ length: 100 }, (_, i) => ({ number: from + i, title: "pr", pull_request: {} }));
+  for (const [last, stops] of [[[], false], [[{ number: 9999, title: "pr", pull_request: {} }], true]]) {
+    const gh = await github(200, (url) => {
+      const n = Number(url.replace(/.*&page=/, ""));
+      return n <= 50 ? full(n * 100) : last;
+    });
+    try {
+      const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
+      assert.equal(gh.seen.length, 51);
+      if (stops) {
+        assert.equal(result.code, 1);
+        assert.match(result.stderr, /^release-holds: more than 5000 open items are labelled release-hold in owner\/repo, more than this check reads\./);
+      } else {
+        assert.equal(result.code, 0, result.stderr);
+      }
     } finally {
       await gh.close();
     }
@@ -283,7 +340,7 @@ test("GitHub out of reach stops the release, naming why", async () => {
   await gh.close();
   const result = await run(project(PKG), { GITHUB_API_URL: gh.url });
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /^release-holds: couldn't reach GitHub to read the release holds \(E[A-Z]+\)\./);
+  assert.match(result.stderr, /^release-holds: couldn't reach GitHub to read the release holds \(E[A-Z]+\)\. Check \S+, and run this again once GitHub can be reached\./);
 });
 
 test("an API URL with a trailing slash asks the same path", async () => {
@@ -302,6 +359,9 @@ test("the stop message says how to go on where it ran", async () => {
   try {
     const workflow = await run(project(PKG), { GITHUB_API_URL: gh.url, GITHUB_ACTIONS: "true" });
     assert.match(workflow.stderr, /then re-run this workflow for the tag\./);
+    // npm version comes before any tag, wherever it runs.
+    const versionInActions = await run(project(PKG), { GITHUB_API_URL: gh.url, GITHUB_ACTIONS: "true", npm_lifecycle_event: "preversion" });
+    assert.match(versionInActions.stderr, /then run npm version again\./);
     const version = await run(project(PKG), { GITHUB_API_URL: gh.url, npm_lifecycle_event: "preversion" });
     assert.match(version.stderr, /then run npm version again\./);
     const publish = await run(project(PKG), { GITHUB_API_URL: gh.url, npm_lifecycle_event: "prepublishOnly" });

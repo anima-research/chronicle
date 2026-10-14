@@ -180,7 +180,9 @@ jobs:
 
       # Checked here as prepublishOnly checks it in the publish job, since
       # this job doesn't wait for that one: a held tag gets neither its npm
-      # publish nor its release notes.
+      # publish nor its release notes. This job sets up no Node; the script
+      # needs only fetch and AbortSignal.timeout (Node 18 and later), which
+      # the runner's own Node has.
       - name: Release holds
         run: node scripts/release-holds.mjs
         env:
