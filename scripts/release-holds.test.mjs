@@ -385,3 +385,26 @@ test("this repository's prepublishOnly stops npm publish while a hold is open", 
     await gh.close();
   }
 });
+
+test("with no hold open, this repository's prepublishOnly lets npm publish go ahead", async () => {
+  const gh = await github(200, []);
+  try {
+    const dir = wiredProject();
+    const result = await npm(dir, ["publish", "--dry-run"], gh.url);
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(gh.seen.some((s) => s.url.startsWith("/repos/owner/repo/issues?")));
+  } finally {
+    await gh.close();
+  }
+});
+
+test("this repository's own package.json sends the check to anima-research/chronicle", async () => {
+  const gh = await github(200, []);
+  try {
+    const result = await run(fileURLToPath(new URL("..", import.meta.url)), { GITHUB_API_URL: gh.url, GITHUB_REPOSITORY: "fork/repo" });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(gh.seen[0].url, /^\/repos\/anima-research\/chronicle\/issues\?/);
+  } finally {
+    await gh.close();
+  }
+});

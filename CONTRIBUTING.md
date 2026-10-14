@@ -164,7 +164,7 @@ never do.
 npm ci                                          # strict lockfile install
 cargo test                                      # Rust suite
 npx napi build --platform --features napi-bindings   # native module (debug)
-npm test                                        # node smoke test (test.mjs)
+npm test                                        # node smoke test (test.mjs), release scripts' tests
 npm run build                                   # release build of the above
 ```
 
