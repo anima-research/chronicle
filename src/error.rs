@@ -85,10 +85,15 @@ impl From<rmp_serde::decode::Error> for StoreError {
     }
 }
 
-/// What kind of failure an error from the Node binding is: each error it
-/// throws carries one as its `code`, beside its unchanged message, so a caller
-/// can tell kinds apart without matching message text. A code, once
-/// published, keeps its name.
+/// What kind of failure an error from the Node binding is. Each error the
+/// binding raises for a store failure, or for a call it refuses, carries one
+/// as its `code`, beside its unchanged message, so a caller can tell kinds
+/// apart without matching message text. (An error napi raises while it
+/// converts a call's arguments, before chronicle runs, keeps napi's own code
+/// or none.) A code's name is its variant's identifier: napi's string enum
+/// takes each value from it, and `as_str` spells the same name for
+/// `error.code`. Renaming a variant would change a published code, so the
+/// tests below pin every name, against both.
 #[cfg_attr(feature = "napi-bindings", napi_derive::napi(string_enum))]
 #[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
 #[derive(Debug, PartialEq, Eq)]
@@ -217,8 +222,9 @@ mod tests {
     use super::*;
 
     /// Each `StoreError` variant's code, by the name JavaScript sees. A code
-    /// is published as `error.code`, so changing one breaks callers that
-    /// branch on it; this test pins them.
+    /// is published as `error.code`, and as the value of `ErrorCode`'s
+    /// member, which napi takes from the variant's identifier; so changing
+    /// one breaks callers that branch on it, and this test pins both.
     #[test]
     fn each_store_error_has_its_published_code() {
         let hash = Hash([0u8; 32]);
@@ -270,10 +276,12 @@ mod tests {
         ];
         for (error, code) in cases {
             assert_eq!(error.code().as_str(), code, "{error}");
+            assert_eq!(format!("{:?}", error.code()), code, "{error}");
         }
     }
 
-    /// The binding's own codes, by the name JavaScript sees.
+    /// The binding's own codes, by the name JavaScript sees, in `error.code`
+    /// and as the enum's value.
     #[test]
     fn the_bindings_own_codes_keep_their_names() {
         let cases = [
@@ -293,6 +301,7 @@ mod tests {
         ];
         for (code, name) in cases {
             assert_eq!(code.as_str(), name);
+            assert_eq!(format!("{code:?}"), name);
         }
     }
 }

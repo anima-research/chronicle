@@ -16,8 +16,10 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Results from this binding. An error carries its [`ErrorCode`] as its
-/// status, which JavaScript sees as `error.code`, beside its message.
+/// Results from this binding's methods. An error one returns carries its
+/// [`ErrorCode`] as its status, which JavaScript sees as `error.code`, beside
+/// its message. (Errors napi raises while converting a call's arguments come
+/// before the method runs, and keep napi's own status.)
 type Result<T> = napi::Result<T, ErrorCode>;
 
 /// One of the binding's own errors, with its code.
@@ -701,7 +703,7 @@ impl JsStore {
     /// Update the strategy parameters of an already-registered state.
     /// Same strategy kind only; cadence fields (deltaSnapshotEvery /
     /// fullSnapshotEvery) are free to change and steer future snapshot
-    /// scheduling. Use after registerState throws "State already exists"
+    /// scheduling. Use after registerState throws with `code` `StateExists`
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
@@ -1267,6 +1269,12 @@ impl JsStore {
         let id: u64 = subscription_id
             .parse()
             .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
+        // An ID this binding never made, or has unsubscribed, is not found,
+        // as polling says; SubscriptionDropped is left for one the store
+        // dropped while the binding still holds it.
+        if !self.subscription_handles.lock().contains_key(&id) {
+            return Err(coded(ErrorCode::SubscriptionNotFound, "Subscription not found"));
+        }
 
         store
             .catch_up_subscription(SubscriptionId(id))
