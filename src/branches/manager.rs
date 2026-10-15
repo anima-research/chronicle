@@ -715,6 +715,10 @@ impl BranchManager {
     }
 
     /// Save branch index to file.
+    ///
+    /// Reads `current` and `index` under separate locks, so a consistent
+    /// checkpoint relies on the caller holding `Store::write_lock`, as
+    /// `Store` does for this and for every mutation of either.
     pub fn save(&self) -> Result<()> {
         let current_id = *self.current.read();
         let index = self.index.read();

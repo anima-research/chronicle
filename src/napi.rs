@@ -541,7 +541,10 @@ impl JsStore {
 
     // --- Branches ---
 
-    /// Create a new branch.
+    /// Create a new branch, and checkpoint it before returning.
+    /// If the checkpoint fails, this throws but the branch stays in memory;
+    /// the next successful checkpoint publishes it and tells subscribers:
+    /// `sync()`, or the retry that every later mutation makes first.
     #[napi]
     pub fn create_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -560,6 +563,7 @@ impl JsStore {
 
     /// Create a new branch at a specific sequence point.
     /// This enables time-travel branching - the new branch will have state as of that sequence.
+    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
     pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -577,6 +581,7 @@ impl JsStore {
     }
 
     /// Create a new branch without copying state from parent.
+    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -593,7 +598,11 @@ impl JsStore {
         })
     }
 
-    /// Switch to a branch.
+    /// Switch to a branch, and checkpoint the switch before returning.
+    /// If the checkpoint fails, this throws but the switch stays in effect;
+    /// the next successful checkpoint publishes it: `sync()`, or the retry
+    /// that every later mutation makes first, so later writes go to the new
+    /// branch.
     #[napi]
     pub fn switch_branch(&self, name: String) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -641,7 +650,11 @@ impl JsStore {
             .collect())
     }
 
-    /// Delete a branch.
+    /// Delete a branch, and checkpoint the deletion before returning.
+    /// If the checkpoint fails, this throws but the branch stays deleted in
+    /// memory; the next successful checkpoint publishes the deletion and
+    /// tells subscribers: `sync()`, or the retry that every later mutation
+    /// makes first.
     #[napi]
     pub fn delete_branch(&self, name: String) -> Result<()> {
         let store = self.get_store()?;
@@ -650,7 +663,11 @@ impl JsStore {
 
     // --- State Management ---
 
-    /// Register a new state.
+    /// Register a new state, and checkpoint it before returning. A state must
+    /// be registered before it is updated: the state-update helpers throw for
+    /// an unregistered state. If the checkpoint fails, this throws but the
+    /// registration stays in memory; the next successful checkpoint publishes
+    /// it: `sync()`, or the retry that every later mutation makes first.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -672,6 +689,10 @@ impl JsStore {
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
+    /// Checkpoints before returning. If the checkpoint fails, this throws but
+    /// the new strategy stays in memory; the next successful checkpoint
+    /// publishes it: `sync()`, or the retry that every later mutation makes
+    /// first.
     #[napi]
     pub fn update_state_strategy(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -726,7 +747,7 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Append to an AppendLog state.
+    /// Append to an AppendLog state, which must be registered first.
     #[napi]
     pub fn append_to_state(&self, state_id: String, item: Buffer) -> Result<JsRecord> {
         let store = self.get_store()?;
@@ -952,6 +973,7 @@ impl JsStore {
     // --- New UI/Explorer Methods ---
 
     /// Append a record with caused_by/linked_to links.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_with_links(
         &self,
@@ -981,6 +1003,7 @@ impl JsStore {
     }
 
     /// Append a JSON record with caused_by/linked_to links.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_json_with_links(
         &self,
@@ -1159,14 +1182,18 @@ impl JsStore {
 
     /// Flush pending record/state contents and publish metadata checkpoints.
     /// A failed periodic fsync of the record log since the last sync is
-    /// reported here, once, even when this call's own fsync succeeds.
-    /// Reopen replays complete surviving log records after a process crash.
+    /// reported here, once, even when this call's own fsync succeeds. A
+    /// failure to save field indexes is only logged, since they are derived.
+    /// Reopen replays complete state updates past the last checkpoint; other
+    /// records are only indexed again.
     /// Unix also syncs checkpoint directories. Windows guarantees flushed
     /// contents and same-volume atomic publication for process interruption,
     /// not survival of the latest checkpoint name through OS/device loss.
-    /// State-registration metadata and branch mutations checkpoint automatically.
-    /// After a metadata-checkpoint error, further mutations retry that checkpoint
-    /// before proceeding. The tentative in-memory metadata is retained.
+    /// State registration, strategy changes and branch changes checkpoint
+    /// before returning. After one of those checkpoints fails, further
+    /// mutations retry it before proceeding, and the change stays applied in
+    /// memory. A failed sync with no such change pending holds back no later
+    /// write.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
@@ -1488,6 +1515,11 @@ impl JsStore {
     /// branch for the same `stateId` drops (poisons) this index rather than
     /// mixing the two branches' ordinals — re-call this to rebuild it for
     /// whichever branch you're now on.
+    ///
+    /// Unlike `registerState`, this doesn't checkpoint before returning: an
+    /// index is derived from its state, so a crash before the next `sync()`
+    /// loses only the index. Queries then return `null`, the cue to call
+    /// this again.
     #[napi]
     pub fn register_state_field_index(
         &self,

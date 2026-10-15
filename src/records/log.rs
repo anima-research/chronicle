@@ -202,6 +202,11 @@ impl RecordLog {
 
     /// Append a record to the log.
     ///
+    /// The `state_update` type is reserved for `Store::update_state`. Past
+    /// the checkpoint, the next `Store::open` replays a record of that type
+    /// that decodes as a state update, refusing the store if its predecessor
+    /// isn't its state's head, and skips one that doesn't decode.
+    ///
     /// Returns the record and the offset where it was written. Every
     /// `sync_interval`-th append also fsyncs the log. A failed fsync doesn't
     /// fail the append, since the record is already complete in the file:

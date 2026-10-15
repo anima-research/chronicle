@@ -1,4 +1,8 @@
-- **Rust/Node write APIs:** Register states before updating them, and use `update_state` (or its Node state helpers) for internal `state_update` records. Unregistered state updates and generic appends with this reserved type now fail before writing; custom record producers must choose another type.
+- **Rust/Node write APIs:** Register states before updating them, and use
+  `update_state` (or its Node state helpers) for internal `state_update`
+  records. Unregistered state updates and generic appends with this reserved
+  type now fail before writing; custom record producers must choose another
+  type.
 - **Stores an earlier release left after a crash:** opening one now replays
   the state updates its log holds past the last checkpoint, which earlier
   releases left out of the state (see Fixed). Three kinds of update there

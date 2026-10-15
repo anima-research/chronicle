@@ -522,6 +522,9 @@ impl Store {
 
     /// Register a new state and persist its strategy before returning.
     /// The log cannot reconstruct a lost registration after a crash.
+    /// If the checkpoint fails, the error is returned but the registration
+    /// stays in memory, and the next successful checkpoint publishes it:
+    /// `sync()`, or the retry that every later mutation makes first.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -534,6 +537,10 @@ impl Store {
     /// kind only — see `StateManager::update_state_strategy`). Lets boot-time
     /// re-registration retune snapshot cadence on existing stores instead of
     /// being permanently pinned to the values from first registration.
+    /// Checkpoints before returning. If the checkpoint fails, the error is
+    /// returned but the new strategy stays in memory, and the next successful
+    /// checkpoint publishes it: `sync()`, or the retry that every later
+    /// mutation makes first.
     pub fn update_state_strategy(
         &self,
         state_id: &str,
@@ -1492,6 +1499,11 @@ impl Store {
     /// either double-counting that item (materialized once, then indexed
     /// again by the concurrent `on_append`) or vanishing from the index
     /// entirely, depending on interleaving.
+    ///
+    /// Unlike state registration, this doesn't checkpoint before returning:
+    /// an index is derived from its state, so a crash before the next
+    /// checkpoint loses only the index. A query then returns `None`, which is
+    /// the cue to register it again.
     pub fn register_state_field_index(
         &self,
         state_id: &str,
@@ -1750,6 +1762,10 @@ impl Store {
     // --- Branch Operations ---
 
     /// Create a new branch from the current branch head and checkpoint it.
+    /// If the checkpoint fails, the error is returned but the branch stays in
+    /// memory, and the next successful checkpoint publishes it and tells
+    /// subscribers: `sync()`, or the retry that every later mutation makes
+    /// first.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1780,6 +1796,7 @@ impl Store {
 
     /// Create and checkpoint a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
+    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1810,6 +1827,8 @@ impl Store {
     /// * `name` - Name for the new branch
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
+    ///
+    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1852,6 +1871,10 @@ impl Store {
     }
 
     /// Switch to a different branch and checkpoint the current-branch pointer.
+    /// If the checkpoint fails, the error is returned but the switch stays in
+    /// effect, and the next successful checkpoint publishes it: `sync()`, or
+    /// the retry that every later mutation makes first, so later writes go
+    /// to the new branch.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1872,6 +1895,10 @@ impl Store {
     }
 
     /// Delete a branch and checkpoint the deletion.
+    /// If the checkpoint fails, the error is returned but the branch stays
+    /// deleted in memory, and the next successful checkpoint publishes the
+    /// deletion and tells subscribers: `sync()`, or the retry that every
+    /// later mutation makes first.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1902,20 +1929,29 @@ impl Store {
 
     /// Sync all data to disk.
     ///
-    /// Flush record/state contents and publish metadata checkpoints. On open,
-    /// surviving log records are replayed even without a checkpoint.
-    /// A failed periodic fsync of the record log since the last sync is
-    /// reported here, once, even when this call's own fsync succeeds.
+    /// Flushes the record log and publishes the metadata checkpoints
+    /// (`state.bin`, `state-indexes.bin` and `branches.bin`). A failed
+    /// periodic fsync of the record log since the last sync is reported
+    /// here, once, even when this call's own fsync succeeds. A failure to save
+    /// `state-indexes.bin` is only logged: field indexes are derived, and
+    /// `register_state_field_index` rebuilds a missing or stale one.
+    ///
+    /// On open, complete state updates in the log past the last checkpoint
+    /// are replayed. Other records are only indexed again, as on every open.
+    ///
+    /// State registration, strategy changes, and branch creation, deletion
+    /// and switching checkpoint before returning, because the record log
+    /// cannot reconstruct them. If that checkpoint fails, the change stays in
+    /// memory, and every later mutation retries the checkpoint before
+    /// proceeding, so a successful write cannot depend on an unpersisted
+    /// registration or branch. This method retries it too; metadata is not
+    /// rolled back. A failed sync with no such change pending holds back no
+    /// later write, since the log can replay what it was saving.
+    ///
     /// Unix also syncs checkpoint directory entries. Windows flushes contents
     /// and atomically publishes on the same volume for process interruption;
     /// it does not guarantee that the latest checkpoint name survives OS or
     /// device loss because this path provides no namespace durability barrier.
-    /// Metadata-only mutations (registration and branch operations) checkpoint
-    /// before returning because the record log cannot reconstruct them.
-    /// A metadata-checkpoint error retains the mutation in memory. Subsequent
-    /// mutations retry that checkpoint before proceeding, so a successful
-    /// write cannot depend on an unpersisted registration or branch. This
-    /// method can also explicitly retry it; metadata is not rolled back.
     /// The record index is rebuilt on startup; checkpoint cost depends on
     /// state heads, branch metadata, and any registered field indexes.
     pub fn sync(&self) -> Result<()> {
