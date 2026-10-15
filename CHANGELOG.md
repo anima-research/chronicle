@@ -12,18 +12,6 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
-### Breaking
-
-- **Windows checkpoint writers:** Replacement now requires reading and recreating the existing native owner/group, DACL, and integrity policy, plus deletion/replacement authority. Staging rename access is checked before payload, and preparation/write failures are cleaned through retained creation handles. Once rename is attempted, a failed acknowledgement preserves the possibly published file (or a diagnostic staging file) rather than risk deleting a checkpoint. Readonly files, EFS, reparse points, unsupported enforcement SACL components, or inaccessible/unpreservable descriptors are refused before publication. Deploy only where these controls can be preserved; retain unsupported policy rather than stripping it to upgrade. Audit-only SACL preservation and path-based policy equivalence are outside this per-file contract, so staging names need appropriate external policy coverage. Checkpoint file encodings are unchanged and remain compatible with existing readers.
-- **Unix checkpoint publication:** Store directories must permit reading as well as writing and searching, so the directory can be opened and synced after atomic replacement. Grant appropriate directory read access before upgrading stores in writable/searchable-only directories. Missing read access produces a descriptive `PermissionDenied` error before replacement. Existing checkpoint encodings are unchanged.
-
-### Fixed
-
-- Windows checkpoints verify source-equivalent native controls at staging creation before any payload bytes, including OWNER RIGHTS and integrity-label policy. Protection and ACE flags are preserved; Windows may normalize automatic-inheritance bookkeeping for regular files.
-- `Store::sync()` now holds the record-write mutex through log sync and checkpoint publication, preventing concurrent syncs from publishing an older checkpoint after a newer one.
-- Metadata checkpoints (`state.bin`, `branches.bin`, and `state-indexes.bin`) now replace the previous file atomically after writing and syncing a same-directory temporary file. An interrupted save leaves the previous complete checkpoint available instead of truncating it. Unix also syncs the containing directory after replacement. Existing file encodings are unchanged.
-- Repeated syncs skip metadata whose exact encoded content was already durably published by the same writer and whose destination file identity/metadata is unchanged. Changed checkpoints keep every file and directory durability barrier. Failed publication, reopening, or cloning a writer requires a fresh durable save. The cache retains a digest and file handle rather than a second copy of field-index data.
-
 ## 0.4.0 — 2026-09-17
 
 ### Added

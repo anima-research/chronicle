@@ -1,22 +1,21 @@
 //! Publish one metadata checkpoint without truncating its previous version.
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod access_tests;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod unix_security;
-#[cfg(windows)]
-mod windows_security;
-
 use crate::error::Result;
 use parking_lot::Mutex;
 use same_file::Handle;
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use std::fs;
-use std::fs::{File, Metadata};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+/// Starts the name of every staging file: a save writes one beside its
+/// checkpoint and renames it over the checkpoint.
+const STAGING_PREFIX: &str = ".chronicle-checkpoint-";
+
+/// How many symbolic links a save follows to the file it replaces. Linux
+/// bounds a path lookup the same way, failing with ELOOP.
+const MAX_LINKS: usize = 40;
 
 /// Remembers the last checkpoint this writer successfully made durable.
 /// The serialized digest avoids a second in-memory copy of large field indexes.
@@ -131,33 +130,25 @@ impl Checkpoint {
 /// the destination atomically. Readers see either the old file or the new one.
 /// This is a per-file guarantee, not a transaction across metadata files.
 ///
-/// Unix also syncs the directory so the replacement survives a power loss.
+/// Unix also syncs the directory, where the system can, so the replacement
+/// survives a power loss.
 /// Windows supports the file sync and atomic replacement, but has no portable
 /// directory-sync equivalent here. Errors before replacement leave the old
 /// checkpoint intact; a directory-sync error is returned after replacement.
 ///
-/// Replacements preserve ownership, mode, Linux POSIX ACLs and macOS extended
-/// ACLs. Linux requires working ACL/security-xattr APIs and an identical initial
-/// security label on the staging file, and
-/// restores capabilities after writing. Content-bound IMA/EVM signatures and
-/// unfamiliar system ACL xattrs are rejected. Security attributes hidden from
-/// the caller and path-based MAC policy are outside this preservation contract;
-/// store policy must cover the staging names as well as the final names.
-/// macOS authorization labels (com.apple.macl) are rejected rather than lost.
-/// Replacing an existing Unix checkpoint requires reading its security metadata
-/// through an open file and permission to restore its ownership and ACL.
+/// A symbolic link at `path` is followed, as git follows one at a lockfile's
+/// target, and the file it leads to is replaced in its own directory. The link
+/// stays, and so does the volume it points to.
 ///
-/// Windows preserves source owner/group, native DACL/ACE flags and integrity
-/// policy through descriptor-at-creation verification before any payload bytes.
-/// Audit-only SACLs are outside the preservation contract; other enforcement
-/// SACL components, EFS/reparse files, and readonly destinations are rejected.
-/// See windows_security for required access and external-policy boundaries.
+/// The replacement is a new file, so any ACL it has comes from its directory's
+/// defaults, as for any new file there. On Unix it takes the old file's owner
+/// and group as far as the writer may set them, and its mode, less what was
+/// granted to an owner or group it couldn't take.
 ///
-/// Unique temporary names allow concurrent callers to write independently.
-/// A process killed before replacement can leave an unused temporary file;
-/// loaders only open the final checkpoint name.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+/// A save that fails before the rename removes its staging file. A process
+/// killed before then leaves it behind. Loaders only open the final names.
 fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<File> {
+    let path = resolve_links(path)?;
     // A bare relative filename has an empty parent, which means the current
     // directory rather than a directory that can be opened by its empty name.
     let parent = path
@@ -181,36 +172,171 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
         }
     })?;
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let (mut temporary, source) = unix_security::prepare(path, parent)?;
+    #[cfg(unix)]
+    let previous = match fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
 
-    #[cfg(windows)]
-    let (mut temporary, security) = windows_security::prepare(path, parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    // A first checkpoint gets File::create's mode, 0666 less the umask. A
+    // replacement stays private until it takes the old file's mode.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(
+        &mut options,
+        if previous.is_some() { 0o600 } else { 0o666 },
+    );
+    let mut temporary = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .make_in(parent, |name| options.open(name))?;
 
     write(temporary.as_file_mut())?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    unix_security::finish(source.as_ref(), temporary.as_file())?;
-    #[cfg(windows)]
-    windows_security::finish(security.as_ref(), temporary.as_file())?;
+    #[cfg(unix)]
+    if let Some(previous) = &previous {
+        use std::os::unix::fs::MetadataExt;
+        carry_over(
+            temporary.as_file(),
+            previous.uid(),
+            previous.gid(),
+            previous.mode(),
+        )?;
+    }
     temporary.as_file().sync_all()?;
-    #[cfg(not(windows))]
-    let published = temporary.persist(path).map_err(|error| error.error)?;
-    #[cfg(windows)]
-    let published = windows_security::publish(temporary, path)?;
+
+    // std's rename converts long Windows paths, which tempfile's persist
+    // passes to MoveFileExW unconverted. If the rename fails, dropping
+    // `staging` deletes whatever is at the staging name. A rename that took
+    // effect despite reporting an error has moved the file off that name, so
+    // the cleanup can't reach a published checkpoint. `file` stays open
+    // across the rename, which Windows allows because std opens every file
+    // sharing delete access.
+    let (file, mut staging) = temporary.into_parts();
+    fs::rename(&staging, &path).map_err(|error| {
+        // The OS error alone names neither the file nor the step, and this is
+        // where a single-file bind mount or a sticky directory refuses a save.
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot rename the new checkpoint over {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    staging.disable_cleanup(true);
 
     #[cfg(unix)]
-    directory.sync_all()?;
+    sync_directory(&directory)?;
 
-    Ok(published)
+    Ok(file)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn atomic_write(_path: &Path, _write: impl FnOnce(&mut File) -> Result<()>) -> Result<File> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic checkpoint access-control preservation is unsupported on this platform",
+/// The file a save replaces: `path` itself, or where the symbolic links at
+/// `path` lead, whether or not that file exists yet.
+fn resolve_links(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_owned();
+    let mut followed = 0;
+    loop {
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if followed == MAX_LINKS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "checkpoint {} leads through more than {MAX_LINKS} symbolic links",
+                            path.display()
+                        ),
+                    ));
+                }
+                followed += 1;
+                // A relative link is resolved from the directory holding it.
+                let link = fs::read_link(&target)?;
+                target = target.parent().unwrap_or(Path::new("")).join(link);
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => return Ok(target),
+        }
+    }
+}
+
+/// Give a replacement the old file's owner and group, as far as the writer
+/// may set them, and then its mode, less what was granted to an id it
+/// couldn't take. Each is changed only where it differs, so a filesystem that
+/// reports one owner and mode for every file is never asked to change them.
+#[cfg(unix)]
+fn carry_over(file: &File, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let mut staged = file.metadata()?;
+    if (staged.uid(), staged.gid()) != (uid, gid) {
+        restore_owner(file, uid, gid)?;
+        staged = file.metadata()?;
+    }
+    // Setuid runs a file as its owner, so it's kept only where the owner
+    // carried over. The group class bits and setgid were granted to the old
+    // group, so where the group didn't carry over, the group the file has
+    // instead gets none of them. cp keeps the group bits, and drops every
+    // special bit whenever it can't set both ids (coreutils copy.c, after
+    // set_owner); cp makes a copy, where this replaces a file in place.
+    let mut mode = mode & 0o7777;
+    if staged.uid() != uid {
+        mode &= !(libc::S_ISUID as u32);
+    }
+    if staged.gid() != gid {
+        mode &= !(libc::S_ISGID as u32 | 0o070);
+    }
+    if staged.mode() & 0o7777 != mode {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+/// Set a replacement's owner and group, or else its group alone, as cp does.
+/// The errors cp's `chown_failure_ok` accepts mean the writer may not keep
+/// ownership, and the file stays the writer's: EPERM without the privilege,
+/// EINVAL for an id this user namespace doesn't map, and EACCES, which Linux
+/// CIFS returns instead of EPERM (https://bugs.gnu.org/65599). Any other
+/// error fails the save.
+#[cfg(unix)]
+fn restore_owner(file: &File, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::fchown;
+    match fchown(file, Some(uid), Some(gid)) {
+        Err(error) if ownership_refused(&error) => match fchown(file, None, Some(gid)) {
+            Err(error) if ownership_refused(&error) => Ok(()),
+            other => other,
+        },
+        other => other,
+    }
+}
+
+/// Whether a failed fchown means the writer may not keep ownership, as
+/// coreutils' `chown_failure_ok` reads it, rather than that the save failed.
+#[cfg(unix)]
+fn ownership_refused(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EPERM | libc::EINVAL | libc::EACCES)
     )
-    .into())
+}
+
+/// Sync the directory a checkpoint was renamed in, so that the rename
+/// survives a power loss.
+#[cfg(unix)]
+fn sync_directory(directory: &File) -> io::Result<()> {
+    match directory.sync_all() {
+        Err(error) if directory_sync_refused(&error) => Ok(()),
+        other => other,
+    }
+}
+
+/// Whether a failed directory sync means the system doesn't sync
+/// directories. PostgreSQL reads EBADF and EINVAL that way ("Some OSes don't
+/// allow us to fsync directories at all", src/backend/storage/file/fd.c,
+/// fsync_fname_ext). A save there goes without the directory sync, as saves
+/// went when they rewrote checkpoints in place.
+#[cfg(unix)]
+fn directory_sync_refused(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EBADF | libc::EINVAL))
 }
 
 #[cfg(test)]
@@ -399,7 +525,16 @@ mod tests {
         let path = dir.path().join("state.bin");
         fs::create_dir(&path).unwrap();
         let result = atomic_write(&path, |file| Ok(file.write_all(b"checkpoint")?));
-        assert!(result.is_err());
+        match result {
+            Err(crate::StoreError::Io(error)) => assert!(
+                error.to_string().contains(&format!(
+                    "cannot rename the new checkpoint over {}",
+                    path.display()
+                )),
+                "{error}"
+            ),
+            other => panic!("expected the rename to fail, got {other:?}"),
+        }
         assert!(path.is_dir());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
@@ -432,6 +567,335 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    // A rename needs the directory's write permission, not the file's, so a
+    // read-only checkpoint no longer stops a save.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_checkpoint_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        atomic_write(&path, |file| Ok(file.write_all(b"new")?)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    // A private store's checkpoint must not be readable by others while its
+    // replacement is written: anyone who opened the stage then could read it.
+    #[cfg(unix)]
+    #[test]
+    fn replacement_stays_private_while_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&path, |file| {
+            let mode = file.metadata()?.permissions().mode();
+            assert_eq!(mode & 0o077, 0, "stage mode {mode:o} grants others access");
+            Ok(file.write_all(b"new")?)
+        })
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    fn ids() -> (u32, Vec<u32>) {
+        // SAFETY: getgroups writes at most `len` ids into a buffer of that size.
+        let euid = unsafe { libc::geteuid() };
+        let len = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0; len.max(0) as usize];
+        let len = unsafe { libc::getgroups(len, groups.as_mut_ptr()) };
+        groups.truncate(len.max(0) as usize);
+        groups.push(unsafe { libc::getegid() });
+        (euid, groups.into_iter().map(|gid| gid as u32).collect())
+    }
+
+    // Whether this account may give its file the group `gid`. Membership alone
+    // doesn't decide that everywhere (CAP_CHOWN, macOS's implicit groups).
+    #[cfg(unix)]
+    fn may_set_group(dir: &Path, gid: u32) -> bool {
+        let probe = File::create(dir.join("probe")).unwrap();
+        std::os::unix::fs::fchown(&probe, None, Some(gid)).is_ok()
+    }
+
+    // A writer that may not take on the old owner or group keeps the file as
+    // its own. Neither setuid nor setgid carries over to an id it wasn't set
+    // for, and the group the file keeps gets none of the old group's access.
+    #[cfg(unix)]
+    #[test]
+    fn ownership_the_writer_may_not_set_is_left_and_what_it_granted_dropped() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (euid, groups) = ids();
+        if euid == 0 {
+            eprintln!("running as root, which may set any owner; probe skipped");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let Some(foreign) = (0..4096)
+            .filter(|gid| !groups.contains(gid))
+            .find(|&gid| !may_set_group(dir.path(), gid))
+        else {
+            eprintln!("this account may set every group it was tried with; probe skipped");
+            return;
+        };
+        let file = File::create(dir.path().join("stage")).unwrap();
+        let before = file.metadata().unwrap();
+        carry_over(&file, 0, foreign, 0o6664).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o604);
+    }
+
+    // Where both ids carry over, so does everything the mode grants them.
+    #[cfg(unix)]
+    #[test]
+    fn special_bits_survive_where_both_ids_carry_over() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TempDir::new().unwrap();
+        let file = File::create(dir.path().join("stage")).unwrap();
+        let ids = file.metadata().unwrap();
+        carry_over(&file, ids.uid(), ids.gid(), 0o6640).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & 0o7777,
+            0o6640
+        );
+    }
+
+    // A file whose owner, group and mode already match isn't asked to change
+    // them, which a filesystem reporting one owner and mode for every file
+    // may refuse. Changing either, even to the same values, sets the ctime.
+    #[cfg(unix)]
+    #[test]
+    fn matching_owner_and_mode_are_left_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TempDir::new().unwrap();
+        let file = File::create(dir.path().join("stage")).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let before = file.metadata().unwrap();
+        // Past the coarse clock tick that ctime is stamped from.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        carry_over(&file, before.uid(), before.gid(), before.mode()).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_refusals_cp_accepts_leave_ownership_to_the_writer() {
+        for errno in [libc::EPERM, libc::EINVAL, libc::EACCES] {
+            assert!(
+                ownership_refused(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        for errno in [libc::EIO, libc::ENOSPC] {
+            assert!(
+                !ownership_refused(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_refused_directory_sync_is_passed_over() {
+        for errno in [libc::EBADF, libc::EINVAL] {
+            assert!(
+                directory_sync_refused(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        for errno in [libc::EIO, libc::ENOSPC] {
+            assert!(
+                !directory_sync_refused(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+    }
+
+    // Where the writer may set the old group, the group carries over even
+    // though the owner can't, and so does setgid, which runs as that group.
+    #[cfg(unix)]
+    #[test]
+    fn group_carries_over_when_the_owner_cannot() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (euid, groups) = ids();
+        if euid == 0 {
+            eprintln!("running as root, which may set any owner; probe skipped");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let file = File::create(dir.path().join("stage")).unwrap();
+        let current = file.metadata().unwrap().gid();
+        let Some(other) = groups
+            .into_iter()
+            .find(|&gid| gid != current && may_set_group(dir.path(), gid))
+        else {
+            eprintln!("this account may set no group but its file's own; probe skipped");
+            return;
+        };
+        carry_over(&file, 0, other, 0o6640).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!((after.uid(), after.gid()), (euid, other));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o2640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_checkpoint_is_replaced_where_its_links_lead() {
+        use std::os::unix::fs::symlink;
+        let store = TempDir::new().unwrap();
+        let volume = TempDir::new().unwrap();
+        let path = store.path().join("state.bin");
+        let target = volume.path().join("state.bin");
+        // A relative link to an absolute one, before the target exists.
+        symlink("hop", &path).unwrap();
+        symlink(&target, store.path().join("hop")).unwrap();
+
+        for bytes in [b"first".as_slice(), b"second".as_slice()] {
+            atomic_write(&path, |file| {
+                // The stage is written beside the target, not the link.
+                assert_eq!(staged(volume.path()), 1);
+                assert_eq!(staged(store.path()), 0);
+                Ok(file.write_all(bytes)?)
+            })
+            .unwrap();
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+            assert_eq!(fs::read_link(&path).unwrap(), Path::new("hop"));
+            assert_eq!(fs::read_link(store.path().join("hop")).unwrap(), target);
+            assert_eq!(fs::read_dir(store.path()).unwrap().count(), 2);
+            assert_eq!(fs::read_dir(volume.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_cycle_fails_the_save() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        symlink("loop", &path).unwrap();
+        symlink("state.bin", dir.path().join("loop")).unwrap();
+        let result = atomic_write(&path, |_| panic!("a looping path must fail before writing"));
+        assert_link_bound(result);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    // Linux follows forty links in a path and refuses the forty-first.
+    #[cfg(unix)]
+    #[test]
+    fn forty_links_are_followed_and_a_forty_first_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        // link0 -> link1 -> ... -> link39 -> state.bin
+        let mut next = PathBuf::from("state.bin");
+        for n in (0..MAX_LINKS).rev() {
+            symlink(&next, dir.path().join(format!("link{n}"))).unwrap();
+            next = PathBuf::from(format!("link{n}"));
+        }
+        atomic_write(&dir.path().join("link0"), |file| {
+            Ok(file.write_all(b"forty")?)
+        })
+        .unwrap();
+        assert_eq!(fs::read(dir.path().join("state.bin")).unwrap(), b"forty");
+
+        let path = dir.path().join("one-more");
+        symlink("link0", &path).unwrap();
+        let result = atomic_write(&path, |_| {
+            panic!("forty-one links must fail before writing")
+        });
+        assert_link_bound(result);
+        assert_eq!(fs::read(dir.path().join("state.bin")).unwrap(), b"forty");
+    }
+
+    #[cfg(unix)]
+    fn assert_link_bound(result: Result<File>) {
+        match result {
+            Err(crate::StoreError::Io(error)) => assert!(
+                error
+                    .to_string()
+                    .contains(&format!("more than {MAX_LINKS} symbolic links")),
+                "{error}"
+            ),
+            other => panic!("expected the link bound to refuse the save, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn staged(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name.as_encoded_bytes()
+                    .starts_with(STAGING_PREFIX.as_bytes())
+            })
+            .count()
+    }
+
+    // The cleanup at the rename relies on tempfile removing a stage by its
+    // name: once the file has been renamed away, dropping its TempPath leaves
+    // it where it went, even while the stage's own handle is open.
+    #[test]
+    fn dropping_a_staging_path_after_its_rename_leaves_the_renamed_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        let mut temporary = tempfile::Builder::new()
+            .prefix(STAGING_PREFIX)
+            .make_in(dir.path(), |name| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(name)
+            })
+            .unwrap();
+        temporary.as_file_mut().write_all(b"published").unwrap();
+        let (file, staging) = temporary.into_parts();
+        fs::rename(&staging, &path).unwrap();
+        drop(staging);
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"published");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    // main saved through std, which converts long paths; tempfile's persist
+    // hands MoveFileExW the plain path, which fails past MAX_PATH.
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_long_paths_support_creation_and_replacement() {
+        use std::os::windows::ffi::OsStrExt;
+        let root = TempDir::new().unwrap();
+        let mut parent = root.path().to_owned();
+        for _ in 0..6 {
+            parent.push("checkpoint-long-path-segment-without-verbatim-prefix");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("state.bin");
+        assert!(path.as_os_str().encode_wide().count() > 300);
+        assert!(!path.to_string_lossy().starts_with(r"\\?\"));
+        for bytes in [b"first".as_slice(), b"replacement".as_slice()] {
+            atomic_write(&path, |file| Ok(file.write_all(bytes)?)).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        let verbatim = fs::canonicalize(&path).unwrap();
+        atomic_write(&verbatim, |file| Ok(file.write_all(b"verbatim")?)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"verbatim");
     }
 
     // This child exits inside the actual writer, bypassing all Rust destructors.
