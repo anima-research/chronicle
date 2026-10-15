@@ -2,7 +2,7 @@
 
 use crate::error::{Result, StoreError};
 use crate::types::{BranchId, PayloadEncoding, Record, RecordId, RecordInput, Sequence, Timestamp};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -61,6 +61,17 @@ pub struct RecordLog {
 
     /// Sync every N writes (0 = sync every write, critical for durability vs performance)
     sync_interval: u64,
+
+    /// The first periodic fsync failure since the last [`RecordLog::sync`],
+    /// which `sync` reports. Linux reports a writeback error to the first
+    /// fsync on an open file after it, and later ones succeed unless another
+    /// error occurs, so once `append` has seen the error nothing else would.
+    deferred_sync_error: Mutex<Option<std::io::Error>>,
+
+    /// How many of the next fsyncs fail without reaching the file, so unit
+    /// tests can stand in for a device error.
+    #[cfg(test)]
+    pub(crate) fsync_failures: Mutex<u64>,
 
     /// Highest sequence seen per branch during the open scan. Immutable after
     /// open; `Store::open` reconciles branch heads against this.
@@ -151,6 +162,9 @@ impl RecordLog {
             file_size: RwLock::new(file_size),
             writes_since_sync: RwLock::new(0),
             sync_interval: if sync_interval == 0 { 1 } else { sync_interval },
+            deferred_sync_error: Mutex::new(None),
+            #[cfg(test)]
+            fsync_failures: Mutex::new(0),
             branch_max_seq,
             recovery,
         })
@@ -173,7 +187,13 @@ impl RecordLog {
 
     /// Append a record to the log.
     ///
-    /// Returns the record and the offset where it was written.
+    /// Returns the record and the offset where it was written. Every
+    /// `sync_interval`-th append also fsyncs the log. A failed fsync doesn't
+    /// fail the append, since the record is already complete in the file:
+    /// failing it would leave a record its caller never adopted, which the
+    /// next record on the same chain would contradict at replay. The next
+    /// append tries the fsync again, and [`RecordLog::sync`] reports the
+    /// failure.
     pub fn append(
         &self,
         input: RecordInput,
@@ -214,11 +234,38 @@ impl RecordLog {
         let mut writes = self.writes_since_sync.write();
         *writes += 1;
         if *writes >= self.sync_interval {
-            file.sync_all()?;
-            *writes = 0;
+            match self.fsync(&file) {
+                Ok(()) => *writes = 0,
+                Err(error) => {
+                    // `writes` stays at the interval, so the next append
+                    // tries again.
+                    let mut deferred = self.deferred_sync_error.lock();
+                    if deferred.is_none() {
+                        tracing::warn!(
+                            %error,
+                            "periodic record log fsync failed; the record is kept, and the \
+                             next sync() reports the failure"
+                        );
+                        *deferred = Some(error);
+                    }
+                }
+            }
         }
 
         Ok((record, offset))
+    }
+
+    /// fsync the log file.
+    fn fsync(&self, file: &File) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut failures = self.fsync_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("injected fsync failure"));
+            }
+        }
+        file.sync_all()
     }
 
     /// Peek the record id the next `append` will assign, without consuming it.
@@ -232,11 +279,20 @@ impl RecordLog {
     }
 
     /// Force sync all pending writes to disk.
+    ///
+    /// Also returns, once, a periodic fsync failure that `append` met since
+    /// the last call, even when this call's own fsync succeeds: records
+    /// written before that failure may not have reached the disk.
     pub fn sync(&self) -> Result<()> {
         let file = self.file.write();
-        file.sync_all()?;
+        let synced = self.fsync(&file);
+        let deferred = self.deferred_sync_error.lock().take();
+        synced?;
         *self.writes_since_sync.write() = 0;
-        Ok(())
+        match deferred {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     /// Read a record at a given offset.
@@ -692,6 +748,33 @@ mod tests {
         assert_eq!(record.sequence.0, 1);
         assert_eq!(record.payload, b"hello");
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn failed_periodic_fsync_keeps_the_record_and_sync_reports_it_once() {
+        let dir = TempDir::new().unwrap();
+        let log = RecordLog::open_with_sync_interval(dir.path().join("log.bin"), 2).unwrap();
+        let append = |n: u64| {
+            log.append(
+                RecordInput::raw("test", vec![n as u8]),
+                BranchId(1),
+                Sequence(n),
+            )
+        };
+        append(1).unwrap();
+
+        // The interval's fsync fails, and the append still returns its record.
+        *log.fsync_failures.lock() = 1;
+        let (record, offset) = append(2).unwrap();
+        assert_eq!(log.read_at(offset).unwrap().id, record.id);
+        assert_eq!(*log.writes_since_sync.read(), 2, "the next append retries");
+
+        // The retry succeeds, and the failure is still reported, once.
+        append(3).unwrap();
+        assert_eq!(*log.writes_since_sync.read(), 0);
+        assert!(log.sync().is_err());
+        log.sync().unwrap();
+        assert_eq!(log.iter().count(), 3);
     }
 
     #[test]

@@ -1127,6 +1127,8 @@ impl JsStore {
     }
 
     /// Flush pending record/state contents and publish metadata checkpoints.
+    /// A failed periodic fsync of the record log since the last sync is
+    /// reported here, once, even when this call's own fsync succeeds.
     /// Reopen replays complete surviving log records after a process crash.
     /// Unix also syncs checkpoint directories. Windows guarantees flushed
     /// contents and same-volume atomic publication for process interruption,

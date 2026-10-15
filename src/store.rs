@@ -1834,6 +1834,8 @@ impl Store {
     ///
     /// Flush record/state contents and publish metadata checkpoints. On open,
     /// surviving log records are replayed even without a checkpoint.
+    /// A failed periodic fsync of the record log since the last sync is
+    /// reported here, once, even when this call's own fsync succeeds.
     /// Unix also syncs checkpoint directory entries. Windows flushes contents
     /// and atomically publishes on the same volume for process interruption;
     /// it does not guarantee that the latest checkpoint name survives OS or
@@ -3033,5 +3035,68 @@ mod tests {
         // No more events
         let result = handle.recv_timeout(Duration::from_millis(50));
         assert!(result.is_err());
+    }
+
+    // R1-1: a failed periodic fsync must not leave a record that its state's
+    // head never adopted, or the next update names the same predecessor and
+    // replay refuses the store. The child keeps writing while every fsync
+    // fails and exits without Drop, so the reopen has only the log and the
+    // registration's checkpoint to go on.
+    #[test]
+    fn failed_periodic_fsync_keeps_heads_and_log_in_step() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::failed_periodic_fsync_child"])
+            .env("CHRONICLE_FSYNC_FAILURE_STORE", &config.path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "child did not finish writing:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let store = Store::open(config).unwrap();
+        let items: Vec<u64> =
+            serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
+        assert_eq!(items, (0..250).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn failed_periodic_fsync_child() {
+        let Some(path) = std::env::var_os("CHRONICLE_FSYNC_FAILURE_STORE") else {
+            return;
+        };
+        let store = Store::create(StoreConfig {
+            path: path.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.set_auto_snapshot(false);
+
+        // Every fsync fails from here, the log's periodic one included.
+        *store.log.fsync_failures.lock() = u64::MAX;
+        for n in 0..250u64 {
+            // Like the writer in the review's reproduction, carry on past errors.
+            let _ = store.update_state("items", StateOperation::Append(n.to_string().into_bytes()));
+            if n == 150 {
+                assert!(store.sync().is_err(), "sync reports the failing fsync");
+            }
+        }
+        // No destructors: Drop's sync must not checkpoint the heads.
+        std::process::exit(73);
     }
 }
