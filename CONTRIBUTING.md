@@ -162,6 +162,9 @@ never do.
 
 ## Building and testing
 
+You need Node 22.12 or later, the floor `package.json`'s `engines` declares,
+and a Rust toolchain.
+
 ```bash
 npm ci                                          # strict lockfile install
 cargo test                                      # Rust suite
@@ -184,8 +187,8 @@ CI installs it with `npm ci`, which unlike `npm install` fails loudly on a
 lock that is broken or out of sync.
 
 Push-time CI (`ci.yml`) runs the Rust suite, the debug napi build and the node
-smoke test on every push and PR (ubuntu only — the cross-target matrix runs at
-release time).
+smoke test on every push and PR, under Node 22.12.0, 24 and the latest Node
+(ubuntu only — the cross-target matrix runs at release time).
 
 Binaries ship inside the single published tarball. The platform packages that
 `napi prepublish` would name were never published, and a manifest declaring
