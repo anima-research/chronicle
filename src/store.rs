@@ -2136,6 +2136,22 @@ mod tests {
         }
     }
 
+    /// Opens a store this process closed a moment ago. A child that a
+    /// concurrent test spawns shares this process's open files until it
+    /// execs, the store's LOCK among them, so the lock can still be held
+    /// for that moment.
+    fn reopen(config: StoreConfig) -> Store {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match Store::open(config.clone()) {
+                Err(StoreError::Locked) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                result => return result.unwrap(),
+            }
+        }
+    }
+
     #[test]
     fn test_create_store() {
         let dir = TempDir::new().unwrap();
@@ -2282,7 +2298,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let store = Store::open(config).unwrap();
+            let store = reopen(config);
 
             assert_eq!(store.index.count(), 2); // message + state_update
 
@@ -2625,7 +2641,7 @@ mod tests {
         // Reopen: the in-memory cache is gone, so get_state hits
         // reconstruct_from_disk over the full Set chain.
         {
-            let store = Store::open(config).unwrap();
+            let store = reopen(config);
             let raw = store.get_state("bookkeeping").unwrap().unwrap();
             let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(parsed, json!({ "n": 199 }));

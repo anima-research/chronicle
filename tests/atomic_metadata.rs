@@ -3,17 +3,35 @@
 
 use chronicle::{
     FieldIndexKind, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
+    StoreError,
 };
 use same_file::Handle;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn config(path: &Path) -> StoreConfig {
     StoreConfig {
         path: path.to_owned(),
         ..Default::default()
+    }
+}
+
+/// Opens a store this process closed a moment ago. A child that a
+/// concurrent test spawns shares this process's open files until it execs,
+/// the store's LOCK among them, so the lock can still be held for that
+/// moment.
+fn reopen(path: &Path) -> Store {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Store::open(config(path)) {
+            Err(StoreError::Locked) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            result => return result.unwrap(),
+        }
     }
 }
 
@@ -71,7 +89,7 @@ fn assert_published_without_truncating(name: &str) {
     drop(previous_file);
     drop(store);
 
-    let reopened = Store::open(config(&path)).unwrap();
+    let reopened = reopen(&path);
     assert_eq!(reopened.get_state_len("messages").unwrap(), Some(2));
     assert!(reopened.list_branches().iter().any(|b| b.name == "feature"));
     assert_eq!(
@@ -129,7 +147,7 @@ fn sync_only_republishes_metadata_that_changed() {
     assert_eq!(identities(), state);
 
     drop(store);
-    let reopened = Store::open(config(&path)).unwrap();
+    let reopened = reopen(&path);
     // Loading bytes is not a durability acknowledgement from this writer.
     reopened.sync().unwrap();
     let loaded = identities();
@@ -193,7 +211,7 @@ fn interrupted_sync_reopens_at_the_previous_checkpoint() {
     );
 
     assert_eq!(fs::read(path.join("state.bin")).unwrap(), previous);
-    let reopened = Store::open(config(&path)).unwrap();
+    let reopened = reopen(&path);
     assert_eq!(reopened.get_state_len("messages").unwrap(), Some(1));
 }
 
@@ -248,7 +266,7 @@ fn open_removes_staging_files_left_by_interrupted_saves() {
         link
     };
 
-    let _store = Store::open(config(&path)).unwrap();
+    let _store = reopen(&path);
     assert!(!stage.exists());
     #[cfg(unix)]
     assert!(fs::symlink_metadata(&link)
