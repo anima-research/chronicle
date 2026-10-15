@@ -161,6 +161,10 @@ impl Store {
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
 
+        // With the lock held, no save of this store is in progress, so its
+        // staging files here were left by interrupted saves.
+        crate::atomic_file::remove_staging_files(&config.path);
+
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;

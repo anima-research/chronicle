@@ -146,7 +146,8 @@ impl Checkpoint {
 /// granted to an owner or group it couldn't take.
 ///
 /// A save that fails before the rename removes its staging file. A process
-/// killed before then leaves it behind. Loaders only open the final names.
+/// killed before then leaves it behind. Loaders only open the final names, and
+/// the next `Store::open` removes the ones in the store directory.
 fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<File> {
     let path = resolve_links(path)?;
     // A bare relative filename has an empty parent, which means the current
@@ -337,6 +338,46 @@ fn sync_directory(directory: &File) -> io::Result<()> {
 #[cfg(unix)]
 fn directory_sync_refused(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EBADF | libc::EINVAL))
+}
+
+/// Remove the staging files that interrupted saves left in the store
+/// directory. The caller holds the store lock, so no save of this store is in
+/// progress, and nothing reads them. One that can't be removed is reported
+/// and left. A linked checkpoint's stage is written beside the file the link
+/// leads to, which may lie outside this directory.
+pub(crate) fn remove_staging_files(directory: &Path) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                directory = %directory.display(),
+                %error,
+                "could not look for checkpoint staging files left by interrupted saves"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let staged = entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(STAGING_PREFIX.as_bytes());
+        if !staged || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "removed a checkpoint staging file left by an interrupted save"
+            ),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not remove a checkpoint staging file left by an interrupted save"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -931,6 +972,11 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
 
         atomic_write(&path, |file| Ok(file.write_all(b"next checkpoint")?)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"next checkpoint");
+
+        // The abandoned stage is what the store's next open sweeps.
+        remove_staging_files(dir.path());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
         assert_eq!(fs::read(&path).unwrap(), b"next checkpoint");
     }
 }

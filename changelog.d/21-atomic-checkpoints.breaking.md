@@ -20,7 +20,8 @@
     saving it fails.
   - **A symbolic link** at a checkpoint's name is still followed, and the
     file it leads to is replaced in its own directory. A crash while saving it
-    can leave a `.chronicle-checkpoint-*` staging file beside that file.
+    can leave a `.chronicle-checkpoint-*` staging file beside that file, and
+    opening the store only removes the ones in the store directory.
   - **What a save needs** is what a rename needs, in the directory of the
     file it replaces: write access, to create the new file and rename it;
     read access, to sync the directory afterwards, without which the save

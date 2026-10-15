@@ -160,3 +160,45 @@ fn branch_checkpoint_is_replaced() {
 fn field_index_checkpoint_is_replaced() {
     assert_published_without_truncating("state-indexes.bin");
 }
+
+#[test]
+fn open_removes_staging_files_left_by_interrupted_saves() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    drop(Store::create(config(&path)).unwrap());
+    // What a save killed before its rename leaves beside the checkpoint.
+    let stage = path.join(".chronicle-checkpoint-a1B2c3");
+    fs::write(&stage, b"unfinished checkpoint").unwrap();
+    // Saves only ever stage regular files, so a link with the name stays.
+    #[cfg(unix)]
+    let link = {
+        let link = path.join(".chronicle-checkpoint-link");
+        std::os::unix::fs::symlink("state.bin", &link).unwrap();
+        link
+    };
+
+    let _store = Store::open(config(&path)).unwrap();
+    assert!(!stage.exists());
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+// The sweep waits for the store lock: an open that finds the store locked
+// fails before it touches a staging file, which may be a save's in progress.
+#[test]
+fn open_of_a_locked_store_leaves_its_staging_files() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let _store = Store::create(config(&path)).unwrap();
+    let stage = path.join(".chronicle-checkpoint-a1B2c3");
+    fs::write(&stage, b"a save in progress").unwrap();
+
+    assert!(matches!(
+        Store::open(config(&path)),
+        Err(chronicle::StoreError::Locked)
+    ));
+    assert!(stage.exists());
+}
