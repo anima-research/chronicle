@@ -1,7 +1,7 @@
 //! NAPI bindings for Node.js/TypeScript.
 
 use crate::{
-    error::StoreError,
+    error::{ErrorCode, StoreError},
     subscriptions::{
         DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
         SubscriptionHandle, SubscriptionId,
@@ -15,6 +15,15 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Results from this binding. An error carries its [`ErrorCode`] as its
+/// status, which JavaScript sees as `error.code`, beside its message.
+type Result<T> = napi::Result<T, ErrorCode>;
+
+/// One of the binding's own errors, with its code.
+fn coded(code: ErrorCode, reason: impl ToString) -> napi::Error<ErrorCode> {
+    napi::Error::new(code, reason)
+}
 
 /// JavaScript-friendly Store wrapper.
 #[napi]
@@ -321,8 +330,8 @@ pub struct JsTreeListEntry {
     pub mode: i32,
 }
 
-fn to_napi_error(e: StoreError) -> napi::Error {
-    napi::Error::from_reason(e.to_string())
+fn to_napi_error(e: StoreError) -> napi::Error<ErrorCode> {
+    napi::Error::new(e.code(), e.to_string())
 }
 
 /// Shared JsStateRegistration -> StateStrategy conversion for
@@ -338,7 +347,7 @@ fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateS
             delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
             full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
         },
-        _ => return Err(napi::Error::from_reason("Invalid strategy")),
+        _ => return Err(coded(ErrorCode::InvalidStrategy, "Invalid strategy")),
     })
 }
 
@@ -348,7 +357,7 @@ impl JsStore {
     fn get_store(&self) -> Result<&Arc<Store>> {
         self.inner
             .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Store has been closed"))
+            .ok_or_else(|| coded(ErrorCode::StoreClosed, "Store has been closed"))
     }
 
     /// Create a new store at the given path.
@@ -457,7 +466,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
         let record = store.get_record(RecordId(id)).map_err(to_napi_error)?;
         Ok(record.map(Into::into))
     }
@@ -474,7 +483,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
         let record = match store.get_record(RecordId(id)).map_err(to_napi_error)? {
             Some(r) => r,
             None => return Ok(None),
@@ -485,7 +494,7 @@ impl JsStore {
         let update =
             crate::types::StateUpdateRecord::decode(&record).map_err(to_napi_error)?;
         let json = serde_json::to_string(&update)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         Ok(Some(json))
     }
 
@@ -508,9 +517,10 @@ impl JsStore {
                     value
                         .map(|value| {
                             value.parse::<u64>().map(RecordId).map_err(|_| {
-                                napi::Error::from_reason(format!(
-                                    "Invalid record ID for {name}: {value:?}"
-                                ))
+                                coded(
+                                    ErrorCode::InvalidRecordId,
+                                    format!("Invalid record ID for {name}: {value:?}"),
+                                )
                             })
                         })
                         .transpose()
@@ -521,9 +531,10 @@ impl JsStore {
                         if limit.is_finite() && limit >= 0.0 && limit.fract() == 0.0 {
                             Ok(limit as usize)
                         } else {
-                            Err(napi::Error::from_reason(format!(
-                                "Invalid limit: {limit} (a non-negative integer)"
-                            )))
+                            Err(coded(
+                                ErrorCode::InvalidLimit,
+                                format!("Invalid limit: {limit} (a non-negative integer)"),
+                            ))
                         }
                     })
                     .transpose()?;
@@ -556,7 +567,7 @@ impl JsStore {
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
         let hash = crate::Hash::from_hex(&hash)
-            .map_err(|_| napi::Error::from_reason("Invalid hash"))?;
+            .map_err(|_| coded(ErrorCode::InvalidHash, "Invalid hash"))?;
         let blob = store.get_blob(&hash).map_err(to_napi_error)?;
         Ok(blob.map(|b| Buffer::from(b.content)))
     }
@@ -719,7 +730,7 @@ impl JsStore {
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -740,8 +751,8 @@ impl JsStore {
     #[napi]
     pub fn set_state_json(&self, state_id: String, value: serde_json::Value) -> Result<JsRecord> {
         let store = self.get_store()?;
-        let bytes =
-            serde_json::to_vec(&value).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         let record = store
             .update_state(&state_id, StateOperation::Set(bytes))
             .map_err(to_napi_error)?;
@@ -766,8 +777,8 @@ impl JsStore {
         item: serde_json::Value,
     ) -> Result<JsRecord> {
         let store = self.get_store()?;
-        let bytes =
-            serde_json::to_vec(&item).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let bytes = serde_json::to_vec(&item)
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         let record = store
             .update_state(&state_id, StateOperation::Append(bytes))
             .map_err(to_napi_error)?;
@@ -887,7 +898,7 @@ impl JsStore {
         match item {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -1150,7 +1161,7 @@ impl JsStore {
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -1163,7 +1174,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
         let effects = store.index.get_caused_by(RecordId(id));
         Ok(effects.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1174,7 +1185,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
         let links = store.index.get_linked_to(RecordId(id));
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1236,7 +1247,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
 
         // Remove handle from our map
         self.subscription_handles.lock().remove(&id);
@@ -1255,7 +1266,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
 
         store
             .catch_up_subscription(SubscriptionId(id))
@@ -1269,19 +1280,20 @@ impl JsStore {
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
             .get(&id)
-            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+            .ok_or_else(|| coded(ErrorCode::SubscriptionNotFound, "Subscription not found"))?;
 
         match handle.try_recv() {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Err(napi::Error::from_reason("Subscription disconnected"))
-            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(coded(
+                ErrorCode::SubscriptionDisconnected,
+                "Subscription disconnected",
+            )),
         }
     }
 
@@ -1296,20 +1308,21 @@ impl JsStore {
     ) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
             .get(&id)
-            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+            .ok_or_else(|| coded(ErrorCode::SubscriptionNotFound, "Subscription not found"))?;
 
         let timeout = std::time::Duration::from_millis(timeout_ms as u64);
         match handle.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(napi::Error::from_reason("Subscription disconnected"))
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(coded(
+                ErrorCode::SubscriptionDisconnected,
+                "Subscription disconnected",
+            )),
         }
     }
 
@@ -1358,9 +1371,9 @@ impl JsStore {
             .into_iter()
             .map(|op| match op.op.as_str() {
                 "set" => {
-                    let entry = op
-                        .entry
-                        .ok_or_else(|| napi::Error::from_reason("TreeOp 'set' requires entry"))?;
+                    let entry = op.entry.ok_or_else(|| {
+                        coded(ErrorCode::InvalidTreeOp, "TreeOp 'set' requires entry")
+                    })?;
                     Ok(TreeOp::Set {
                         path: op.path,
                         entry: TreeEntry {
@@ -1371,10 +1384,10 @@ impl JsStore {
                     })
                 }
                 "remove" => Ok(TreeOp::Remove { path: op.path }),
-                other => Err(napi::Error::from_reason(format!(
-                    "Invalid tree op: '{}', expected 'set' or 'remove'",
-                    other
-                ))),
+                other => Err(coded(
+                    ErrorCode::InvalidTreeOp,
+                    format!("Invalid tree op: '{}', expected 'set' or 'remove'", other),
+                )),
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -1513,10 +1526,13 @@ impl JsStore {
             "number" => FieldIndexKind::Number,
             "string" => FieldIndexKind::String,
             _ => {
-                return Err(napi::Error::from_reason(format!(
-                    "Invalid field index kind '{}': expected \"number\" or \"string\"",
-                    kind
-                )))
+                return Err(coded(
+                    ErrorCode::InvalidFieldIndexKind,
+                    format!(
+                        "Invalid field index kind '{}': expected \"number\" or \"string\"",
+                        kind
+                    ),
+                ))
             }
         };
         store
