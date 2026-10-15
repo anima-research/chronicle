@@ -9,12 +9,29 @@ use chronicle::{
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn config(path: &Path) -> StoreConfig {
     StoreConfig {
         path: path.to_owned(),
         ..Default::default()
+    }
+}
+
+/// Opens a store in the test's own process. A child that a concurrent test
+/// spawns shares this process's open files until it execs, the LOCK of any
+/// store open here among them, so a store this process closed a moment ago
+/// can still be locked for that moment.
+fn open_store(path: &Path) -> chronicle::Result<Store> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Store::open(config(path)) {
+            Err(StoreError::Locked) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            result => return result,
+        }
     }
 }
 
@@ -260,7 +277,7 @@ fn crash_writer() {
 fn registration_and_strategy_change_survive_without_close() {
     let dir = TempDir::new().unwrap();
     crash(dir.path(), "registration");
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(store.stats().unwrap().state_slot_count, 1);
     assert!(matches!(
         store.register_state(StateRegistration {
@@ -293,7 +310,7 @@ fn new_store_and_incremental_tail_replay_without_duplicates() {
         crash(dir.path(), scenario);
         crash(dir.path(), "reopen");
         for cycle in 0..2 {
-            let store = Store::open(config(dir.path())).unwrap();
+            let store = open_store(dir.path()).unwrap();
             assert_eq!(
                 value(&store, "items"),
                 json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
@@ -328,7 +345,7 @@ fn replay_restores_mixed_operations_snapshots_and_field_index() {
     let expected: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("expected.json")).unwrap()).unwrap();
     for _ in 0..2 {
-        let store = Store::open(config(dir.path())).unwrap();
+        let store = open_store(dir.path()).unwrap();
         assert_eq!(observe(&store), expected);
         assert_eq!(value(&store, "items").as_array().unwrap().len(), 13);
         assert_eq!(
@@ -348,7 +365,7 @@ fn all_branch_creation_paths_survive_with_inherited_heads_and_tail() {
         for suffix in ["created", "tail"] {
             let dir = TempDir::new().unwrap();
             crash(dir.path(), &format!("{kind}-{suffix}"));
-            let store = Store::open(config(dir.path())).unwrap();
+            let store = open_store(dir.path()).unwrap();
             assert_eq!(store.list_branches().len(), 2, "{kind}-{suffix}");
             assert_eq!(
                 store.current_branch().name,
@@ -379,7 +396,7 @@ fn all_branch_creation_paths_survive_with_inherited_heads_and_tail() {
 fn deleted_branch_is_not_resurrected_by_replay() {
     let dir = TempDir::new().unwrap();
     crash(dir.path(), "delete");
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(store.list_branches().len(), 1);
     assert_eq!(value(&store, "items"), json!([0, 9]));
     assert_eq!(store.get_state_len("items").unwrap(), Some(2));
@@ -400,7 +417,7 @@ fn torn_tail_replays_only_complete_updates() {
         .unwrap();
     file.set_len(file.metadata().unwrap().len() - 3).unwrap();
     drop(file);
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(value(&store, "items"), json!([0, 1, 2, 3, 4, 5, 6, 7, 8]));
     assert_eq!(store.get_state_len("items").unwrap(), Some(9));
     assert!(store.recovery().is_some());
@@ -434,7 +451,7 @@ fn legacy_json_tail_replays_from_offset_zero() {
     log.append(input, BranchId(1), Sequence(1)).unwrap();
     log.sync().unwrap();
     drop(log);
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(value(&store, "items"), json!([42]));
     assert_eq!(store.get_state_len("items").unwrap(), Some(1));
 }
@@ -450,7 +467,7 @@ fn lost_registration_is_replayed_and_waits_for_register_state() {
     .unwrap();
     let items: Vec<Value> = (0..10).map(|n| json!(n)).collect();
 
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(value(&store, "items"), json!(items));
     assert_eq!(value(&store, "keep"), json!(["synced", "tail"]));
     let report = store.recovery().unwrap();
@@ -466,14 +483,14 @@ fn lost_registration_is_replayed_and_waits_for_register_state() {
     // next open replays none of them: the chain must be saved by then.
     drop(store);
 
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert!(store.recovery().is_none());
     assert_eq!(value(&store, "items"), json!(items));
     register(&store, "items", log_strategy());
     append(&store, "items", json!(10));
     drop(store);
 
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     let mut items = items;
     items.push(json!(10));
     assert_eq!(value(&store, "items"), json!(items));
@@ -502,7 +519,7 @@ fn record_typed_state_update_that_is_not_one_is_skipped_and_counted() {
 
     // It stays past the checkpoint until a state update moves it.
     for _ in 0..2 {
-        let store = Store::open(config(dir.path())).unwrap();
+        let store = open_store(dir.path()).unwrap();
         let report = store.recovery().unwrap();
         assert_eq!(report.undecodable_state_updates, 1);
         assert!(report.unregistered_states.is_empty());
@@ -511,11 +528,11 @@ fn record_typed_state_update_that_is_not_one_is_skipped_and_counted() {
         assert_eq!(value(&store, "items"), json!([1]));
         assert_eq!(store.stats().unwrap().record_count, 2);
     }
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     store.set_auto_snapshot(false);
     append(&store, "items", json!(2));
     drop(store);
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert!(store.recovery().is_none());
     assert_eq!(value(&store, "items"), json!([1, 2]));
 }
@@ -555,7 +572,7 @@ fn update_whose_predecessor_is_not_its_head_refuses_open() {
     drop(log);
     let before = std::fs::read(dir.path().join("records.log")).unwrap();
 
-    let err = match Store::open(config(dir.path())) {
+    let err = match open_store(dir.path()) {
         Ok(_) => panic!("a broken chain opened"),
         Err(e) => e,
     };
@@ -586,7 +603,7 @@ fn updates_on_a_branch_missing_from_branches_bin_are_not_replayed() {
     append_raw_update(&log, BranchId(7), 2, Some(0));
     drop(log);
 
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(store.list_branches().len(), 1);
     assert_eq!(value(&store, "items"), json!([0]));
     assert!(store.recovery().is_none());
@@ -617,7 +634,7 @@ fn partially_published_branch_cannot_leak_heads_into_a_new_empty_branch() {
     // Model interruption after state.bin publication but before branches.bin.
     // The child has copied state heads, but no log record reserves its ID.
     std::fs::write(dir.path().join("branches.bin"), previous_branches).unwrap();
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(store.list_branches().len(), 1);
     let new = store.create_empty_branch("new", None).unwrap();
     assert!(new.id > abandoned.id);
@@ -654,7 +671,7 @@ fn generic_appends_cannot_forge_internal_state_updates() {
     }
     store.sync().unwrap();
     drop(store);
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     assert_eq!(store.stats().unwrap().record_count, 0);
     assert_eq!(value(&store, "items"), Value::Null);
 }
