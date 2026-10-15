@@ -26,10 +26,7 @@ fn append(store: &Store, timestamp: u64) {
         .unwrap();
 }
 
-fn assert_published_without_truncating(name: &str) {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("store");
-    let store = Store::create(config(&path)).unwrap();
+fn register(store: &Store) {
     store
         .register_state(StateRegistration {
             id: "messages".into(),
@@ -40,6 +37,13 @@ fn assert_published_without_truncating(name: &str) {
             initial_value: None,
         })
         .unwrap();
+}
+
+fn assert_published_without_truncating(name: &str) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    register(&store);
     append(&store, 10);
     store
         .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
@@ -89,16 +93,7 @@ fn sync_only_republishes_metadata_that_changed() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     let store = Store::create(config(&path)).unwrap();
-    store
-        .register_state(StateRegistration {
-            id: "messages".into(),
-            strategy: StateStrategy::AppendLog {
-                delta_snapshot_every: 100,
-                full_snapshot_every: 100,
-            },
-            initial_value: None,
-        })
-        .unwrap();
+    register(&store);
     append(&store, 10);
     store
         .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
@@ -159,6 +154,82 @@ fn branch_checkpoint_is_replaced() {
 #[test]
 fn field_index_checkpoint_is_replaced() {
     assert_published_without_truncating("state-indexes.bin");
+}
+
+// #19: a sync cut off while writing `state.bin` must leave the store opening
+// at the checkpoint before it. The child's writes fail for real, at the file
+// size limit, partway through the new checkpoint. On `main`, which truncated
+// `state.bin` and rewrote it in place, the reopen fails reading it.
+#[cfg(unix)]
+#[test]
+fn interrupted_sync_reopens_at_the_previous_checkpoint() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    register(&store);
+    append(&store, 10);
+    store.sync().unwrap();
+    drop(store);
+    let previous = fs::read(path.join("state.bin")).unwrap();
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "interrupted_sync_child"])
+        .env("CHRONICLE_INTERRUPTED_SYNC_STORE", &path)
+        // Half the previous checkpoint, so the next one is cut partway.
+        .env(
+            "CHRONICLE_INTERRUPTED_SYNC_LIMIT",
+            (previous.len() / 2).to_string(),
+        )
+        .output()
+        .unwrap();
+    // 73 comes only from the end of the child test, so a filter that ran no
+    // test, which exits 0, can't pass for an interrupted sync.
+    assert_eq!(
+        child.status.code(),
+        Some(73),
+        "child failed: {}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    assert_eq!(fs::read(path.join("state.bin")).unwrap(), previous);
+    let reopened = Store::open(config(&path)).unwrap();
+    assert_eq!(reopened.get_state_len("messages").unwrap(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_sync_child() {
+    let Some(path) = std::env::var_os("CHRONICLE_INTERRUPTED_SYNC_STORE") else {
+        return;
+    };
+    let limit: u64 = std::env::var("CHRONICLE_INTERRUPTED_SYNC_LIMIT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let store = Store::open(config(Path::new(&path))).unwrap();
+    append(&store, 20);
+    // From here a write past `limit` bytes of any file fails with EFBIG, which
+    // SIGXFSZ would otherwise turn into the process's death. The appended
+    // record is already in the log, so only the checkpoints meet the limit.
+    let limit = limit as libc::rlim_t;
+    let rlimit = libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: limit,
+    };
+    // SAFETY: plain libc calls with a valid, initialized rlimit.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit), 0);
+    }
+    match store.sync() {
+        Err(chronicle::StoreError::Io(error)) => {
+            assert_eq!(error.raw_os_error(), Some(libc::EFBIG), "{error}")
+        }
+        other => panic!("expected the checkpoint write to fail with EFBIG, got {other:?}"),
+    }
+    // Without destructors, so Drop's sync can't touch the store again.
+    std::process::exit(73);
 }
 
 #[test]
