@@ -72,16 +72,34 @@ pub struct JsStoreStats {
     pub blob_size_bytes: i64,
 }
 
-/// Torn-tail recovery report surfaced to JavaScript. Present only when the
-/// most recent `open` truncated a torn/partial tail record.
+/// What the most recent `open` had to recover, surfaced to JavaScript:
+/// a torn/partial tail record it truncated, updates it replayed for a state
+/// with no registration, or records typed `state_update` it skipped.
 #[napi(object)]
 pub struct JsRecoveryReport {
-    /// Byte offset the log was truncated back to (end of the last valid record).
+    /// Byte offset the log was truncated back to (end of the last valid
+    /// record), or the log's length when nothing was torn.
     pub truncated_at: i64,
-    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced records).
+    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced
+    /// records). 0 when nothing was torn.
     pub dropped_bytes: i64,
     /// Number of valid records that survived recovery.
     pub valid_records: i64,
+    /// Each state whose updates were replayed although the store holds no
+    /// registration for it. It can be read; updating it waits for
+    /// `registerState` to supply its strategy again.
+    pub unregistered_states: Vec<JsUnregisteredState>,
+    /// Records typed `state_update` that don't decode as state updates, which
+    /// open skipped. They stay in the log as ordinary records.
+    pub undecodable_state_updates: i64,
+}
+
+/// A state whose updates `open` replayed without a registration.
+#[napi(object)]
+pub struct JsUnregisteredState {
+    pub id: String,
+    /// How many of its updates were replayed.
+    pub updates: i64,
 }
 
 /// Configuration for creating a store.
@@ -399,11 +417,15 @@ impl JsStore {
         self.inner.is_none()
     }
 
-    /// Torn-tail recovery the log performed on open, if any.
+    /// What the most recent open had to recover, if anything.
     ///
-    /// Returns a report when `open` silently truncated a torn/partial tail
-    /// record (crash during append), or `null` when the log opened cleanly.
-    /// Lets JS callers detect lost un-fsynced writes without scraping logs.
+    /// Returns a report when `open` truncated a torn/partial tail record
+    /// (crash during append), replayed updates for a state with no
+    /// registration, or skipped records typed `state_update` that aren't
+    /// state updates, and `null` when none of these happened. A report
+    /// doesn't by itself mean a tail was torn: `droppedBytes` is 0 when
+    /// nothing was. Lets JS callers detect lost un-fsynced writes, or a state
+    /// to register again, without scraping logs.
     #[napi]
     pub fn recovery(&self) -> Result<Option<JsRecoveryReport>> {
         let store = self.get_store()?;
@@ -411,6 +433,15 @@ impl JsStore {
             truncated_at: r.truncated_at as i64,
             dropped_bytes: r.dropped_bytes as i64,
             valid_records: r.valid_records as i64,
+            unregistered_states: r
+                .unregistered_states
+                .into_iter()
+                .map(|(id, updates)| JsUnregisteredState {
+                    id,
+                    updates: updates as i64,
+                })
+                .collect(),
+            undecodable_state_updates: r.undecodable_state_updates as i64,
         }))
     }
 

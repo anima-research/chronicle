@@ -17,17 +17,30 @@ const LOG_VERSION: u8 = 1;
 /// What an open-time scan of the log found and (if a torn tail was recovered)
 /// what it dropped. Surfaced via [`RecordLog::recovery`] so callers can log or
 /// react to silent data truncation instead of only seeing a stderr warning.
+/// `Store::recovery` adds what the store's open found in the state-update
+/// tail, and reports it even when no tail was torn.
 #[derive(Clone, Debug)]
 pub struct RecoveryReport {
-    /// Byte offset the file was truncated back to (end of the last valid record).
+    /// Byte offset the file was truncated back to (end of the last valid
+    /// record), or the log's length when nothing was torn.
     pub truncated_at: u64,
     /// Number of trailing bytes discarded. NOTE: this is *all* bytes after the
     /// last valid record — with the default `sync_interval`, up to that many
     /// un-fsynced records. Bit-rot in the final fsynced record is
-    /// indistinguishable from a tear and is counted here too.
+    /// indistinguishable from a tear and is counted here too. 0 when nothing
+    /// was torn.
     pub dropped_bytes: u64,
     /// Number of valid records that survived (i.e. the length of the recovered log).
     pub valid_records: u64,
+    /// Each state whose updates open replayed although `state.bin` holds no
+    /// registration for it, with the number of updates replayed. Such a
+    /// state can be read, and updating it waits for `register_state` to
+    /// supply its strategy. Empty from [`RecordLog::recovery`].
+    pub unregistered_states: Vec<(String, u64)>,
+    /// Records past the checkpoint typed `state_update` that don't decode as
+    /// state updates, which open skipped. They stay in the log as ordinary
+    /// records. 0 from [`RecordLog::recovery`].
+    pub undecodable_state_updates: u64,
 }
 
 /// Outcome of a full validating scan of the log.
@@ -147,6 +160,8 @@ impl RecordLog {
                     truncated_at: scan.valid_len,
                     dropped_bytes: dropped,
                     valid_records: scan.valid_records,
+                    unregistered_states: Vec::new(),
+                    undecodable_state_updates: 0,
                 })
             } else {
                 None

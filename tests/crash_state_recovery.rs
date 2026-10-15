@@ -102,7 +102,33 @@ fn crash_writer() {
         // Crash again after replay, before the recovered heads are saved.
         std::process::exit(73);
     }
+    if scenario == "reopen-mixed" {
+        let store = Store::open(config(path)).unwrap();
+        let expected: Value =
+            serde_json::from_slice(&std::fs::read(path.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(observe(&store), expected);
+        std::process::exit(73);
+    }
     let store = Store::create(config(path)).unwrap();
+    if scenario == "lost-registration" {
+        // An earlier release saved a registration only at sync. Model its
+        // crash: "keep" was registered and synced, then "items" was
+        // registered and updated, and the process died before the next sync.
+        // The parent puts back the state.bin saved before "items" existed.
+        store.set_auto_snapshot(false);
+        register(&store, "keep", log_strategy());
+        append(&store, "keep", json!("synced"));
+        store.sync().unwrap();
+        std::fs::copy(path.join("state.bin"), path.join("state.before")).unwrap();
+        register(&store, "items", log_strategy());
+        for n in 0..10 {
+            append(&store, "items", json!(n));
+        }
+        // A later update to "keep", so any checkpoint after replay holds a
+        // head past every update of "items".
+        append(&store, "keep", json!("tail"));
+        std::process::exit(73);
+    }
     register(&store, "items", log_strategy());
 
     match scenario.as_str() {
@@ -295,6 +321,10 @@ fn new_store_and_incremental_tail_replay_without_duplicates() {
 fn replay_restores_mixed_operations_snapshots_and_field_index() {
     let dir = TempDir::new().unwrap();
     crash(dir.path(), "mixed");
+    // The child replays and exits before anything checkpoints, so the first
+    // open here replays the same tail again. The second follows Drop's
+    // checkpoint.
+    crash(dir.path(), "reopen-mixed");
     let expected: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("expected.json")).unwrap()).unwrap();
     for _ in 0..2 {
@@ -410,23 +440,156 @@ fn legacy_json_tail_replays_from_offset_zero() {
 }
 
 #[test]
-fn lost_legacy_registration_fails_explicitly_instead_of_opening_empty() {
+fn lost_registration_is_replayed_and_waits_for_register_state() {
     let dir = TempDir::new().unwrap();
-    crash(dir.path(), "fresh");
-    std::fs::remove_file(dir.path().join("state.bin")).unwrap();
+    crash(dir.path(), "lost-registration");
+    std::fs::rename(
+        dir.path().join("state.before"),
+        dir.path().join("state.bin"),
+    )
+    .unwrap();
+    let items: Vec<Value> = (0..10).map(|n| json!(n)).collect();
+
+    let store = Store::open(config(dir.path())).unwrap();
+    assert_eq!(value(&store, "items"), json!(items));
+    assert_eq!(value(&store, "keep"), json!(["synced", "tail"]));
+    let report = store.recovery().unwrap();
+    assert_eq!(report.unregistered_states, vec![("items".to_string(), 10)]);
+    assert_eq!(report.undecodable_state_updates, 0);
+    assert_eq!(report.dropped_bytes, 0);
+    assert_eq!(store.stats().unwrap().state_slot_count, 1);
+    assert!(matches!(
+        store.update_state("items", StateOperation::Append(b"10".to_vec())),
+        Err(StoreError::StateNotRegistered(_))
+    ));
+    // Drop checkpoints a head of "keep" past every update of "items", so the
+    // next open replays none of them: the chain must be saved by then.
+    drop(store);
+
+    let store = Store::open(config(dir.path())).unwrap();
+    assert!(store.recovery().is_none());
+    assert_eq!(value(&store, "items"), json!(items));
+    register(&store, "items", log_strategy());
+    append(&store, "items", json!(10));
+    drop(store);
+
+    let store = Store::open(config(dir.path())).unwrap();
+    let mut items = items;
+    items.push(json!(10));
+    assert_eq!(value(&store, "items"), json!(items));
+    assert_eq!(store.get_state_len("items").unwrap(), Some(11));
+}
+
+#[test]
+fn record_typed_state_update_that_is_not_one_is_skipped_and_counted() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::create(config(dir.path())).unwrap();
+        register(&store, "items", log_strategy());
+        store.set_auto_snapshot(false);
+        append(&store, "items", json!(1));
+    }
+    // What an earlier release's generic append could write under this name.
+    let log = RecordLog::open(dir.path().join("records.log")).unwrap();
+    log.append(
+        RecordInput::raw("state_update", b"custom payload".to_vec()),
+        BranchId(1),
+        Sequence(2),
+    )
+    .unwrap();
+    log.sync().unwrap();
+    drop(log);
+
+    // It stays past the checkpoint until a state update moves it.
+    for _ in 0..2 {
+        let store = Store::open(config(dir.path())).unwrap();
+        let report = store.recovery().unwrap();
+        assert_eq!(report.undecodable_state_updates, 1);
+        assert!(report.unregistered_states.is_empty());
+        assert_eq!(report.dropped_bytes, 0);
+        assert_eq!(report.valid_records, 2);
+        assert_eq!(value(&store, "items"), json!([1]));
+        assert_eq!(store.stats().unwrap().record_count, 2);
+    }
+    let store = Store::open(config(dir.path())).unwrap();
+    store.set_auto_snapshot(false);
+    append(&store, "items", json!(2));
+    drop(store);
+    let store = Store::open(config(dir.path())).unwrap();
+    assert!(store.recovery().is_none());
+    assert_eq!(value(&store, "items"), json!([1, 2]));
+}
+
+fn append_raw_update(log: &RecordLog, branch: BranchId, sequence: u64, prev: Option<u64>) -> u64 {
+    let update = StateUpdateRecord {
+        record_id: RecordId(0),
+        global_sequence: Sequence(sequence),
+        state_id: "items".into(),
+        prev_update_offset: prev,
+        operation: StateOperation::Append(sequence.to_string().into_bytes()),
+        timestamp: Timestamp(0),
+    };
+    let (payload, encoding) = update.encode().unwrap();
+    let mut input = RecordInput::raw("state_update", payload);
+    input.encoding = encoding;
+    let (_, offset) = log.append(input, branch, Sequence(sequence)).unwrap();
+    log.sync().unwrap();
+    offset
+}
+
+#[test]
+fn update_whose_predecessor_is_not_its_head_refuses_open() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::create(config(dir.path())).unwrap();
+        register(&store, "items", log_strategy());
+        store.set_auto_snapshot(false);
+        // The log's first record, at offset 0, then one after it.
+        append(&store, "items", json!(0));
+        append(&store, "items", json!(1));
+    }
+    // A second update after the first one: the fork a writer leaves when
+    // its head missed an update it had written.
+    let log = RecordLog::open(dir.path().join("records.log")).unwrap();
+    let offset = append_raw_update(&log, BranchId(1), 3, Some(0));
+    drop(log);
     let before = std::fs::read(dir.path().join("records.log")).unwrap();
+
     let err = match Store::open(config(dir.path())) {
-        Ok(_) => panic!("missing registration"),
+        Ok(_) => panic!("a broken chain opened"),
         Err(e) => e,
     };
+    let at = format!("at log offset {offset}: previous offset Some(0) does not match");
     assert!(
-        matches!(&err, StoreError::Corruption(msg) if msg.contains("registration is missing")),
+        matches!(&err, StoreError::Corruption(msg) if msg.contains(&at)),
         "{err}"
     );
     assert_eq!(
         std::fs::read(dir.path().join("records.log")).unwrap(),
         before
     );
+}
+
+#[test]
+fn updates_on_a_branch_missing_from_branches_bin_are_not_replayed() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::create(config(dir.path())).unwrap();
+        register(&store, "items", log_strategy());
+        store.set_auto_snapshot(false);
+        append(&store, "items", json!(0));
+    }
+    // An earlier release saved branches.bin only at sync, so a crash can
+    // leave updates on a branch it never saved. The first names its parent's
+    // head as predecessor, which a branch without a head can't match.
+    let log = RecordLog::open(dir.path().join("records.log")).unwrap();
+    append_raw_update(&log, BranchId(7), 2, Some(0));
+    drop(log);
+
+    let store = Store::open(config(dir.path())).unwrap();
+    assert_eq!(store.list_branches().len(), 1);
+    assert_eq!(value(&store, "items"), json!([0]));
+    assert!(store.recovery().is_none());
 }
 
 #[test]

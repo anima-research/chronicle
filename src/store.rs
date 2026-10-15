@@ -110,6 +110,9 @@ pub struct Store {
     /// (e.g. importers) turn this off to avoid the O(N²) snapshot series and
     /// take a single compacting snapshot at the end via `compact_state`.
     auto_snapshot_enabled: AtomicBool,
+
+    /// What `open` had to recover, for [`Store::recovery`].
+    recovery: Option<RecoveryReport>,
 }
 
 impl Store {
@@ -159,6 +162,7 @@ impl Store {
             subscriptions: SubscriptionManager::new(),
             write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
+            recovery: None,
         })
     }
 
@@ -232,10 +236,16 @@ impl Store {
         // The checkpoint covers all updates through its latest head, including
         // updates on other branches. Keep this boundary fixed during replay.
         let checkpoint = state.checkpoint_offset();
+        let mut records = 0u64;
+        // Updates replayed per state that has no registration in state.bin.
+        let mut unregistered = std::collections::BTreeMap::<String, u64>::new();
+        let mut undecodable = 0u64;
+        let mut first_undecodable = None;
         let index = RecordIndex::rebuild_from_log_with(
             config.path.join("records.idx"),
             &log,
             |offset, record| {
+                records += 1;
                 if record.record_type != "state_update"
                     || checkpoint.is_some_and(|saved| offset <= saved)
                     || branches.get_branch_by_id(record.branch).is_none()
@@ -243,13 +253,21 @@ impl Store {
                     return Ok(());
                 }
 
-                let update = StateUpdateRecord::decode(record)?;
+                // Earlier releases let any append use this type, so a record
+                // may not be a state update at all. It stays in the log as an
+                // ordinary record.
+                let Ok(update) = StateUpdateRecord::decode(record) else {
+                    undecodable += 1;
+                    first_undecodable.get_or_insert(offset);
+                    return Ok(());
+                };
+                // Earlier releases saved a registration only at sync, so a
+                // crash can leave updates whose registration never reached
+                // state.bin. Replay doesn't need the strategy, so the chain is
+                // kept and checkpointed like any other, and update_state
+                // refuses the state until register_state supplies it again.
                 if state.get_strategy(&update.state_id).is_none() {
-                    return Err(StoreError::Corruption(format!(
-                        "cannot replay state '{}' at log offset {}: registration is missing \
-                         from state.bin; restore the state metadata from a backup",
-                        update.state_id, offset
-                    )));
+                    *unregistered.entry(update.state_id.clone()).or_default() += 1;
                 }
                 let previous = state.get_head(record.branch, &update.state_id)
                     .map(|head| head.head_offset);
@@ -264,6 +282,39 @@ impl Store {
             },
         )?;
 
+        for (state_id, updates) in &unregistered {
+            tracing::warn!(
+                state = %state_id,
+                updates,
+                "replayed updates for a state with no registration in state.bin; it can be \
+                 read, and updating it waits for register_state to supply its strategy"
+            );
+        }
+        if let Some(first_offset) = first_undecodable {
+            tracing::warn!(
+                records = undecodable,
+                first_offset,
+                "skipped records typed state_update that don't decode as state updates; \
+                 they stay in the log as ordinary records"
+            );
+        }
+        let unregistered_states: Vec<_> = unregistered.into_iter().collect();
+        let recovery = match log.recovery() {
+            Some(torn) => Some(RecoveryReport {
+                unregistered_states,
+                undecodable_state_updates: undecodable,
+                ..torn.clone()
+            }),
+            None if !unregistered_states.is_empty() || undecodable > 0 => Some(RecoveryReport {
+                truncated_at: log.size(),
+                dropped_bytes: 0,
+                valid_records: records,
+                unregistered_states,
+                undecodable_state_updates: undecodable,
+            }),
+            None => None,
+        };
+
         Ok(Self {
             config,
             _lock_file: lock_file,
@@ -275,18 +326,22 @@ impl Store {
             subscriptions: SubscriptionManager::new(),
             write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
+            recovery,
         })
     }
 
-    /// Torn-tail recovery the log performed on the most recent open, if any.
+    /// What the most recent open had to recover, if anything: a torn tail
+    /// record it truncated (crash during append), updates it replayed for a
+    /// state whose registration isn't in `state.bin`, and records typed
+    /// `state_update` it skipped because they don't decode as state updates.
     ///
-    /// Returns `Some(report)` when `open` truncated a torn/partial tail record
-    /// (crash during append), describing how many bytes and records were
-    /// dropped, or `None` when the log opened cleanly. Callers that need to know
-    /// their store silently lost un-fsynced writes on open can consult this
-    /// instead of scraping the `tracing` warning out of logs.
+    /// `None` when none of these happened. A report doesn't by itself mean a
+    /// tail was torn: `dropped_bytes` is 0 when nothing was. Callers that
+    /// need to know their store lost un-fsynced writes, or holds a state it
+    /// must register again before updating it, can consult this instead of
+    /// scraping the `tracing` warnings out of logs.
     pub fn recovery(&self) -> Option<RecoveryReport> {
-        self.log.recovery().cloned()
+        self.recovery.clone()
     }
 
     /// Toggle the auto-snapshot pass inside `update_state`.
