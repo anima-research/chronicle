@@ -69,6 +69,17 @@ struct WriteState {
     /// checkpoint failed, finish it before allowing another mutation to use
     /// the in-memory definition. Reads may still inspect that tentative state.
     checkpoint_required: bool,
+
+    /// A branch creation or deletion that no checkpoint has persisted yet.
+    /// Subscribers hear of it once one does, as its caller does. At most one
+    /// is ever pending, since a mutation first finishes a failed checkpoint.
+    pending_branch_event: Option<BranchEvent>,
+}
+
+/// A branch change to announce once a checkpoint persists it.
+enum BranchEvent {
+    Created { branch: Branch, parent: Option<String> },
+    Deleted { name: String },
 }
 
 /// The main record store.
@@ -1758,10 +1769,11 @@ impl Store {
 
         // Persist copied state heads before publishing the branch identity.
         write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Created {
+            branch: new_branch.clone(),
+            parent: Some(parent_name),
+        });
         self.sync_locked(&mut write)?;
-
-        // Broadcast branch created
-        self.subscriptions.broadcast_branch_created(&new_branch, Some(parent_name));
 
         Ok(new_branch)
     }
@@ -1777,10 +1789,11 @@ impl Store {
         let new_branch = self.branches.create_branch(name, from)?;
 
         write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Created {
+            branch: new_branch.clone(),
+            parent: parent_name,
+        });
         self.sync_locked(&mut write)?;
-
-        // Broadcast branch created
-        self.subscriptions.broadcast_branch_created(&new_branch, parent_name);
 
         // Don't copy state - let the caller populate state manually
         Ok(new_branch)
@@ -1829,9 +1842,11 @@ impl Store {
         }
 
         write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Created {
+            branch: new_branch.clone(),
+            parent: Some(from.to_string()),
+        });
         self.sync_locked(&mut write)?;
-        self.subscriptions
-            .broadcast_branch_created(&new_branch, Some(from.to_string()));
 
         Ok(new_branch)
     }
@@ -1862,10 +1877,10 @@ impl Store {
         self.retry_metadata_checkpoint(&mut write)?;
         self.branches.delete_branch(name)?;
         write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Deleted {
+            name: name.to_string(),
+        });
         self.sync_locked(&mut write)?;
-
-        // Broadcast branch deleted
-        self.subscriptions.broadcast_branch_deleted(name);
 
         Ok(())
     }
@@ -1918,6 +1933,7 @@ impl Store {
 
     /// Call only while holding write_lock, so a state head cannot reach disk
     /// ahead of its log record and branch/state checkpoints cannot interleave.
+    /// A branch change waiting on a checkpoint is announced once one succeeds.
     fn sync_locked(&self, write: &mut WriteState) -> Result<()> {
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
@@ -1925,6 +1941,13 @@ impl Store {
         self.state.save()?;
         self.branches.save()?;
         write.checkpoint_required = false;
+        match write.pending_branch_event.take() {
+            Some(BranchEvent::Created { branch, parent }) => {
+                self.subscriptions.broadcast_branch_created(&branch, parent)
+            }
+            Some(BranchEvent::Deleted { name }) => self.subscriptions.broadcast_branch_deleted(&name),
+            None => {}
+        }
         Ok(())
     }
 

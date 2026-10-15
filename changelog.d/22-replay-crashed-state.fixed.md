@@ -1,2 +1,7 @@
-- After a metadata checkpoint fails, further mutations retry that checkpoint before accepting writes that could depend on an unpersisted state registration or branch. The tentative in-memory mutation remains available for inspection; `sync()` can retry explicitly. Historical branch creation completes its fallible chain reads before allocating a branch.
+- After a metadata checkpoint fails, further mutations retry that checkpoint
+  before accepting writes that could depend on an unpersisted state
+  registration or branch. The tentative in-memory mutation remains available
+  for inspection; `sync()` can retry explicitly. Subscribers hear of a branch
+  created or deleted once a checkpoint persists it. Historical branch
+  creation completes its fallible chain reads before allocating a branch.
 - Reopening a store replays complete state updates after its metadata checkpoint, including snapshot accounting and fresh secondary indexes. State registration, strategy changes, and branch creation/deletion/switching now checkpoint before returning. Store checkpoints are serialized with writes, and branch identities found only in partially published state metadata are reserved against reuse. No on-disk format change; record updates still require `sync()` to flush contents. Unix also syncs checkpoint directory entries; Windows provides process-interruption atomicity but does not guarantee the latest checkpoint name survives OS/device loss.

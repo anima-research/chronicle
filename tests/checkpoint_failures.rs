@@ -4,7 +4,8 @@
 
 use chronicle::{
     Branch, FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration,
-    StateStrategy, Store, StoreConfig, StoreError,
+    StateStrategy, Store, StoreConfig, StoreError, StoreEvent, SubscriptionConfig,
+    SubscriptionFilter, SubscriptionHandle,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -103,6 +104,33 @@ fn check_write_admission(store: &Store) {
         .is_none());
 }
 
+fn branch_events(store: &Store) -> SubscriptionHandle {
+    let handle = store.subscribe(SubscriptionConfig {
+        filter: SubscriptionFilter {
+            include_branch_events: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    store.catch_up_subscription(handle.id).unwrap();
+    assert!(matches!(handle.try_recv(), Ok(StoreEvent::CaughtUp)));
+    handle
+}
+
+/// The branch creations and deletions a subscriber has heard of since the
+/// last call.
+fn announced(events: &SubscriptionHandle) -> Vec<String> {
+    events
+        .receiver
+        .try_iter()
+        .filter_map(|event| match event {
+            StoreEvent::BranchCreated { branch } => Some(format!("created {}", branch.name)),
+            StoreEvent::BranchDeleted { name } => Some(format!("deleted {name}")),
+            _ => None,
+        })
+        .collect()
+}
+
 fn create_branch(store: &Store, kind: &str) -> chronicle::Result<Branch> {
     match kind {
         "branch" => store.create_branch("feature", None),
@@ -134,21 +162,45 @@ fn failed_checkpoint_child() {
             store.register_state(registration("items")),
             Err(StoreError::StateExists(_))
         ));
+    } else if scenario == "delete" {
+        store.register_state(registration("items")).unwrap();
+        append(&store, 0).unwrap();
+        let events = branch_events(&store);
+        store.create_branch("feature", None).unwrap();
+        assert_eq!(announced(&events), ["created feature"]);
+        let branches_path = path.join("branches.bin");
+        let previous = obstruct(&branches_path);
+        assert_io(store.delete_branch("feature"));
+        check_write_admission(&store);
+        // Subscribers hear of the deletion once a checkpoint persists it.
+        assert!(announced(&events).is_empty());
+        repair(&branches_path, previous);
+        store.sync().unwrap();
+        assert_eq!(announced(&events), ["deleted feature"]);
+        store.sync().unwrap();
+        assert!(announced(&events).is_empty(), "announced once");
     } else {
         store.register_state(registration("items")).unwrap();
         append(&store, 0).unwrap();
         append(&store, 1).unwrap();
         store.sync().unwrap();
+        let events = branch_events(&store);
         let branches_path = path.join("branches.bin");
         let previous = obstruct(&branches_path);
         assert_io(create_branch(&store, &scenario));
         check_write_admission(&store);
+        // Subscribers hear of the branch once a checkpoint persists it: here,
+        // the retry that the second creation makes before it finds the name
+        // taken.
+        assert!(announced(&events).is_empty());
         repair(&branches_path, previous);
         assert!(matches!(
             create_branch(&store, &scenario),
             Err(StoreError::BranchExists(_))
         ));
+        assert_eq!(announced(&events), ["created feature"]);
         store.switch_branch("feature").unwrap();
+        assert!(announced(&events).is_empty(), "announced once");
     }
     append(&store, 42).unwrap();
     std::process::exit(73);
@@ -206,6 +258,18 @@ fn failed_branch_publication_blocks_writes_until_checkpoint_retry_succeeds() {
             json!([0, 1])
         );
     }
+}
+
+#[test]
+fn failed_branch_deletion_is_announced_once_its_checkpoint_succeeds() {
+    let dir = TempDir::new().unwrap();
+    run_crash(dir.path(), "delete");
+    let store = Store::open(config(dir.path())).unwrap();
+    assert_eq!(store.list_branches().len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&store.get_state("items").unwrap().unwrap()).unwrap(),
+        json!([0, 42])
+    );
 }
 
 #[test]
