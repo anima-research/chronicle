@@ -282,8 +282,73 @@ fn failed_historical_chain_read_does_not_allocate_a_partial_branch() {
     store
         .update_state("items", StateOperation::Append(b"not-json".to_vec()))
         .unwrap();
-    assert!(store.create_branch_at("bad", "main", Sequence(1)).is_err());
+    let err = store
+        .create_branch_at("bad", "main", Sequence(1))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Deserialization(_)), "{err}");
     assert_eq!(store.list_branches().len(), 1);
     let fresh = store.create_empty_branch("fresh", None).unwrap();
     assert_eq!(fresh.id.0, 2);
+}
+
+#[test]
+fn updates_after_a_successful_checkpoint_do_not_checkpoint_again() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    store.set_auto_snapshot(false);
+    let state_path = dir.path().join("state.bin");
+    let published = || same_file::Handle::from_path(&state_path).unwrap();
+
+    // After the registration's own checkpoint.
+    store.register_state(registration("items")).unwrap();
+    let registered = published();
+    append(&store, 0).unwrap();
+    append(&store, 1).unwrap();
+    assert_eq!(published(), registered, "a state update checkpointed");
+
+    // After a failed checkpoint that a later sync() finished.
+    let previous = obstruct(&state_path);
+    assert_io(store.register_state(registration("other")));
+    repair(&state_path, previous);
+    store.sync().unwrap();
+    let retried = published();
+    append(&store, 2).unwrap();
+    append(&store, 3).unwrap();
+    assert_eq!(published(), retried, "a state update checkpointed");
+}
+
+/// Collects what the test's tracing subscriber writes.
+#[derive(Clone, Default)]
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logged {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failed_final_sync_is_logged() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    let state_path = dir.path().join("state.bin");
+    let previous = obstruct(&state_path);
+    assert_io(store.register_state(registration("items")));
+
+    let logged = Logged::default();
+    let writer = logged.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || drop(store));
+    repair(&state_path, previous);
+
+    let text = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("final sync on drop failed"), "{text}");
 }

@@ -2202,8 +2202,15 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // Best-effort sync on drop
-        let _ = self.sync();
+        // Best-effort sync on drop. Nothing else would report its failure.
+        if let Err(error) = self.sync() {
+            tracing::warn!(
+                %error,
+                path = %self.config.path.display(),
+                "final sync on drop failed: the next open replays state updates from the log, \
+                 and a registration or branch change whose checkpoint failed is lost"
+            );
+        }
     }
 }
 
