@@ -41,7 +41,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # Exercise native permission/ACL handling, file replacement, and caching.
+      # Exercise native file replacement, permissions, long paths and caching.
       # Cross-compilation alone cannot establish these OS filesystem contracts.
       - name: Atomic checkpoint unit tests
         run: cargo test --lib atomic_file -- --nocapture
