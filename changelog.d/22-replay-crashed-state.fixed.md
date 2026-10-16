@@ -12,6 +12,6 @@
   checkpoints are serialized with writes, and branch identities found only
   in partially published state metadata are reserved against reuse. No
   on-disk format change; record updates still require `sync()` to flush
-  contents. Unix also syncs checkpoint directory entries; Windows provides
-  process-interruption atomicity but does not guarantee the latest
-  checkpoint name survives OS/device loss.
+  contents. On Windows, a save doesn't wait for its rename to reach the
+  disk, so after an OS crash or power loss the store may open from an
+  earlier checkpoint.
