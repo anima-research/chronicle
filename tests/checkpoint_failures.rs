@@ -87,6 +87,8 @@ fn check_write_admission(store: &Store) {
     assert_io(store.create_empty_branch("blocked-empty", None));
     assert_io(store.create_branch_at("blocked-at", "main", Sequence(0)));
     assert_io(store.switch_branch("main"));
+    // The retry comes first: without it, this fails with BranchNotFound.
+    assert_io(store.switch_branch("missing"));
     assert_io(store.delete_branch("missing"));
     assert_io(store.sync());
     assert_eq!(
