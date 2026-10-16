@@ -28,9 +28,9 @@
     directory; free space for a whole new checkpoint while the old one still
     exists; and on Windows, permission to delete the checkpoint, with no
     other process holding it open without delete sharing. Replacing a
-    checkpoint used to need write access to that file alone, so a read-only
-    checkpoint no longer stops a save by an account that can write its
-    directory.
+    checkpoint used to need write access to that file alone. On Unix, a
+    read-only checkpoint therefore no longer stops a save by an account that
+    can write its directory.
 
   **Who needs to act:** anyone whose stores are set up as above.
   **Migration:** before upgrading, move a per-file ACL onto the directory's
