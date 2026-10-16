@@ -551,7 +551,9 @@ impl Store {
     /// The log cannot reconstruct a lost registration after a crash.
     /// If the checkpoint fails, the error is returned but the registration
     /// stays in memory, and the next successful checkpoint publishes it:
-    /// `sync()`, or the retry that every later mutation makes first.
+    /// `sync()`, or the retry that every later mutation makes first. Calling
+    /// this again retries that checkpoint first and, once it succeeds, returns
+    /// `StateExists`, since the registration was kept.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1788,7 +1790,8 @@ impl Store {
     /// If the checkpoint fails, the error is returned but the branch stays in
     /// memory, and the next successful checkpoint publishes it and tells
     /// subscribers: `sync()`, or the retry that every later mutation makes
-    /// first.
+    /// first. Calling this again retries that checkpoint first and, once it
+    /// succeeds, returns `BranchExists`.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -1924,7 +1927,8 @@ impl Store {
     /// If the checkpoint fails, the error is returned but the branch stays
     /// deleted in memory, and the next successful checkpoint publishes the
     /// deletion and tells subscribers: `sync()`, or the retry that every
-    /// later mutation makes first.
+    /// later mutation makes first. Calling this again retries that checkpoint
+    /// first and, once it succeeds, returns `BranchNotFound`.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;

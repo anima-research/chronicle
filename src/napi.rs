@@ -492,7 +492,9 @@ impl JsStore {
     /// `JSON.parse(record.payload)` — after the 2026-08 encoding migration
     /// the raw payload is no longer guaranteed to be JSON. The operation's
     /// value bytes are surfaced as JSON integer arrays (the legacy shape),
-    /// so existing shape-expectations keep holding.
+    /// so existing shape-expectations keep holding. Returns `null` when no
+    /// record has this id or its type isn't `state_update`, and throws for a
+    /// record typed `state_update` that doesn't decode as a state update.
     #[napi]
     pub fn get_state_update_json(&self, id: String) -> Result<Option<String>> {
         let store = self.get_store()?;
@@ -551,7 +553,9 @@ impl JsStore {
     /// Create a new branch, and checkpoint it before returning.
     /// If the checkpoint fails, this throws but the branch stays in memory;
     /// the next successful checkpoint publishes it and tells subscribers:
-    /// `sync()`, or the retry that every later mutation makes first.
+    /// `sync()`, or the retry that every later mutation makes first. Calling
+    /// this again retries that checkpoint first and, once it succeeds, throws,
+    /// since the branch exists.
     #[napi]
     pub fn create_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -661,7 +665,8 @@ impl JsStore {
     /// If the checkpoint fails, this throws but the branch stays deleted in
     /// memory; the next successful checkpoint publishes the deletion and
     /// tells subscribers: `sync()`, or the retry that every later mutation
-    /// makes first.
+    /// makes first. Calling this again retries that checkpoint first and,
+    /// once it succeeds, throws, since the branch is gone.
     #[napi]
     pub fn delete_branch(&self, name: String) -> Result<()> {
         let store = self.get_store()?;
@@ -673,7 +678,9 @@ impl JsStore {
     /// Register a new state, and checkpoint it before returning. If the
     /// checkpoint fails, this throws but the registration stays in memory;
     /// the next successful checkpoint publishes it: `sync()`, or the retry
-    /// that every later mutation makes first.
+    /// that every later mutation makes first. Calling this again retries that
+    /// checkpoint first and, once it succeeds, throws, since the state is
+    /// registered.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;

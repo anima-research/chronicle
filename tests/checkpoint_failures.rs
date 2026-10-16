@@ -209,6 +209,10 @@ fn failed_checkpoint_child() {
         assert_eq!(announced(&events), ["deleted feature"]);
         store.sync().unwrap();
         assert!(announced(&events).is_empty(), "announced once");
+        assert!(matches!(
+            store.delete_branch("feature"),
+            Err(StoreError::BranchNotFound(_))
+        ));
     } else {
         store.register_state(registration("items")).unwrap();
         append(&store, 0).unwrap();
