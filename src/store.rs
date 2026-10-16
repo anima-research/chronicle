@@ -252,6 +252,7 @@ impl Store {
         let mut unregistered = std::collections::BTreeMap::<String, u64>::new();
         let mut undecodable = 0u64;
         let mut first_undecodable = None;
+        let mut on_missing_branches = 0u64;
         let index = RecordIndex::rebuild_from_log_with(
             config.path.join("records.idx"),
             &log,
@@ -259,8 +260,15 @@ impl Store {
                 records += 1;
                 if record.record_type != "state_update"
                     || checkpoint.is_some_and(|saved| offset <= saved)
-                    || branches.get_branch_by_id(record.branch).is_none()
                 {
+                    return Ok(());
+                }
+                // Earlier releases saved a branch only at sync, so a crash can
+                // leave updates on a branch that branches.bin doesn't hold.
+                // Nothing can read that branch, so they aren't replayed;
+                // recovery() counts them.
+                if branches.get_branch_by_id(record.branch).is_none() {
+                    on_missing_branches += 1;
                     return Ok(());
                 }
 
@@ -311,20 +319,34 @@ impl Store {
                  they stay in the log as ordinary records"
             );
         }
+        if on_missing_branches > 0 {
+            tracing::warn!(
+                updates = on_missing_branches,
+                "did not replay state updates on branches that branches.bin doesn't hold; \
+                 nothing can read those branches"
+            );
+        }
         let unregistered_states: Vec<_> = unregistered.into_iter().collect();
         let recovery = match log.recovery() {
             Some(torn) => Some(RecoveryReport {
                 unregistered_states,
                 undecodable_state_updates: undecodable,
+                updates_on_missing_branches: on_missing_branches,
                 ..torn.clone()
             }),
-            None if !unregistered_states.is_empty() || undecodable > 0 => Some(RecoveryReport {
-                truncated_at: log.size(),
-                dropped_bytes: 0,
-                valid_records: records,
-                unregistered_states,
-                undecodable_state_updates: undecodable,
-            }),
+            None if !unregistered_states.is_empty()
+                || undecodable > 0
+                || on_missing_branches > 0 =>
+            {
+                Some(RecoveryReport {
+                    truncated_at: log.size(),
+                    dropped_bytes: 0,
+                    valid_records: records,
+                    unregistered_states,
+                    undecodable_state_updates: undecodable,
+                    updates_on_missing_branches: on_missing_branches,
+                })
+            }
             None => None,
         };
 
@@ -345,8 +367,10 @@ impl Store {
 
     /// What the most recent open had to recover, if anything: a torn tail
     /// record it truncated (crash during append), updates it replayed for a
-    /// state whose registration isn't in `state.bin`, and records typed
-    /// `state_update` it skipped because they don't decode as state updates.
+    /// state whose registration isn't in `state.bin`, records typed
+    /// `state_update` it skipped because they don't decode as state updates,
+    /// and updates it didn't replay because their branch isn't in
+    /// `branches.bin`.
     ///
     /// `None` when none of these happened. A report doesn't by itself mean a
     /// tail was torn: `dropped_bytes` is 0 when nothing was. Nor does a state
@@ -1946,7 +1970,9 @@ impl Store {
     /// cache drops them refuses the store as mid-log corruption.
     ///
     /// On open, complete state updates in the log past the last checkpoint
-    /// are replayed. Other records are only indexed again, as on every open.
+    /// are replayed, except those on a branch that `branches.bin` doesn't
+    /// hold, which [`Store::recovery`] counts. Other records are only indexed
+    /// again, as on every open.
     ///
     /// State registration, strategy changes, and branch creation, deletion
     /// and switching checkpoint before returning, because the record log

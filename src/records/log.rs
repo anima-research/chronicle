@@ -41,6 +41,12 @@ pub struct RecoveryReport {
     /// state updates, which open skipped. They stay in the log as ordinary
     /// records. 0 from [`RecordLog::recovery`].
     pub undecodable_state_updates: u64,
+    /// Records past the checkpoint typed `state_update` on a branch that
+    /// `branches.bin` doesn't hold, which open didn't replay, since nothing can
+    /// read that branch: an earlier release saved a branch only at sync, so a
+    /// crash after creating one can leave its updates without it. 0 from
+    /// [`RecordLog::recovery`].
+    pub updates_on_missing_branches: u64,
 }
 
 /// Outcome of a full validating scan of the log.
@@ -167,6 +173,7 @@ impl RecordLog {
                     valid_records: scan.valid_records,
                     unregistered_states: Vec::new(),
                     undecodable_state_updates: 0,
+                    updates_on_missing_branches: 0,
                 })
             } else {
                 None

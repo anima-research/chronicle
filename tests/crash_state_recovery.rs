@@ -655,7 +655,10 @@ fn updates_on_a_branch_missing_from_branches_bin_are_not_replayed() {
     let store = open_store(dir.path()).unwrap();
     assert_eq!(store.list_branches().len(), 1);
     assert_eq!(value(&store, "items"), json!([0]));
-    assert!(store.recovery().is_none());
+    let report = store.recovery().unwrap();
+    assert_eq!(report.updates_on_missing_branches, 1);
+    assert_eq!(report.dropped_bytes, 0);
+    assert!(report.unregistered_states.is_empty());
 }
 
 #[test]

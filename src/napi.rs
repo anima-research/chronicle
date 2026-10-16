@@ -92,6 +92,10 @@ pub struct JsRecoveryReport {
     /// Records typed `state_update` that don't decode as state updates, which
     /// open skipped. They stay in the log as ordinary records.
     pub undecodable_state_updates: i64,
+    /// Records typed `state_update` on a branch that the store's branch
+    /// checkpoint doesn't hold, which open didn't replay, since nothing can
+    /// read that branch: an earlier release saved a branch only at sync.
+    pub updates_on_missing_branches: i64,
 }
 
 /// A state whose updates `open` replayed without a registration.
@@ -421,12 +425,13 @@ impl JsStore {
     ///
     /// Returns a report when `open` truncated a torn/partial tail record
     /// (crash during append), replayed updates for a state with no
-    /// registration, or skipped records typed `state_update` that aren't
-    /// state updates, and `null` when none of these happened. A report
-    /// doesn't by itself mean a tail was torn: `droppedBytes` is 0 when
-    /// nothing was. Nor does a state with no registration mean damage: a state
-    /// written without one is named whenever its updates are replayed. Lets
-    /// JS callers detect lost un-fsynced writes without scraping logs.
+    /// registration, skipped records typed `state_update` that don't decode
+    /// as state updates, or passed over updates on a branch the store never
+    /// saved, and `null` when none of these happened. A report doesn't by
+    /// itself mean a tail was torn: `droppedBytes` is 0 when nothing was. Nor
+    /// does a state with no registration mean damage: a state written without
+    /// one is named whenever its updates are replayed. Lets JS callers detect
+    /// lost un-fsynced writes without scraping logs.
     #[napi]
     pub fn recovery(&self) -> Result<Option<JsRecoveryReport>> {
         let store = self.get_store()?;
@@ -443,6 +448,7 @@ impl JsStore {
                 })
                 .collect(),
             undecodable_state_updates: r.undecodable_state_updates as i64,
+            updates_on_missing_branches: r.updates_on_missing_branches as i64,
         }))
     }
 

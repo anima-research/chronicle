@@ -4,7 +4,7 @@
   type.
 - **Stores an earlier release left after a crash:** opening one now replays
   the state updates its log holds past the last checkpoint, which earlier
-  releases left out of the state (see Fixed). Three kinds of update there:
+  releases left out of the state (see Fixed). Four kinds of update there:
   - **Updates to a state with no registration in `state.bin`** are replayed
     like any other. A consumer can update a state it never registered, as
     0.4.x allows and this release still does, and an earlier release that
@@ -14,6 +14,10 @@
   - **A record typed `state_update` that isn't a state update,** which an
     earlier release let any append write, is skipped and counted in
     `recovery()`. It stays in the log as an ordinary record.
+  - **An update on a branch that `branches.bin` doesn't hold,** which an
+    earlier release leaves if it crashes after creating a branch and before
+    its next sync, isn't replayed, since nothing can read that branch, and
+    `recovery()` counts it.
   - **An update whose predecessor isn't its state's head,** which an earlier
     release could leave if a periodic fsync of the log failed and the
     process crashed before its next sync, makes opening fail with a

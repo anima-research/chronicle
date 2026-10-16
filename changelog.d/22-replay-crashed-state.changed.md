@@ -15,9 +15,11 @@
   earlier releases do.
 - `recovery()` also reports what opening found in the state-update tail: each
   state it replayed without a registration, with its number of updates
-  (`unregistered_states`), and how many records typed `state_update` it
-  skipped because they aren't state updates (`undecodable_state_updates`). It
-  returns a report whenever any of these or a torn tail happened, so a report
-  no longer means a tail was torn. Its `dropped_bytes` is 0 when nothing was.
-  A state in `unregistered_states` isn't damage either: after a crash, a state
-  written without a registration on purpose is named there too.
+  (`unregistered_states`), how many records typed `state_update` it skipped
+  because they aren't state updates (`undecodable_state_updates`), and how
+  many updates it didn't replay because their branch isn't in `branches.bin`
+  (`updates_on_missing_branches`). It returns a report whenever any of these
+  or a torn tail happened, so a report no longer means a tail was torn. Its
+  `dropped_bytes` is 0 when nothing was. A state in `unregistered_states`
+  isn't damage either: after a crash, a state written without a registration
+  on purpose is named there too.
