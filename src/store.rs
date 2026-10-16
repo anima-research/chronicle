@@ -3159,16 +3159,50 @@ mod tests {
 
     // R1-1: a failed periodic fsync must not leave a record that its state's
     // head never adopted, or the next update names the same predecessor and
-    // replay refuses the store. The child keeps writing while every fsync
-    // fails and exits without Drop, so the reopen has only the log and the
-    // registration's checkpoint to go on.
+    // replay refuses the store. The child keeps writing after one failed
+    // fsync, and again while every fsync fails, and exits without Drop, so
+    // the reopen has only the log and the registration's checkpoint to go on.
     #[test]
     fn failed_periodic_fsync_keeps_heads_and_log_in_step() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config(&dir);
+        for failures in ["one", "every"] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config(&dir);
+            run_fsync_failure_child(&config, "update", failures);
+
+            let store = Store::open(config).unwrap();
+            let items: Vec<u64> =
+                serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
+            assert_eq!(items, (0..250).collect::<Vec<u64>>(), "{failures}");
+        }
+    }
+
+    // The same failure on the generic path: each record keeps its own
+    // sequence, where a record left behind by a failed append used to share
+    // its sequence with the next one.
+    #[test]
+    fn failed_periodic_fsync_leaves_no_generic_sequence_twice() {
+        for failures in ["one", "every"] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config(&dir);
+            run_fsync_failure_child(&config, "append", failures);
+
+            let store = Store::open(config).unwrap();
+            let mut sequences: Vec<u64> = store
+                .get_records_by_type("message")
+                .into_iter()
+                .map(|id| store.get_record(id).unwrap().unwrap().sequence.0)
+                .collect();
+            sequences.sort_unstable();
+            assert_eq!(sequences, (1..=250).collect::<Vec<u64>>(), "{failures}");
+        }
+    }
+
+    fn run_fsync_failure_child(config: &StoreConfig, writes: &str, failures: &str) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "store::tests::failed_periodic_fsync_child"])
             .env("CHRONICLE_FSYNC_FAILURE_STORE", &config.path)
+            .env("CHRONICLE_FSYNC_FAILURE_WRITES", writes)
+            .env("CHRONICLE_FSYNC_FAILURES", failures)
             .output()
             .unwrap();
         assert_eq!(
@@ -3178,11 +3212,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-
-        let store = Store::open(config).unwrap();
-        let items: Vec<u64> =
-            serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
-        assert_eq!(items, (0..250).collect::<Vec<u64>>());
     }
 
     #[test]
@@ -3190,6 +3219,8 @@ mod tests {
         let Some(path) = std::env::var_os("CHRONICLE_FSYNC_FAILURE_STORE") else {
             return;
         };
+        let writes = std::env::var("CHRONICLE_FSYNC_FAILURE_WRITES").unwrap();
+        let failures = std::env::var("CHRONICLE_FSYNC_FAILURES").unwrap();
         let store = Store::create(StoreConfig {
             path: path.into(),
             ..Default::default()
@@ -3207,13 +3238,21 @@ mod tests {
             .unwrap();
         store.set_auto_snapshot(false);
 
-        // Every fsync fails from here, the log's periodic one included.
-        *store.log.fsync_failures.lock() = u64::MAX;
+        // From here the next fsync fails, the log's periodic one, or every
+        // fsync does.
+        *store.log.fsync_failures.lock() = if failures == "one" { 1 } else { u64::MAX };
         for n in 0..250u64 {
             // Like the writer in the review's reproduction, carry on past errors.
-            let _ = store.update_state("items", StateOperation::Append(n.to_string().into_bytes()));
+            let payload = n.to_string().into_bytes();
+            let _ = if writes == "update" {
+                store
+                    .update_state("items", StateOperation::Append(payload))
+                    .map(drop)
+            } else {
+                store.append(RecordInput::raw("message", payload)).map(drop)
+            };
             if n == 150 {
-                assert!(store.sync().is_err(), "sync reports the failing fsync");
+                assert!(store.sync().is_err(), "sync reports the failed fsync");
             }
         }
         // No destructors: Drop's sync must not checkpoint the heads.
