@@ -1,9 +1,10 @@
 - After a metadata checkpoint fails, further mutations retry that checkpoint
   before accepting writes that could depend on an unpersisted state
   registration or branch. The tentative in-memory mutation remains available
-  for inspection; `sync()` can retry explicitly. Subscribers hear of a branch
-  created or deleted once a checkpoint persists it. Historical branch
-  creation completes its fallible chain reads before allocating a branch.
+  for inspection; `sync()` can retry explicitly, unless the record log's
+  fsync failed (see Changed). Subscribers hear of a branch created or
+  deleted once a checkpoint persists it. Historical branch creation
+  completes its fallible chain reads before allocating a branch.
 - Reopening a store replays complete state updates after its metadata
   checkpoint, including snapshot accounting and the field indexes whose saved
   head matches `state.bin`. It drops any other field index, which registering

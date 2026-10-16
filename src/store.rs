@@ -1929,11 +1929,21 @@ impl Store {
     /// Sync all data to disk.
     ///
     /// Flushes the record log and publishes the metadata checkpoints
-    /// (`state.bin`, `state-indexes.bin` and `branches.bin`). A failed
-    /// periodic fsync of the record log since the last sync is reported
-    /// here, once, even when this call's own fsync succeeds. A failure to save
-    /// `state-indexes.bin` is only logged: field indexes are derived, and
+    /// (`state.bin`, `state-indexes.bin` and `branches.bin`). A failure to
+    /// save `state-indexes.bin` is only logged: field indexes are derived, and
     /// `register_state_field_index` rebuilds a missing or stale one.
+    ///
+    /// Once an fsync of the record log has failed, this call's own or a
+    /// periodic one, this returns the failure every time until the store is
+    /// reopened, and publishes nothing. Linux reports a write-back error to
+    /// one fsync, and a later one can succeed although the records written
+    /// before the failure never reached the disk, so a checkpoint published
+    /// after it could name records the disk doesn't hold. Every metadata
+    /// mutation fails the same way, and so does any write while one waits for
+    /// its checkpoint. Reopening replays the log from the last checkpoint. It
+    /// can't tell whether records the operating system still caches reached
+    /// the disk: if they didn't while later records did, an open after the
+    /// cache drops them refuses the store as mid-log corruption.
     ///
     /// On open, complete state updates in the log past the last checkpoint
     /// are replayed. Other records are only indexed again, as on every open.
@@ -1945,14 +1955,14 @@ impl Store {
     /// proceeding, so a successful write cannot depend on an unpersisted
     /// registration or branch. This method retries it too; metadata is not
     /// rolled back. A failed sync with no such change pending holds back no
-    /// later write, since the log can replay what it was saving.
+    /// later append or state update.
     ///
-    /// Unix also syncs checkpoint directory entries. Windows flushes contents
-    /// and atomically publishes on the same volume for process interruption;
-    /// it does not guarantee that the latest checkpoint name survives OS or
-    /// device loss because this path provides no namespace durability barrier.
-    /// The record index is rebuilt on startup; checkpoint cost depends on
-    /// state heads, branch metadata, and any registered field indexes.
+    /// On Unix a save also syncs the containing directory, where the system
+    /// can. On Windows it doesn't wait for the rename to reach the disk, so
+    /// after an OS crash or power loss the store may open from an earlier
+    /// checkpoint. The record index is rebuilt on startup; checkpoint cost
+    /// depends on state heads, branch metadata, and any registered field
+    /// indexes.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.sync_locked(&mut write)
@@ -2242,8 +2252,9 @@ impl Drop for Store {
             tracing::warn!(
                 %error,
                 path = %self.config.path.display(),
-                "final sync on drop failed: the next open replays state updates from the log, \
-                 and a registration or branch change whose checkpoint failed is lost"
+                "final sync on drop failed: the next open replays state updates from the log \
+                 past the last checkpoint, and loses any registration or branch change whose \
+                 checkpoint failed"
             );
         }
     }
@@ -2394,13 +2405,17 @@ mod tests {
     /// execs, the store's LOCK among them, so the lock can still be held
     /// for that moment.
     fn reopen(config: StoreConfig) -> Store {
+        try_reopen(config).unwrap()
+    }
+
+    fn try_reopen(config: StoreConfig) -> Result<Store> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match Store::open(config.clone()) {
                 Err(StoreError::Locked) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(5))
                 }
-                result => return result.unwrap(),
+                result => return result,
             }
         }
     }
@@ -3197,6 +3212,100 @@ mod tests {
         }
     }
 
+    // After one failed fsync of the log, nothing publishes a checkpoint until
+    // the store is reopened: neither sync(), a metadata mutation nor Drop.
+    // Writes go on until a metadata mutation waits for its checkpoint.
+    #[test]
+    fn a_failed_log_fsync_publishes_nothing_until_reopen() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let registration = |id: &str| StateRegistration {
+            id: id.into(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        };
+        let store = Store::create(config.clone()).unwrap();
+        store.register_state(registration("items")).unwrap();
+        store.set_auto_snapshot(false);
+        let checkpoint = std::fs::read(config.path.join("state.bin")).unwrap();
+
+        // The 100th update's periodic fsync fails, and the retry succeeds.
+        *store.log.fsync_failures.lock() = 1;
+        for n in 0..150u64 {
+            store
+                .update_state("items", StateOperation::Append(n.to_string().into_bytes()))
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let result = store.sync();
+            assert_eq!(
+                std::fs::read(config.path.join("state.bin")).unwrap(),
+                checkpoint,
+                "sync() published state.bin"
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("until it is reopened"), "{error}");
+        }
+        assert!(store.register_state(registration("other")).is_err());
+        assert!(
+            store
+                .update_state("items", StateOperation::Append(b"150".to_vec()))
+                .is_err(),
+            "a write waits for the registration's checkpoint"
+        );
+        drop(store);
+        assert_eq!(
+            std::fs::read(config.path.join("state.bin")).unwrap(),
+            checkpoint,
+            "nothing published state.bin"
+        );
+
+        let store = reopen(config);
+        let items: Vec<u64> =
+            serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
+        assert_eq!(items, (0..150).collect::<Vec<u64>>());
+        store.register_state(registration("other")).unwrap();
+        store.sync().unwrap();
+    }
+
+    // What a checkpoint published past records the disk lost would meet: a
+    // log whose torn tail open truncates, behind a head in state.bin.
+    #[test]
+    fn a_checkpoint_past_the_logs_valid_end_refuses_open() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+        for n in 0..3u64 {
+            store
+                .update_state("items", StateOperation::Set(n.to_string().into_bytes()))
+                .unwrap();
+        }
+        store.sync().unwrap();
+        drop(store);
+        let log = config.path.join("records.log");
+        let len = std::fs::metadata(&log).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        file.set_len(len - 5).unwrap();
+        drop(file);
+
+        let error = match try_reopen(config) {
+            Ok(_) => panic!("expected open to refuse a checkpoint past the log's valid end"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Corruption(_)), "{error:?}");
+        assert!(error.to_string().contains("newer than the durable log"), "{error}");
+    }
+
     fn run_fsync_failure_child(config: &StoreConfig, writes: &str, failures: &str) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "store::tests::failed_periodic_fsync_child"])
@@ -3253,9 +3362,10 @@ mod tests {
             };
             if n == 150 {
                 assert!(store.sync().is_err(), "sync reports the failed fsync");
+                assert!(store.sync().is_err(), "and goes on reporting it");
             }
         }
-        // No destructors: Drop's sync must not checkpoint the heads.
+        // Exit without destructors, as a crash would.
         std::process::exit(73);
     }
 }

@@ -1181,19 +1181,27 @@ impl JsStore {
     }
 
     /// Flush pending record/state contents and publish metadata checkpoints.
-    /// A failed periodic fsync of the record log since the last sync is
-    /// reported here, once, even when this call's own fsync succeeds. A
-    /// failure to save field indexes is only logged, since they are derived.
+    /// A failure to save field indexes is only logged, since they are derived.
+    /// Once an fsync of the record log has failed, this call's own or a
+    /// periodic one, this throws that failure every time until the store is
+    /// reopened, and publishes nothing: records written before it may not
+    /// have reached the disk, and a later fsync can't show that they did.
+    /// Every metadata mutation throws it too, and so does any write while one
+    /// waits for its checkpoint. Reopening can't tell whether records the
+    /// operating system still caches reached the disk: if they didn't while
+    /// later records did, an open after the cache drops them refuses the
+    /// store as mid-log corruption.
     /// Reopen replays complete state updates past the last checkpoint; other
     /// records are only indexed again.
-    /// Unix also syncs checkpoint directories. Windows guarantees flushed
-    /// contents and same-volume atomic publication for process interruption,
-    /// not survival of the latest checkpoint name through OS/device loss.
+    /// On Unix a save also syncs the containing directory, where the system
+    /// can. On Windows it doesn't wait for the rename to reach the disk, so
+    /// after an OS crash or power loss the store may open from an earlier
+    /// checkpoint.
     /// State registration, strategy changes and branch changes checkpoint
     /// before returning. After one of those checkpoints fails, further
     /// mutations retry it before proceeding, and the change stays applied in
     /// memory. A failed sync with no such change pending holds back no later
-    /// write.
+    /// append or state update.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
