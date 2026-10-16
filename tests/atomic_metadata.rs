@@ -291,3 +291,38 @@ fn open_of_a_locked_store_leaves_its_staging_files() {
     ));
     assert!(stage.exists());
 }
+
+// A store directory the saving account can write and search but not read, as
+// at mode 0300, still takes saves, which go without the directory sync there,
+// and a reopen sees what they saved.
+#[cfg(unix)]
+#[test]
+fn a_store_directory_without_read_access_still_saves() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    register(&store);
+    append(&store, 1);
+    store.sync().unwrap();
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+    // Restore even after an assertion failure, so TempDir can clean up.
+    struct Restore<'a>(&'a Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            fs::set_permissions(self.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    let _restore = Restore(&path);
+    if File::open(&path).is_ok() {
+        eprintln!("directory access checks bypassed by this user; permission probe skipped");
+        return;
+    }
+    append(&store, 2);
+    store.sync().unwrap();
+    drop(store);
+
+    let reopened = reopen(&path);
+    assert_eq!(reopened.get_state_len("messages").unwrap(), Some(2));
+}

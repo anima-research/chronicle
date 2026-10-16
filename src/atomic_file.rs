@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// Starts the name of every staging file: a save writes one beside its
@@ -23,6 +24,9 @@ const MAX_LINKS: usize = 40;
 #[derive(Debug, Default)]
 pub(crate) struct Checkpoint {
     saved: Mutex<Option<SavedCheckpoint>>,
+    /// Whether this writer has said that it saves without syncing its
+    /// checkpoint's directory, which it may not open.
+    unsynced_directory_reported: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -65,12 +69,25 @@ impl Clone for Checkpoint {
 impl Checkpoint {
     pub(crate) fn save(&self, path: &Path, chunks: &[&[u8]]) -> Result<()> {
         self.save_with(path, chunks, || {
-            atomic_write(path, |file| {
+            let published = atomic_write(path, |file| {
                 for chunk in chunks {
                     file.write_all(chunk)?;
                 }
                 Ok(())
-            })
+            })?;
+            if let Some(error) = published.unsynced_directory {
+                if !self
+                    .unsynced_directory_reported
+                    .swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        %error,
+                        "saving this checkpoint without syncing its directory, which this \
+                         process may not open: a power loss may roll the newest save back"
+                    );
+                }
+            }
+            Ok(published.file)
         })
     }
 
@@ -126,12 +143,22 @@ impl Checkpoint {
     }
 }
 
+/// A checkpoint `atomic_write` has published: its new file, still open, and
+/// why its directory wasn't synced, if it wasn't.
+#[derive(Debug)]
+struct Published {
+    file: File,
+    unsynced_directory: Option<io::Error>,
+}
+
 /// Write a complete checkpoint beside its destination, sync it, then replace
 /// the destination atomically. Readers see either the old file or the new one.
 /// This is a per-file guarantee, not a transaction across metadata files.
 ///
-/// Unix also syncs the directory, where the system can, so the replacement
-/// survives a power loss.
+/// Unix also syncs the directory, so the replacement survives a power loss.
+/// Where the writer may not open the directory, the save goes without that
+/// sync and says why in what it returns. Where the system doesn't sync
+/// directories (EBADF or EINVAL from the sync), it goes without it silently.
 /// Windows supports the file sync and atomic replacement, but has no portable
 /// directory-sync equivalent here. Errors before replacement leave the old
 /// checkpoint intact; a directory-sync error is returned after replacement.
@@ -148,7 +175,7 @@ impl Checkpoint {
 /// A save that fails before the rename removes its staging file. A process
 /// killed before then leaves it behind. Loaders only open the final names, and
 /// the next `Store::open` removes the ones in the store directory.
-fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<File> {
+fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<Published> {
     let path = resolve_links(path)?;
     // A bare relative filename has an empty parent, which means the current
     // directory rather than a directory that can be opened by its empty name.
@@ -158,20 +185,22 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
         .unwrap_or(Path::new("."));
 
     #[cfg(unix)]
-    let directory = File::open(parent).map_err(|error| {
-        if error.kind() == io::ErrorKind::PermissionDenied {
-            io::Error::new(
+    let (directory, unsynced_directory) = match File::open(parent) {
+        Ok(directory) => (Some(directory), None),
+        Err(error) if directory_open_refused(&error) => (
+            None,
+            Some(io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot open checkpoint directory {} for synchronization: directory read \
-                     permission is required to durably publish metadata ({error})",
+                    "cannot open checkpoint directory {} to sync it: {error}",
                     parent.display()
                 ),
-            )
-        } else {
-            error
-        }
-    })?;
+            )),
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(not(unix))]
+    let unsynced_directory = None;
 
     #[cfg(unix)]
     let previous = match fs::metadata(&path) {
@@ -228,9 +257,14 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
     staging.disable_cleanup(true);
 
     #[cfg(unix)]
-    sync_directory(&directory)?;
+    if let Some(directory) = &directory {
+        sync_directory(directory)?;
+    }
 
-    Ok(file)
+    Ok(Published {
+        file,
+        unsynced_directory,
+    })
 }
 
 /// The file a save replaces: `path` itself, or where the symbolic links at
@@ -338,6 +372,17 @@ fn sync_directory(directory: &File) -> io::Result<()> {
 #[cfg(unix)]
 fn directory_sync_refused(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EBADF | libc::EINVAL))
+}
+
+/// Whether failing to open a checkpoint's directory means the writer may not
+/// open it, as in a directory it can write but not read, rather than that the
+/// save failed. A save there goes without the directory sync: PostgreSQL's
+/// fsync_fname_ext returns success when opening a directory fails with
+/// EACCES (src/backend/storage/file/fd.c), and SQLite's unixSync goes on
+/// when it can't open the directory (src/os_unix.c).
+#[cfg(unix)]
+fn directory_open_refused(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
 }
 
 /// Remove the staging files that interrupted saves left in the store
@@ -481,13 +526,16 @@ mod tests {
         assert_ne!(Handle::from_path(&alias).unwrap(), before);
     }
 
+    // A directory the writer can write and search but not read, as at mode
+    // 0300, is saved in without its sync, and each writer says so once.
     #[cfg(unix)]
     #[test]
-    fn unreadable_directory_reports_requirement_before_writing() {
+    fn unreadable_directory_is_saved_without_its_sync() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.bin");
-        fs::write(&path, b"previous checkpoint").unwrap();
+        let checkpoint = Checkpoint::default();
+        checkpoint.save(&path, &[b"previous checkpoint"]).unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
         // Restore even after an assertion failure, so TempDir can clean up.
         struct Restore<'a>(&'a Path);
@@ -501,17 +549,65 @@ mod tests {
             eprintln!("directory access checks bypassed by this user; permission probe skipped");
             return;
         }
-        let result = atomic_write(&path, |_| panic!("must fail before writing"));
-        match result {
-            Err(crate::StoreError::Io(error)) => {
-                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-                assert!(error
-                    .to_string()
-                    .contains("directory read permission is required"));
-            }
-            other => panic!("expected contextual permission error, got {other:?}"),
+        let log = logged(|| {
+            checkpoint.save(&path, &[b"second"]).unwrap();
+            checkpoint.save(&path, &[b"third"]).unwrap();
+        });
+        assert_eq!(fs::read(&path).unwrap(), b"third");
+        assert_eq!(
+            log.matches("without syncing its directory").count(),
+            1,
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "cannot open checkpoint directory {}",
+                dir.path().display()
+            )),
+            "{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_refused_directory_open_is_passed_over() {
+        for errno in [libc::EACCES, libc::EPERM] {
+            assert!(
+                directory_open_refused(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
         }
-        assert_eq!(fs::read(&path).unwrap(), b"previous checkpoint");
+        for errno in [libc::ENOENT, libc::ENOTDIR, libc::EIO] {
+            assert!(
+                !directory_open_refused(&io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+    }
+
+    /// What `f` logs through `tracing` on this thread.
+    #[cfg(unix)]
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().clone();
+        String::from_utf8(bytes).unwrap()
     }
 
     #[test]
@@ -865,7 +961,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_link_bound(result: Result<File>) {
+    fn assert_link_bound(result: Result<Published>) {
         match result {
             Err(crate::StoreError::Io(error)) => assert!(
                 error

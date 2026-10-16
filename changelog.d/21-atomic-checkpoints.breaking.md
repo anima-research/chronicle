@@ -23,13 +23,11 @@
     can leave a `.chronicle-checkpoint-*` staging file beside that file, and
     opening the store only removes the ones in the store directory.
   - **What a save needs** is what a rename needs, in the directory of the
-    file it replaces: write access, to create the new file and rename it;
-    read access, to sync the directory afterwards, without which the save
-    fails with a `PermissionDenied` error that says so before anything is
-    written; in a directory with the sticky bit, ownership of the checkpoint
-    or of the directory; free space for a whole new checkpoint while the old
-    one still exists; and on Windows, permission to delete the checkpoint,
-    with no other process holding it open without delete sharing. Replacing a
+    file it replaces: write access, to create the new file and rename it; in
+    a directory with the sticky bit, ownership of the checkpoint or of the
+    directory; free space for a whole new checkpoint while the old one still
+    exists; and on Windows, permission to delete the checkpoint, with no
+    other process holding it open without delete sharing. Replacing a
     checkpoint used to need write access to that file alone, so a read-only
     checkpoint no longer stops a save by an account that can write its
     directory.
