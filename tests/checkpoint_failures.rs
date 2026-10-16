@@ -131,6 +131,34 @@ fn announced(events: &SubscriptionHandle) -> Vec<String> {
         .collect()
 }
 
+// An empty branch created with no parent named is created under main, and its
+// announcement names that parent, whichever branch is current.
+#[test]
+fn an_empty_branch_is_announced_with_the_parent_it_was_created_under() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    store.create_branch("feature", None).unwrap();
+    store.switch_branch("feature").unwrap();
+    let events = branch_events(&store);
+
+    let branch = store.create_empty_branch("empty", None).unwrap();
+    let main = store
+        .list_branches()
+        .into_iter()
+        .find(|b| b.name == "main")
+        .unwrap();
+    assert_eq!(branch.parent, Some(main.id));
+    let parents: Vec<Option<String>> = events
+        .receiver
+        .try_iter()
+        .filter_map(|event| match event {
+            StoreEvent::BranchCreated { branch } => Some(branch.parent),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parents, vec![Some("main".to_string())]);
+}
+
 fn create_branch(store: &Store, kind: &str) -> chronicle::Result<Branch> {
     match kind {
         "branch" => store.create_branch("feature", None),

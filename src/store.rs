@@ -1823,10 +1823,13 @@ impl Store {
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
-        let parent_name = from.map(|n| n.to_string()).or_else(|| {
-            Some(self.branches.current_branch().name.clone())
-        });
         let new_branch = self.branches.create_branch(name, from)?;
+        // The branch manager creates it under `from`, or under main when that
+        // is None, so announce the parent it recorded.
+        let parent_name = new_branch
+            .parent
+            .and_then(|id| self.branches.get_branch_by_id(id))
+            .map(|parent| parent.name);
 
         write.checkpoint_required = true;
         write.pending_branch_event = Some(BranchEvent::Created {
