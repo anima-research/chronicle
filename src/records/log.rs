@@ -33,9 +33,9 @@ pub struct RecoveryReport {
     /// Number of valid records that survived (i.e. the length of the recovered log).
     pub valid_records: u64,
     /// Each state whose updates open replayed although `state.bin` holds no
-    /// registration for it, with the number of updates replayed. Such a
-    /// state can be read, and updating it waits for `register_state` to
-    /// supply its strategy. Empty from [`RecordLog::recovery`].
+    /// registration for it, with the number of updates replayed: a state
+    /// written without a registration, or whose registration an earlier
+    /// release lost in a crash. Empty from [`RecordLog::recovery`].
     pub unregistered_states: Vec<(String, u64)>,
     /// Records past the checkpoint typed `state_update` that don't decode as
     /// state updates, which open skipped. They stay in the log as ordinary

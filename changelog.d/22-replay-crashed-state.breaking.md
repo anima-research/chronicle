@@ -1,17 +1,16 @@
-- **Rust/Node write APIs:** Register states before updating them, and use
-  `update_state` (or its Node state helpers) for internal `state_update`
-  records. Unregistered state updates and generic appends with this reserved
+- **Rust/Node write APIs:** use `update_state` (or its Node state helpers)
+  for internal `state_update` records. Generic appends with this reserved
   type now fail before writing; custom record producers must choose another
   type.
 - **Stores an earlier release left after a crash:** opening one now replays
   the state updates its log holds past the last checkpoint, which earlier
-  releases left out of the state (see Fixed). Three kinds of update there
-  are handled differently:
-  - **Updates to a state whose registration isn't in `state.bin`,** which an
-    earlier release leaves if it crashes after registering a state and
-    before its next sync, are replayed. The state can be read, and
-    `recovery()` names it, but updating it fails with `StateNotRegistered`
-    until `register_state` supplies its strategy again.
+  releases left out of the state (see Fixed). Three kinds of update there:
+  - **Updates to a state with no registration in `state.bin`** are replayed
+    like any other. A consumer can update a state it never registered, as
+    0.4.x allows and this release still does, and an earlier release that
+    crashes after registering a state and before its next sync leaves its
+    updates without one. The state can be read and updated, and
+    `register_state` gives it a strategy whenever it's called.
   - **A record typed `state_update` that isn't a state update,** which an
     earlier release let any append write, is skipped and counted in
     `recovery()`. It stays in the log as an ordinary record.

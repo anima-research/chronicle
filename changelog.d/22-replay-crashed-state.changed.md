@@ -8,3 +8,5 @@
   skipped because they aren't state updates (`undecodable_state_updates`). It
   returns a report whenever any of these or a torn tail happened, so a report
   no longer means a tail was torn. Its `dropped_bytes` is 0 when nothing was.
+  A state in `unregistered_states` isn't damage either: after a crash, a state
+  written without a registration on purpose is named there too.

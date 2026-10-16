@@ -272,11 +272,13 @@ impl Store {
                     first_undecodable.get_or_insert(offset);
                     return Ok(());
                 };
-                // Earlier releases saved a registration only at sync, so a
-                // crash can leave updates whose registration never reached
-                // state.bin. Replay doesn't need the strategy, so the chain is
-                // kept and checkpointed like any other, and update_state
-                // refuses the state until register_state supplies it again.
+                // A state can have updates and no registration: a consumer
+                // may update a state it never registered, and an earlier
+                // release that crashed after registering a state and before
+                // its next sync left the registration out of state.bin.
+                // Replay doesn't need the strategy, so the chain is kept and
+                // checkpointed like any other, and register_state supplies a
+                // strategy whenever it's called.
                 if state.get_strategy(&update.state_id).is_none() {
                     *unregistered.entry(update.state_id.clone()).or_default() += 1;
                 }
@@ -297,8 +299,8 @@ impl Store {
             tracing::warn!(
                 state = %state_id,
                 updates,
-                "replayed updates for a state with no registration in state.bin; it can be \
-                 read, and updating it waits for register_state to supply its strategy"
+                "replayed updates for a state with no registration in state.bin: one written \
+                 without a registration, or whose registration an earlier release lost"
             );
         }
         if let Some(first_offset) = first_undecodable {
@@ -347,10 +349,11 @@ impl Store {
     /// `state_update` it skipped because they don't decode as state updates.
     ///
     /// `None` when none of these happened. A report doesn't by itself mean a
-    /// tail was torn: `dropped_bytes` is 0 when nothing was. Callers that
-    /// need to know their store lost un-fsynced writes, or holds a state it
-    /// must register again before updating it, can consult this instead of
-    /// scraping the `tracing` warnings out of logs.
+    /// tail was torn: `dropped_bytes` is 0 when nothing was. Nor does a state
+    /// with no registration mean damage: a state written without one is named
+    /// whenever its updates are replayed. Callers that need to know their
+    /// store lost un-fsynced writes can consult this instead of scraping the
+    /// `tracing` warnings out of logs.
     pub fn recovery(&self) -> Option<RecoveryReport> {
         self.recovery.clone()
     }
@@ -636,10 +639,6 @@ impl Store {
     {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
-
-        if self.state.get_strategy(state_id).is_none() {
-            return Err(StoreError::StateNotRegistered(state_id.to_string()));
-        }
 
         let branch = self.branches.current_branch();
         let prev_update_offset = self.state.get_head(branch.id, state_id).map(|h| h.head_offset);

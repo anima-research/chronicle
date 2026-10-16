@@ -86,8 +86,8 @@ pub struct JsRecoveryReport {
     /// Number of valid records that survived recovery.
     pub valid_records: i64,
     /// Each state whose updates were replayed although the store holds no
-    /// registration for it. It can be read; updating it waits for
-    /// `registerState` to supply its strategy again.
+    /// registration for it: one written without a registration, or whose
+    /// registration an earlier release lost in a crash.
     pub unregistered_states: Vec<JsUnregisteredState>,
     /// Records typed `state_update` that don't decode as state updates, which
     /// open skipped. They stay in the log as ordinary records.
@@ -424,8 +424,9 @@ impl JsStore {
     /// registration, or skipped records typed `state_update` that aren't
     /// state updates, and `null` when none of these happened. A report
     /// doesn't by itself mean a tail was torn: `droppedBytes` is 0 when
-    /// nothing was. Lets JS callers detect lost un-fsynced writes, or a state
-    /// to register again, without scraping logs.
+    /// nothing was. Nor does a state with no registration mean damage: a state
+    /// written without one is named whenever its updates are replayed. Lets
+    /// JS callers detect lost un-fsynced writes without scraping logs.
     #[napi]
     pub fn recovery(&self) -> Result<Option<JsRecoveryReport>> {
         let store = self.get_store()?;
@@ -663,11 +664,10 @@ impl JsStore {
 
     // --- State Management ---
 
-    /// Register a new state, and checkpoint it before returning. A state must
-    /// be registered before it is updated: the state-update helpers throw for
-    /// an unregistered state. If the checkpoint fails, this throws but the
-    /// registration stays in memory; the next successful checkpoint publishes
-    /// it: `sync()`, or the retry that every later mutation makes first.
+    /// Register a new state, and checkpoint it before returning. If the
+    /// checkpoint fails, this throws but the registration stays in memory;
+    /// the next successful checkpoint publishes it: `sync()`, or the retry
+    /// that every later mutation makes first.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -747,7 +747,7 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Append to an AppendLog state, which must be registered first.
+    /// Append to an AppendLog state.
     #[napi]
     pub fn append_to_state(&self, state_id: String, item: Buffer) -> Result<JsRecord> {
         let store = self.get_store()?;

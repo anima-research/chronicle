@@ -61,6 +61,12 @@ fn append(store: &Store, id: &str, value: Value) {
         .unwrap();
 }
 
+fn set(store: &Store, id: &str, value: Value) {
+    store
+        .update_state(id, StateOperation::Set(serde_json::to_vec(&value).unwrap()))
+        .unwrap();
+}
+
 fn value(store: &Store, id: &str) -> Value {
     store
         .get_state(id)
@@ -127,6 +133,15 @@ fn crash_writer() {
         std::process::exit(73);
     }
     let store = Store::create(config(path)).unwrap();
+    if scenario == "unregistered" {
+        // A consumer that writes a state it never registers, as
+        // context-manager's image-strip watermark is written: one update
+        // synced, and one the process dies before syncing.
+        set(&store, "watermark", json!({"sequence": 1}));
+        store.sync().unwrap();
+        set(&store, "watermark", json!({"sequence": 2}));
+        std::process::exit(73);
+    }
     if scenario == "lost-registration" {
         // An earlier release saved a registration only at sync. Model its
         // crash: "keep" was registered and synced, then "items" was
@@ -457,7 +472,7 @@ fn legacy_json_tail_replays_from_offset_zero() {
 }
 
 #[test]
-fn lost_registration_is_replayed_and_waits_for_register_state() {
+fn lost_registration_is_replayed_and_stays_writable() {
     let dir = TempDir::new().unwrap();
     crash(dir.path(), "lost-registration");
     std::fs::rename(
@@ -475,26 +490,60 @@ fn lost_registration_is_replayed_and_waits_for_register_state() {
     assert_eq!(report.undecodable_state_updates, 0);
     assert_eq!(report.dropped_bytes, 0);
     assert_eq!(store.stats().unwrap().state_slot_count, 1);
-    assert!(matches!(
-        store.update_state("items", StateOperation::Append(b"10".to_vec())),
-        Err(StoreError::StateNotRegistered(_))
-    ));
-    // Drop checkpoints a head of "keep" past every update of "items", so the
-    // next open replays none of them: the chain must be saved by then.
+    // It takes updates before its registration comes back, as any state does.
+    append(&store, "items", json!(10));
+    // Drop checkpoints every head, so the next open replays nothing: the
+    // chain must be saved by then.
     drop(store);
 
     let store = open_store(dir.path()).unwrap();
     assert!(store.recovery().is_none());
-    assert_eq!(value(&store, "items"), json!(items));
-    register(&store, "items", log_strategy());
-    append(&store, "items", json!(10));
-    drop(store);
-
-    let store = open_store(dir.path()).unwrap();
     let mut items = items;
     items.push(json!(10));
     assert_eq!(value(&store, "items"), json!(items));
-    assert_eq!(store.get_state_len("items").unwrap(), Some(11));
+    // The consumer's own registration gives it back its strategy.
+    register(&store, "items", log_strategy());
+    append(&store, "items", json!(11));
+    drop(store);
+
+    let store = open_store(dir.path()).unwrap();
+    items.push(json!(11));
+    assert_eq!(value(&store, "items"), json!(items));
+    assert_eq!(store.get_state_len("items").unwrap(), Some(12));
+    assert_eq!(store.stats().unwrap().state_slot_count, 2);
+}
+
+// A state written without a registration, as 0.4.x allowed and as
+// context-manager writes its image-strip watermark: its updates are kept
+// across a sync and a crash, it stays writable, and register_state can still
+// give it a strategy later.
+#[test]
+fn a_state_written_without_registration_is_kept_and_stays_writable() {
+    let dir = TempDir::new().unwrap();
+    crash(dir.path(), "unregistered");
+
+    let store = open_store(dir.path()).unwrap();
+    assert_eq!(value(&store, "watermark"), json!({"sequence": 2}));
+    let report = store.recovery().unwrap();
+    assert_eq!(
+        report.unregistered_states,
+        vec![("watermark".to_string(), 1)]
+    );
+    assert_eq!(report.dropped_bytes, 0);
+    assert_eq!(store.stats().unwrap().state_slot_count, 0);
+    set(&store, "watermark", json!({"sequence": 3}));
+    drop(store);
+
+    let store = open_store(dir.path()).unwrap();
+    assert!(store.recovery().is_none());
+    assert_eq!(value(&store, "watermark"), json!({"sequence": 3}));
+    register(&store, "watermark", StateStrategy::Snapshot);
+    set(&store, "watermark", json!({"sequence": 4}));
+    drop(store);
+
+    let store = open_store(dir.path()).unwrap();
+    assert_eq!(value(&store, "watermark"), json!({"sequence": 4}));
+    assert_eq!(store.stats().unwrap().state_slot_count, 1);
 }
 
 #[test]
@@ -607,17 +656,6 @@ fn updates_on_a_branch_missing_from_branches_bin_are_not_replayed() {
     assert_eq!(store.list_branches().len(), 1);
     assert_eq!(value(&store, "items"), json!([0]));
     assert!(store.recovery().is_none());
-}
-
-#[test]
-fn update_requires_a_durable_registration() {
-    let dir = TempDir::new().unwrap();
-    let store = Store::create(config(dir.path())).unwrap();
-    assert!(matches!(
-        store.update_state("unknown", StateOperation::Append(b"1".to_vec())),
-        Err(StoreError::StateNotRegistered(_))
-    ));
-    assert_eq!(store.stats().unwrap().record_count, 0);
 }
 
 #[test]
