@@ -24,6 +24,8 @@
   and how many updates it didn't replay because their branch isn't in
   `branches.bin` (`updates_on_missing_branches`). It returns a report whenever
   any of these or a torn tail happened, so a report no longer means a tail was
-  torn. Its `dropped_bytes` is 0 when nothing was. A state in
+  torn. The records it skips stay past the checkpoint, so every open counts
+  them again until a state update moves the checkpoint past them. Its
+  `dropped_bytes` is 0 when nothing was. A state in
   `unregistered_states` isn't damage either. After a crash, `recovery()` also
   names a state written without a registration on purpose.

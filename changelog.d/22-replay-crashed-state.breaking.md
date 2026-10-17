@@ -16,7 +16,10 @@
     `register_state` gives it a strategy whenever it's called.
   - **A record typed `state_update` that doesn't decode as a state update,**
     such as one an earlier release let any append write, stays in the log as
-    an ordinary record, and `recovery()` counts it.
+    an ordinary record, and `recovery()` counts it. A generic record typed
+    `state_update` whose payload does decode as a state update is replayed
+    as one, and refused like the last kind below if its predecessor doesn't
+    match.
   - **An update on a branch that `branches.bin` doesn't hold,** which an
     earlier release leaves if it crashes after creating a branch and before
     its next sync, isn't replayed, since nothing can read that branch, and

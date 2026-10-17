@@ -652,13 +652,24 @@ fn updates_on_a_branch_missing_from_branches_bin_are_not_replayed() {
     append_raw_update(&log, BranchId(7), 2, Some(0));
     drop(log);
 
+    // It stays past the checkpoint, and counted, until a state update moves
+    // the checkpoint past it.
+    for _ in 0..2 {
+        let store = open_store(dir.path()).unwrap();
+        assert_eq!(store.list_branches().len(), 1);
+        assert_eq!(value(&store, "items"), json!([0]));
+        let report = store.recovery().unwrap();
+        assert_eq!(report.updates_on_missing_branches, 1);
+        assert_eq!(report.dropped_bytes, 0);
+        assert!(report.unregistered_states.is_empty());
+    }
     let store = open_store(dir.path()).unwrap();
-    assert_eq!(store.list_branches().len(), 1);
-    assert_eq!(value(&store, "items"), json!([0]));
-    let report = store.recovery().unwrap();
-    assert_eq!(report.updates_on_missing_branches, 1);
-    assert_eq!(report.dropped_bytes, 0);
-    assert!(report.unregistered_states.is_empty());
+    store.set_auto_snapshot(false);
+    append(&store, "items", json!(3));
+    drop(store);
+    let store = open_store(dir.path()).unwrap();
+    assert!(store.recovery().is_none());
+    assert_eq!(value(&store, "items"), json!([0, 3]));
 }
 
 #[test]
