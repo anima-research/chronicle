@@ -162,7 +162,8 @@ impl Store {
         let lock_file = Self::acquire_lock(&config.path)?;
 
         // With the lock held, no save of this store is in progress, so its
-        // staging files here were left by interrupted saves.
+        // own staging files here were left by interrupted saves. The sweep's
+        // doc says what else it can reach.
         crate::atomic_file::remove_staging_files(&config.path);
 
         // Open components
@@ -1727,6 +1728,9 @@ impl Store {
     /// Sync all data to disk.
     ///
     /// This is O(1) - only syncs the log file and small metadata files.
+    /// Where this process can't open a checkpoint's directory to sync it, the
+    /// checkpoint's newest save may not survive a power loss, and the store
+    /// logs a warning the first time.
     /// The record index is not persisted; it's rebuilt from the log on startup.
     pub fn sync(&self) -> Result<()> {
         // Keep the durable log and metadata publication ordered with record

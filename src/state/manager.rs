@@ -1270,12 +1270,12 @@ impl StateManager {
         // bearing), while a missing/stale field-index file is recoverable
         // (derived data — `load` returns `None` for it, never an error).
         //
-        // Written AFTER `state.bin` is already durably synced above, and its
+        // Written AFTER `state.bin` is already saved above, and its
         // own failure is deliberately swallowed (logged, not propagated):
         // `state.bin` is the real durable data this function exists to
         // protect, and a disk-full/permission failure writing the derived
         // index must not make `Store::sync()` report failure for data that
-        // in fact synced fine — callers reading `sync()`'s `Result` as "did
+        // in fact saved fine — callers reading `sync()`'s `Result` as "did
         // my durable data make it to disk" would otherwise get a false
         // negative. The next successful `save()` (or a fresh
         // `register_field_index`) recovers it; nothing is lost except the
