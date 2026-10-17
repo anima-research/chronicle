@@ -662,6 +662,35 @@ fn updates_on_a_branch_missing_from_branches_bin_are_not_replayed() {
 }
 
 #[test]
+fn an_undecodable_record_on_a_missing_branch_is_counted_as_undecodable() {
+    let dir = TempDir::new().unwrap();
+    {
+        let store = Store::create(config(dir.path())).unwrap();
+        register(&store, "items", log_strategy());
+        store.set_auto_snapshot(false);
+        append(&store, "items", json!(1));
+    }
+    // An earlier release's generic append under this name, on a branch
+    // branches.bin doesn't hold. It isn't a state update, whatever branch it
+    // names.
+    let log = RecordLog::open(dir.path().join("records.log")).unwrap();
+    log.append(
+        RecordInput::raw("state_update", b"custom payload".to_vec()),
+        BranchId(7),
+        Sequence(2),
+    )
+    .unwrap();
+    log.sync().unwrap();
+    drop(log);
+
+    let store = open_store(dir.path()).unwrap();
+    let report = store.recovery().unwrap();
+    assert_eq!(report.undecodable_state_updates, 1);
+    assert_eq!(report.updates_on_missing_branches, 0);
+    assert_eq!(value(&store, "items"), json!([1]));
+}
+
+#[test]
 fn partially_published_branch_cannot_leak_heads_into_a_new_empty_branch() {
     let dir = TempDir::new().unwrap();
     let store = Store::create(config(dir.path())).unwrap();

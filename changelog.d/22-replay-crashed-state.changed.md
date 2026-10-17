@@ -6,12 +6,14 @@
   one fsync, and a later one can succeed although the records written before
   the failure never reached the disk, so a checkpoint published after it could
   name records the disk doesn't hold. Until the reopen, `sync()` returns the
-  failure every time, even when its own fsync succeeds, and so do every
-  metadata mutation and any write while one waits for its checkpoint. Nothing
-  publishes a checkpoint. Reopening replays the log from the last checkpoint,
-  and can't tell whether records the operating system still caches reached the
-  disk. If they didn't while later records did, an open after the cache drops
-  them refuses the store as mid-log corruption, as earlier releases do.
+  failure every time, even when its own fsync succeeds, and so do
+  registration, strategy changes, and branch creation, deletion and
+  switching, and any write while one of them waits for its checkpoint.
+  Nothing publishes a checkpoint. Reopening replays the log from the last
+  checkpoint, and can't tell whether records the operating system still
+  caches reached the disk. If they didn't while later records did, an open
+  after the cache drops them refuses the store as mid-log corruption, as
+  earlier releases do.
 - `recovery()` also reports what opening found in the state-update tail: each
   state it replayed without a registration, with its number of updates
   (`unregistered_states`), how many records typed `state_update` it skipped

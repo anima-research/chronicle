@@ -263,6 +263,15 @@ impl Store {
                 {
                     return Ok(());
                 }
+                // Earlier releases let any append use this type, so a record
+                // may not be a state update at all, whatever branch it names.
+                // It stays in the log as an ordinary record.
+                let Ok(update) = StateUpdateRecord::decode(record) else {
+                    undecodable += 1;
+                    first_undecodable.get_or_insert(offset);
+                    return Ok(());
+                };
+
                 // Earlier releases saved a branch only at sync, so a crash can
                 // leave updates on a branch that branches.bin doesn't hold.
                 // Nothing can read that branch, so they aren't replayed;
@@ -271,15 +280,6 @@ impl Store {
                     on_missing_branches += 1;
                     return Ok(());
                 }
-
-                // Earlier releases let any append use this type, so a record
-                // may not be a state update at all. It stays in the log as an
-                // ordinary record.
-                let Ok(update) = StateUpdateRecord::decode(record) else {
-                    undecodable += 1;
-                    first_undecodable.get_or_insert(offset);
-                    return Ok(());
-                };
                 // A state can have updates and no registration: a consumer
                 // may update a state it never registered, and an earlier
                 // release that crashed after registering a state and before
@@ -1969,9 +1969,10 @@ impl Store {
     /// reopened, and publishes nothing. Linux reports a write-back error to
     /// one fsync, and a later one can succeed although the records written
     /// before the failure never reached the disk, so a checkpoint published
-    /// after it could name records the disk doesn't hold. Every metadata
-    /// mutation fails the same way, and so does any write while one waits for
-    /// its checkpoint. Reopening replays the log from the last checkpoint. It
+    /// after it could name records the disk doesn't hold. Registration,
+    /// strategy changes, and branch creation, deletion and switching fail the
+    /// same way, and so does any write while one of them waits for its
+    /// checkpoint. Reopening replays the log from the last checkpoint. It
     /// can't tell whether records the operating system still caches reached
     /// the disk: if they didn't while later records did, an open after the
     /// cache drops them refuses the store as mid-log corruption.
@@ -2286,8 +2287,8 @@ impl Drop for Store {
                 %error,
                 path = %self.config.path.display(),
                 "final sync on drop failed: the next open replays state updates from the log \
-                 past the last checkpoint, and loses any registration or branch change whose \
-                 checkpoint failed"
+                 past the last checkpoint, and may lose any registration or branch change \
+                 whose checkpoint failed"
             );
         }
     }
