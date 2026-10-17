@@ -67,6 +67,10 @@ impl Clone for Checkpoint {
 }
 
 impl Checkpoint {
+    /// Save `chunks` as the checkpoint at `path`, unless this writer last saved
+    /// the same bytes there and the file is unchanged. A save whose directory
+    /// couldn't be synced still counts, so a later save of the same bytes
+    /// doesn't retry that sync.
     pub(crate) fn save(&self, path: &Path, chunks: &[&[u8]]) -> Result<()> {
         self.save_with(path, chunks, || {
             let published = atomic_write(path, |file| {
@@ -165,7 +169,9 @@ struct Published {
 ///
 /// A symbolic link at `path` is followed, as git follows one at a lockfile's
 /// target, and the file it leads to is replaced in its own directory. The link
-/// stays, and so does the volume it points to.
+/// stays, and so does the volume it points to. On Unix a save refuses a target
+/// that isn't a regular file, such as a device, which a rename would replace
+/// for everyone using it.
 ///
 /// The replacement is a new file, so any ACL it has comes from its directory's
 /// defaults, as for any new file there. On Unix it takes the old file's owner
@@ -176,6 +182,8 @@ struct Published {
 /// killed before then leaves it behind. Loaders only open the final names, and
 /// the next `Store::open` removes the ones in the store directory.
 fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<Published> {
+    #[cfg(unix)]
+    let named = path;
     let path = resolve_links(path)?;
     // A bare relative filename has an empty parent, which means the current
     // directory rather than a directory that can be opened by its empty name.
@@ -208,6 +216,18 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    #[cfg(unix)]
+    if previous.as_ref().is_some_and(|previous| !previous.is_file()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot save checkpoint {}: {} isn't a regular file",
+                named.display(),
+                path.display()
+            ),
+        )
+        .into());
+    }
 
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
@@ -389,7 +409,9 @@ fn directory_open_refused(error: &io::Error) -> bool {
 /// directory. The caller holds the store lock, so no save of this store is in
 /// progress, and nothing reads them. One that can't be removed is reported
 /// and left. A linked checkpoint's stage is written beside the file the link
-/// leads to, which may lie outside this directory.
+/// leads to, which may lie outside this directory. Another store whose
+/// checkpoint links into this directory stages here outside this lock, and a
+/// save of it whose stage this removes fails, leaving its checkpoint as it was.
 pub(crate) fn remove_staging_files(directory: &Path) {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -660,8 +682,14 @@ mod tests {
     fn replacement_failure_is_reported_and_cleans_temporary_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.bin");
-        fs::create_dir(&path).unwrap();
-        let result = atomic_write(&path, |file| Ok(file.write_all(b"checkpoint")?));
+        fs::write(&path, b"old checkpoint").unwrap();
+        // A directory takes the checkpoint's place once the save has checked
+        // it, so the rename itself fails.
+        let result = atomic_write(&path, |file| {
+            fs::remove_file(&path)?;
+            fs::create_dir(&path)?;
+            Ok(file.write_all(b"checkpoint")?)
+        });
         match result {
             Err(crate::StoreError::Io(error)) => assert!(
                 error.to_string().contains(&format!(
@@ -918,6 +946,37 @@ mod tests {
             assert_eq!(fs::read_dir(store.path()).unwrap().count(), 2);
             assert_eq!(fs::read_dir(volume.path()).unwrap().count(), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_that_is_not_a_regular_file_fails_the_save() {
+        use std::os::unix::fs::{symlink, FileTypeExt};
+        let store = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let fifo = elsewhere.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let linked = store.path().join("state-indexes.bin");
+        symlink(&fifo, &linked).unwrap();
+        let directory = store.path().join("state.bin");
+        fs::create_dir(&directory).unwrap();
+
+        for path in [&linked, &directory] {
+            let result = atomic_write(path, |_| {
+                panic!("a target that isn't a regular file must fail before writing")
+            });
+            match result {
+                Err(crate::StoreError::Io(error)) => {
+                    assert!(error.to_string().contains("isn't a regular file"), "{error}")
+                }
+                other => panic!("expected the save to refuse {path:?}, got {other:?}"),
+            }
+        }
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 1);
+        assert!(directory.is_dir());
+        assert_eq!(fs::read_dir(store.path()).unwrap().count(), 2);
     }
 
     #[cfg(unix)]
