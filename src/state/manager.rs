@@ -5,6 +5,7 @@
 //! stores recently reconstructed states for fast repeated access.
 
 use super::{FieldIndexKind, FieldIndexManager};
+use crate::atomic_file::Checkpoint;
 use crate::error::{Result, StoreError};
 use crate::records::RecordLog;
 use crate::types::{
@@ -15,8 +16,8 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -167,6 +168,9 @@ pub struct StateManager {
     /// Path to state index file.
     path: PathBuf,
 
+    /// Last successfully published checkpoint, never seeded just by loading.
+    checkpoint: Checkpoint,
+
     /// In-memory index (just heads + strategies, very small).
     index: RwLock<StateIndex>,
 
@@ -218,6 +222,7 @@ impl StateManager {
 
         Ok(Self {
             path,
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(StateIndex::default()),
             cache: RwLock::new(LruCache::new(cache_size)),
             items_cache: RwLock::new(LruCache::new(cache_size)),
@@ -246,6 +251,7 @@ impl StateManager {
 
         let manager = Self {
             path: path.clone(),
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(StateIndex::default()),
             cache: RwLock::new(LruCache::new(cache_size)),
             items_cache: RwLock::new(LruCache::new(cache_size)),
@@ -1244,28 +1250,18 @@ impl StateManager {
 
     /// Save state index to file.
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
-
-        // Write magic
-        file.write_all(STATE_INDEX_MAGIC)?;
-
-        // Write version
-        file.write_all(&[STATE_INDEX_VERSION])?;
-
-        // Serialize index with MessagePack
         let index = self.index.read();
-        let encoded =
-            rmp_serde::to_vec(&*index).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        // Write length and data
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+        let encoded = rmp_serde::to_vec(&*index)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        self.checkpoint.save(
+            &self.path,
+            &[
+                STATE_INDEX_MAGIC,
+                &[STATE_INDEX_VERSION],
+                &(encoded.len() as u64).to_le_bytes(),
+                &encoded,
+            ],
+        )?;
         drop(index);
 
         // Field indexes live in their own file (`state-indexes.bin`), kept
