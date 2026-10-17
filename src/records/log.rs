@@ -86,7 +86,7 @@ pub struct RecordLog {
     /// error to one fsync on an open file, and a later fsync succeeds although
     /// the pages that failed may never reach the disk, so after one failure no
     /// fsync can show that the records written before it are durable.
-    durability_failure: Mutex<Option<(std::io::ErrorKind, String)>>,
+    durability_failure: Mutex<Option<String>>,
 
     /// How many of the next fsyncs fail without reaching the file, so unit
     /// tests can stand in for a device error.
@@ -303,10 +303,10 @@ impl RecordLog {
     /// Force sync all pending writes to disk.
     ///
     /// Once an fsync of the log has failed, this call's own or a periodic one
-    /// that `append` made, this returns that failure every time, even when
-    /// its own fsync succeeds, until the log is opened again: records written
-    /// before the failure may not have reached the disk, and no later fsync
-    /// can show that they did.
+    /// that `append` made, this returns that failure every time, as
+    /// `StoreError::DurabilityLost`, even when its own fsync succeeds, until
+    /// the log is opened again: records written before the failure may not
+    /// have reached the disk, and no later fsync can show that they did.
     pub fn sync(&self) -> Result<()> {
         let file = self.file.write();
         match self.fsync(&file) {
@@ -314,15 +314,11 @@ impl RecordLog {
             Err(error) => self.keep_failure(&error),
         }
         match &*self.durability_failure.lock() {
-            Some((kind, text)) => Err(std::io::Error::new(
-                *kind,
-                format!(
-                    "fsync of the record log failed ({text}); records written before it may \
-                     not have reached the disk, and the store publishes no checkpoint until \
-                     it is reopened"
-                ),
-            )
-            .into()),
+            Some(text) => Err(StoreError::DurabilityLost(format!(
+                "fsync of the record log failed ({text}); records written before it may \
+                 not have reached the disk, and the store publishes no checkpoint until \
+                 it is reopened"
+            ))),
             None => Ok(()),
         }
     }
@@ -337,7 +333,7 @@ impl RecordLog {
                  the disk, so sync() and every metadata checkpoint fail until the store is \
                  reopened"
             );
-            *kept = Some((error.kind(), error.to_string()));
+            *kept = Some(error.to_string());
         }
     }
 
@@ -822,9 +818,15 @@ mod tests {
             append(3).unwrap();
             assert_eq!(*log.writes_since_sync.read(), 0);
             for _ in 0..2 {
-                let error = log.sync().unwrap_err().to_string();
-                assert!(error.contains("injected fsync failure"), "{error}");
-                assert!(error.contains("until it is reopened"), "{error}");
+                let error = log.sync().unwrap_err();
+                assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+                let text = error.to_string();
+                assert!(
+                    text.starts_with("Durability lost: fsync of the record log failed ("),
+                    "{text}"
+                );
+                assert!(text.contains("injected fsync failure"), "{text}");
+                assert!(text.contains("until it is reopened"), "{text}");
             }
         }
 
@@ -841,9 +843,9 @@ mod tests {
         log.append(RecordInput::raw("test", vec![1]), BranchId(1), Sequence(1))
             .unwrap();
         *log.fsync_failures.lock() = 1;
-        assert!(log.sync().is_err());
+        assert!(matches!(log.sync(), Err(StoreError::DurabilityLost(_))));
         // This call's own fsync succeeds, and the earlier failure stands.
-        assert!(log.sync().is_err());
+        assert!(matches!(log.sync(), Err(StoreError::DurabilityLost(_))));
     }
 
     // What a failed write-back can leave once the page cache no longer holds

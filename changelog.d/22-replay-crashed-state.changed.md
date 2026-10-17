@@ -8,12 +8,15 @@
   name records the disk doesn't hold. Until the reopen, `sync()` returns the
   failure every time, even when its own fsync succeeds, and so do
   registration, strategy changes, and branch creation, deletion and
-  switching, and any write while one of them waits for its checkpoint.
-  Nothing publishes a checkpoint. Reopening replays the log from the last
-  checkpoint, and can't tell whether records the operating system still
-  caches reached the disk. If they didn't while later records did, an open
-  after the cache drops them refuses the store as mid-log corruption, as
-  earlier releases do.
+  switching, and any write while one of them waits for its checkpoint. They
+  return it as a new error, `StoreError::DurabilityLost`, whose message
+  begins `Durability lost:`, in Node too. Nothing publishes a checkpoint. The
+  only way to resume durable writes is to reopen the store, which for a host
+  that holds it open for its whole life means restarting the process.
+  Reopening replays the log from the last checkpoint, and can't tell whether
+  records the operating system still caches reached the disk. If they didn't
+  while later records did, an open after the cache drops them refuses the
+  store as mid-log corruption, as earlier releases do.
 - `recovery()` also reports what opening found in the state-update tail: each
   state it replayed without a registration, with its number of updates
   (`unregistered_states`), how many records typed `state_update` it skipped

@@ -1966,16 +1966,18 @@ impl Store {
     ///
     /// Once an fsync of the record log has failed, this call's own or a
     /// periodic one, this returns the failure every time until the store is
-    /// reopened, and publishes nothing. Linux reports a write-back error to
-    /// one fsync, and a later one can succeed although the records written
-    /// before the failure never reached the disk, so a checkpoint published
-    /// after it could name records the disk doesn't hold. Registration,
-    /// strategy changes, and branch creation, deletion and switching fail the
-    /// same way, and so does any write while one of them waits for its
-    /// checkpoint. Reopening replays the log from the last checkpoint. It
-    /// can't tell whether records the operating system still caches reached
-    /// the disk: if they didn't while later records did, an open after the
-    /// cache drops them refuses the store as mid-log corruption.
+    /// reopened, as [`StoreError::DurabilityLost`], and publishes nothing.
+    /// Linux reports a write-back error to one fsync, and a later one can
+    /// succeed although the records written before the failure never reached
+    /// the disk, so a checkpoint published after it could name records the
+    /// disk doesn't hold. Registration, strategy changes, and branch
+    /// creation, deletion and switching fail the same way, and so does any
+    /// write while one of them waits for its checkpoint. Reopening the store
+    /// is the only way to resume durable writes. It replays the log from the
+    /// last checkpoint, and can't tell whether records the operating system
+    /// still caches reached the disk: if they didn't while later records did,
+    /// an open after the cache drops them refuses the store as mid-log
+    /// corruption.
     ///
     /// On open, complete state updates in the log past the last checkpoint
     /// are replayed, except those on a branch that `branches.bin` doesn't
@@ -3247,8 +3249,9 @@ mod tests {
     }
 
     // After one failed fsync of the log, nothing publishes a checkpoint until
-    // the store is reopened: neither sync(), a metadata mutation nor Drop.
-    // Writes go on until a metadata mutation waits for its checkpoint.
+    // the store is reopened: neither sync(), a metadata mutation nor Drop,
+    // and each of them reports DurabilityLost. Writes go on until a metadata
+    // mutation waits for its checkpoint, and then report it too.
     #[test]
     fn a_failed_log_fsync_publishes_nothing_until_reopen() {
         let dir = TempDir::new().unwrap();
@@ -3280,16 +3283,39 @@ mod tests {
                 checkpoint,
                 "sync() published state.bin"
             );
-            let error = result.unwrap_err().to_string();
-            assert!(error.contains("until it is reopened"), "{error}");
+            let error = result.unwrap_err();
+            assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+            assert!(error.to_string().contains("until it is reopened"), "{error}");
         }
-        assert!(store.register_state(registration("other")).is_err());
+        fn lost<T>(result: Result<T>) -> bool {
+            matches!(result, Err(StoreError::DurabilityLost(_)))
+        }
+        assert!(lost(store.register_state(registration("other"))));
+        // Every call that retries the registration's pending checkpoint first
+        // meets the same failure.
         assert!(
-            store
-                .update_state("items", StateOperation::Append(b"150".to_vec()))
-                .is_err(),
+            lost(store.update_state("items", StateOperation::Append(b"150".to_vec()))),
             "a write waits for the registration's checkpoint"
         );
+        assert!(lost(store.append(RecordInput::raw("event", b"blocked".to_vec()))));
+        assert!(lost(store.update_state_strategy(
+            "items",
+            crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 50,
+                full_snapshot_every: 20,
+            },
+        )));
+        assert!(lost(store.register_state_field_index(
+            "items",
+            "/n",
+            crate::state::FieldIndexKind::Number
+        )));
+        assert!(lost(store.create_branch("blocked", None)));
+        assert!(lost(store.create_empty_branch("blocked-empty", None)));
+        assert!(lost(store.create_branch_at("blocked-at", "main", Sequence(0))));
+        assert!(lost(store.switch_branch("main")));
+        assert!(lost(store.delete_branch("missing")));
+        assert!(lost(store.sync()));
         drop(store);
         assert_eq!(
             std::fs::read(config.path.join("state.bin")).unwrap(),

@@ -2,6 +2,9 @@
   for internal `state_update` records. Generic appends with this reserved
   type now fail before writing; custom record producers must choose another
   type.
+- **Rust embedders:** `StoreError` has a new variant, `DurabilityLost`, for
+  a failed fsync of the record log (see Changed). An exhaustive `match` on
+  `StoreError` needs an arm for it.
 - **Stores an earlier release left after a crash:** opening one now replays
   the state updates its log holds past the last checkpoint, which earlier
   releases left out of the state (see Fixed). Four kinds of update there:
