@@ -420,6 +420,8 @@ impl JsStore {
 
     /// Close the store, releasing the lock and any resources.
     /// After closing, all operations on this store will fail.
+    /// If the record log's fsync has failed, this throws that error after
+    /// closing the store, so it can be reopened.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         if let Some(store) = self.inner.take() {
