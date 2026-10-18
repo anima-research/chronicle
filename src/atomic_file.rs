@@ -18,7 +18,8 @@ const STAGING_PREFIX: &str = ".chronicle-checkpoint-";
 /// bounds a path lookup the same way, failing with ELOOP.
 const MAX_LINKS: usize = 40;
 
-/// Remembers the last checkpoint this writer successfully made durable.
+/// Remembers the last checkpoint this writer published, including one whose
+/// directory it couldn't sync.
 /// The serialized digest avoids a second in-memory copy of large field indexes.
 /// File identity prevents a deleted/replaced checkpoint from being skipped.
 #[derive(Debug, Default)]
@@ -67,6 +68,10 @@ impl Clone for Checkpoint {
 }
 
 impl Checkpoint {
+    /// Save `chunks` as the checkpoint at `path`, unless this writer last saved
+    /// the same bytes there and the file is unchanged. A save whose directory
+    /// couldn't be synced still counts, so a later save of the same bytes
+    /// doesn't retry that sync.
     pub(crate) fn save(&self, path: &Path, chunks: &[&[u8]]) -> Result<()> {
         self.save_with(path, chunks, || {
             let published = atomic_write(path, |file| {
@@ -81,6 +86,7 @@ impl Checkpoint {
                     .swap(true, Ordering::Relaxed)
                 {
                     tracing::warn!(
+                        path = %path.display(),
                         %error,
                         "saving this checkpoint without syncing its directory, which this \
                          process may not open: a power loss may roll the newest save back"
@@ -104,7 +110,12 @@ impl Checkpoint {
         let digest: [u8; 32] = hash.finalize().into();
         let mut saved = self.saved.lock();
         if let Some(previous) = saved.as_ref() {
-            if previous.path == path && previous.digest == digest {
+            // A name that is no longer a regular file goes on to publish,
+            // which refuses it. Opening a FIFO here would wait for a writer.
+            if previous.path == path
+                && previous.digest == digest
+                && fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+            {
                 if let Ok(current) = Handle::from_path(path) {
                     if current == previous.identity
                         && current
@@ -127,8 +138,8 @@ impl Checkpoint {
         let file = publish()?;
 
         // Failure to obtain a cache identity is not a failed checkpoint: the
-        // publication above is already durable. It just prevents skipping the
-        // next save. Concurrent out-of-band file edits are not supported.
+        // publication above has already happened. It just prevents skipping
+        // the next save. Concurrent out-of-band file edits are not supported.
         if let Ok(identity) = Handle::from_file(file) {
             if let Ok(stamp) = identity.as_file().metadata().and_then(FileStamp::read) {
                 *saved = Some(SavedCheckpoint {
@@ -165,17 +176,22 @@ struct Published {
 ///
 /// A symbolic link at `path` is followed, as git follows one at a lockfile's
 /// target, and the file it leads to is replaced in its own directory. The link
-/// stays, and so does the volume it points to.
+/// stays, and so does the volume it points to. On Unix a save refuses a target
+/// that isn't a regular file, such as a device, which a rename would replace
+/// for everyone using it.
 ///
 /// The replacement is a new file, so any ACL it has comes from its directory's
 /// defaults, as for any new file there. On Unix it takes the old file's owner
-/// and group as far as the writer may set them, and its mode, less what was
-/// granted to an owner or group it couldn't take.
+/// and group as far as the writer may set them, and its mode, less setuid
+/// where it couldn't take the owner, and less setgid and the group's bits
+/// where it couldn't take the group.
 ///
 /// A save that fails before the rename removes its staging file. A process
 /// killed before then leaves it behind. Loaders only open the final names, and
 /// the next `Store::open` removes the ones in the store directory.
 fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<Published> {
+    #[cfg(unix)]
+    let named = path;
     let path = resolve_links(path)?;
     // A bare relative filename has an empty parent, which means the current
     // directory rather than a directory that can be opened by its empty name.
@@ -208,6 +224,19 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    #[cfg(unix)]
+    if previous.as_ref().is_some_and(|previous| !previous.is_file()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot save checkpoint {}: {} isn't a regular file, so nothing was \
+                 written; make the checkpoint a regular file, or a link to one",
+                named.display(),
+                path.display()
+            ),
+        )
+        .into());
+    }
 
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
@@ -258,7 +287,17 @@ fn atomic_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Res
 
     #[cfg(unix)]
     if let Some(directory) = &directory {
-        sync_directory(directory)?;
+        sync_directory(directory).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "the new checkpoint {} is in place, but syncing its directory {} \
+                     failed: {error}",
+                    path.display(),
+                    parent.display()
+                ),
+            )
+        })?;
     }
 
     Ok(Published {
@@ -296,9 +335,10 @@ fn resolve_links(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Give a replacement the old file's owner and group, as far as the writer
-/// may set them, and then its mode, less what was granted to an id it
-/// couldn't take. Each is changed only where it differs, so a filesystem that
-/// reports one owner and mode for every file is never asked to change them.
+/// may set them, and then its mode, less setuid where the owner didn't carry
+/// over and less setgid and the group's bits where the group didn't. Each is
+/// changed only where it differs, so a filesystem that reports one owner and
+/// mode for every file is never asked to change them.
 #[cfg(unix)]
 fn carry_over(file: &File, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -388,8 +428,12 @@ fn directory_open_refused(error: &io::Error) -> bool {
 /// Remove the staging files that interrupted saves left in the store
 /// directory. The caller holds the store lock, so no save of this store is in
 /// progress, and nothing reads them. One that can't be removed is reported
-/// and left. A linked checkpoint's stage is written beside the file the link
-/// leads to, which may lie outside this directory.
+/// and left, and so are all of them in a directory this process can't list,
+/// such as one it may write but not read. A linked checkpoint's stage is
+/// written beside the file the link leads to, which may lie outside this
+/// directory. Another store whose checkpoint links into this directory stages
+/// here outside this lock, and a save of it whose stage this removes fails,
+/// leaving its checkpoint as it was.
 pub(crate) fn remove_staging_files(directory: &Path) {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -531,7 +575,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_directory_is_saved_without_its_sync() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.bin");
         let checkpoint = Checkpoint::default();
@@ -552,6 +596,11 @@ mod tests {
         let log = logged(|| {
             checkpoint.save(&path, &[b"second"]).unwrap();
             checkpoint.save(&path, &[b"third"]).unwrap();
+            // The save that went without the directory sync still counts, so
+            // the same bytes again aren't published again.
+            let published = fs::metadata(&path).unwrap().ino();
+            checkpoint.save(&path, &[b"third"]).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().ino(), published);
         });
         assert_eq!(fs::read(&path).unwrap(), b"third");
         assert_eq!(
@@ -559,6 +608,7 @@ mod tests {
             1,
             "{log}"
         );
+        assert!(log.contains(&format!("path={}", path.display())), "{log}");
         assert!(
             log.contains(&format!(
                 "cannot open checkpoint directory {}",
@@ -660,8 +710,14 @@ mod tests {
     fn replacement_failure_is_reported_and_cleans_temporary_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.bin");
-        fs::create_dir(&path).unwrap();
-        let result = atomic_write(&path, |file| Ok(file.write_all(b"checkpoint")?));
+        fs::write(&path, b"old checkpoint").unwrap();
+        // A directory takes the checkpoint's place after the check Unix makes
+        // of it, so on every platform the rename itself fails.
+        let result = atomic_write(&path, |file| {
+            fs::remove_file(&path)?;
+            fs::create_dir(&path)?;
+            Ok(file.write_all(b"checkpoint")?)
+        });
         match result {
             Err(crate::StoreError::Io(error)) => assert!(
                 error.to_string().contains(&format!(
@@ -848,6 +904,18 @@ mod tests {
         }
     }
 
+    // Linux answers an fsync of /dev/null with EINVAL, as a system that
+    // doesn't sync directories answers a directory's, so this reaches the
+    // pass-over itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_sync_the_system_refuses_is_passed_over() {
+        let null = File::open("/dev/null").unwrap();
+        let refused = null.sync_all().unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EINVAL), "{refused}");
+        sync_directory(&null).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn only_a_refused_directory_sync_is_passed_over() {
@@ -918,6 +986,79 @@ mod tests {
             assert_eq!(fs::read_dir(store.path()).unwrap().count(), 2);
             assert_eq!(fs::read_dir(volume.path()).unwrap().count(), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_that_is_not_a_regular_file_fails_the_save() {
+        use std::os::unix::fs::{symlink, FileTypeExt};
+        let store = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let fifo = elsewhere.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let linked = store.path().join("state-indexes.bin");
+        symlink(&fifo, &linked).unwrap();
+        let directory = store.path().join("state.bin");
+        fs::create_dir(&directory).unwrap();
+
+        for path in [&linked, &directory] {
+            let result = atomic_write(path, |_| {
+                panic!("a target that isn't a regular file must fail before writing")
+            });
+            match result {
+                Err(crate::StoreError::Io(error)) => {
+                    assert!(error.to_string().contains("isn't a regular file"), "{error}")
+                }
+                other => panic!("expected the save to refuse {path:?}, got {other:?}"),
+            }
+        }
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 1);
+        assert!(directory.is_dir());
+        assert_eq!(fs::read_dir(store.path()).unwrap().count(), 2);
+    }
+
+    // A name that stops being a regular file after a save is refused when the
+    // same bytes are saved again, rather than opened for the unchanged-bytes
+    // check: opening a FIFO for reading waits for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn same_bytes_over_a_name_that_became_a_fifo_are_refused_without_waiting() {
+        use std::os::unix::fs::{symlink, FileTypeExt, OpenOptionsExt};
+        use std::sync::{mpsc, Arc};
+        let store = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let path = store.path().join("state-indexes.bin");
+        let checkpoint = Arc::new(Checkpoint::default());
+        checkpoint.save(&path, &[b"index"]).unwrap();
+        let fifo = elsewhere.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        fs::remove_file(&path).unwrap();
+        symlink(&fifo, &path).unwrap();
+
+        let (sent, received) = mpsc::channel();
+        let (saver, target) = (Arc::clone(&checkpoint), path.clone());
+        std::thread::spawn(move || {
+            let result = saver.save(&target, &[b"index"]).map_err(|e| e.to_string());
+            sent.send(result).unwrap();
+        });
+        // Far above what the save takes; it only bounds a save that waits.
+        let result = match received.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(_) => {
+                // Release a save waiting in the FIFO's open before failing.
+                let _ = OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo);
+                panic!("the save of the same bytes waited on the FIFO");
+            }
+        };
+        let error = result.expect_err("a FIFO at the checkpoint's name must be refused");
+        assert!(error.contains("isn't a regular file"), "{error}");
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
     }
 
     #[cfg(unix)]

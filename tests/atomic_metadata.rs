@@ -1,5 +1,10 @@
 //! Every metadata saver publishes a new file, leaving an open previous
-//! checkpoint intact. These tests fail against truncate-in-place saves.
+//! checkpoint intact. Against saves that truncate a checkpoint and rewrite it
+//! in place, the tests of replacement, of an interrupted sync, of republishing
+//! and of the sweep's removals fail. Three check what such saves did as well: a
+//! store directory without read access still saves, opening a locked store
+//! leaves its staging files, and `interrupted_sync_child` is the body that the
+//! interrupted-sync test runs in a child process.
 
 use chronicle::{
     FieldIndexKind, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,

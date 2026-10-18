@@ -19,9 +19,14 @@
   - **A checkpoint bind-mounted as a single file** can't be replaced, so
     saving it fails.
   - **A symbolic link** at a checkpoint's name is still followed, and the
-    file it leads to is replaced in its own directory. A crash while saving it
-    can leave a `.chronicle-checkpoint-*` staging file beside that file, and
-    opening the store only removes the ones in the store directory.
+    file it leads to is replaced in its own directory. On Unix, a link that
+    leads to something other than a regular file, such as a device, makes the
+    save fail. A crash while saving a linked checkpoint can leave a
+    `.chronicle-checkpoint-*` staging file beside the file the link leads to,
+    and opening the store only removes the ones in the store directory. A
+    store whose checkpoint links into another store's directory stages its
+    saves there, so opening that other store during such a save fails the
+    save, and the checkpoint keeps its previous contents.
   - **What a save needs** is what a rename needs, in the directory of the
     file it replaces: write access, to create the new file and rename it; in
     a directory with the sticky bit, ownership of the checkpoint or of the

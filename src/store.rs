@@ -186,7 +186,8 @@ impl Store {
         let lock_file = Self::acquire_lock(&config.path)?;
 
         // With the lock held, no save of this store is in progress, so its
-        // staging files here were left by interrupted saves.
+        // own staging files here were left by interrupted saves. The sweep's
+        // doc says what else it can reach.
         crate::atomic_file::remove_staging_files(&config.path);
 
         // Open components
@@ -457,6 +458,22 @@ impl Store {
     /// Get records by type.
     pub fn get_records_by_type(&self, record_type: &str) -> Vec<RecordId> {
         self.index.get_by_type(record_type)
+    }
+
+    /// Get the IDs of a type's records greater than `after` and less than
+    /// `before` (both exclusive, either optional), at most `limit` of them,
+    /// oldest first or with `reverse` newest first. Found by binary search, so
+    /// a page or the newest record costs what it returns, not the type's size.
+    pub fn get_records_by_type_range(
+        &self,
+        record_type: &str,
+        after: Option<RecordId>,
+        before: Option<RecordId>,
+        limit: Option<usize>,
+        reverse: bool,
+    ) -> Vec<RecordId> {
+        self.index
+            .get_by_type_range(record_type, after, before, limit, reverse)
     }
 
     /// Iterate records from a sequence.
@@ -1994,11 +2011,13 @@ impl Store {
     /// later append or state update.
     ///
     /// On Unix a save also syncs the containing directory, where the system
-    /// can. On Windows it doesn't wait for the rename to reach the disk, so
-    /// after an OS crash or power loss the store may open from an earlier
-    /// checkpoint. The record index is rebuilt on startup; checkpoint cost
-    /// depends on state heads, branch metadata, and any registered field
-    /// indexes.
+    /// can. Where this process can't open that directory to sync it, the
+    /// checkpoint's newest save may not survive a power loss, and the store
+    /// logs a warning the first time. On Windows it doesn't wait for the
+    /// rename to reach the disk, so after an OS crash or power loss the store
+    /// may open from an earlier checkpoint. The record index is rebuilt on
+    /// startup; checkpoint cost depends on state heads, branch metadata, and
+    /// any registered field indexes.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.sync_locked(&mut write)
