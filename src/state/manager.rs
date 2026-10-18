@@ -299,6 +299,23 @@ impl StateManager {
         Ok(())
     }
 
+    /// Last state update included in this metadata checkpoint.
+    ///
+    /// Store serializes mutations and checkpoints under its write lock. Heads
+    /// are saved together, and branch copies only refer to earlier records, so
+    /// their maximum offset also covers every preceding state update. Branch
+    /// deletion retains heads, so it cannot move this watermark backwards.
+    /// None means no update has been checkpointed, including offset zero.
+    pub(crate) fn checkpoint_offset(&self) -> Option<u64> {
+        self.index.read().heads.values().map(|h| h.head_offset).max()
+    }
+
+    /// Highest branch identity referenced by state metadata, including copied
+    /// heads that may have reached disk before their branch was published.
+    pub(crate) fn max_branch_id(&self) -> Option<BranchId> {
+        self.index.read().heads.keys().map(|(branch, _)| *branch).max()
+    }
+
     /// Register a new state with its strategy.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
         let mut index = self.index.write();

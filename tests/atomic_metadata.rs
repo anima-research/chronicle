@@ -217,7 +217,8 @@ fn interrupted_sync_reopens_at_the_previous_checkpoint() {
 
     assert_eq!(fs::read(path.join("state.bin")).unwrap(), previous);
     let reopened = reopen(&path);
-    assert_eq!(reopened.get_state_len("messages").unwrap(), Some(1));
+    // The previous checkpoint's item, and the child's, replayed from the log.
+    assert_eq!(reopened.get_state_len("messages").unwrap(), Some(2));
 }
 
 #[cfg(unix)]
