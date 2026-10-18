@@ -9,6 +9,13 @@ pub enum StoreError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// An fsync of the record log failed, so records written before it may
+    /// not have reached the disk. Every later call that would publish a
+    /// checkpoint returns this until the store is reopened, which is the only
+    /// way to resume durable writes.
+    #[error("Durability lost: {0}")]
+    DurabilityLost(String),
+
     #[error("Record not found: {0}")]
     RecordNotFound(RecordId),
 

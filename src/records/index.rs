@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::records::RecordLog;
-use crate::types::{BranchId, RecordId, Sequence};
+use crate::types::{BranchId, Record, RecordId, Sequence};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -54,11 +54,22 @@ impl RecordIndex {
     /// This scans the entire log sequentially and builds all indexes.
     /// For a store with 1M records, this typically takes 1-3 seconds on SSD.
     pub fn rebuild_from_log(path: impl AsRef<Path>, log: &RecordLog) -> Result<Self> {
+        Self::rebuild_from_log_with(path, log, |_, _| Ok(()))
+    }
+
+    /// Visit records during the existing startup scan, so state recovery does
+    /// not need another full pass over the log.
+    pub(crate) fn rebuild_from_log_with(
+        path: impl AsRef<Path>,
+        log: &RecordLog,
+        mut visit: impl FnMut(u64, &Record) -> Result<()>,
+    ) -> Result<Self> {
         let index = Self::new(path)?;
 
         // Iterate through all records in the log
         for result in log.iter() {
             let (offset, record) = result?;
+            visit(offset, &record)?;
 
             // Add to all indexes
             index.add(

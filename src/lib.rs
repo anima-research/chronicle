@@ -32,6 +32,7 @@
 //! store.create_branch("experiment", None)?;
 //! ```
 
+mod atomic_file;
 pub mod blobs;
 pub mod branches;
 pub mod error;

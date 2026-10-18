@@ -41,13 +41,14 @@
 //! but before `state-indexes.bin` was (the two are separate, non-atomic
 //! files); comparing `head_offset` catches that and any other value drift.
 
+use crate::atomic_file::Checkpoint;
 use crate::error::{Result, StoreError};
 use crate::types::BranchId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 /// Magic bytes for the persisted state field-index file.
@@ -282,6 +283,8 @@ pub struct FieldIndexManager {
         deserialize_with = "deserialize_indexes"
     )]
     indexes: HashMap<BranchId, BranchIndexes>,
+    #[serde(skip)]
+    checkpoint: Checkpoint,
 }
 
 fn serialize_indexes<S: serde::Serializer>(
@@ -750,21 +753,17 @@ impl FieldIndexManager {
     /// a streaming/chunked build would be worth doing before this is used on
     /// multi-GB slots.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-
-        file.write_all(FIELD_INDEX_MAGIC)?;
-        file.write_all(&[FIELD_INDEX_VERSION])?;
-
-        let encoded =
-            rmp_serde::to_vec(self).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+        let encoded = rmp_serde::to_vec(self)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        self.checkpoint.save(
+            path,
+            &[
+                FIELD_INDEX_MAGIC,
+                &[FIELD_INDEX_VERSION],
+                &(encoded.len() as u64).to_le_bytes(),
+                &encoded,
+            ],
+        )?;
         Ok(())
     }
 
@@ -835,7 +834,7 @@ impl FieldIndexManager {
     /// reports right now. `load()` only rejects a file that fails to parse
     /// — it has no way to know whether the *content* it successfully parsed
     /// is still current, since `state.bin` and `state-indexes.bin` are
-    /// separate, non-atomically-written files (`save()` writes `state.bin`
+    /// separately published files (`save()` writes `state.bin`
     /// first and swallows a later field-index save failure). A crash in
     /// that window, or a structurally-valid-but-older `state-indexes.bin`
     /// restored from a backup, parses fine but is stale relative to the
@@ -874,6 +873,7 @@ fn apply_offset_limit(values: Vec<u32>, offset: Option<usize>, limit: Option<usi
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
     use tempfile::TempDir;
 
     const MAIN: BranchId = BranchId(1);
@@ -881,6 +881,20 @@ mod tests {
 
     fn items(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
         values.to_vec()
+    }
+
+    #[test]
+    fn checkpoint_cache_is_not_part_of_the_persisted_format() {
+        let dir = TempDir::new().unwrap();
+        let manager = FieldIndexManager::new();
+        // The existing compact encoding is one field containing an empty map.
+        let expected = vec![0x91, 0x80];
+        assert_eq!(rmp_serde::to_vec(&manager).unwrap(), expected);
+        let path = dir.path().join("state-indexes.bin");
+        manager.save(&path).unwrap();
+        assert_eq!(rmp_serde::to_vec(&manager).unwrap(), expected);
+        let loaded = FieldIndexManager::load(&path).unwrap().unwrap();
+        assert_eq!(rmp_serde::to_vec(&loaded).unwrap(), expected);
     }
 
     #[test]

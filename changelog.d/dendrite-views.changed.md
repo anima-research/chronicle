@@ -76,11 +76,15 @@
     `Arc<Vec<Vec<u8>>>`); `StateItems` indexes and iterates as `&[u8]`.
     `Store::state_items_on` exposes it per branch.
 - `deleteBranch` now releases what the store held for the branch: its cached
-  state values and field indexes immediately, and its state chain heads at
-  the next `sync` (they stay until the deletion itself is on disk, so a crash
-  between the two metadata files can bring a deleted branch back whole but
-  never listed-and-empty). Memory and `state.bin` therefore stop growing with
-  branches that were forked and deleted; previously every deleted branch left
-  its heads in `state.bin` for good. Records the branch wrote remain in the
-  append-only log, and heads left behind by branches deleted under earlier
-  versions are not swept. `deleteBranch` also takes the store's write lock.
+  state values and field indexes immediately, and its state chain heads once
+  the deletion is on disk — at the end of the checkpoint the deletion makes
+  before returning, or of the next successful `sync` if that checkpoint
+  failed. `state.bin` is written before `branches.bin` within a checkpoint,
+  and the heads leave only after both, so a crash between the two metadata
+  files can bring a deleted branch back whole but never listed-and-empty; the
+  heads then leave `state.bin` at the following `sync`. Memory and
+  `state.bin` therefore stop growing with branches that were forked and
+  deleted; previously every deleted branch left its heads in `state.bin` for
+  good. Records the branch wrote remain in the append-only log, and heads
+  left behind by branches deleted under earlier versions are not swept.
+  `deleteBranch` also takes the store's write lock.

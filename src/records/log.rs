@@ -2,7 +2,7 @@
 
 use crate::error::{Result, StoreError};
 use crate::types::{BranchId, PayloadEncoding, Record, RecordId, RecordInput, Sequence, Timestamp};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -17,17 +17,36 @@ const LOG_VERSION: u8 = 1;
 /// What an open-time scan of the log found and (if a torn tail was recovered)
 /// what it dropped. Surfaced via [`RecordLog::recovery`] so callers can log or
 /// react to silent data truncation instead of only seeing a stderr warning.
+/// `Store::recovery` adds what the store's open found in the state-update
+/// tail, and reports it even when no tail was torn.
 #[derive(Clone, Debug)]
 pub struct RecoveryReport {
-    /// Byte offset the file was truncated back to (end of the last valid record).
+    /// Byte offset the file was truncated back to (end of the last valid
+    /// record), or the log's length when nothing was torn.
     pub truncated_at: u64,
     /// Number of trailing bytes discarded. NOTE: this is *all* bytes after the
     /// last valid record — with the default `sync_interval`, up to that many
     /// un-fsynced records. Bit-rot in the final fsynced record is
-    /// indistinguishable from a tear and is counted here too.
+    /// indistinguishable from a tear and is counted here too. 0 when nothing
+    /// was torn.
     pub dropped_bytes: u64,
     /// Number of valid records that survived (i.e. the length of the recovered log).
     pub valid_records: u64,
+    /// Each state whose updates open replayed although `state.bin` holds no
+    /// registration for it, with the number of updates replayed: a state
+    /// written without a registration, or whose registration an earlier
+    /// release lost in a crash. Empty from [`RecordLog::recovery`].
+    pub unregistered_states: Vec<(String, u64)>,
+    /// Records past the checkpoint typed `state_update` that don't decode as
+    /// state updates, which open skipped. They stay in the log as ordinary
+    /// records. 0 from [`RecordLog::recovery`].
+    pub undecodable_state_updates: u64,
+    /// Records past the checkpoint typed `state_update` on a branch that
+    /// `branches.bin` doesn't hold, which open didn't replay, since nothing can
+    /// read that branch: an earlier release saved a branch only at sync, so a
+    /// crash after creating one can leave its updates without it. 0 from
+    /// [`RecordLog::recovery`].
+    pub updates_on_missing_branches: u64,
 }
 
 /// Outcome of a full validating scan of the log.
@@ -62,6 +81,18 @@ pub struct RecordLog {
     /// Sync every N writes (0 = sync every write, critical for durability vs performance)
     sync_interval: u64,
 
+    /// The first failed fsync of the log, kept until it is opened again:
+    /// [`RecordLog::sync`] returns it every time. Linux reports a writeback
+    /// error to one fsync on an open file, and a later fsync succeeds although
+    /// the pages that failed may never reach the disk, so after one failure no
+    /// fsync can show that the records written before it are durable.
+    durability_failure: Mutex<Option<String>>,
+
+    /// How many of the next fsyncs fail without reaching the file, so unit
+    /// tests can stand in for a device error.
+    #[cfg(test)]
+    pub(crate) fsync_failures: Mutex<u64>,
+
     /// Highest sequence seen per branch during the open scan. Immutable after
     /// open; `Store::open` reconciles branch heads against this.
     branch_max_seq: HashMap<BranchId, Sequence>,
@@ -84,6 +115,10 @@ impl RecordLog {
     /// - sync_interval = 1: sync every write
     /// - sync_interval = 100: sync every 100 writes (good balance)
     /// - sync_interval = 1000: sync every 1000 writes (fastest, least durable)
+    ///
+    /// A failed fsync doesn't fail the append that made it:
+    /// [`RecordLog::sync`] reports it, every time until the log is opened
+    /// again.
     ///
     /// On open, the log is validated end-to-end (framing + checksums). A
     /// torn/partial *tail* — the crash-during-append case — is recovered by
@@ -136,6 +171,9 @@ impl RecordLog {
                     truncated_at: scan.valid_len,
                     dropped_bytes: dropped,
                     valid_records: scan.valid_records,
+                    unregistered_states: Vec::new(),
+                    undecodable_state_updates: 0,
+                    updates_on_missing_branches: 0,
                 })
             } else {
                 None
@@ -151,6 +189,9 @@ impl RecordLog {
             file_size: RwLock::new(file_size),
             writes_since_sync: RwLock::new(0),
             sync_interval: if sync_interval == 0 { 1 } else { sync_interval },
+            durability_failure: Mutex::new(None),
+            #[cfg(test)]
+            fsync_failures: Mutex::new(0),
             branch_max_seq,
             recovery,
         })
@@ -173,7 +214,18 @@ impl RecordLog {
 
     /// Append a record to the log.
     ///
-    /// Returns the record and the offset where it was written.
+    /// The `state_update` type is reserved for `Store::update_state`. Past
+    /// the checkpoint, the next `Store::open` replays a record of that type
+    /// that decodes as a state update, refusing the store if its predecessor
+    /// isn't its state's head, and skips one that doesn't decode.
+    ///
+    /// Returns the record and the offset where it was written. Every
+    /// `sync_interval`-th append also fsyncs the log. A failed fsync doesn't
+    /// fail the append, since the record is already complete in the file:
+    /// failing it would leave a record its caller never adopted, which the
+    /// next record on the same chain would contradict at replay. The next
+    /// append tries the fsync again, and from then on [`RecordLog::sync`]
+    /// returns the failure until the log is opened again.
     pub fn append(
         &self,
         input: RecordInput,
@@ -214,11 +266,28 @@ impl RecordLog {
         let mut writes = self.writes_since_sync.write();
         *writes += 1;
         if *writes >= self.sync_interval {
-            file.sync_all()?;
-            *writes = 0;
+            match self.fsync(&file) {
+                Ok(()) => *writes = 0,
+                // `writes` stays at the interval, so the next append tries
+                // again.
+                Err(error) => self.keep_failure(&error),
+            }
         }
 
         Ok((record, offset))
+    }
+
+    /// fsync the log file.
+    fn fsync(&self, file: &File) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut failures = self.fsync_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("injected fsync failure"));
+            }
+        }
+        file.sync_all()
     }
 
     /// Peek the record id the next `append` will assign, without consuming it.
@@ -232,11 +301,40 @@ impl RecordLog {
     }
 
     /// Force sync all pending writes to disk.
+    ///
+    /// Once an fsync of the log has failed, this call's own or a periodic one
+    /// that `append` made, this returns that failure every time, as
+    /// `StoreError::DurabilityLost`, even when its own fsync succeeds, until
+    /// the log is opened again: records written before the failure may not
+    /// have reached the disk, and no later fsync can show that they did.
     pub fn sync(&self) -> Result<()> {
         let file = self.file.write();
-        file.sync_all()?;
-        *self.writes_since_sync.write() = 0;
-        Ok(())
+        match self.fsync(&file) {
+            Ok(()) => *self.writes_since_sync.write() = 0,
+            Err(error) => self.keep_failure(&error),
+        }
+        match &*self.durability_failure.lock() {
+            Some(text) => Err(StoreError::DurabilityLost(format!(
+                "fsync of the record log failed ({text}); records written before it may \
+                 not have reached the disk, and the store publishes no checkpoint until \
+                 it is reopened"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Keep the first failed fsync of the log, with one warning.
+    fn keep_failure(&self, error: &std::io::Error) {
+        let mut kept = self.durability_failure.lock();
+        if kept.is_none() {
+            tracing::warn!(
+                %error,
+                "record log fsync failed: records written before it may not have reached \
+                 the disk, so sync() and every metadata checkpoint fail until the store is \
+                 reopened"
+            );
+            *kept = Some(error.to_string());
+        }
     }
 
     /// Read a record at a given offset.
@@ -692,6 +790,91 @@ mod tests {
         assert_eq!(record.sequence.0, 1);
         assert_eq!(record.payload, b"hello");
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn failed_periodic_fsync_keeps_the_record_and_is_reported_until_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        {
+            let log = RecordLog::open_with_sync_interval(&path, 2).unwrap();
+            let append = |n: u64| {
+                log.append(
+                    RecordInput::raw("test", vec![n as u8]),
+                    BranchId(1),
+                    Sequence(n),
+                )
+            };
+            append(1).unwrap();
+
+            // The interval's fsync fails, and the append still returns its
+            // record.
+            *log.fsync_failures.lock() = 1;
+            let (record, offset) = append(2).unwrap();
+            assert_eq!(log.read_at(offset).unwrap().id, record.id);
+            assert_eq!(*log.writes_since_sync.read(), 2, "the next append retries");
+
+            // The retry succeeds, and every sync() still reports the failure.
+            append(3).unwrap();
+            assert_eq!(*log.writes_since_sync.read(), 0);
+            for _ in 0..2 {
+                let error = log.sync().unwrap_err();
+                assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+                let text = error.to_string();
+                assert!(
+                    text.starts_with("Durability lost: fsync of the record log failed ("),
+                    "{text}"
+                );
+                assert!(text.contains("injected fsync failure"), "{text}");
+                assert!(text.contains("until it is reopened"), "{text}");
+            }
+        }
+
+        // Opened again, the log syncs and holds every record.
+        let log = RecordLog::open(&path).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.iter().count(), 3);
+    }
+
+    #[test]
+    fn a_failed_sync_is_reported_by_every_later_one() {
+        let dir = TempDir::new().unwrap();
+        let log = RecordLog::open(dir.path().join("log.bin")).unwrap();
+        log.append(RecordInput::raw("test", vec![1]), BranchId(1), Sequence(1))
+            .unwrap();
+        *log.fsync_failures.lock() = 1;
+        assert!(matches!(log.sync(), Err(StoreError::DurabilityLost(_))));
+        // This call's own fsync succeeds, and the earlier failure stands.
+        assert!(matches!(log.sync(), Err(StoreError::DurabilityLost(_))));
+    }
+
+    // What a failed write-back can leave once the page cache no longer holds
+    // the pages: a page of the log that never reached the disk, with records
+    // after it that did. Open refuses the log rather than drop those records.
+    #[test]
+    fn a_lost_page_with_records_after_it_fails_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        {
+            let log = RecordLog::open(&path).unwrap();
+            for i in 1..=200u64 {
+                let input = RecordInput::raw("test", format!("record {i}").into_bytes());
+                log.append(input, BranchId(1), Sequence(i)).unwrap();
+            }
+        }
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > 3 * 4096, "{len}");
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&[0u8; 4096]).unwrap();
+        drop(file);
+
+        let err = match RecordLog::open(&path) {
+            Ok(_) => panic!("expected open to fail on a lost page with records after it"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreError::Corruption(_)), "{err:?}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
     }
 
     #[test]

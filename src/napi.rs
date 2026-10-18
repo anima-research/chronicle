@@ -141,16 +141,38 @@ pub struct JsStoreStats {
     pub blob_size_bytes: i64,
 }
 
-/// Torn-tail recovery report surfaced to JavaScript. Present only when the
-/// most recent `open` truncated a torn/partial tail record.
+/// What the most recent `open` had to recover, surfaced to JavaScript:
+/// a torn/partial tail record it truncated, updates it replayed for a state
+/// with no registration, or records typed `state_update` it skipped.
 #[napi(object)]
 pub struct JsRecoveryReport {
-    /// Byte offset the log was truncated back to (end of the last valid record).
+    /// Byte offset the log was truncated back to (end of the last valid
+    /// record), or the log's length when nothing was torn.
     pub truncated_at: i64,
-    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced records).
+    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced
+    /// records). 0 when nothing was torn.
     pub dropped_bytes: i64,
     /// Number of valid records that survived recovery.
     pub valid_records: i64,
+    /// Each state whose updates were replayed although the store holds no
+    /// registration for it: one written without a registration, or whose
+    /// registration an earlier release lost in a crash.
+    pub unregistered_states: Vec<JsUnregisteredState>,
+    /// Records typed `state_update` that don't decode as state updates, which
+    /// open skipped. They stay in the log as ordinary records.
+    pub undecodable_state_updates: i64,
+    /// Records typed `state_update` on a branch that the store's branch
+    /// checkpoint doesn't hold, which open didn't replay, since nothing can
+    /// read that branch: an earlier release saved a branch only at sync.
+    pub updates_on_missing_branches: i64,
+}
+
+/// A state whose updates `open` replayed without a registration.
+#[napi(object)]
+pub struct JsUnregisteredState {
+    pub id: String,
+    /// How many of its updates were replayed.
+    pub updates: i64,
 }
 
 /// Options for `getRecordIdsByType`: exclusive record-ID bounds, a limit,
@@ -496,7 +518,9 @@ impl JsStore {
     /// On the root handle this closes the store itself: it is synced, every
     /// view made from this handle stops working ("Store has been closed"),
     /// and the lock file is released before `close()` returns — live views
-    /// do not keep the store or its lock alive.
+    /// do not keep the store or its lock alive. If the record log's fsync
+    /// has failed, this throws that error after closing the store, so it
+    /// can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed". The store stays open,
@@ -585,11 +609,17 @@ impl JsStore {
         self.pinned.as_ref().map(|p| p.name.clone())
     }
 
-    /// Torn-tail recovery the log performed on open, if any.
+    /// What the most recent open had to recover, if anything.
     ///
-    /// Returns a report when `open` silently truncated a torn/partial tail
-    /// record (crash during append), or `null` when the log opened cleanly.
-    /// Lets JS callers detect lost un-fsynced writes without scraping logs.
+    /// Returns a report when `open` truncated a torn/partial tail record
+    /// (crash during append), replayed updates for a state with no
+    /// registration, skipped records typed `state_update` that don't decode
+    /// as state updates, or passed over updates on a branch the store never
+    /// saved, and `null` when none of these happened. A report doesn't by
+    /// itself mean a tail was torn: `droppedBytes` is 0 when nothing was. Nor
+    /// does a state with no registration mean damage: a state written without
+    /// one is named whenever its updates are replayed. Lets JS callers detect
+    /// lost un-fsynced writes without scraping logs.
     #[napi]
     pub fn recovery(&self) -> Result<Option<JsRecoveryReport>> {
         let store = self.get_store()?;
@@ -597,12 +627,23 @@ impl JsStore {
             truncated_at: r.truncated_at as i64,
             dropped_bytes: r.dropped_bytes as i64,
             valid_records: r.valid_records as i64,
+            unregistered_states: r
+                .unregistered_states
+                .into_iter()
+                .map(|(id, updates)| JsUnregisteredState {
+                    id,
+                    updates: updates as i64,
+                })
+                .collect(),
+            undecodable_state_updates: r.undecodable_state_updates as i64,
+            updates_on_missing_branches: r.updates_on_missing_branches as i64,
         }))
     }
 
     // --- Records ---
 
     /// Append a record to the store.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append(&self, record_type: String, payload: Buffer) -> Result<JsRecord> {
         let (store, branch) = self.target()?;
@@ -612,6 +653,7 @@ impl JsStore {
     }
 
     /// Append a JSON record.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_json(&self, record_type: String, data: serde_json::Value) -> Result<JsRecord> {
         let (store, branch) = self.target()?;
@@ -638,7 +680,9 @@ impl JsStore {
     /// `JSON.parse(record.payload)` — after the 2026-08 encoding migration
     /// the raw payload is no longer guaranteed to be JSON. The operation's
     /// value bytes are surfaced as JSON integer arrays (the legacy shape),
-    /// so existing shape-expectations keep holding.
+    /// so existing shape-expectations keep holding. Returns `null` when no
+    /// record has this id or its type isn't `state_update`, and throws for a
+    /// record typed `state_update` that doesn't decode as a state update.
     #[napi]
     pub fn get_state_update_json(&self, id: String) -> Result<Option<String>> {
         let store = self.get_store()?;
@@ -746,7 +790,12 @@ impl JsStore {
         }
     }
 
-    /// Create a new branch.
+    /// Create a new branch, and checkpoint it before returning.
+    /// If the checkpoint fails, this throws but the branch stays in memory;
+    /// the next successful checkpoint publishes it and tells subscribers:
+    /// `sync()`, or the retry that every later mutation makes first. Calling
+    /// this again retries that checkpoint first and, once it succeeds, throws,
+    /// since the branch exists.
     ///
     /// With `from` omitted the parent is the current branch — on a view, the
     /// branch the view is pinned to.
@@ -821,6 +870,7 @@ impl JsStore {
 
     /// Create a new branch at a specific sequence point.
     /// This enables time-travel branching - the new branch will have state as of that sequence.
+    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
     pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -838,6 +888,7 @@ impl JsStore {
     }
 
     /// Create a new branch without copying state from parent.
+    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -855,7 +906,12 @@ impl JsStore {
         })
     }
 
-    /// Switch to a branch.
+    /// Switch to a branch, and checkpoint the switch before returning.
+    /// If the checkpoint fails, this throws but the switch stays in effect;
+    /// the next successful checkpoint publishes it: `sync()`, or the retry
+    /// that every later mutation makes first, so later writes go to the new
+    /// branch.
+    ///
     ///
     /// Root handle only. A view is pinned to its branch for life and throws:
     /// moving the store-wide current branch from a view would silently
@@ -916,7 +972,13 @@ impl JsStore {
             .collect())
     }
 
-    /// Delete a branch.
+    /// Delete a branch, and checkpoint the deletion before returning.
+    /// If the checkpoint fails, this throws but the branch stays deleted in
+    /// memory; the next successful checkpoint publishes the deletion and
+    /// tells subscribers: `sync()`, or the retry that every later mutation
+    /// makes first. Calling this again retries that checkpoint first and,
+    /// once it succeeds, throws, since the branch is gone.
+    ///
     ///
     /// The main branch and the current branch cannot be deleted; nor can a
     /// view delete the branch it is itself pinned to. A branch that OTHER
@@ -938,7 +1000,12 @@ impl JsStore {
 
     // --- State Management ---
 
-    /// Register a new state.
+    /// Register a new state, and checkpoint it before returning. If the
+    /// checkpoint fails, this throws but the registration stays in memory;
+    /// the next successful checkpoint publishes it: `sync()`, or the retry
+    /// that every later mutation makes first. Calling this again retries that
+    /// checkpoint first and, once it succeeds, throws, since the state is
+    /// registered.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -960,6 +1027,10 @@ impl JsStore {
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
+    /// Checkpoints before returning. If the checkpoint fails, this throws but
+    /// the new strategy stays in memory; the next successful checkpoint
+    /// publishes it: `sync()`, or the retry that every later mutation makes
+    /// first.
     #[napi]
     pub fn update_state_strategy(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -1258,6 +1329,7 @@ impl JsStore {
     // --- New UI/Explorer Methods ---
 
     /// Append a record with caused_by/linked_to links.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_with_links(
         &self,
@@ -1287,6 +1359,7 @@ impl JsStore {
     }
 
     /// Append a JSON record with caused_by/linked_to links.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_json_with_links(
         &self,
@@ -1466,7 +1539,30 @@ impl JsStore {
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
 
-    /// Sync all pending writes to disk.
+    /// Flush pending record/state contents and publish metadata checkpoints.
+    /// A failure to save field indexes is only logged, since they are derived.
+    /// Once an fsync of the record log has failed, this call's own or a
+    /// periodic one, this throws that failure every time until the store is
+    /// reopened, and publishes nothing: records written before it may not
+    /// have reached the disk, and a later fsync can't show that they did.
+    /// Its message begins `Durability lost:`. Registering a state, changing
+    /// a strategy, and creating, deleting or switching a branch throw it too,
+    /// and so does any write while one of them waits for its checkpoint.
+    /// Reopening the store is the only way to resume durable writes.
+    /// Reopening can't tell whether records the operating system still caches
+    /// reached the disk: if they didn't while later records did, an open
+    /// after the cache drops them refuses the store as mid-log corruption.
+    /// Reopen replays complete state updates past the last checkpoint; other
+    /// records are only indexed again.
+    /// On Unix a save also syncs the containing directory, where the system
+    /// can. On Windows it doesn't wait for the rename to reach the disk, so
+    /// after an OS crash or power loss the store may open from an earlier
+    /// checkpoint.
+    /// State registration, strategy changes and branch changes checkpoint
+    /// before returning. After one of those checkpoints fails, further
+    /// mutations retry it before proceeding, and the change stays applied in
+    /// memory. A failed sync with no such change pending holds back no later
+    /// append or state update.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
@@ -1794,6 +1890,11 @@ impl JsStore {
     /// own. Registering on a branch whose slot is unchanged since it forked
     /// copies the parent's index instead of rebuilding it; either way each
     /// branch's index costs memory proportional to the slot's length.
+    ///
+    /// Unlike `registerState`, this doesn't checkpoint before returning: an
+    /// index is derived from its state, so a crash before the next `sync()`
+    /// loses only the index. Queries then return `null`, the cue to call
+    /// this again.
     #[napi]
     pub fn register_state_field_index(
         &self,
