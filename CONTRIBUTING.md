@@ -66,6 +66,15 @@ habit, and plain descriptive titles are perfectly normal here.
 - The reviewer will typically **run your branch** (`cargo test`, the napi
   build, the node smoke test, sometimes opening a real store with the
   inspector tools) and paste transcripts. Claims are checked, not trusted.
+- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
+  A scheduled workflow adds that label to each open, non-draft PR whose
+  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
+  and the review starts when the label lands: within about half an hour of
+  the PR opening, passing 400 lines or being marked ready, and later when
+  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
+  maintainer adds the label. `no-greptile` skips the review. Removing
+  `greptile` from a PR past 400 lines doesn't skip it, since the next run
+  adds the label back.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -148,14 +157,28 @@ never do.
   checkouts, so release notes must exist even when npm publish fails.
   Version bumps are a maintainer release-time action, not part of feature
   PRs.
+- **Release holds.** When releasing `main` as it stands would harm
+  someone running it, open an issue that says what has to happen first
+  and label it `release-hold`, or ask a maintainer to label it. Close it
+  once that's happened, or if it no longer applies. While one is open,
+  `npm version` stops before it bumps anything, `npm publish` refuses,
+  and the publish workflow refuses both its npm publish and its GitHub
+  release notes. The check also stops a release when it can't read the
+  holds from GitHub, and says why. Closing the hold is the way past it:
+  npm's `--ignore-scripts` would skip the check, but on `npm version` it
+  skips the changelog fold too, and the tag then fails the publish
+  workflow's changelog check.
 
 ## Building and testing
+
+You need Node 22.12 or later, the floor `package.json`'s `engines` declares,
+and a Rust toolchain.
 
 ```bash
 npm ci                                          # strict lockfile install
 cargo test                                      # Rust suite
 npx napi build --platform --features napi-bindings   # native module (debug)
-npm test                                        # node smoke test (test.mjs)
+npm test                                        # node smoke test (test.mjs), release scripts' tests
 npm run build                                   # release build of the above
 ```
 
@@ -173,8 +196,8 @@ CI installs it with `npm ci`, which unlike `npm install` fails loudly on a
 lock that is broken or out of sync.
 
 Push-time CI (`ci.yml`) runs the Rust suite, the debug napi build and the node
-smoke test on every push and PR (ubuntu only — the cross-target matrix runs at
-release time).
+smoke test on every push and PR, under Node 22.12.0, 24 and the latest Node
+(ubuntu only — the cross-target matrix runs at release time).
 
 Binaries ship inside the single published tarball. The platform packages that
 `napi prepublish` would name were never published, and a manifest declaring

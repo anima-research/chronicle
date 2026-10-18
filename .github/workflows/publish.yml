@@ -38,7 +38,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          # The floor package.json's engines promises, like CI's floor leg.
+          node-version: '22.12.0'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -96,9 +97,11 @@ jobs:
     # exchanges it for a publish credential. No long-lived NPM_TOKEN secret.
     # npm-side config: npmjs.com -> package -> Settings -> Trusted Publishers
     # -> GitHub Actions, matching the repo + this workflow path.
+    # issues: read lets prepublishOnly's release-hold check list the holds.
     permissions:
       contents: read
       id-token: write
+      issues: read
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -152,6 +155,11 @@ jobs:
 
       - name: Publish
         run: npm publish --access public --provenance
+        env:
+          # prepublishOnly checks the release holds first (see CONTRIBUTING.md),
+          # as `npm version` did before the bump: an open issue labelled
+          # release-hold stops the publish.
+          GH_TOKEN: ${{ github.token }}
 
   github-release:
     name: GitHub release notes
@@ -161,13 +169,25 @@ jobs:
     # release notes must exist even when the cross-build or publish fails.
     if: startsWith(github.ref, 'refs/tags/v')
 
+    # issues: read lets the release-hold check list the holds.
     permissions:
       contents: write
+      issues: read
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # Checked here as prepublishOnly checks it in the publish job, since
+      # this job doesn't wait for that one: a held tag gets neither its npm
+      # publish nor its release notes. This job sets up no Node; the script
+      # needs only fetch and AbortSignal.timeout (Node 18 and later), which
+      # the runner's own Node has.
+      - name: Release holds
+        run: node scripts/release-holds.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Mirror changelog section into release notes
         env:

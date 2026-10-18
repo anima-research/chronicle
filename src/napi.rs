@@ -84,6 +84,22 @@ pub struct JsRecoveryReport {
     pub valid_records: i64,
 }
 
+/// Options for `getRecordIdsByType`: exclusive record-ID bounds, a limit,
+/// and the order. IDs are decimal strings, as everywhere in this API.
+#[napi(object)]
+pub struct JsRecordIdsByTypeOptions {
+    /// Only IDs greater than this one.
+    pub after: Option<String>,
+    /// Only IDs less than this one.
+    pub before: Option<String>,
+    /// At most this many: the oldest within the bounds, or the newest with
+    /// `reverse`. A non-negative integer; anything else is rejected rather
+    /// than wrapped the way a `u32` conversion would wrap it.
+    pub limit: Option<f64>,
+    /// Newest first.
+    pub reverse: Option<bool>,
+}
+
 /// Configuration for creating a store.
 #[napi(object)]
 pub struct JsStoreConfig {
@@ -473,15 +489,54 @@ impl JsStore {
         Ok(Some(json))
     }
 
-    /// Get record IDs by type.
+    /// Get record IDs by type, oldest first. With options, only those
+    /// greater than `after` and less than `before` (both exclusive), at most
+    /// `limit` of them, newest first with `reverse`: `{ reverse: true,
+    /// limit: 1 }` gives the type's newest record. These are found by binary
+    /// search, so a page costs what it returns rather than the type's size.
     #[napi]
-    pub fn get_record_ids_by_type(&self, record_type: String) -> Result<Vec<String>> {
+    pub fn get_record_ids_by_type(
+        &self,
+        record_type: String,
+        options: Option<JsRecordIdsByTypeOptions>,
+    ) -> Result<Vec<String>> {
         let store = self.get_store()?;
-        Ok(store
-            .get_records_by_type(&record_type)
-            .into_iter()
-            .map(|id| id.0.to_string())
-            .collect())
+        let ids = match options {
+            None => store.get_records_by_type(&record_type),
+            Some(options) => {
+                let bound = |value: Option<String>, name: &str| -> Result<Option<RecordId>> {
+                    value
+                        .map(|value| {
+                            value.parse::<u64>().map(RecordId).map_err(|_| {
+                                napi::Error::from_reason(format!(
+                                    "Invalid record ID for {name}: {value:?}"
+                                ))
+                            })
+                        })
+                        .transpose()
+                };
+                let limit = options
+                    .limit
+                    .map(|limit| {
+                        if limit.is_finite() && limit >= 0.0 && limit.fract() == 0.0 {
+                            Ok(limit as usize)
+                        } else {
+                            Err(napi::Error::from_reason(format!(
+                                "Invalid limit: {limit} (a non-negative integer)"
+                            )))
+                        }
+                    })
+                    .transpose()?;
+                store.get_records_by_type_range(
+                    &record_type,
+                    bound(options.after, "after")?,
+                    bound(options.before, "before")?,
+                    limit,
+                    options.reverse.unwrap_or(false),
+                )
+            }
+        };
+        Ok(ids.into_iter().map(|id| id.0.to_string()).collect())
     }
 
     // --- Blobs ---
