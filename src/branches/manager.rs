@@ -1,5 +1,6 @@
 //! Branch manager implementation.
 
+use crate::atomic_file::Checkpoint;
 use crate::error::{Result, StoreError};
 use crate::types::{Branch, BranchId, Sequence, Timestamp};
 use parking_lot::RwLock;
@@ -33,8 +34,8 @@ pub struct ReconciliationReport {
     /// adopt them as ghosts.
     pub orphaned_branch_ids: Vec<BranchId>,
 }
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Magic bytes for branch index file.
@@ -94,6 +95,9 @@ pub struct BranchManager {
     /// Path to branch index file.
     path: PathBuf,
 
+    /// Last successfully published checkpoint, never seeded just by loading.
+    checkpoint: Checkpoint,
+
     /// In-memory index.
     index: RwLock<BranchIndex>,
 
@@ -125,6 +129,7 @@ impl BranchManager {
 
         Ok(Self {
             path,
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(index),
             current: RwLock::new(main_id),
         })
@@ -136,6 +141,7 @@ impl BranchManager {
 
         let manager = Self {
             path: path.clone(),
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(BranchIndex::default()),
             current: RwLock::new(BranchId(1)),
         };
@@ -698,31 +704,20 @@ impl BranchManager {
 
     /// Save branch index to file.
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
-
-        // Write magic
-        file.write_all(BRANCH_INDEX_MAGIC)?;
-
-        // Write version
-        file.write_all(&[BRANCH_INDEX_VERSION])?;
-
-        // Write current branch
         let current_id = *self.current.read();
-        file.write_all(&current_id.0.to_le_bytes())?;
-
-        // Serialize index with MessagePack
         let index = self.index.read();
         let encoded = rmp_serde::to_vec(&*index)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+        self.checkpoint.save(
+            &self.path,
+            &[
+                BRANCH_INDEX_MAGIC,
+                &[BRANCH_INDEX_VERSION],
+                &current_id.0.to_le_bytes(),
+                &(encoded.len() as u64).to_le_bytes(),
+                &encoded,
+            ],
+        )?;
         Ok(())
     }
 
