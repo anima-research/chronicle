@@ -240,6 +240,7 @@ mod tests {
         let hash = Hash([0u8; 32]);
         let cases: Vec<(StoreError, &str)> = vec![
             (StoreError::Io(std::io::Error::other("disk")), "Io"),
+            (StoreError::DurabilityLost("x".into()), "DurabilityLost"),
             (StoreError::RecordNotFound(RecordId(7)), "RecordNotFound"),
             (StoreError::BranchNotFound("main".into()), "BranchNotFound"),
             (StoreError::BlobNotFound(hash), "BlobNotFound"),

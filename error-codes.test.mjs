@@ -37,12 +37,12 @@ function throwsCoded(call, code, message) {
 test('ErrorCode lists every code, each named as its value', () => {
   assert.deepEqual(Object.keys(ErrorCode).sort(), [
     'BlobNotFound', 'BranchExists', 'BranchNotFound', 'ChecksumMismatch', 'Corruption',
-    'Deserialization', 'HashMismatch', 'InvalidFieldIndexKind', 'InvalidFormat', 'InvalidHash',
-    'InvalidLimit', 'InvalidOperation', 'InvalidRecordId', 'InvalidSequence', 'InvalidStrategy',
-    'InvalidSubscriptionId', 'InvalidTreeOp', 'Io', 'Locked', 'NotInitialized',
-    'RecordNotFound', 'Serialization', 'StateExists', 'StateNotRegistered', 'StoreClosed',
-    'StrategyMismatch', 'SubscriptionDisconnected', 'SubscriptionDropped', 'SubscriptionNotFound',
-    'Transaction',
+    'Deserialization', 'DurabilityLost', 'HashMismatch', 'InvalidFieldIndexKind',
+    'InvalidFormat', 'InvalidHash', 'InvalidLimit', 'InvalidOperation', 'InvalidRecordId',
+    'InvalidSequence', 'InvalidStrategy', 'InvalidSubscriptionId', 'InvalidTreeOp', 'Io',
+    'Locked', 'NotInitialized', 'RecordNotFound', 'Serialization', 'StateExists',
+    'StateNotRegistered', 'StoreClosed', 'StrategyMismatch', 'SubscriptionDisconnected',
+    'SubscriptionDropped', 'SubscriptionNotFound', 'Transaction',
   ]);
   for (const [key, value] of Object.entries(ErrorCode)) assert.equal(value, key);
 });

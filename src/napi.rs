@@ -1269,9 +1269,10 @@ impl JsStore {
     /// periodic one, this throws that failure every time until the store is
     /// reopened, and publishes nothing: records written before it may not
     /// have reached the disk, and a later fsync can't show that they did.
-    /// Its message begins `Durability lost:`. Registering a state, changing
-    /// a strategy, and creating, deleting or switching a branch throw it too,
-    /// and so does any write while one of them waits for its checkpoint.
+    /// Its message begins `Durability lost:`, and its `code` is
+    /// `DurabilityLost`. Registering a state, changing a strategy, and
+    /// creating, deleting or switching a branch throw it too, and so does any
+    /// write while one of them waits for its checkpoint.
     /// Reopening the store is the only way to resume durable writes.
     /// Reopening can't tell whether records the operating system still caches
     /// reached the disk: if they didn't while later records did, an open
