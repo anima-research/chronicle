@@ -9,6 +9,13 @@ pub enum StoreError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// An fsync of the record log failed, so records written before it may
+    /// not have reached the disk. Every later call that would publish a
+    /// checkpoint returns this until the store is reopened, which is the only
+    /// way to resume durable writes.
+    #[error("Durability lost: {0}")]
+    DurabilityLost(String),
+
     #[error("Record not found: {0}")]
     RecordNotFound(RecordId),
 
@@ -100,6 +107,7 @@ impl From<rmp_serde::decode::Error> for StoreError {
 pub enum ErrorCode {
     // One per `StoreError` variant.
     Io,
+    DurabilityLost,
     RecordNotFound,
     BranchNotFound,
     BlobNotFound,
@@ -147,6 +155,7 @@ impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCode::Io => "Io",
+            ErrorCode::DurabilityLost => "DurabilityLost",
             ErrorCode::RecordNotFound => "RecordNotFound",
             ErrorCode::BranchNotFound => "BranchNotFound",
             ErrorCode::BlobNotFound => "BlobNotFound",
@@ -191,6 +200,7 @@ impl StoreError {
     pub fn code(&self) -> ErrorCode {
         match self {
             StoreError::Io(_) => ErrorCode::Io,
+            StoreError::DurabilityLost(_) => ErrorCode::DurabilityLost,
             StoreError::RecordNotFound(_) => ErrorCode::RecordNotFound,
             StoreError::BranchNotFound(_) => ErrorCode::BranchNotFound,
             StoreError::BlobNotFound(_) => ErrorCode::BlobNotFound,

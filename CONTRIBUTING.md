@@ -66,6 +66,15 @@ habit, and plain descriptive titles are perfectly normal here.
 - The reviewer will typically **run your branch** (`cargo test`, the napi
   build, the node smoke test, sometimes opening a real store with the
   inspector tools) and paste transcripts. Claims are checked, not trusted.
+- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
+  A scheduled workflow adds that label to each open, non-draft PR whose
+  additions plus deletions pass 400 lines, unless it carries `no-greptile`,
+  and the review starts when the label lands: within about half an hour of
+  the PR opening, passing 400 lines or being marked ready, and later when
+  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
+  maintainer adds the label. `no-greptile` skips the review. Removing
+  `greptile` from a PR past 400 lines doesn't skip it, since the next run
+  adds the label back.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -162,6 +171,9 @@ never do.
 
 ## Building and testing
 
+You need Node 22.12 or later, the floor `package.json`'s `engines` declares,
+and a Rust toolchain.
+
 ```bash
 npm ci                                          # strict lockfile install
 cargo test                                      # Rust suite
@@ -184,8 +196,8 @@ CI installs it with `npm ci`, which unlike `npm install` fails loudly on a
 lock that is broken or out of sync.
 
 Push-time CI (`ci.yml`) runs the Rust suite, the debug napi build and the node
-smoke test on every push and PR (ubuntu only — the cross-target matrix runs at
-release time).
+smoke test on every push and PR, under Node 22.12.0, 24 and the latest Node
+(ubuntu only — the cross-target matrix runs at release time).
 
 Binaries ship inside the single published tarball. The platform packages that
 `napi prepublish` would name were never published, and a manifest declaring

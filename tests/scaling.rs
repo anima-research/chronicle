@@ -77,8 +77,9 @@ fn test_scaling_50k_single_branch() {
     let store = Store::create(test_config(&dir)).unwrap();
     timer.report();
 
-    // Mix of record types
-    let record_types = ["message", "tool_call", "tool_result", "state_update", "system"];
+    // Mix of generic record types. Internal state_update records must use
+    // the state APIs; custom_event has the same byte length for this workload.
+    let record_types = ["message", "tool_call", "tool_result", "custom_event", "system"];
 
     let timer = Timer::new("Append 50k records");
     for i in 0..RECORD_COUNT {

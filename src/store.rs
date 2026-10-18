@@ -62,6 +62,26 @@ const STORE_MAGIC: &[u8; 4] = b"RST\0";
 /// Current store format version.
 const STORE_VERSION: u8 = 1;
 
+/// Admission state protected by the store's write mutex.
+#[derive(Default)]
+struct WriteState {
+    /// Metadata-only mutations cannot be replayed from records.log. If their
+    /// checkpoint failed, finish it before allowing another mutation to use
+    /// the in-memory definition. Reads may still inspect that tentative state.
+    checkpoint_required: bool,
+
+    /// A branch creation or deletion that no checkpoint has persisted yet.
+    /// Subscribers hear of it once one does, as its caller does. At most one
+    /// is ever pending, since a mutation first finishes a failed checkpoint.
+    pending_branch_event: Option<BranchEvent>,
+}
+
+/// A branch change to announce once a checkpoint persists it.
+enum BranchEvent {
+    Created { branch: Branch, parent: Option<String> },
+    Deleted { name: String },
+}
+
 /// The main record store.
 ///
 /// Provides a unified interface for:
@@ -95,12 +115,15 @@ pub struct Store {
     subscriptions: SubscriptionManager,
 
     /// Lock for write operations to ensure atomicity.
-    write_lock: Mutex<()>,
+    write_lock: Mutex<WriteState>,
 
     /// When false, `update_state` skips the auto-snapshot pass. Bulk loaders
     /// (e.g. importers) turn this off to avoid the O(N²) snapshot series and
     /// take a single compacting snapshot at the end via `compact_state`.
     auto_snapshot_enabled: AtomicBool,
+
+    /// What `open` had to recover, for [`Store::recovery`].
+    recovery: Option<RecoveryReport>,
 }
 
 impl Store {
@@ -148,8 +171,9 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
-            write_lock: Mutex::new(()),
+            write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
+            recovery: None,
         })
     }
 
@@ -160,6 +184,11 @@ impl Store {
 
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
+
+        // With the lock held, no save of this store is in progress, so its
+        // own staging files here were left by interrupted saves. The sweep's
+        // doc says what else it can reach.
+        crate::atomic_file::remove_staging_files(&config.path);
 
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
@@ -190,6 +219,14 @@ impl Store {
             );
         }
 
+        // A crash between the state and branch checkpoint publications can
+        // leave copied heads for an unpublished branch with no log records.
+        // Reserve those identities too, so a new empty branch cannot inherit
+        // the abandoned branch's state through an accidentally reused ID.
+        if let Some(id) = state.max_branch_id() {
+            branches.reserve_id_after(id)?;
+        }
+
         // Fail loudly if state metadata points past the (possibly truncated)
         // valid log — its offsets would otherwise dereference to garbage.
         state.validate_offsets(log.size())?;
@@ -204,11 +241,115 @@ impl Store {
             );
         }
 
-        // Rebuild index from log (O(N) startup, but O(1) sync)
-        let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
-
-        // Connect state manager to log for disk-based traversal
+        // Connect the state manager for disk-based chain traversal.
         state.set_log(Arc::clone(&log));
+
+        // Recover the state-update tail while rebuilding the record index.
+        // The checkpoint covers all updates through its latest head, including
+        // updates on other branches. Keep this boundary fixed during replay.
+        let checkpoint = state.checkpoint_offset();
+        let mut records = 0u64;
+        // Updates replayed per state that has no registration in state.bin.
+        let mut unregistered = std::collections::BTreeMap::<String, u64>::new();
+        let mut undecodable = 0u64;
+        let mut first_undecodable = None;
+        let mut on_missing_branches = 0u64;
+        let index = RecordIndex::rebuild_from_log_with(
+            config.path.join("records.idx"),
+            &log,
+            |offset, record| {
+                records += 1;
+                if record.record_type != "state_update"
+                    || checkpoint.is_some_and(|saved| offset <= saved)
+                {
+                    return Ok(());
+                }
+                // Earlier releases let any append use this type, so a record
+                // may not be a state update at all, whatever branch it names.
+                // It stays in the log as an ordinary record.
+                let Ok(update) = StateUpdateRecord::decode(record) else {
+                    undecodable += 1;
+                    first_undecodable.get_or_insert(offset);
+                    return Ok(());
+                };
+
+                // Earlier releases saved a branch only at sync, so a crash can
+                // leave updates on a branch that branches.bin doesn't hold.
+                // Nothing can read that branch, so they aren't replayed;
+                // recovery() counts them.
+                if branches.get_branch_by_id(record.branch).is_none() {
+                    on_missing_branches += 1;
+                    return Ok(());
+                }
+                // A state can have updates and no registration: a consumer
+                // may update a state it never registered, and an earlier
+                // release that crashed after registering a state and before
+                // its next sync left the registration out of state.bin.
+                // Replay doesn't need the strategy, so the chain is kept and
+                // checkpointed like any other, and register_state supplies a
+                // strategy whenever it's called.
+                if state.get_strategy(&update.state_id).is_none() {
+                    *unregistered.entry(update.state_id.clone()).or_default() += 1;
+                }
+                let previous = state.get_head(record.branch, &update.state_id)
+                    .map(|head| head.head_offset);
+                if update.prev_update_offset != previous {
+                    return Err(StoreError::Corruption(format!(
+                        "cannot replay state '{}' at log offset {}: previous offset {:?} \
+                         does not match checkpoint/replayed head {:?}",
+                        update.state_id, offset, update.prev_update_offset, previous
+                    )));
+                }
+                state.record_update(record.branch, &update.state_id, offset, &update.operation)
+            },
+        )?;
+
+        for (state_id, updates) in &unregistered {
+            tracing::warn!(
+                state = %state_id,
+                updates,
+                "replayed updates for a state with no registration in state.bin: one written \
+                 without a registration, or whose registration an earlier release lost"
+            );
+        }
+        if let Some(first_offset) = first_undecodable {
+            tracing::warn!(
+                records = undecodable,
+                first_offset,
+                "skipped records typed state_update that don't decode as state updates; \
+                 they stay in the log as ordinary records"
+            );
+        }
+        if on_missing_branches > 0 {
+            tracing::warn!(
+                updates = on_missing_branches,
+                "did not replay state updates on branches that branches.bin doesn't hold; \
+                 nothing can read those branches"
+            );
+        }
+        let unregistered_states: Vec<_> = unregistered.into_iter().collect();
+        let recovery = match log.recovery() {
+            Some(torn) => Some(RecoveryReport {
+                unregistered_states,
+                undecodable_state_updates: undecodable,
+                updates_on_missing_branches: on_missing_branches,
+                ..torn.clone()
+            }),
+            None if !unregistered_states.is_empty()
+                || undecodable > 0
+                || on_missing_branches > 0 =>
+            {
+                Some(RecoveryReport {
+                    truncated_at: log.size(),
+                    dropped_bytes: 0,
+                    valid_records: records,
+                    unregistered_states,
+                    undecodable_state_updates: undecodable,
+                    updates_on_missing_branches: on_missing_branches,
+                })
+            }
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -219,20 +360,27 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
-            write_lock: Mutex::new(()),
+            write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
+            recovery,
         })
     }
 
-    /// Torn-tail recovery the log performed on the most recent open, if any.
+    /// What the most recent open had to recover, if anything: a torn tail
+    /// record it truncated (crash during append), updates it replayed for a
+    /// state whose registration isn't in `state.bin`, records typed
+    /// `state_update` it skipped because they don't decode as state updates,
+    /// and updates it didn't replay because their branch isn't in
+    /// `branches.bin`.
     ///
-    /// Returns `Some(report)` when `open` truncated a torn/partial tail record
-    /// (crash during append), describing how many bytes and records were
-    /// dropped, or `None` when the log opened cleanly. Callers that need to know
-    /// their store silently lost un-fsynced writes on open can consult this
-    /// instead of scraping the `tracing` warning out of logs.
+    /// `None` when none of these happened. A report doesn't by itself mean a
+    /// tail was torn: `dropped_bytes` is 0 when nothing was. Nor does a state
+    /// with no registration mean damage: a state written without one is named
+    /// whenever its updates are replayed. Callers that need to know their
+    /// store lost un-fsynced writes can consult this instead of scraping the
+    /// `tracing` warnings out of logs.
     pub fn recovery(&self) -> Option<RecoveryReport> {
-        self.log.recovery().cloned()
+        self.recovery.clone()
     }
 
     /// Toggle the auto-snapshot pass inside `update_state`.
@@ -262,8 +410,15 @@ impl Store {
     // --- Record Operations ---
 
     /// Append a record to the current branch.
+    /// The internal `state_update` type is reserved for `update_state`.
     pub fn append(&self, input: RecordInput) -> Result<Record> {
-        let _lock = self.write_lock.lock();
+        if input.record_type == "state_update" {
+            return Err(StoreError::InvalidOperation(
+                "record type 'state_update' is reserved; use update_state instead".into(),
+            ));
+        }
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
 
         let branch = self.branches.current_branch();
         let next_seq = branch.head.next();
@@ -409,21 +564,39 @@ impl Store {
 
     // --- State Operations ---
 
-    /// Register a new state.
+    /// Register a new state and persist its strategy before returning.
+    /// The log cannot reconstruct a lost registration after a crash.
+    /// If the checkpoint fails, the error is returned but the registration
+    /// stays in memory, and the next successful checkpoint publishes it:
+    /// `sync()`, or the retry that every later mutation makes first. Calling
+    /// this again retries that checkpoint first and, once it succeeds, returns
+    /// `StateExists`, since the registration was kept.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
-        self.state.register_state(registration)
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
+        self.state.register_state(registration)?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)
     }
 
     /// Update the strategy parameters of an already-registered state (same
     /// kind only — see `StateManager::update_state_strategy`). Lets boot-time
     /// re-registration retune snapshot cadence on existing stores instead of
     /// being permanently pinned to the values from first registration.
+    /// Checkpoints before returning. If the checkpoint fails, the error is
+    /// returned but the new strategy stays in memory, and the next successful
+    /// checkpoint publishes it: `sync()`, or the retry that every later
+    /// mutation makes first.
     pub fn update_state_strategy(
         &self,
         state_id: &str,
         strategy: crate::types::StateStrategy,
     ) -> Result<()> {
-        self.state.update_state_strategy(state_id, strategy)
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
+        self.state.update_state_strategy(state_id, strategy)?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)
     }
 
     /// Update a state and record it.
@@ -507,7 +680,8 @@ impl Store {
     where
         F: FnOnce(RecordId, Sequence) -> Result<StateOperation>,
     {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
 
         let branch = self.branches.current_branch();
         let prev_update_offset = self.state.get_head(branch.id, state_id).map(|h| h.head_offset);
@@ -609,7 +783,7 @@ impl Store {
         // Done after indices/branch update so the snapshot sees consistent state
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
-            drop(_lock);
+            drop(write);
             self.auto_snapshot_if_needed(state_id)?;
         }
 
@@ -1367,13 +1541,19 @@ impl Store {
     /// either double-counting that item (materialized once, then indexed
     /// again by the concurrent `on_append`) or vanishing from the index
     /// entirely, depending on interleaving.
+    ///
+    /// Unlike state registration, this doesn't checkpoint before returning:
+    /// an index is derived from its state, so a crash before the next
+    /// checkpoint loses only the index. A query then returns `None`, which is
+    /// the cue to register it again.
     pub fn register_state_field_index(
         &self,
         state_id: &str,
         field_path: &str,
         kind: crate::state::FieldIndexKind,
     ) -> Result<()> {
-        let _lock = self.write_lock.lock();
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let branch_id = self.branches.current_branch().id;
         self.state
             .register_field_index(branch_id, state_id, field_path, kind)
@@ -1623,8 +1803,15 @@ impl Store {
 
     // --- Branch Operations ---
 
-    /// Create a new branch from the current branch head.
+    /// Create a new branch from the current branch head and checkpoint it.
+    /// If the checkpoint fails, the error is returned but the branch stays in
+    /// memory, and the next successful checkpoint publishes it and tells
+    /// subscribers: `sync()`, or the retry that every later mutation makes
+    /// first. Calling this again retries that checkpoint first and, once it
+    /// succeeds, returns `BranchExists`.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let parent = if let Some(from_name) = from {
             self.branches.get_branch(from_name).ok_or_else(|| {
                 StoreError::BranchNotFound(from_name.to_string())
@@ -1639,28 +1826,43 @@ impl Store {
         // Copy state chain heads from parent to child
         self.state.copy_heads_for_branch(parent.id, new_branch.id);
 
-        // Broadcast branch created
-        self.subscriptions.broadcast_branch_created(&new_branch, Some(parent_name));
+        // Persist copied state heads before publishing the branch identity.
+        write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Created {
+            branch: new_branch.clone(),
+            parent: Some(parent_name),
+        });
+        self.sync_locked(&mut write)?;
 
         Ok(new_branch)
     }
 
-    /// Create a branch without copying state from parent.
+    /// Create and checkpoint a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
+    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
-        let parent_name = from.map(|n| n.to_string()).or_else(|| {
-            Some(self.branches.current_branch().name.clone())
-        });
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let new_branch = self.branches.create_branch(name, from)?;
+        // The branch manager creates it under `from`, or under main when that
+        // is None, so announce the parent it recorded.
+        let parent_name = new_branch
+            .parent
+            .and_then(|id| self.branches.get_branch_by_id(id))
+            .map(|parent| parent.name);
 
-        // Broadcast branch created
-        self.subscriptions.broadcast_branch_created(&new_branch, parent_name);
+        write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Created {
+            branch: new_branch.clone(),
+            parent: parent_name,
+        });
+        self.sync_locked(&mut write)?;
 
         // Don't copy state - let the caller populate state manually
         Ok(new_branch)
     }
 
-    /// Create a branch at a specific sequence (time-travel branching).
+    /// Create and checkpoint a branch at a specific sequence (time-travel branching).
     ///
     /// This creates a new branch that starts with the state as it existed at the
     /// given sequence on the parent branch. The new branch's state heads point to
@@ -1671,34 +1873,61 @@ impl Store {
     /// * `name` - Name for the new branch
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
+    ///
+    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         let parent = self
             .branches
             .get_branch(from)
             .ok_or_else(|| StoreError::BranchNotFound(from.to_string()))?;
 
-        let new_branch = self.branches.create_branch_at(name, from, at)?;
-
-        // Point the new branch's state heads at the parent's chain at the branch point.
-        // No new records are written - the branch shares the existing chain up to this point.
+        // Prepare all fallible chain reads before allocating a branch. A
+        // corrupt historical chain must not leave a partly constructed branch
+        // for a subsequent mutation (or Drop) to checkpoint.
+        if self.branches.get_branch(name).is_some() {
+            return Err(StoreError::BranchExists(name.to_string()));
+        }
+        if at > parent.head {
+            return Err(StoreError::InvalidSequence(at, parent.head));
+        }
+        let mut heads = Vec::new();
         for state_id in self.state.state_ids() {
             if let Some((head_offset, item_count)) =
                 self.find_chain_info_at(parent.id, &state_id, at)?
             {
-                self.state
-                    .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+                heads.push((state_id, head_offset, item_count));
             }
         }
+        let new_branch = self.branches.create_branch_at(name, from, at)?;
+        for (state_id, head_offset, item_count) in heads {
+            self.state
+                .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+        }
 
-        self.subscriptions
-            .broadcast_branch_created(&new_branch, Some(from.to_string()));
+        write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Created {
+            branch: new_branch.clone(),
+            parent: Some(from.to_string()),
+        });
+        self.sync_locked(&mut write)?;
 
         Ok(new_branch)
     }
 
-    /// Switch to a different branch.
+    /// Switch to a different branch and checkpoint the current-branch pointer.
+    /// If the checkpoint fails, the error is returned but the switch stays in
+    /// effect, and the next successful checkpoint publishes it: `sync()`, or
+    /// the retry that every later mutation makes first, so later writes go
+    /// to the new branch.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
-        self.branches.switch_branch(name)
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
+        let branch = self.branches.switch_branch(name)?;
+        write.checkpoint_required = true;
+        self.sync_locked(&mut write)?;
+        Ok(branch)
     }
 
     /// Get the current branch.
@@ -1711,12 +1940,21 @@ impl Store {
         self.branches.list_branches()
     }
 
-    /// Delete a branch.
+    /// Delete a branch and checkpoint the deletion.
+    /// If the checkpoint fails, the error is returned but the branch stays
+    /// deleted in memory, and the next successful checkpoint publishes the
+    /// deletion and tells subscribers: `sync()`, or the retry that every
+    /// later mutation makes first. Calling this again retries that checkpoint
+    /// first and, once it succeeds, returns `BranchNotFound`.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
+        let mut write = self.write_lock.lock();
+        self.retry_metadata_checkpoint(&mut write)?;
         self.branches.delete_branch(name)?;
-
-        // Broadcast branch deleted
-        self.subscriptions.broadcast_branch_deleted(name);
+        write.checkpoint_required = true;
+        write.pending_branch_event = Some(BranchEvent::Deleted {
+            name: name.to_string(),
+        });
+        self.sync_locked(&mut write)?;
 
         Ok(())
     }
@@ -1738,14 +1976,78 @@ impl Store {
 
     /// Sync all data to disk.
     ///
-    /// This is O(1) - only syncs the log file and small metadata files.
-    /// The record index is not persisted; it's rebuilt from the log on startup.
+    /// Flushes the record log and publishes the metadata checkpoints
+    /// (`state.bin`, `state-indexes.bin` and `branches.bin`). A failure to
+    /// save `state-indexes.bin` is only logged: field indexes are derived, and
+    /// `register_state_field_index` rebuilds a missing or stale one.
+    ///
+    /// Once an fsync of the record log has failed, this call's own or a
+    /// periodic one, this returns the failure every time until the store is
+    /// reopened, as [`StoreError::DurabilityLost`], and publishes nothing.
+    /// Linux reports a write-back error to one fsync, and a later one can
+    /// succeed although the records written before the failure never reached
+    /// the disk, so a checkpoint published after it could name records the
+    /// disk doesn't hold. Registration, strategy changes, and branch
+    /// creation, deletion and switching fail the same way, and so does any
+    /// write while one of them waits for its checkpoint. Reopening the store
+    /// is the only way to resume durable writes. It replays the log from the
+    /// last checkpoint, and can't tell whether records the operating system
+    /// still caches reached the disk: if they didn't while later records did,
+    /// an open after the cache drops them refuses the store as mid-log
+    /// corruption.
+    ///
+    /// On open, complete state updates in the log past the last checkpoint
+    /// are replayed, except those on a branch that `branches.bin` doesn't
+    /// hold, which [`Store::recovery`] counts. Other records are only indexed
+    /// again, as on every open.
+    ///
+    /// State registration, strategy changes, and branch creation, deletion
+    /// and switching checkpoint before returning, because the record log
+    /// cannot reconstruct them. If that checkpoint fails, the change stays in
+    /// memory, and every later mutation retries the checkpoint before
+    /// proceeding, so a successful write cannot depend on an unpersisted
+    /// registration or branch. This method retries it too; metadata is not
+    /// rolled back. A failed sync with no such change pending holds back no
+    /// later append or state update.
+    ///
+    /// On Unix a save also syncs the containing directory, where the system
+    /// can. Where this process can't open that directory to sync it, the
+    /// checkpoint's newest save may not survive a power loss, and the store
+    /// logs a warning the first time. On Windows it doesn't wait for the
+    /// rename to reach the disk, so after an OS crash or power loss the store
+    /// may open from an earlier checkpoint. The record index is rebuilt on
+    /// startup; checkpoint cost depends on state heads, branch metadata, and
+    /// any registered field indexes.
     pub fn sync(&self) -> Result<()> {
+        let mut write = self.write_lock.lock();
+        self.sync_locked(&mut write)
+    }
+
+    /// Finish a failed metadata checkpoint before admitting another mutation.
+    fn retry_metadata_checkpoint(&self, write: &mut WriteState) -> Result<()> {
+        if write.checkpoint_required {
+            self.sync_locked(write)?;
+        }
+        Ok(())
+    }
+
+    /// Call only while holding write_lock, so a state head cannot reach disk
+    /// ahead of its log record and branch/state checkpoints cannot interleave.
+    /// A branch change waiting on a checkpoint is announced once one succeeds.
+    fn sync_locked(&self, write: &mut WriteState) -> Result<()> {
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
         self.branches.save()?;
+        write.checkpoint_required = false;
+        match write.pending_branch_event.take() {
+            Some(BranchEvent::Created { branch, parent }) => {
+                self.subscriptions.broadcast_branch_created(&branch, parent)
+            }
+            Some(BranchEvent::Deleted { name }) => self.subscriptions.broadcast_branch_deleted(&name),
+            None => {}
+        }
         Ok(())
     }
 
@@ -2000,8 +2302,16 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // Best-effort sync on drop
-        let _ = self.sync();
+        // Best-effort sync on drop. Nothing else would report its failure.
+        if let Err(error) = self.sync() {
+            tracing::warn!(
+                %error,
+                path = %self.config.path.display(),
+                "final sync on drop failed: the next open replays state updates from the log \
+                 past the last checkpoint, and may lose any registration or branch change \
+                 whose checkpoint failed"
+            );
+        }
     }
 }
 
@@ -2145,6 +2455,26 @@ mod tests {
         }
     }
 
+    /// Opens a store this process closed a moment ago. A child that a
+    /// concurrent test spawns shares this process's open files until it
+    /// execs, the store's LOCK among them, so the lock can still be held
+    /// for that moment.
+    fn reopen(config: StoreConfig) -> Store {
+        try_reopen(config).unwrap()
+    }
+
+    fn try_reopen(config: StoreConfig) -> Result<Store> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match Store::open(config.clone()) {
+                Err(StoreError::Locked) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn test_create_store() {
         let dir = TempDir::new().unwrap();
@@ -2190,6 +2520,32 @@ mod tests {
         let blob = store.get_blob(&hash).unwrap().unwrap();
         assert_eq!(blob.content, content);
         assert_eq!(blob.content_type, "application/javascript");
+    }
+
+    #[test]
+    fn sync_waits_for_active_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::create(test_config(&dir)).unwrap());
+        store.sync().unwrap();
+        let writer = store.write_lock.lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let sync_store = Arc::clone(&store);
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(sync_store.sync()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let while_locked = finished_rx.recv_timeout(Duration::from_millis(250));
+        drop(writer);
+        assert!(
+            matches!(while_locked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "sync passed an active writer: {while_locked:?}"
+        );
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -2265,7 +2621,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let store = Store::open(config).unwrap();
+            let store = reopen(config);
 
             assert_eq!(store.index.count(), 2); // message + state_update
 
@@ -2608,7 +2964,7 @@ mod tests {
         // Reopen: the in-memory cache is gone, so get_state hits
         // reconstruct_from_disk over the full Set chain.
         {
-            let store = Store::open(config).unwrap();
+            let store = reopen(config);
             let raw = store.get_state("bookkeeping").unwrap().unwrap();
             let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(parsed, json!({ "n": 199 }));
@@ -2869,5 +3225,226 @@ mod tests {
         // No more events
         let result = handle.recv_timeout(Duration::from_millis(50));
         assert!(result.is_err());
+    }
+
+    // R1-1: a failed periodic fsync must not leave a record that its state's
+    // head never adopted, or the next update names the same predecessor and
+    // replay refuses the store. The child keeps writing after one failed
+    // fsync, and again while every fsync fails, and exits without Drop, so
+    // the reopen has only the log and the registration's checkpoint to go on.
+    #[test]
+    fn failed_periodic_fsync_keeps_heads_and_log_in_step() {
+        for failures in ["one", "every"] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config(&dir);
+            run_fsync_failure_child(&config, "update", failures);
+
+            let store = Store::open(config).unwrap();
+            let items: Vec<u64> =
+                serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
+            assert_eq!(items, (0..250).collect::<Vec<u64>>(), "{failures}");
+        }
+    }
+
+    // The same failure on the generic path: each record keeps its own
+    // sequence, where a record left behind by a failed append used to share
+    // its sequence with the next one.
+    #[test]
+    fn failed_periodic_fsync_leaves_no_generic_sequence_twice() {
+        for failures in ["one", "every"] {
+            let dir = TempDir::new().unwrap();
+            let config = test_config(&dir);
+            run_fsync_failure_child(&config, "append", failures);
+
+            let store = Store::open(config).unwrap();
+            let mut sequences: Vec<u64> = store
+                .get_records_by_type("message")
+                .into_iter()
+                .map(|id| store.get_record(id).unwrap().unwrap().sequence.0)
+                .collect();
+            sequences.sort_unstable();
+            assert_eq!(sequences, (1..=250).collect::<Vec<u64>>(), "{failures}");
+        }
+    }
+
+    // After one failed fsync of the log, nothing publishes a checkpoint until
+    // the store is reopened: neither sync(), a metadata mutation nor Drop,
+    // and each of them reports DurabilityLost. Writes go on until a metadata
+    // mutation waits for its checkpoint, and then report it too.
+    #[test]
+    fn a_failed_log_fsync_publishes_nothing_until_reopen() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let registration = |id: &str| StateRegistration {
+            id: id.into(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 1000,
+                full_snapshot_every: 1000,
+            },
+            initial_value: None,
+        };
+        let store = Store::create(config.clone()).unwrap();
+        store.register_state(registration("items")).unwrap();
+        store.set_auto_snapshot(false);
+        let checkpoint = std::fs::read(config.path.join("state.bin")).unwrap();
+
+        // The 100th update's periodic fsync fails, and the retry succeeds.
+        *store.log.fsync_failures.lock() = 1;
+        for n in 0..150u64 {
+            store
+                .update_state("items", StateOperation::Append(n.to_string().into_bytes()))
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let result = store.sync();
+            assert_eq!(
+                std::fs::read(config.path.join("state.bin")).unwrap(),
+                checkpoint,
+                "sync() published state.bin"
+            );
+            let error = result.unwrap_err();
+            assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+            assert!(error.to_string().contains("until it is reopened"), "{error}");
+        }
+        fn lost<T>(result: Result<T>) -> bool {
+            matches!(result, Err(StoreError::DurabilityLost(_)))
+        }
+        assert!(lost(store.register_state(registration("other"))));
+        // Every call that retries the registration's pending checkpoint first
+        // meets the same failure.
+        assert!(
+            lost(store.update_state("items", StateOperation::Append(b"150".to_vec()))),
+            "a write waits for the registration's checkpoint"
+        );
+        assert!(lost(store.append(RecordInput::raw("event", b"blocked".to_vec()))));
+        assert!(lost(store.update_state_strategy(
+            "items",
+            crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 50,
+                full_snapshot_every: 20,
+            },
+        )));
+        assert!(lost(store.register_state_field_index(
+            "items",
+            "/n",
+            crate::state::FieldIndexKind::Number
+        )));
+        assert!(lost(store.create_branch("blocked", None)));
+        assert!(lost(store.create_empty_branch("blocked-empty", None)));
+        assert!(lost(store.create_branch_at("blocked-at", "main", Sequence(0))));
+        assert!(lost(store.switch_branch("main")));
+        assert!(lost(store.delete_branch("missing")));
+        assert!(lost(store.sync()));
+        drop(store);
+        assert_eq!(
+            std::fs::read(config.path.join("state.bin")).unwrap(),
+            checkpoint,
+            "nothing published state.bin"
+        );
+
+        let store = reopen(config);
+        let items: Vec<u64> =
+            serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
+        assert_eq!(items, (0..150).collect::<Vec<u64>>());
+        store.register_state(registration("other")).unwrap();
+        store.sync().unwrap();
+    }
+
+    // What a checkpoint published past records the disk lost would meet: a
+    // log whose torn tail open truncates, behind a head in state.bin.
+    #[test]
+    fn a_checkpoint_past_the_logs_valid_end_refuses_open() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+        for n in 0..3u64 {
+            store
+                .update_state("items", StateOperation::Set(n.to_string().into_bytes()))
+                .unwrap();
+        }
+        store.sync().unwrap();
+        drop(store);
+        let log = config.path.join("records.log");
+        let len = std::fs::metadata(&log).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        file.set_len(len - 5).unwrap();
+        drop(file);
+
+        let error = match try_reopen(config) {
+            Ok(_) => panic!("expected open to refuse a checkpoint past the log's valid end"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Corruption(_)), "{error:?}");
+        assert!(error.to_string().contains("newer than the durable log"), "{error}");
+    }
+
+    fn run_fsync_failure_child(config: &StoreConfig, writes: &str, failures: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::failed_periodic_fsync_child"])
+            .env("CHRONICLE_FSYNC_FAILURE_STORE", &config.path)
+            .env("CHRONICLE_FSYNC_FAILURE_WRITES", writes)
+            .env("CHRONICLE_FSYNC_FAILURES", failures)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "child did not finish writing:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn failed_periodic_fsync_child() {
+        let Some(path) = std::env::var_os("CHRONICLE_FSYNC_FAILURE_STORE") else {
+            return;
+        };
+        let writes = std::env::var("CHRONICLE_FSYNC_FAILURE_WRITES").unwrap();
+        let failures = std::env::var("CHRONICLE_FSYNC_FAILURES").unwrap();
+        let store = Store::create(StoreConfig {
+            path: path.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.set_auto_snapshot(false);
+
+        // From here the next fsync fails, the log's periodic one, or every
+        // fsync does.
+        *store.log.fsync_failures.lock() = if failures == "one" { 1 } else { u64::MAX };
+        for n in 0..250u64 {
+            // Like the writer in the review's reproduction, carry on past errors.
+            let payload = n.to_string().into_bytes();
+            let _ = if writes == "update" {
+                store
+                    .update_state("items", StateOperation::Append(payload))
+                    .map(drop)
+            } else {
+                store.append(RecordInput::raw("message", payload)).map(drop)
+            };
+            if n == 150 {
+                assert!(store.sync().is_err(), "sync reports the failed fsync");
+                assert!(store.sync().is_err(), "and goes on reporting it");
+            }
+        }
+        // Exit without destructors, as a crash would.
+        std::process::exit(73);
     }
 }
