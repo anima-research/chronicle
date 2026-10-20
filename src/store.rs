@@ -129,19 +129,40 @@ pub struct Store {
 impl Store {
     /// Open an existing store or create a new one.
     ///
-    /// A directory holds a store when it holds its `MANIFEST`. One without
-    /// (missing, empty, a fresh volume's root with `lost+found`, or a create
-    /// that stopped before writing its manifest) is created into when
-    /// `create_if_missing` is set; [`Store::create`] still refuses one that
-    /// holds a store's data files without a `MANIFEST`.
+    /// A directory holds a store when it holds its `MANIFEST`, and is opened.
+    /// Without one, it is created into (when `create_if_missing` is set) only
+    /// if it is missing or holds nothing but what a new store can sit beside:
+    /// `lost+found` (a fresh volume's root), Finder's `.DS_Store`, and the `LOCK` and `blobs/` a
+    /// create leaves when it stops before its manifest. A directory holding
+    /// anything else, such as a mistaken path to a project, isn't taken for a
+    /// place to put a store; one holding a store's data files without a
+    /// `MANIFEST` is refused as a damaged store.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
         if config.path.join("MANIFEST").exists() {
-            Self::open(config)
-        } else if config.create_if_missing {
+            return Self::open(config);
+        }
+        if let Some(other) = Self::foreign_entry(&config.path) {
+            return Err(StoreError::InvalidFormat(format!(
+                "{} has no MANIFEST and holds {other}, so it isn't a Chronicle store or an empty place for one",
+                config.path.display()
+            )));
+        }
+        if config.create_if_missing {
             Self::create(config)
         } else {
             Err(StoreError::NotInitialized)
         }
+    }
+
+    /// An entry a new store can't sit beside, in a directory with no MANIFEST:
+    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs` and a
+    /// store's own data files
+    /// (which [`Store::create`] refuses as a damaged store, naming the file).
+    fn foreign_entry(path: &Path) -> Option<String> {
+        let allowed = |name: &str| ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name) || Self::STORE_FILES.contains(&name);
+        fs::read_dir(path).ok()?.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|name| !allowed(name))
     }
 
     /// Create a new store.

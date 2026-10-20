@@ -150,7 +150,34 @@ fn open_or_create_finishes_a_create_that_stopped_before_its_manifest() {
 }
 
 #[test]
-fn open_or_create_still_refuses_an_empty_directory_without_create_if_missing() {
+fn open_or_create_refuses_a_directory_holding_other_files_and_writes_nothing() {
+    // A mistaken path to a project directory: main refused it with an IO
+    // error, and it mustn't become a place to put a store.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("project");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("Cargo.toml"), b"[package]").unwrap();
+
+    match Store::open_or_create(config(&path)) {
+        Err(StoreError::InvalidFormat(msg)) => assert!(msg.contains("Cargo.toml") && msg.contains("no MANIFEST"), "{msg}"),
+        Err(e) => panic!("expected InvalidFormat naming the file, got {e}"),
+        Ok(_) => panic!("created a store in a directory of other files"),
+    }
+    assert!(!path.join("MANIFEST").exists() && !path.join("LOCK").exists(), "nothing was written");
+}
+
+#[test]
+fn open_or_create_creates_beside_a_finder_ds_store() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("volume");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join(".DS_Store"), b"").unwrap();
+    drop(Store::open_or_create(config(&path)).unwrap());
+    assert!(path.join("MANIFEST").exists());
+}
+
+#[test]
+fn open_or_create_without_create_if_missing_refuses_a_directory_with_no_manifest() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("volume");
     fs::create_dir(&path).unwrap();

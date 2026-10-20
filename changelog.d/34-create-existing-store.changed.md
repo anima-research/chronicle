@@ -1,1 +1,2 @@
 - Opening a directory with no `MANIFEST` now fails with `InvalidFormat` naming the directory, and saying whether it holds a damaged store's files or no store at all, instead of a bare `IO error: No such file or directory` that named neither (#34).
+- `Store::open_or_create` on a directory with no `MANIFEST` that holds other files now fails with `InvalidFormat` naming one of them, and on any directory with no `MANIFEST` with `create_if_missing` unset now fails with `NotInitialized`. Both used to fail with the bare IO `NotFound` (#34).
