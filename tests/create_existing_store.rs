@@ -177,6 +177,23 @@ fn open_or_create_creates_beside_a_finder_ds_store() {
 }
 
 #[test]
+fn open_or_create_finishes_a_create_that_stopped_inside_its_manifest_save() {
+    // The manifest is saved through a staging file renamed over MANIFEST; a
+    // create that stops between the two leaves that file beside LOCK and
+    // blobs/ (Basil-1007's case on #46).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir_all(path.join("blobs")).unwrap();
+    fs::write(path.join("LOCK"), b"").unwrap();
+    let staged = path.join(".chronicle-checkpoint-AbC123");
+    fs::write(&staged, b"CHR").unwrap();
+
+    drop(Store::open_or_create(config(&path)).unwrap());
+    Store::open(config(&path)).unwrap();
+    assert!(!staged.exists(), "the interrupted save's staging file is swept");
+}
+
+#[test]
 fn open_or_create_without_create_if_missing_refuses_a_directory_with_no_manifest() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("volume");

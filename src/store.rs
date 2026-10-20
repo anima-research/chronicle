@@ -155,11 +155,16 @@ impl Store {
     }
 
     /// An entry a new store can't sit beside, in a directory with no MANIFEST:
-    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs` and a
-    /// store's own data files
+    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs`, the
+    /// staging file of a manifest save that was interrupted, and a store's own
+    /// data files
     /// (which [`Store::create`] refuses as a damaged store, naming the file).
     fn foreign_entry(path: &Path) -> Option<String> {
-        let allowed = |name: &str| ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name) || Self::STORE_FILES.contains(&name);
+        let allowed = |name: &str| {
+            ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
+                || Self::STORE_FILES.contains(&name)
+                || name.starts_with(crate::atomic_file::STAGING_PREFIX)
+        };
         fs::read_dir(path).ok()?.flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .find(|name| !allowed(name))
@@ -192,6 +197,9 @@ impl Store {
             }));
         }
 
+        // With the lock held, staging files here were left by interrupted
+        // saves, a create's own manifest save among them (as open sweeps them).
+        crate::atomic_file::remove_staging_files(&config.path);
         fs::create_dir_all(config.path.join("blobs"))?;
         Self::write_manifest(&config.path)?;
 
