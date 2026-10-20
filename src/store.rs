@@ -128,8 +128,12 @@ pub struct Store {
 
 impl Store {
     /// Open an existing store or create a new one.
+    ///
+    /// An existing empty directory (a pre-created volume or mount point) is
+    /// created into when `create_if_missing` is set, as a missing one is.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.exists() {
+        let empty_dir = fs::read_dir(&config.path).is_ok_and(|mut d| d.next().is_none());
+        if config.path.exists() && !empty_dir {
             Self::open(config)
         } else if config.create_if_missing {
             Self::create(config)
@@ -139,16 +143,27 @@ impl Store {
     }
 
     /// Create a new store.
+    ///
+    /// Refuses a directory that already holds a store: creating over one
+    /// used to keep its records but publish empty state and branch indexes
+    /// over its own at the first sync (#34). Use [`Store::open`] or
+    /// [`Store::open_or_create`] for a store that may exist.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
-        fs::create_dir_all(config.path.join("blobs"))?;
 
-        // Write manifest
-        Self::write_manifest(&config.path)?;
-
-        // Acquire lock
+        // The lock comes first, so a create aimed at a store another process
+        // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
+        if let Some(found) = Self::STORE_FILES.iter().find(|f| config.path.join(f).exists()) {
+            return Err(StoreError::InvalidOperation(format!(
+                "create: {} already holds a Chronicle store ({found} exists); open it with open or open_or_create",
+                config.path.display()
+            )));
+        }
+
+        fs::create_dir_all(config.path.join("blobs"))?;
+        Self::write_manifest(&config.path)?;
 
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
@@ -2235,6 +2250,9 @@ impl Store {
 
     // --- Private Helpers ---
 
+    /// The files whose presence means a directory already holds a store.
+    const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
+
     fn write_manifest(path: &Path) -> Result<()> {
         use std::io::Write;
 
@@ -2252,7 +2270,13 @@ impl Store {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
-        let mut file = File::open(manifest_path)?;
+        let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StoreError::InvalidFormat(format!(
+                "{} has no MANIFEST, so it isn't a Chronicle store",
+                path.display()
+            )),
+            _ => e.into(),
+        })?;
 
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;

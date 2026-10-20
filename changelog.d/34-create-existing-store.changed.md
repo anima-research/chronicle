@@ -1,0 +1,1 @@
+- Opening a directory with no `MANIFEST` now fails with `InvalidFormat` naming the directory, instead of a bare `IO error: No such file or directory` that named neither (#34).
