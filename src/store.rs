@@ -129,11 +129,13 @@ pub struct Store {
 impl Store {
     /// Open an existing store or create a new one.
     ///
-    /// An existing empty directory (a pre-created volume or mount point) is
-    /// created into when `create_if_missing` is set, as a missing one is.
+    /// A directory holds a store when it holds its `MANIFEST`. One without
+    /// (missing, empty, a fresh volume's root with `lost+found`, or a create
+    /// that stopped before writing its manifest) is created into when
+    /// `create_if_missing` is set; [`Store::create`] still refuses one that
+    /// holds a store's data files without a `MANIFEST`.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        let empty_dir = fs::read_dir(&config.path).is_ok_and(|mut d| d.next().is_none());
-        if config.path.exists() && !empty_dir {
+        if config.path.join("MANIFEST").exists() {
             Self::open(config)
         } else if config.create_if_missing {
             Self::create(config)
@@ -156,10 +158,17 @@ impl Store {
         // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
         if let Some(found) = Self::STORE_FILES.iter().find(|f| config.path.join(f).exists()) {
-            return Err(StoreError::InvalidOperation(format!(
-                "create: {} already holds a Chronicle store ({found} exists); open it with open or open_or_create",
-                config.path.display()
-            )));
+            return Err(StoreError::InvalidOperation(if *found == "MANIFEST" {
+                format!(
+                    "create: {} already holds a Chronicle store; open it with open or open_or_create",
+                    config.path.display()
+                )
+            } else {
+                format!(
+                    "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over",
+                    config.path.display()
+                )
+            }));
         }
 
         fs::create_dir_all(config.path.join("blobs"))?;
@@ -2253,17 +2262,10 @@ impl Store {
     /// The files whose presence means a directory already holds a store.
     const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
 
+    // Published whole, through a staging file renamed over it, so a crash
+    // mid-write can't leave a MANIFEST that create refuses and open can't read.
     fn write_manifest(path: &Path) -> Result<()> {
-        use std::io::Write;
-
-        let manifest_path = path.join("MANIFEST");
-        let mut file = File::create(manifest_path)?;
-
-        file.write_all(STORE_MAGIC)?;
-        file.write_all(&[STORE_VERSION])?;
-        file.sync_all()?;
-
-        Ok(())
+        crate::atomic_file::Checkpoint::default().save(&path.join("MANIFEST"), &[STORE_MAGIC, &[STORE_VERSION]])
     }
 
     fn verify_manifest(path: &Path) -> Result<()> {
@@ -2271,10 +2273,15 @@ impl Store {
 
         let manifest_path = path.join("MANIFEST");
         let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => StoreError::InvalidFormat(format!(
-                "{} has no MANIFEST, so it isn't a Chronicle store",
-                path.display()
-            )),
+            std::io::ErrorKind::NotFound => StoreError::InvalidFormat(
+                match Self::STORE_FILES.iter().find(|f| path.join(f).exists()) {
+                    Some(found) => format!(
+                        "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
+                        path.display()
+                    ),
+                    None => format!("{} has no MANIFEST, so it isn't a Chronicle store", path.display()),
+                },
+            ),
             _ => e.into(),
         })?;
 

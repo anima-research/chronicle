@@ -1,1 +1,1 @@
-- Opening a directory with no `MANIFEST` now fails with `InvalidFormat` naming the directory, instead of a bare `IO error: No such file or directory` that named neither (#34).
+- Opening a directory with no `MANIFEST` now fails with `InvalidFormat` naming the directory, and saying whether it holds a damaged store's files or no store at all, instead of a bare `IO error: No such file or directory` that named neither (#34).
