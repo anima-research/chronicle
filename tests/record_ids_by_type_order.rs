@@ -120,6 +120,8 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
 fn concurrent_appends_keep_each_type_list_ascending() {
     // The order rests on the store's write lock, held across the log append
     // and the index add at both append sites (`append` and `update_state`).
+    // A race test: it catches a missing lock only when two threads switch in
+    // the gap between those two steps, so it's a smoke test for the lock.
     let dir = TempDir::new().unwrap();
     let store = Arc::new(Store::create(config(&dir.path().join("store"))).unwrap());
     let threads: Vec<_> = (0..4u64)
@@ -146,7 +148,8 @@ fn concurrent_appends_keep_each_type_list_ascending() {
 #[test]
 fn concurrent_state_updates_keep_the_state_update_list_ascending() {
     // `update_state` is the other append site; it too holds the write lock
-    // across the log append and the index add.
+    // across the log append and the index add. A smoke test for that lock,
+    // as the one above is for `append`'s.
     let dir = TempDir::new().unwrap();
     let store = Arc::new(Store::create(config(&dir.path().join("store"))).unwrap());
     for t in 0..4u64 {

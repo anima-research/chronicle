@@ -25,8 +25,9 @@ pub struct RecordIndex {
     /// lock, and a rebuild at open reads the log in order. After a torn tail
     /// the log issues IDs again from just above the last surviving record, so
     /// the order holds. The records the tail dropped are gone, though, and
-    /// their IDs are issued again: a count or last ID taken before the crash
-    /// can refer to a record that no longer exists, or to one of another type.
+    /// their IDs are issued again to new records: a last ID taken before the
+    /// crash can name a different record afterwards, possibly of another type,
+    /// and a count taken then can skip new ones.
     type_index: RwLock<HashMap<String, Vec<RecordId>>>,
 
     /// caused_by index: record_id -> records that have it in caused_by.
