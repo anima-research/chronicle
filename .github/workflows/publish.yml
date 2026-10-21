@@ -29,6 +29,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     name: Build - ${{ matrix.target }}
+    # Bounds a hung build, which would otherwise hold its runner, and the
+    # publish job waiting on it, for six hours.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -87,6 +90,7 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs: build
+    timeout-minutes: 15
     # Gated on the ref, not the event, so a manual re-dispatch against an
     # existing tag still publishes — but a dispatch against a branch cannot,
     # which would otherwise publish whatever version package.json happened to
@@ -164,6 +168,7 @@ jobs:
   github-release:
     name: GitHub release notes
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Deliberately independent of the npm publish job — and of the native
     # build matrix it needs: some consumers run github-clone checkouts, and
     # release notes must exist even when the cross-build or publish fails.
