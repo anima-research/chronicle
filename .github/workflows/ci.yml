@@ -13,6 +13,10 @@ jobs:
   build-and-test:
     name: Build & Test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    # Bounds a hung run, which would otherwise hold its runner for six hours.
+    # On Node 22.12.0, node --test can loop forever when a child's output
+    # splits at an unlucky byte.
+    timeout-minutes: 30
 
     # The floor package.json's engines promises, pinned exactly, the newest
     # Node, and 24, the maintained line between them.
