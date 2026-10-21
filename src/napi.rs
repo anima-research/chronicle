@@ -517,7 +517,11 @@ impl JsStore {
         Ok(Some(json))
     }
 
-    /// Get record IDs by type.
+    /// Get the IDs of a type's records across all branches, in ascending ID
+    /// order, which is log order: the last is the newest. The records a torn
+    /// tail drops at open are gone, and their IDs are issued again, so a count
+    /// or last ID taken before the crash can refer to a record that no longer
+    /// exists.
     #[napi]
     pub fn get_record_ids_by_type(&self, record_type: String) -> Result<Vec<String>> {
         let store = self.get_store()?;

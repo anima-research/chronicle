@@ -455,7 +455,8 @@ impl Store {
         }
     }
 
-    /// Get records by type.
+    /// Get the IDs of a type's records across all branches, in ascending ID
+    /// order, which is log order.
     pub fn get_records_by_type(&self, record_type: &str) -> Vec<RecordId> {
         self.index.get_by_type(record_type)
     }

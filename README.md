@@ -58,7 +58,7 @@ Every method is synchronous: it runs on the calling thread, and `pollSubscriptio
 
 Each record has an ID, a sequence number, a type, a payload, a timestamp, and two lists of links to other records: `causedBy` for what caused it, and `linkedTo` for any other relation. `append` takes the payload as bytes and `appendJson` as JSON, and the `WithLinks` forms of each add the links. `getEffects(id)` lists the records whose `causedBy` names that record, and `getLinksTo(id)` those whose `linkedTo` does.
 
-`getRecord` reads any record by ID, and `getRecordIdsByType` lists a type's record IDs across all branches. `query` reads the records the current branch has appended, by sequence range and type, at most `limit` of them (10,000 if you give none).
+`getRecord` reads any record by ID, and `getRecordIdsByType` lists a type's record IDs across all branches, in ascending ID order, so the last is the newest. The records a torn tail drops at open are gone and their IDs are issued again, so a count or last ID taken before a crash can refer to a record that no longer exists. `query` reads the records the current branch has appended, by sequence range and type, at most `limit` of them (10,000 if you give none).
 
 ### States
 
