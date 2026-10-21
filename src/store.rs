@@ -13,7 +13,7 @@ use crate::types::{
 };
 use fs2::FileExt;
 use parking_lot::Mutex;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -2273,15 +2273,54 @@ impl Store {
         Ok(())
     }
 
+    // LOCK is opened without truncating it, and nothing is written to it. It
+    // must be a regular file in the store's directory, or absent (then it's
+    // created). A symlink is refused: its target can be replaced by a rename,
+    // leaving the lock on the old file while the next open locks the new one,
+    // so two processes could hold the store. A FIFO would hang the open.
     fn acquire_lock(path: &Path) -> Result<File> {
         let lock_path = path.join("LOCK");
-        let lock_file = File::create(lock_path)?;
+        match fs::symlink_metadata(&lock_path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                let kind = if meta.file_type().is_symlink() {
+                    "a symbolic link"
+                } else if meta.is_dir() {
+                    "a directory"
+                } else {
+                    "not a regular file"
+                };
+                return Err(StoreError::InvalidFormat(format!(
+                    "{} is {kind}, and the store takes its lock only on a regular LOCK file of \
+                     its own. Stop anything that uses this store, then move LOCK aside or remove \
+                     it: the next open creates a regular one",
+                    lock_path.display()
+                )));
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let lock_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
 
-        lock_file
-            .try_lock_exclusive()
-            .map_err(|_| StoreError::Locked)?;
+        lock_file.try_lock_exclusive().map_err(lock_error)?;
 
         Ok(lock_file)
+    }
+}
+
+/// What a failed `try_lock_exclusive` on LOCK means. fs2 reports another
+/// holder of the lock (another process, or another open in this one) as its
+/// contention error (EWOULDBLOCK, or ERROR_LOCK_VIOLATION on Windows), and
+/// only that is `Locked`. Any other failure is the I/O error it is, so it
+/// isn't reported as the store being held.
+fn lock_error(error: std::io::Error) -> StoreError {
+    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        StoreError::Locked
+    } else {
+        StoreError::Io(error)
     }
 }
 
@@ -2615,6 +2654,30 @@ mod tests {
 
             let state = store.get_state("test").unwrap().unwrap();
             assert_eq!(state, b"value");
+        }
+    }
+
+    #[test]
+    fn only_another_holders_lock_is_reported_as_locked() {
+        assert!(matches!(
+            lock_error(fs2::lock_contended_error()),
+            StoreError::Locked
+        ));
+        // Any other error comes back as itself, its OS code included.
+        let unsupported = std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no locks on this filesystem",
+        );
+        match lock_error(unsupported) {
+            StoreError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+            other => panic!("{other:?}"),
+        }
+        #[cfg(unix)]
+        for code in [libc::ENOLCK, libc::EOPNOTSUPP] {
+            match lock_error(std::io::Error::from_raw_os_error(code)) {
+                StoreError::Io(e) => assert_eq!(e.raw_os_error(), Some(code)),
+                other => panic!("{code}: {other:?}"),
+            }
         }
     }
 
