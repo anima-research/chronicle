@@ -57,3 +57,6 @@ jobs:
       # Windows) and file types, so its tests run here too.
       - name: Store lock tests
         run: cargo test --test lock_file -- --nocapture
+
+      - name: Lock error mapping test
+        run: cargo test --lib store::tests::only_another_holders_lock_is_reported_as_locked -- --nocapture

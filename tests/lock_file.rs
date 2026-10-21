@@ -116,10 +116,12 @@ fn a_lock_that_is_a_dangling_symlink_is_refused_and_creates_nothing() {
     fs::remove_file(&lock).unwrap();
     std::os::unix::fs::symlink(&target, &lock).unwrap();
 
-    let result = Store::open(config(&dir));
+    let opened = Store::open(config(&dir));
+    let created = Store::create(config(&dir));
 
     assert!(!target.exists(), "nothing created at the target");
-    assert!(matches!(result, Err(StoreError::InvalidFormat(_))));
+    assert!(matches!(opened, Err(StoreError::InvalidFormat(_))));
+    assert!(matches!(created, Err(StoreError::InvalidFormat(_))));
 }
 
 #[cfg(unix)]
@@ -132,18 +134,26 @@ fn a_lock_that_is_a_fifo_is_refused_without_hanging() {
     let c_path = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-    // Opening a FIFO for writing blocks until a reader comes, so the open runs
-    // on a thread, and a refusal has to arrive within the wait.
-    let (done, result) = std::sync::mpsc::channel();
-    let store_config = config(&dir);
-    std::thread::spawn(move || {
-        let _ = done.send(Store::open(store_config).map(|_| ()));
-    });
-    match result.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(Err(StoreError::InvalidFormat(message))) => {
-            assert!(message.contains("not a regular file"), "{message}")
+    // Opening a FIFO for writing blocks until a reader comes, so open and
+    // create each run on a thread, and a refusal has to arrive within the wait.
+    for (route, run) in [
+        (
+            "open",
+            Store::open as fn(StoreConfig) -> chronicle::Result<Store>,
+        ),
+        ("create", Store::create),
+    ] {
+        let (done, result) = std::sync::mpsc::channel();
+        let store_config = config(&dir);
+        std::thread::spawn(move || {
+            let _ = done.send(run(store_config).map(|_| ()));
+        });
+        match result.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Err(StoreError::InvalidFormat(message))) => {
+                assert!(message.contains("not a regular file"), "{route}: {message}")
+            }
+            Ok(other) => panic!("{route}: {other:?}"),
+            Err(_) => panic!("{route} of a FIFO LOCK didn't return within 10 s"),
         }
-        Ok(other) => panic!("{other:?}"),
-        Err(_) => panic!("open of a FIFO LOCK didn't return within 10 s"),
     }
 }
