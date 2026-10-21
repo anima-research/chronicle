@@ -8,6 +8,7 @@ on:
       - 'build.rs'
       - 'src/**'
       - 'tests/atomic_metadata.rs'
+      - 'tests/lock_file.rs'
   pull_request:
     paths:
       - '.github/workflows/checkpoint-platforms.yml'
@@ -15,6 +16,7 @@ on:
       - 'build.rs'
       - 'src/**'
       - 'tests/atomic_metadata.rs'
+      - 'tests/lock_file.rs'
   workflow_dispatch:
 
 permissions:
@@ -50,3 +52,8 @@ jobs:
 
       - name: Store checkpoint integration tests
         run: cargo test --test atomic_metadata -- --nocapture
+
+      # LOCK's handling depends on each platform's locks (mandatory on
+      # Windows) and file types, so its tests run here too.
+      - name: Store lock tests
+        run: cargo test --test lock_file -- --nocapture
