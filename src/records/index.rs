@@ -22,9 +22,12 @@ pub struct RecordIndex {
 
     /// Record type to record IDs, in log order, which is ascending ID order:
     /// an append takes the next ID and adds it here under the store's write
-    /// lock, a rebuild reads the log in order, and after a torn tail the log
-    /// restarts IDs above every surviving record. `get_by_type_range` relies
-    /// on that order to binary-search.
+    /// lock, and a rebuild at open reads the log in order. After a torn tail
+    /// the log issues IDs again from just above the last surviving record, so
+    /// the order holds. The records the tail dropped are gone, though, and
+    /// their IDs are issued again to new records: a last ID taken before the
+    /// crash can name a different record afterwards, possibly of another type,
+    /// and a count taken then can skip new ones.
     type_index: RwLock<HashMap<String, Vec<RecordId>>>,
 
     /// caused_by index: record_id -> records that have it in caused_by.
@@ -95,11 +98,9 @@ impl RecordIndex {
 
     /// Add an entry to the index.
     ///
-    /// Within a record type, IDs must be added in ascending order: every
-    /// append path and the rebuild at open add them so (see `type_index`), and
-    /// `get_by_type_range` binary-searches on it. A debug build asserts it;
-    /// a release build trusts it, and an out-of-order add would leave that
-    /// type's ranges wrong.
+    /// Within a record type, IDs must be added in ascending order, as every
+    /// store path does (see `type_index`), since `get_by_type` returns them in
+    /// the order added. A debug build asserts it.
     pub fn add(
         &self,
         id: RecordId,
@@ -113,15 +114,17 @@ impl RecordIndex {
         self.entries.write().insert((branch, sequence), offset);
         self.id_to_offset.write().insert(id, offset);
 
-        let mut type_index = self.type_index.write();
-        let ids = type_index.entry(record_type.to_string()).or_default();
-        debug_assert!(
-            ids.last().map_or(true, |last| last.0 < id.0),
-            "record {} of type {record_type:?} indexed out of ID order",
-            id.0
-        );
-        ids.push(id);
-        drop(type_index);
+        {
+            let mut type_index = self.type_index.write();
+            let ids = type_index.entry(record_type.to_string()).or_default();
+            debug_assert!(
+                ids.last().is_none_or(|last| last.0 < id.0),
+                "type {record_type:?}: record {} added after {}, out of ascending order",
+                id.0,
+                ids.last().map_or(0, |last| last.0),
+            );
+            ids.push(id);
+        }
 
         for &cause in caused_by {
             self.caused_by_index
@@ -150,54 +153,14 @@ impl RecordIndex {
         self.id_to_offset.read().get(&id).copied()
     }
 
-    /// Get all record IDs of a given type.
+    /// Get all record IDs of a given type, in ascending ID order (see
+    /// `type_index`).
     pub fn get_by_type(&self, record_type: &str) -> Vec<RecordId> {
         self.type_index
             .read()
             .get(record_type)
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// Get the record IDs of a type between two exclusive bounds: those
-    /// greater than `after` and less than `before`, either of which may be
-    /// absent. At most `limit` of them, oldest first, or with `reverse` the
-    /// newest first, so `reverse` with a limit of 1 gives the type's newest
-    /// record. The bounds need not be IDs of this type, or of any record.
-    ///
-    /// The type's IDs are kept in ascending order (see `type_index`), so the
-    /// bounds are found by binary search and only the IDs returned are
-    /// copied, rather than every ID of the type.
-    pub fn get_by_type_range(
-        &self,
-        record_type: &str,
-        after: Option<RecordId>,
-        before: Option<RecordId>,
-        limit: Option<usize>,
-        reverse: bool,
-    ) -> Vec<RecordId> {
-        let type_index = self.type_index.read();
-        let Some(ids) = type_index.get(record_type) else {
-            return Vec::new();
-        };
-        let start = after.map_or(0, |after| ids.partition_point(|id| id.0 <= after.0));
-        let end = before.map_or(ids.len(), |before| {
-            ids.partition_point(|id| id.0 < before.0)
-        });
-        if start >= end {
-            return Vec::new();
-        }
-        let within = &ids[start..end];
-        let take = limit.map_or(within.len(), |limit| limit.min(within.len()));
-        if reverse {
-            within[within.len() - take..]
-                .iter()
-                .rev()
-                .copied()
-                .collect()
-        } else {
-            within[..take].to_vec()
-        }
     }
 
     /// Get records that have `id` in their caused_by.
@@ -310,6 +273,17 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "out of ascending order")]
+    fn adding_a_type_out_of_ascending_order_panics_in_a_debug_build() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+        index.add(RecordId(2), branch, Sequence(1), 0, "message", &[], &[]);
+        index.add(RecordId(1), branch, Sequence(2), 100, "message", &[], &[]);
+    }
+
+    #[test]
     fn test_add_and_lookup() {
         let dir = TempDir::new().unwrap();
         let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
@@ -340,93 +314,6 @@ mod tests {
 
         let code = index.get_by_type("code");
         assert_eq!(code.len(), 1);
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "record 4 of type \"message\" indexed out of ID order")]
-    fn test_type_index_refuses_an_out_of_order_add_in_debug() {
-        let dir = TempDir::new().unwrap();
-        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
-        let branch = BranchId(1);
-        index.add(RecordId(5), branch, Sequence(1), 0, "message", &[], &[]);
-        // Another type's lower ID is fine; this type's lower ID is not.
-        index.add(RecordId(3), branch, Sequence(2), 10, "code", &[], &[]);
-        index.add(RecordId(4), branch, Sequence(3), 20, "message", &[], &[]);
-    }
-
-    #[test]
-    fn test_type_index_range() {
-        let dir = TempDir::new().unwrap();
-        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
-        let branch = BranchId(1);
-        // Messages at 2, 4, 6, 8 and 10; a code record at each odd ID between.
-        for id in 1..=10u64 {
-            let record_type = if id % 2 == 0 { "message" } else { "code" };
-            index.add(
-                RecordId(id),
-                branch,
-                Sequence(id),
-                id * 100,
-                record_type,
-                &[],
-                &[],
-            );
-        }
-        let range = |after: Option<u64>,
-                     before: Option<u64>,
-                     limit: Option<usize>,
-                     reverse: bool|
-         -> Vec<u64> {
-            index
-                .get_by_type_range(
-                    "message",
-                    after.map(RecordId),
-                    before.map(RecordId),
-                    limit,
-                    reverse,
-                )
-                .into_iter()
-                .map(|id| id.0)
-                .collect()
-        };
-
-        // No bounds: every ID, oldest first, as get_by_type gives them.
-        assert_eq!(range(None, None, None, false), vec![2, 4, 6, 8, 10]);
-        assert_eq!(
-            range(None, None, None, false),
-            index
-                .get_by_type("message")
-                .into_iter()
-                .map(|id| id.0)
-                .collect::<Vec<_>>()
-        );
-        // Both bounds exclusive, whether they're IDs of this type, of another, or of none.
-        assert_eq!(range(Some(4), None, None, false), vec![6, 8, 10]);
-        assert_eq!(range(Some(5), None, None, false), vec![6, 8, 10]);
-        assert_eq!(range(None, Some(8), None, false), vec![2, 4, 6]);
-        assert_eq!(range(None, Some(7), None, false), vec![2, 4, 6]);
-        assert_eq!(range(Some(2), Some(10), None, false), vec![4, 6, 8]);
-        assert_eq!(range(Some(0), Some(99), None, false), vec![2, 4, 6, 8, 10]);
-        // A limit keeps the oldest within the bounds, or with reverse the newest.
-        assert_eq!(range(Some(2), None, Some(2), false), vec![4, 6]);
-        assert_eq!(range(None, None, None, true), vec![10, 8, 6, 4, 2]);
-        assert_eq!(
-            range(None, None, Some(1), true),
-            vec![10],
-            "the type's newest record"
-        );
-        assert_eq!(range(None, Some(8), Some(2), true), vec![6, 4]);
-        assert_eq!(range(None, None, Some(99), false), vec![2, 4, 6, 8, 10]);
-        // Nothing within the bounds, a limit of 0, or an unknown type: empty.
-        assert_eq!(range(Some(10), None, None, false), Vec::<u64>::new());
-        assert_eq!(range(None, Some(2), None, true), Vec::<u64>::new());
-        assert_eq!(range(Some(6), Some(6), None, false), Vec::<u64>::new());
-        assert_eq!(range(Some(8), Some(4), None, false), Vec::<u64>::new());
-        assert_eq!(range(None, None, Some(0), false), Vec::<u64>::new());
-        assert!(index
-            .get_by_type_range("unknown", None, None, None, false)
-            .is_empty());
     }
 
     #[test]
