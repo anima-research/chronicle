@@ -100,6 +100,20 @@ fn redact_inside_the_state_counts_as_before() {
 }
 
 #[test]
+fn a_reversed_range_removes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with_items(&dir, 5);
+    store
+        .update_state("s", StateOperation::Redact { start: 3, end: 1 })
+        .unwrap();
+    assert_count_matches(
+        dir,
+        store,
+        vec![json!(0), json!(1), json!(2), json!(3), json!(4)],
+    );
+}
+
+#[test]
 fn an_item_appended_after_redacting_past_the_end_reads_at_its_own_index() {
     let dir = TempDir::new().unwrap();
     let store = store_with_items(&dir, 5);
