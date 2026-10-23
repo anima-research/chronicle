@@ -420,9 +420,13 @@ impl StateManager {
             StateOperation::Redact { start, end } => {
                 head.ops_since_delta_snapshot += 1;
                 head.has_non_append_since_snapshot = true;
-                // Redact removes items (clamped to valid range)
-                let remove_count = end.saturating_sub(*start).min(head.item_count);
-                head.item_count = head.item_count.saturating_sub(remove_count);
+                // Redact removes the items of [start, end) that exist: both
+                // ends are clamped to the length, as the materialized value
+                // clamps them, so a range running past the end removes only
+                // the items before it.
+                let start = (*start).min(head.item_count);
+                let end = (*end).min(head.item_count);
+                head.item_count -= end.saturating_sub(start);
             }
             StateOperation::Edit { .. } => {
                 head.ops_since_delta_snapshot += 1;
