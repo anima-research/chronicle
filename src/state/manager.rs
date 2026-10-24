@@ -111,9 +111,11 @@ pub struct StateChainHead {
     pub last_full_snapshot_offset: Option<u64>,
 
     /// Whether there are non-Append operations (Edit, Redact, Set) since the
-    /// last full snapshot. While true, no delta snapshot is taken, because a
-    /// delta can only carry Append operations; the next full snapshot, at the
-    /// size-aware interval (`snapshot_needed`), clears it.
+    /// last full snapshot. While true, an `append_log` state takes no delta
+    /// snapshot, because a delta can only carry Append operations (the tree
+    /// strategy doesn't read it); any full snapshot clears it:
+    /// the size-aware one `snapshot_needed` asks for, `compact_state`'s, or
+    /// the one the store takes in place of a delta (`compute_delta_items`).
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
@@ -1053,9 +1055,9 @@ impl StateManager {
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
     /// `has_non_append_since_snapshot` is whether the parent's chain holds a
-    /// non-Append change (is_non_append_change) between that position and
-    /// the last full snapshot behind it, as the parent's head would have
-    /// recorded at that position.
+    /// non-Append change (is_non_append_change) from that position back to
+    /// the last full snapshot, or to a Set, which itself counts: what the
+    /// parent's head records there when its own flag is right.
     pub fn set_head_for_branch(
         &self,
         branch_id: BranchId,

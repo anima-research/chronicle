@@ -900,12 +900,13 @@ impl Store {
         let mut operations = Vec::new();
         let mut hit_snapshot = false;
         // Whether a change a delta can't carry lies between the head and the
-        // last full snapshot (or Set) behind it, where the walk ends. Read
-        // from the chain, not from the parent's saved flag, so it's right
-        // for a parent whose own flag is wrong; only a full snapshot clears
-        // the flag on the parent, and a delta taken while it's clear can have
-        // only Appends behind it, so this is the parent's flag when that's
-        // right.
+        // last full snapshot (or Set) behind it, where the walk ends. It is
+        // read from the chain, not from the parent's saved flag, so it's right
+        // for a parent whose own flag is wrong. The walk goes on past delta
+        // snapshots: on a chain the store wrote, a delta is taken only while
+        // the flag is clear, so only Appends lie behind it, but a delta a
+        // caller wrote, or one a branch took before branches inherited the
+        // flag, can have such a change behind it.
         let mut non_append_since_snapshot = false;
 
         while let Some(offset) = current_offset {
@@ -1426,9 +1427,9 @@ impl Store {
                         // The head said only Appends since its last snapshot,
                         // and the chain disagrees: a branch made at a past
                         // sequence before branches inherited the flag, or a
-                        // head saved before a Set set the flag (v0.2.6). A
-                        // full snapshot keeps the change, and clears the flag
-                        // rightly.
+                        // head saved before a Set set the flag (a9677a1). A
+                        // full snapshot keeps the change, and clears the
+                        // flag, which is then true of the chain.
                         None => full(),
                     }
                 }
