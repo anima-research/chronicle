@@ -12,4 +12,5 @@ pub use field_index::{FieldIndexKind, FieldIndexManager};
 pub use manager::{
     ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
 };
+pub(crate) use manager::is_non_append_change;
 pub use operations::{apply_operation, materialize_operations};

@@ -453,7 +453,7 @@ impl FieldIndexManager {
     /// been exercised at; would want a smarter structure (e.g. a Fenwick/BIT
     /// of shifts, or lazily-applied offsets) if redact-heavy workloads on
     /// multi-million-item indexes show up.
-    pub fn on_redact(&mut self, state_id: &str, branch_id: BranchId, offset: u64, start: u32, end: u32) {
+    pub fn on_redact(&mut self, state_id: &str, branch_id: BranchId, offset: u64, start: usize, end: usize) {
         for key in self.matching_keys(state_id) {
             if !self.branch_matches(&key, branch_id) {
                 self.indexes.remove(&key);
@@ -461,8 +461,10 @@ impl FieldIndexManager {
             }
             let index = self.indexes.get_mut(&key).expect("just matched");
             let len = index.by_ordinal.len();
-            let start_c = (start as usize).min(len);
-            let end_c = (end as usize).min(len);
+            // Clamped as the stored value clamps them, before any narrowing
+            // to an ordinal, so a range past the end removes only what's there.
+            let start_c = start.min(len);
+            let end_c = end.min(len);
             if start_c >= end_c {
                 index.head_offset = Some(offset);
                 continue;

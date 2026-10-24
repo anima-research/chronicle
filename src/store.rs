@@ -82,6 +82,19 @@ enum BranchEvent {
     Deleted { name: String },
 }
 
+/// Where a branch made at a past sequence starts a state's chain
+/// (`create_branch_at`).
+struct ChainInfoAt {
+    /// The parent's last update to the state at or before that sequence.
+    head_offset: u64,
+    /// The number of items the state held there.
+    item_count: usize,
+    /// Whether a non-Append change lies between that update and the last full
+    /// snapshot or Set behind it (a Set is itself such a change): what the
+    /// parent's head records there when its own flag is right.
+    non_append_since_snapshot: bool,
+}
+
 /// The main record store.
 ///
 /// Provides a unified interface for:
@@ -872,17 +885,16 @@ impl Store {
         Ok(Some(state))
     }
 
-    /// Find the chain head info (offset and item count) at a historical sequence.
+    /// Find the chain head info at a historical sequence.
     ///
     /// Used by `create_branch_at` to point a new branch at an existing chain position
-    /// without writing new records. Returns `(head_offset, item_count)` or None if
-    /// no state existed at that sequence.
+    /// without writing new records. Returns None if no state existed at that sequence.
     fn find_chain_info_at(
         &self,
         branch_id: crate::types::BranchId,
         state_id: &str,
         at_sequence: Sequence,
-    ) -> Result<Option<(u64, usize)>> {
+    ) -> Result<Option<ChainInfoAt>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
@@ -893,6 +905,15 @@ impl Store {
         let mut found_offset: Option<u64> = None;
         let mut operations = Vec::new();
         let mut hit_snapshot = false;
+        // Whether a change a delta can't carry lies between the head and the
+        // last full snapshot (or Set) behind it, where the walk ends. It is
+        // read from the chain, not from the parent's saved flag, so it's right
+        // for a parent whose own flag is wrong. The walk goes on past delta
+        // snapshots: on a chain the store wrote, a delta is taken only while
+        // the flag is clear, so only Appends lie behind it, but a delta a
+        // caller wrote, or one a branch took before branches inherited the
+        // flag, can have such a change behind it.
+        let mut non_append_since_snapshot = false;
 
         while let Some(offset) = current_offset {
             let record = self.log.read_at(offset)?;
@@ -908,6 +929,10 @@ impl Store {
             // This is the first record at or before target - it becomes our head
             if found_offset.is_none() {
                 found_offset = Some(offset);
+            }
+
+            if crate::state::is_non_append_change(&update.operation) {
+                non_append_since_snapshot = true;
             }
 
             // Collect operations to compute item_count
@@ -961,7 +986,7 @@ impl Store {
             }
         };
 
-        Ok(Some((head_offset, item_count)))
+        Ok(Some(ChainInfoAt { head_offset, item_count, non_append_since_snapshot }))
     }
 
     /// Get the length of an AppendLog state without loading all items.
@@ -1368,17 +1393,19 @@ impl Store {
     ) -> Result<Option<Record>> {
         use crate::state::SnapshotNeeded;
 
+        let full = || -> Result<Option<Record>> {
+            let current = self.get_state(state_id)?.unwrap_or_default();
+            let record = self.update_state_internal(
+                state_id,
+                StateOperation::Snapshot(current),
+                skip_auto,
+            )?;
+            Ok(Some(record))
+        };
+
         match self.state.snapshot_needed(self.branches.current_branch().id, state_id) {
             None => Ok(None),
-            Some(SnapshotNeeded::Full) => {
-                let current = self.get_state(state_id)?.unwrap_or_default();
-                let record = self.update_state_internal(
-                    state_id,
-                    StateOperation::Snapshot(current),
-                    skip_auto,
-                )?;
-                Ok(Some(record))
-            }
+            Some(SnapshotNeeded::Full) => full(),
             Some(SnapshotNeeded::Delta) => {
                 // Check if this is a Tree strategy (uses TreeDeltaSnapshot) or AppendLog (uses DeltaSnapshot)
                 let is_tree = matches!(
@@ -1394,13 +1421,23 @@ impl Store {
                     )?;
                     Ok(Some(record))
                 } else {
-                    let delta_items = self.compute_delta_items(state_id)?;
-                    let record = self.update_state_internal(
-                        state_id,
-                        StateOperation::DeltaSnapshot(delta_items),
-                        skip_auto,
-                    )?;
-                    Ok(Some(record))
+                    match self.compute_delta_items(state_id)? {
+                        Some(delta_items) => {
+                            let record = self.update_state_internal(
+                                state_id,
+                                StateOperation::DeltaSnapshot(delta_items),
+                                skip_auto,
+                            )?;
+                            Ok(Some(record))
+                        }
+                        // The head said only Appends since its last snapshot,
+                        // and the chain disagrees: a branch made at a past
+                        // sequence before branches inherited the flag, or a
+                        // head saved before a Set set the flag (a9677a1). A
+                        // full snapshot keeps the change, and clears the
+                        // flag, which is then true of the chain.
+                        None => full(),
+                    }
                 }
             }
         }
@@ -1413,13 +1450,16 @@ impl Store {
         Ok(())
     }
 
-    /// Compute items added since the last delta or full snapshot.
+    /// Compute items added since the last delta or full snapshot, or None when
+    /// a Redact, Edit or Set (`is_non_append_change`) lies in that stretch:
+    /// a delta holds only Appends, so one built across such a change would
+    /// bring back what it removed or replaced.
     ///
     /// This walks the chain collecting Append operations until hitting a snapshot.
-    fn compute_delta_items(&self, state_id: &str) -> Result<Vec<u8>> {
+    fn compute_delta_items(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
             Some(h) => h,
-            None => return Ok(serde_json::to_vec(&Vec::<serde_json::Value>::new())?),
+            None => return Ok(Some(serde_json::to_vec(&Vec::<serde_json::Value>::new())?)),
         };
 
         // Walk chain backwards, collecting append operations until snapshot
@@ -1440,10 +1480,8 @@ impl Store {
                     // Hit a snapshot, stop collecting
                     break;
                 }
-                _ => {
-                    // Other operations (Edit, Redact) - for now, fall back to full state
-                    // This is a simplification; proper delta handling would track edits too
-                }
+                op if crate::state::is_non_append_change(op) => return Ok(None),
+                _ => {}
             }
 
             current_offset = update.prev_update_offset;
@@ -1452,7 +1490,9 @@ impl Store {
         // Reverse since we collected in reverse order
         appended_items.reverse();
 
-        serde_json::to_vec(&appended_items).map_err(|e| StoreError::Serialization(e.to_string()))
+        serde_json::to_vec(&appended_items)
+            .map(Some)
+            .map_err(|e| StoreError::Serialization(e.to_string()))
     }
 
     /// Compute tree operations since the last delta or full snapshot.
@@ -1885,16 +1925,19 @@ impl Store {
         }
         let mut heads = Vec::new();
         for state_id in self.state.state_ids() {
-            if let Some((head_offset, item_count)) =
-                self.find_chain_info_at(parent.id, &state_id, at)?
-            {
-                heads.push((state_id, head_offset, item_count));
+            if let Some(info) = self.find_chain_info_at(parent.id, &state_id, at)? {
+                heads.push((state_id, info));
             }
         }
         let new_branch = self.branches.create_branch_at(name, from, at)?;
-        for (state_id, head_offset, item_count) in heads {
-            self.state
-                .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+        for (state_id, info) in heads {
+            self.state.set_head_for_branch(
+                new_branch.id,
+                &state_id,
+                info.head_offset,
+                info.item_count,
+                info.non_append_since_snapshot,
+            );
         }
 
         write.checkpoint_required = true;
@@ -2482,6 +2525,73 @@ mod tests {
             path: dir.path().join("store"),
             blob_cache_size: 100,
             create_if_missing: true,
+        }
+    }
+
+    /// A head that says only Appends since its last snapshot while its chain
+    /// holds a Redact, an Edit or a Set there, as a branch made at a past
+    /// sequence was saved before branches inherited the parent's flag: when
+    /// its delta comes due, the store takes a full snapshot instead, so the
+    /// change holds.
+    #[test]
+    fn a_head_whose_flag_missed_a_change_takes_a_full_snapshot_not_a_delta() {
+        let n = |v: i64| serde_json::to_vec(&json!(v)).unwrap();
+        // Each change, after Append 0 and Append 1 (whose delta is taken),
+        // and what the branch reads after it appends 2 and 3.
+        let cases: Vec<(&str, Vec<StateOperation>, serde_json::Value)> = vec![
+            ("Redact", vec![StateOperation::Redact { start: 1, end: 100 }], json!([0, 2, 3])),
+            (
+                "Edit",
+                vec![StateOperation::Edit { index: 0, new_value: serde_json::to_vec(&json!("e")).unwrap() }],
+                json!(["e", 1, 2, 3]),
+            ),
+            // An Append before the Set, which a delta walking past the Set
+            // would carry back.
+            (
+                "Set",
+                vec![StateOperation::Append(n(7)), StateOperation::Set(serde_json::to_vec(&json!([9])).unwrap())],
+                json!([9, 2, 3]),
+            ),
+        ];
+        for (name, change, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            let store = Store::create(test_config(&dir)).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "s".to_string(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 2,
+                        full_snapshot_every: 100,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for v in [0, 1] {
+                store.update_state("s", StateOperation::Append(n(v))).unwrap();
+            }
+            for op in change {
+                store.update_state("s", op).unwrap();
+            }
+            let child = store.create_branch_at("child", "main", store.current_branch().head).unwrap();
+            let head = store.state.get_head(child.id, "s").unwrap();
+            assert!(head.has_non_append_since_snapshot, "{name}: setup: the branch inherits the flag");
+            // As create_branch_at saved such a branch before.
+            store.state.set_head_for_branch(child.id, "s", head.head_offset, head.item_count, false);
+            store.switch_branch("child").unwrap();
+            for v in [2, 3] {
+                store.update_state("s", StateOperation::Append(n(v))).unwrap();
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&store.get_state("s").unwrap().unwrap()).unwrap();
+            assert_eq!(value, expected, "{name}");
+            let head = store.state.get_head(child.id, "s").unwrap();
+            assert!(head.last_full_snapshot_offset.is_some(), "{name}: the snapshot that came due was a full one");
+            assert!(!head.has_non_append_since_snapshot, "{name}");
+            assert_eq!(
+                store.get_state_len("s").unwrap(),
+                Some(expected.as_array().unwrap().len()),
+                "{name}"
+            );
         }
     }
 

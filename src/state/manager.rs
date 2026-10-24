@@ -31,6 +31,22 @@ const STATE_INDEX_VERSION: u8 = 2; // Bumped for new format
 /// Default cache size (number of states).
 const DEFAULT_CACHE_SIZE: usize = 1000;
 
+/// Whether `op` is one of the operations an append-log delta snapshot can't
+/// consolidate: a delta holds only the Appends since the last snapshot, and
+/// reconstruction reads it in place of every operation behind it, so a delta
+/// taken across a Redact, an Edit or a Set would lose that change. One of
+/// these sets `StateChainHead::has_non_append_since_snapshot` as it's
+/// recorded, and gives a branch made at a past sequence that flag when one
+/// lies between that point and the parent's last full snapshot or Set; and
+/// `Store::compute_delta_items` stops at one, so the store takes a full
+/// snapshot instead of the delta.
+pub(crate) fn is_non_append_change(op: &StateOperation) -> bool {
+    matches!(
+        op,
+        StateOperation::Redact { .. } | StateOperation::Edit { .. } | StateOperation::Set(_)
+    )
+}
+
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotNeeded {
@@ -94,9 +110,12 @@ pub struct StateChainHead {
     /// File offset of most recent full snapshot.
     pub last_full_snapshot_offset: Option<u64>,
 
-    /// Whether there are non-Append operations (Edit, Redact, Set) since the last snapshot.
-    /// When true, a full snapshot should be created instead of a delta snapshot,
-    /// because delta snapshots can only track Append operations.
+    /// Whether there are non-Append operations (Edit, Redact, Set) since the
+    /// last full snapshot. While true, an `append_log` state takes no delta
+    /// snapshot, because a delta can only carry Append operations (the tree
+    /// strategy doesn't read it); any full snapshot clears it:
+    /// the size-aware one `snapshot_needed` asks for, `compact_state`'s, or
+    /// the one the store takes in place of a delta (`compute_delta_items`).
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
@@ -395,6 +414,9 @@ impl StateManager {
         });
 
         head.head_offset = offset;
+        if is_non_append_change(operation) {
+            head.has_non_append_since_snapshot = true;
+        }
 
         match operation {
             StateOperation::Snapshot(data) => {
@@ -426,7 +448,6 @@ impl StateManager {
             }
             StateOperation::Redact { start, end } => {
                 head.ops_since_delta_snapshot += 1;
-                head.has_non_append_since_snapshot = true;
                 // Redact removes the items of [start, end) that exist: both
                 // ends are clamped to the length, as the materialized value
                 // clamps them, so a range running past the end removes only
@@ -437,16 +458,15 @@ impl StateManager {
             }
             StateOperation::Edit { .. } => {
                 head.ops_since_delta_snapshot += 1;
-                head.has_non_append_since_snapshot = true;
                 // Edit doesn't change count
             }
             StateOperation::Set(data) => {
                 head.ops_since_delta_snapshot += 1;
                 // Set replaces the entire state. Append-log delta snapshots only
                 // consolidate Append operations, so allowing a delta after Set
-                // would walk past the replacement and resurrect older appends.
-                // Force the next threshold snapshot to contain the full state.
-                head.has_non_append_since_snapshot = true;
+                // would walk past the replacement and resurrect older appends:
+                // the flag set above (is_non_append_change) holds deltas off
+                // until the next full snapshot.
                 if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(data) {
                     head.item_count = arr.len();
                 }
@@ -554,8 +574,8 @@ impl StateManager {
                         state_id,
                         branch_id,
                         offset,
-                        *start as u32,
-                        *end as u32,
+                        *start,
+                        *end,
                     );
                 }
                 StateOperation::Set(data)
@@ -969,7 +989,11 @@ impl StateManager {
                     // snapshot of the whole state every delta interval while
                     // edits kept occurring — O(N²/D) disk): the raw tail just
                     // grows until the size-aware full above fires, and
-                    // single-pass materialization keeps reading it O(N).
+                    // single-pass materialization keeps reading it O(N). A
+                    // head whose flag missed such an op, as a branch made at a
+                    // past sequence before branches inherited the flag, gets a
+                    // Delta here, and the store then takes a full snapshot in
+                    // its place (Store::compute_delta_items).
                     if head.has_non_append_since_snapshot {
                         None
                     } else {
@@ -1037,12 +1061,17 @@ impl StateManager {
     ///
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
+    /// `has_non_append_since_snapshot` is whether the parent's chain holds a
+    /// non-Append change (is_non_append_change) from that position back to
+    /// the last full snapshot, or to a Set, which itself counts: what the
+    /// parent's head records there when its own flag is right.
     pub fn set_head_for_branch(
         &self,
         branch_id: BranchId,
         state_id: &str,
         head_offset: u64,
         item_count: usize,
+        has_non_append_since_snapshot: bool,
     ) {
         let mut index = self.index.write();
 
@@ -1053,7 +1082,11 @@ impl StateManager {
             delta_snapshots_since_full: 0,
             last_delta_snapshot_offset: None,
             last_full_snapshot_offset: None,
-            has_non_append_since_snapshot: false,
+            // Inherited, as the parent recorded it at this position: a delta
+            // built on the branch would walk past a non-Append change it
+            // inherits, so one holds deltas off until a full snapshot here
+            // too.
+            has_non_append_since_snapshot,
             item_count,
             // No record is written here — this head aliases into the parent's
             // chain. The branch starts at size N with the parent's snapshots
