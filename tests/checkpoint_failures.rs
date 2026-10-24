@@ -316,6 +316,9 @@ fn failed_historical_chain_read_does_not_allocate_a_partial_branch() {
     store
         .update_state("items", StateOperation::Append(b"not-json".to_vec()))
         .unwrap();
+    // The parent must have moved past `at`: a state whose head is at or
+    // before the branch point is inherited verbatim, with no chain read.
+    append(&store, 1).unwrap();
     let err = store
         .create_branch_at("bad", "main", Sequence(1))
         .unwrap_err();

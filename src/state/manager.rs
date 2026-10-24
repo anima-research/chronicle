@@ -4,6 +4,7 @@
 //! eliminating the need to keep all updates in memory. An LRU cache
 //! stores recently reconstructed states for fast repeated access.
 
+use super::cache::{SharedCache, StateBytes, StateItems};
 use super::{FieldIndexKind, FieldIndexManager};
 use crate::atomic_file::Checkpoint;
 use crate::error::{Result, StoreError};
@@ -12,14 +13,14 @@ use crate::types::{
     BranchId, StateOperation, StateRegistration, StateStrategy, StateUpdateRecord, TreeOp,
     TreeState,
 };
-use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Magic bytes for state index file.
@@ -130,41 +131,146 @@ pub struct StateChainHead {
     pub item_count_at_last_full: usize,
 }
 
+/// Chain heads for every `(branch, state)` pair, grouped by branch.
+///
+/// Grouping by branch is what keeps branch operations proportional to the
+/// branch involved rather than to the whole store: forking copies one
+/// branch's map (or just the selected entries of it), dropping a branch
+/// removes one entry, and neither scans the heads of any other branch. The
+/// per-branch map is ordered so that a state-id prefix selects a contiguous
+/// range.
+///
+/// **On-disk format:** unchanged. This serializes as the flat
+/// `(branch_id, state_id) -> head` map that `state.bin` has always held
+/// (the format a `HashMap<(BranchId, String), StateChainHead>` produces), and
+/// deserializes from it — see `test_state_index_wire_format_is_flat_map`.
+#[derive(Clone, Debug, Default)]
+pub struct BranchHeads {
+    by_branch: HashMap<BranchId, BTreeMap<String, StateChainHead>>,
+}
+
+impl BranchHeads {
+    /// Head of `state_id` on `branch`, if it has one.
+    pub fn get(&self, branch: BranchId, state_id: &str) -> Option<&StateChainHead> {
+        self.by_branch.get(&branch)?.get(state_id)
+    }
+
+    /// Mutable head of `state_id` on `branch`, if it has one.
+    pub fn get_mut(&mut self, branch: BranchId, state_id: &str) -> Option<&mut StateChainHead> {
+        self.by_branch.get_mut(&branch)?.get_mut(state_id)
+    }
+
+    /// Insert or replace the head for `(branch, state_id)`.
+    pub fn insert(
+        &mut self,
+        (branch, state_id): (BranchId, String),
+        head: StateChainHead,
+    ) -> Option<StateChainHead> {
+        self.by_branch.entry(branch).or_default().insert(state_id, head)
+    }
+
+    /// All heads of one branch, ordered by state id.
+    pub fn branch(&self, branch: BranchId) -> Option<&BTreeMap<String, StateChainHead>> {
+        self.by_branch.get(&branch)
+    }
+
+    /// Remove every head of `branch`, returning them.
+    pub fn remove_branch(&mut self, branch: BranchId) -> Option<BTreeMap<String, StateChainHead>> {
+        self.by_branch.remove(&branch)
+    }
+
+    /// Every head in the index.
+    pub fn iter(&self) -> impl Iterator<Item = ((BranchId, &String), &StateChainHead)> {
+        self.by_branch.iter().flat_map(|(branch, heads)| {
+            heads.iter().map(move |(state_id, head)| ((*branch, state_id), head))
+        })
+    }
+
+    /// Total number of heads across all branches.
+    pub fn len(&self) -> usize {
+        self.by_branch.values().map(|heads| heads.len()).sum()
+    }
+
+    /// Whether the index holds no heads at all.
+    pub fn is_empty(&self) -> bool {
+        self.by_branch.values().all(|heads| heads.is_empty())
+    }
+}
+
+impl Serialize for BranchHeads {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Entry-by-entry this makes the same serializer calls as
+        // `HashMap<(BranchId, String), StateChainHead>`. The entry count is
+        // passed explicitly: the nested iterator has no exact size hint, and
+        // MessagePack needs the map length up front.
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (key, head) in self.iter() {
+            map.serialize_entry(&key, head)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BranchHeads {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct HeadsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeadsVisitor {
+            type Value = BranchHeads;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of (branch_id, state_id) to chain head")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<BranchHeads, A::Error> {
+                let mut heads = BranchHeads::default();
+                while let Some((key, head)) =
+                    map.next_entry::<(BranchId, String), StateChainHead>()?
+                {
+                    heads.insert(key, head);
+                }
+                Ok(heads)
+            }
+        }
+
+        deserializer.deserialize_map(HeadsVisitor)
+    }
+}
+
+/// Which of a parent branch's states a new branch inherits.
+///
+/// A state is selected if its id equals one of `state_ids` or starts with one
+/// of `state_prefixes`. An empty selection selects nothing. Ids that name no
+/// state, or a state with no value on the parent, are ignored: there is
+/// nothing to inherit and the state reads as empty on the child either way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateSelection {
+    /// Exact state ids to inherit.
+    pub state_ids: Vec<String>,
+    /// State-id prefixes to inherit.
+    pub state_prefixes: Vec<String>,
+}
+
+impl StateSelection {
+    /// Whether `state_id` is covered by this selection.
+    pub fn matches(&self, state_id: &str) -> bool {
+        self.state_ids.iter().any(|id| id == state_id)
+            || self.state_prefixes.iter().any(|p| state_id.starts_with(p.as_str()))
+    }
+}
+
 /// In-memory state index (small - just heads and strategies).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StateIndex {
     /// Chain heads per (branch_id, state_id).
-    pub heads: HashMap<(BranchId, String), StateChainHead>,
+    pub heads: BranchHeads,
 
     /// Registered state strategies.
     pub strategies: HashMap<String, StateStrategy>,
-}
-
-/// Cached state value.
-#[derive(Clone)]
-struct CachedState {
-    value: Vec<u8>,
-    head_offset: u64, // To detect staleness
-}
-
-/// Cached per-item byte spans of an array-shaped (AppendLog) state.
-///
-/// Items are the raw JSON bytes of each array element, split once per
-/// materialization via `serde_json::value::RawValue` (boundary scan only —
-/// no `Value` tree is built). Shared out as `Arc` so repeated item/slice
-/// reads never re-copy the whole state.
-#[derive(Clone)]
-struct CachedItems {
-    items: Arc<Vec<Vec<u8>>>,
-    head_offset: u64, // To detect staleness (same discipline as CachedState)
-}
-
-/// Cached decoded form of a Tree state (path → entry map), so point reads
-/// (`tree_get`) and prefix lists stop paying a full-map JSON parse per call.
-#[derive(Clone)]
-struct CachedTree {
-    tree: Arc<TreeState>,
-    head_offset: u64, // To detect staleness (same discipline as CachedState)
 }
 
 /// State manager handles per-state chains and reconstruction.
@@ -181,17 +287,22 @@ pub struct StateManager {
     /// In-memory index (just heads + strategies, very small).
     index: RwLock<StateIndex>,
 
-    /// LRU cache for reconstructed states.
-    cache: RwLock<LruCache<String, CachedState>>,
+    /// LRU cache for reconstructed states (serialized bytes).
+    ///
+    /// All three caches are keyed per `(branch, state)` and validated by
+    /// `head_offset`, and all three share a value between branches whose
+    /// head for the state is at the same offset — see `state::cache`.
+    cache: RwLock<SharedCache<StateBytes>>,
 
     /// LRU cache for per-item byte spans of array-shaped states.
-    /// Populated lazily by `get_state_items`; invalidated in lockstep
-    /// with `cache` (same key scheme, same head_offset validity check).
-    items_cache: RwLock<LruCache<String, CachedItems>>,
+    /// Populated lazily by `get_state_items`, then kept current across
+    /// Append/Edit/Redact writes by deriving the next value from the cached
+    /// one (`record_update_with`) instead of being dropped and re-read.
+    items_cache: RwLock<SharedCache<StateItems>>,
 
     /// LRU cache for decoded Tree states. Populated lazily by
     /// `get_tree_state`; same key scheme and head_offset validity as above.
-    tree_cache: RwLock<LruCache<String, CachedTree>>,
+    tree_cache: RwLock<SharedCache<TreeState>>,
 
     /// Reference to record log for disk-based chain traversal.
     log: Option<Arc<RecordLog>>,
@@ -205,6 +316,19 @@ pub struct StateManager {
     /// Path to the persisted field-index file, derived once at construction
     /// as a sibling of `path` (`state.bin` -> `state-indexes.bin`).
     field_index_path: PathBuf,
+
+    /// Branches that were deleted since the last `purge_retired_branches`.
+    /// Their chain heads stay in `index` (and so in the next `state.bin`)
+    /// until the store has durably recorded the deletion — see
+    /// `retire_branch`.
+    retired_branches: parking_lot::Mutex<Vec<BranchId>>,
+
+    /// Number of times a state value was rebuilt from the log
+    /// (`reconstruct_from_disk`). Everything served from a cache — this
+    /// branch's own entry or one shared with another branch — leaves it
+    /// untouched, which makes it the observable for "this read did not
+    /// re-materialize".
+    reconstructions: AtomicU64,
 }
 
 /// Derive the field-index file path as a sibling of the state-index path.
@@ -231,12 +355,14 @@ impl StateManager {
             path,
             checkpoint: Checkpoint::default(),
             index: RwLock::new(StateIndex::default()),
-            cache: RwLock::new(LruCache::new(cache_size)),
-            items_cache: RwLock::new(LruCache::new(cache_size)),
-            tree_cache: RwLock::new(LruCache::new(cache_size)),
+            cache: RwLock::new(SharedCache::new(cache_size)),
+            items_cache: RwLock::new(SharedCache::new(cache_size)),
+            tree_cache: RwLock::new(SharedCache::new(cache_size)),
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            retired_branches: parking_lot::Mutex::new(Vec::new()),
+            reconstructions: AtomicU64::new(0),
         })
     }
 
@@ -260,12 +386,14 @@ impl StateManager {
             path: path.clone(),
             checkpoint: Checkpoint::default(),
             index: RwLock::new(StateIndex::default()),
-            cache: RwLock::new(LruCache::new(cache_size)),
-            items_cache: RwLock::new(LruCache::new(cache_size)),
-            tree_cache: RwLock::new(LruCache::new(cache_size)),
+            cache: RwLock::new(SharedCache::new(cache_size)),
+            items_cache: RwLock::new(SharedCache::new(cache_size)),
+            tree_cache: RwLock::new(SharedCache::new(cache_size)),
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            retired_branches: parking_lot::Mutex::new(Vec::new()),
+            reconstructions: AtomicU64::new(0),
         };
 
         if path.exists() {
@@ -314,13 +442,13 @@ impl StateManager {
     /// deletion retains heads, so it cannot move this watermark backwards.
     /// None means no update has been checkpointed, including offset zero.
     pub(crate) fn checkpoint_offset(&self) -> Option<u64> {
-        self.index.read().heads.values().map(|h| h.head_offset).max()
+        self.index.read().heads.iter().map(|(_, h)| h.head_offset).max()
     }
 
     /// Highest branch identity referenced by state metadata, including copied
     /// heads that may have reached disk before their branch was published.
     pub(crate) fn max_branch_id(&self) -> Option<BranchId> {
-        self.index.read().heads.keys().map(|(branch, _)| *branch).max()
+        self.index.read().heads.iter().map(|((branch, _), _)| branch).max()
     }
 
     /// Register a new state with its strategy.
@@ -378,11 +506,35 @@ impl StateManager {
         offset: u64,
         operation: &StateOperation,
     ) -> Result<()> {
+        self.record_update_with(branch_id, state_id, offset, operation, false)
+    }
+
+    /// `record_update`, with the caller's assurance about the value.
+    ///
+    /// `content_preserving` says that `operation` is a snapshot (full or
+    /// delta) of exactly the value the state already had at its previous
+    /// head — true for the snapshots the store writes itself (threshold
+    /// snapshots, `compact_state`, `tree_snapshot`) when no other write
+    /// reached the state between reading the value and recording the
+    /// snapshot. Such a record moves the chain head without changing what
+    /// the state materializes to, so the cached values are kept and re-filed
+    /// under the new head instead of being dropped. It must be `false` for a
+    /// snapshot whose payload came from anywhere else.
+    pub(crate) fn record_update_with(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        offset: u64,
+        operation: &StateOperation,
+        content_preserving: bool,
+    ) -> Result<()> {
         let mut index = self.index.write();
 
-        let key = (branch_id, state_id.to_string());
-        let head = index.heads.entry(key.clone()).or_insert_with(|| {
-            StateChainHead {
+        let branch_heads = index.heads.by_branch.entry(branch_id).or_default();
+        // Where the chain stood before this record (`None`: first record).
+        let prev_offset = branch_heads.get(state_id).map(|h| h.head_offset);
+        if !branch_heads.contains_key(state_id) {
+            branch_heads.insert(state_id.to_string(), StateChainHead {
                 head_offset: offset,
                 ops_since_delta_snapshot: 0,
                 delta_snapshots_since_full: 0,
@@ -391,8 +543,11 @@ impl StateManager {
                 has_non_append_since_snapshot: false,
                 item_count: 0,
                 item_count_at_last_full: 0,
-            }
-        });
+            });
+        }
+        let head = branch_heads
+            .get_mut(state_id)
+            .expect("head inserted above");
 
         head.head_offset = offset;
 
@@ -486,26 +641,59 @@ impl StateManager {
             }
         }
 
-        // Invalidate cache for this state (need to invalidate for all branches)
-        // Use a cache key that includes branch
+        // Bring this branch's cached values for the state in line with the
+        // new head. Entries are per branch: nothing another branch holds is
+        // touched, including a value this branch was sharing with it.
         let cache_key = format!("{}:{}", branch_id.0, state_id);
-        self.cache.write().pop(&cache_key);
-        self.items_cache.write().pop(&cache_key);
+        let preserved_from = if content_preserving { prev_offset } else { None };
 
-        // Incrementally maintain any registered field indexes for this state.
-        // Gated on `has_indexes_for` so states with nothing registered pay
-        // no parse cost at all on the hot append path.
+        // Serialized bytes: kept across a content-preserving snapshot,
+        // otherwise dropped (the next `get_state` rebuilds them).
+        {
+            let mut cache = self.cache.write();
+            match preserved_from {
+                Some(prev) => cache.rekey(&cache_key, prev, offset),
+                None => cache.pop(&cache_key),
+            }
+        }
+
+        // Per-item form: derive the new value from the one cached at the
+        // previous head (this branch's own, or one another branch holds at
+        // that offset) rather than dropping it — otherwise every append
+        // would cost the next slice read a full re-materialization. Only
+        // when a value is already cached: a write never materializes.
+        {
+            let mut items_cache = self.items_cache.write();
+            let next = prev_offset
+                .and_then(|prev| items_cache.take(&cache_key, prev))
+                .and_then(|items| Self::advance_items(items, operation, content_preserving));
+            if let Some(items) = next {
+                items_cache.put(cache_key.clone(), offset, items);
+            }
+        }
+
+        // Decoded trees are not dropped on write (a stale entry is detected
+        // by head_offset on the next read); a content-preserving snapshot
+        // keeps the decoded tree current.
+        if let Some(prev) = preserved_from {
+            self.tree_cache.write().rekey(&cache_key, prev, offset);
+        }
+
+        // Incrementally maintain the field indexes registered for this state
+        // ON THIS BRANCH. Gated on `has_indexes_on` so a slot with nothing
+        // registered on the branch being written pays no parse cost at all
+        // on the hot append path — including when other branches do index it.
         //
-        // Parse failures poison (drop) every field index registered for this
-        // state_id rather than being silently skipped: skipping would leave
-        // `by_ordinal` one short forever, permanently misaligning every
-        // later ordinal against the real slot content with no signal to the
-        // caller. A poisoned index is simply gone — `register_field_index`
-        // rebuilds it from scratch — which is far safer than confidently
-        // returning wrong ordinals. Branch mismatches (a write on a branch
-        // other than the one an index was registered against) poison the
-        // same way; see `FieldIndexManager`'s "Branch scoping" docs.
-        if self.field_indexes.read().has_indexes_for(state_id) {
+        // Parse failures poison (drop) every field index this branch holds
+        // for this state_id rather than being silently skipped: skipping
+        // would leave `by_ordinal` one short forever, permanently
+        // misaligning every later ordinal against the real slot content with
+        // no signal to the caller. A poisoned index is simply gone —
+        // `register_field_index` rebuilds it from scratch — which is far
+        // safer than confidently returning wrong ordinals. Indexes other
+        // branches hold for the same state_id are never touched by this
+        // write; see `FieldIndexManager`'s "Branch scoping" docs.
+        if self.field_indexes.read().has_indexes_on(state_id, branch_id) {
             match operation {
                 StateOperation::Append(item) => {
                     match serde_json::from_slice::<serde_json::Value>(item) {
@@ -513,7 +701,7 @@ impl StateManager {
                             .field_indexes
                             .write()
                             .on_append(state_id, branch_id, offset, &value),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::DeltaSnapshot(_) => {
@@ -546,7 +734,7 @@ impl StateManager {
                             *index as u32,
                             &value,
                         ),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::Redact { start, end } => {
@@ -577,7 +765,7 @@ impl StateManager {
                             offset,
                             items.iter(),
                         ),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 // Tree ops (path->entry maps) and Struct Field ops are not
@@ -597,12 +785,24 @@ impl StateManager {
     /// Get the current value of a state.
     ///
     /// Uses LRU cache for fast repeated access. On cache miss,
-    /// reconstructs state by traversing the chain from disk.
+    /// reconstructs state by traversing the chain from disk — unless another
+    /// branch already holds the value for the same chain head, in which case
+    /// that value is shared.
     pub fn get_state(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_state_shared(branch_id, state_id)?
+            .map(|state| state.data.clone()))
+    }
+
+    /// `get_state` without the final copy: the cached bytes themselves.
+    fn get_state_shared(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<StateBytes>>> {
         let index = self.index.read();
 
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -610,14 +810,23 @@ impl StateManager {
 
         let cache_key = format!("{}:{}", branch_id.0, state_id);
 
-        // Check cache
-        {
-            let mut cache = self.cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(Some(cached.value.clone()));
-                }
-                // Stale cache entry, will reconstruct
+        // Check cache: this branch's entry, or a value another branch holds
+        // at the same head offset.
+        if let Some(cached) = self.cache.write().get(&cache_key, head.head_offset) {
+            return Ok(Some(cached));
+        }
+
+        // The per-item form may be current when the bytes are not (it is
+        // kept across writes, the bytes are dropped). Joining canonical
+        // items yields exactly the bytes a reconstruction would serialize,
+        // without touching the log. Not cached: the items already hold the
+        // data, and a second full copy per branch is what this avoids.
+        if let Some(items) = self.items_cache.read().peek(&cache_key, head.head_offset) {
+            if items.is_canonical() {
+                return Ok(Some(Arc::new(StateBytes {
+                    data: Self::join_items(&items, 0, items.len()),
+                    canonical: true,
+                })));
             }
         }
 
@@ -627,32 +836,96 @@ impl StateManager {
             .as_ref()
             .ok_or_else(|| StoreError::NotInitialized)?;
 
-        let value = self.reconstruct_from_disk(log, head.head_offset)?;
+        let (data, canonical) = self.reconstruct_from_disk(log, head.head_offset)?;
+        let value = Arc::new(StateBytes { data, canonical });
 
         // Cache the result
-        {
-            let mut cache = self.cache.write();
-            cache.put(
-                cache_key,
-                CachedState {
-                    value: value.clone(),
-                    head_offset: head.head_offset,
-                },
-            );
-        }
+        self.cache
+            .write()
+            .put(cache_key, head.head_offset, Arc::clone(&value));
 
         Ok(Some(value))
+    }
+
+    /// Items `start..end` re-joined as a JSON array (item bytes verbatim).
+    pub(crate) fn join_items(items: &StateItems, start: usize, end: usize) -> Vec<u8> {
+        let total: usize = items.range(start, end).map(|i| i.len() + 1).sum();
+        let mut out = Vec::with_capacity(total + 2);
+        out.push(b'[');
+        for (i, item) in items.range(start, end).enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(item);
+        }
+        out.push(b']');
+        out
+    }
+
+    /// The value the per-item cache holds for the state after `operation`,
+    /// derived from `items`, the value it held before. `None` when the new
+    /// value cannot be derived (the entry is then dropped and the next read
+    /// re-materializes, as every write used to cause).
+    ///
+    /// Derivation must produce exactly what re-materializing would.
+    /// Materialization decodes every item and serializes it again, so the
+    /// base is first brought into that form (`StateItems::into_canonical` —
+    /// a no-op for a value that already is, and otherwise computed once and
+    /// shared by every branch deriving from the same inherited value), and
+    /// an appended or edited item is stored re-serialized.
+    fn advance_items(
+        items: Arc<StateItems>,
+        operation: &StateOperation,
+        content_preserving: bool,
+    ) -> Option<Arc<StateItems>> {
+        fn reserialize(item: &[u8]) -> Option<Arc<[u8]>> {
+            let value: serde_json::Value = serde_json::from_slice(item).ok()?;
+            serde_json::to_vec(&value).ok().map(Arc::from)
+        }
+
+        match operation {
+            StateOperation::Snapshot(_) | StateOperation::DeltaSnapshot(_)
+                if content_preserving =>
+            {
+                Some(items)
+            }
+            StateOperation::Append(item) => {
+                let item = reserialize(item)?;
+                let mut items = items.into_canonical()?;
+                Arc::make_mut(&mut items).push(item);
+                Some(items)
+            }
+            StateOperation::Edit { index, new_value } => {
+                if *index >= items.len() {
+                    return None;
+                }
+                let item = reserialize(new_value)?;
+                let mut items = items.into_canonical()?;
+                Arc::make_mut(&mut items).set(*index, item);
+                Some(items)
+            }
+            StateOperation::Redact { start, end } => {
+                let mut items = items.into_canonical()?;
+                Arc::make_mut(&mut items).remove_range(*start, *end);
+                Some(items)
+            }
+            _ => None,
+        }
     }
 
     /// Get the current value of an array-shaped (AppendLog) state as
     /// per-item raw JSON byte spans.
     ///
-    /// The full state is materialized at most once per head_offset; the
-    /// split result is cached and shared out as `Arc`, so item and slice
-    /// reads are O(returned data) instead of O(state size). Validity is
-    /// governed by the same head_offset discipline as `get_state` — any
-    /// write to the state (on this branch) produces a new head_offset and
-    /// the next read re-materializes. No caller-side invalidation exists.
+    /// The full state is materialized at most once; the split result is
+    /// cached and shared out as `Arc`, so item and slice reads are
+    /// O(returned data) instead of O(state size). Validity is governed by
+    /// the same head_offset discipline as `get_state`. A write to the state
+    /// on this branch moves the head; the cached items follow it when the
+    /// new value can be derived from them (Append, Edit, Redact, and the
+    /// store's own snapshots), and are otherwise dropped so the next read
+    /// re-materializes. A branch whose head is at an offset another branch
+    /// has cached shares that branch's items. No caller-side invalidation
+    /// exists.
     ///
     /// Returns an error if the state is not a JSON array (e.g. a Snapshot
     /// strategy state holding an object) — matching the behavior of the
@@ -661,10 +934,9 @@ impl StateManager {
         &self,
         branch_id: BranchId,
         state_id: &str,
-    ) -> Result<Option<Arc<Vec<Vec<u8>>>>> {
+    ) -> Result<Option<Arc<StateItems>>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -673,42 +945,29 @@ impl StateManager {
         let cache_key = format!("{}:{}", branch_id.0, state_id);
 
         // Check items cache
-        {
-            let mut cache = self.items_cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(Some(Arc::clone(&cached.items)));
-                }
-                // Stale entry, will re-materialize
-            }
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(Some(cached));
         }
 
         // Materialize the full state once (served from the byte cache when
         // warm), then split into item spans without building a Value tree.
-        let state = match self.get_state(branch_id, state_id)? {
+        let state = match self.get_state_shared(branch_id, state_id)? {
             Some(s) => s,
             None => return Ok(None),
         };
 
-        let items: Vec<Vec<u8>> = if state.is_empty() {
-            Vec::new()
+        let items = if state.data.is_empty() {
+            StateItems::from_items(std::iter::empty(), state.canonical)
         } else {
-            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&state)
+            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&state.data)
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-            raw.iter().map(|r| r.get().as_bytes().to_vec()).collect()
+            StateItems::from_items(raw.iter().map(|r| r.get().as_bytes()), state.canonical)
         };
         let items = Arc::new(items);
 
-        {
-            let mut cache = self.items_cache.write();
-            cache.put(
-                cache_key,
-                CachedItems {
-                    items: Arc::clone(&items),
-                    head_offset: head.head_offset,
-                },
-            );
-        }
+        self.items_cache
+            .write()
+            .put(cache_key, head.head_offset, Arc::clone(&items));
 
         Ok(Some(items))
     }
@@ -743,7 +1002,7 @@ impl StateManager {
     ) -> Result<Option<Vec<u8>>> {
         let head = {
             let idx = self.index.read();
-            match idx.heads.get(&(branch_id, state_id.to_string())) {
+            match idx.heads.get(branch_id, state_id) {
                 Some(h) => h.clone(),
                 None => return Ok(None),
             }
@@ -751,13 +1010,8 @@ impl StateManager {
 
         // Warm cache wins: O(1) and avoids even the head-record read.
         let cache_key = format!("{}:{}", branch_id.0, state_id);
-        {
-            let mut cache = self.items_cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(cached.items.get(index).cloned());
-                }
-            }
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(cached.get(index).map(|item| item.to_vec()));
         }
 
         // Head-record fast path: last item + Append head.
@@ -777,7 +1031,7 @@ impl StateManager {
 
         // Slow path: full materialization (result cached for later reads).
         match self.get_state_items(branch_id, state_id)? {
-            Some(items) => Ok(items.get(index).cloned()),
+            Some(items) => Ok(items.get(index).map(|item| item.to_vec())),
             None => Ok(None),
         }
     }
@@ -803,8 +1057,7 @@ impl StateManager {
         state_id: &str,
     ) -> Result<Option<Arc<TreeState>>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -812,38 +1065,26 @@ impl StateManager {
 
         let cache_key = format!("{}:{}", branch_id.0, state_id);
 
-        // Check tree cache
-        {
-            let mut cache = self.tree_cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(Some(Arc::clone(&cached.tree)));
-                }
-                // Stale entry, will re-parse
-            }
+        // Check tree cache (own entry, or one another branch holds at the
+        // same head offset)
+        if let Some(cached) = self.tree_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(Some(cached));
         }
 
         // Materialize the state bytes once (served from the byte cache when
         // warm), then decode the map once per head_offset.
-        let state = match self.get_state(branch_id, state_id)? {
-            Some(s) if !s.is_empty() => s,
+        let state = match self.get_state_shared(branch_id, state_id)? {
+            Some(s) if !s.data.is_empty() => s,
             _ => return Ok(None),
         };
 
-        let tree: TreeState = serde_json::from_slice(&state)
+        let tree: TreeState = serde_json::from_slice(&state.data)
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
         let tree = Arc::new(tree);
 
-        {
-            let mut cache = self.tree_cache.write();
-            cache.put(
-                cache_key,
-                CachedTree {
-                    tree: Arc::clone(&tree),
-                    head_offset: head.head_offset,
-                },
-            );
-        }
+        self.tree_cache
+            .write()
+            .put(cache_key, head.head_offset, Arc::clone(&tree));
 
         Ok(Some(tree))
     }
@@ -856,7 +1097,8 @@ impl StateManager {
     /// - Regular ops: Collect only if before any snapshot
     ///
     /// Reconstruction: base_snapshot + delta_snapshots + recent_ops
-    fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<Vec<u8>> {
+    fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<(Vec<u8>, bool)> {
+        self.reconstructions.fetch_add(1, Ordering::Relaxed);
         let mut operations = Vec::new();
         let mut current_offset = Some(head_offset);
         let mut hit_snapshot = false; // Once we hit any snapshot, stop collecting regular ops
@@ -901,13 +1143,12 @@ impl StateManager {
         // decoding once and encoding once — per-op application made cold
         // reconstruction O(tail × N).
         operations.reverse();
-        crate::state::materialize_operations(operations)
+        crate::state::materialize_operations_tagged(operations)
     }
 
     /// Get the chain head for a state.
     pub fn get_head(&self, branch_id: BranchId, state_id: &str) -> Option<StateChainHead> {
-        let key = (branch_id, state_id.to_string());
-        self.index.read().heads.get(&key).cloned()
+        self.index.read().heads.get(branch_id, state_id).cloned()
     }
 
     /// Get the strategy for a state.
@@ -921,8 +1162,7 @@ impl StateManager {
     pub fn snapshot_needed(&self, branch_id: BranchId, state_id: &str) -> Option<SnapshotNeeded> {
         let index = self.index.read();
 
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h,
             None => return None,
         };
@@ -1018,62 +1258,138 @@ impl StateManager {
     }
 
     /// Copy state chain heads from one branch to another (for branching).
-    pub fn copy_heads_for_branch(&self, from_branch: BranchId, to_branch: BranchId) {
+    ///
+    /// Heads are copied verbatim, snapshot accounting included, so the new
+    /// branch schedules snapshots exactly as its parent would have. With
+    /// `selection` only the selected states are copied; the others have no
+    /// head on the new branch and read there as registered-but-empty.
+    ///
+    /// Cost is proportional to the heads copied (plus a `log n` lookup per
+    /// exact id or prefix), never to the number of branches or to the heads
+    /// other branches hold. Returns the number of heads copied.
+    pub fn copy_heads_for_branch(
+        &self,
+        from_branch: BranchId,
+        to_branch: BranchId,
+        selection: Option<&StateSelection>,
+    ) -> usize {
         let mut index = self.index.write();
 
-        // Find all heads for the source branch
-        let heads_to_copy: Vec<_> = index.heads.iter()
-            .filter(|((branch_id, _), _)| *branch_id == from_branch)
-            .map(|((_, state_id), head)| (state_id.clone(), head.clone()))
-            .collect();
+        let copied: BTreeMap<String, StateChainHead> = match index.heads.branch(from_branch) {
+            None => return 0,
+            Some(parent) => match selection {
+                None => parent.clone(),
+                // Collecting into a map dedups a state named twice (by id
+                // and by prefix, or by overlapping prefixes).
+                Some(selection) => Self::select_heads(parent, selection)
+                    .map(|(state_id, head)| (state_id.clone(), head.clone()))
+                    .collect(),
+            },
+        };
 
-        // Copy them to the new branch
-        for (state_id, head) in heads_to_copy {
-            index.heads.insert((to_branch, state_id), head);
+        let count = copied.len();
+        if count > 0 {
+            for (state_id, head) in &copied {
+                self.share_cached(to_branch, state_id, head.head_offset);
+            }
+            index
+                .heads
+                .by_branch
+                .entry(to_branch)
+                .or_default()
+                .extend(copied);
+        }
+        count
+    }
+
+    /// Give `branch_id` a reference to whatever is already cached for the
+    /// chain head `head_offset` it has just been handed.
+    ///
+    /// Without this a new branch would only find its parent's cached value
+    /// if it happened to read before the parent's next write moved the
+    /// parent's entry on. Holding its own reference pins the value the
+    /// branch actually inherited. Limited to the per-item and decoded-tree
+    /// forms, which share structure with their successors (pinning one costs
+    /// a few pointers); the serialized bytes are a flat copy per version and
+    /// are shared only on demand, by a read at the same offset.
+    fn share_cached(&self, branch_id: BranchId, state_id: &str, head_offset: u64) {
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        self.items_cache.write().adopt(cache_key.clone(), head_offset);
+        self.tree_cache.write().adopt(cache_key, head_offset);
+    }
+
+    /// The entries of one branch's head map that `selection` covers. A state
+    /// covered more than once is yielded more than once; callers dedup.
+    fn select_heads<'a>(
+        heads: &'a BTreeMap<String, StateChainHead>,
+        selection: &'a StateSelection,
+    ) -> impl Iterator<Item = (&'a String, &'a StateChainHead)> + 'a {
+        let exact = selection
+            .state_ids
+            .iter()
+            .filter_map(move |id| heads.get_key_value(id.as_str()));
+        let prefixed = selection.state_prefixes.iter().flat_map(move |prefix| {
+            heads
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(move |(id, _)| id.starts_with(prefix.as_str()))
+        });
+        exact.chain(prefixed)
+    }
+
+    /// The heads of `branch_id` covered by `selection` (all of them when
+    /// `selection` is `None`), each state once, ordered by state id.
+    pub fn selected_heads(
+        &self,
+        branch_id: BranchId,
+        selection: Option<&StateSelection>,
+    ) -> Vec<(String, StateChainHead)> {
+        let index = self.index.read();
+        let heads = match index.heads.branch(branch_id) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        match selection {
+            None => heads.iter().map(|(id, h)| (id.clone(), h.clone())).collect(),
+            Some(selection) => Self::select_heads(heads, selection)
+                .map(|(id, h)| (id.clone(), h.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
         }
     }
 
-    /// Set a state chain head for a branch at a specific offset.
+    /// Install a complete chain head for a branch.
     ///
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
-    pub fn set_head_for_branch(
-        &self,
-        branch_id: BranchId,
-        state_id: &str,
-        head_offset: u64,
-        item_count: usize,
-    ) {
+    /// The caller supplies the whole head — including the snapshot accounting
+    /// the chain had at that position — because the accounting decides which
+    /// kind of snapshot the branch may take next: starting a branch with
+    /// "no non-append ops since the last snapshot" while its inherited chain
+    /// holds an uncovered Edit/Redact/Set lets an append-only delta snapshot
+    /// walk past that mutation and lose it.
+    pub fn insert_head_for_branch(&self, branch_id: BranchId, state_id: &str, head: StateChainHead) {
         let mut index = self.index.write();
-
-        let head = StateChainHead {
-            head_offset,
-            // Fresh snapshot accounting - the branch starts its own tracking
-            ops_since_delta_snapshot: 0,
-            delta_snapshots_since_full: 0,
-            last_delta_snapshot_offset: None,
-            last_full_snapshot_offset: None,
-            has_non_append_since_snapshot: false,
-            item_count,
-            // No record is written here — this head aliases into the parent's
-            // chain. The branch starts at size N with the parent's snapshots
-            // behind it; treating N as the spacing baseline keeps the doubling
-            // schedule (the branch's first full fires once it has grown by N).
-            item_count_at_last_full: item_count,
-        };
-
+        self.share_cached(branch_id, state_id, head.head_offset);
         index.heads.insert((branch_id, state_id.to_string()), head);
     }
 
     /// Register (or refresh) a secondary index on a JSON field of every item
     /// currently in `state_id` (materialized on `branch_id`), extracted via
     /// the JSON-pointer `field_path`. Idempotent: a no-op if an index for
-    /// this `(state_id, field_path)` is already registered, fresh (same
-    /// `branch_id` and the slot's current `head_offset`), and of the same
-    /// `kind` — see `FieldIndexManager::register`. Registering from a
-    /// different branch than whatever last held this `(state_id,
-    /// field_path)` index replaces it outright (only one branch's index can
-    /// be live per field at a time — see `FieldIndexManager`'s module docs).
+    /// this `(state_id, field_path)` is already registered on `branch_id`,
+    /// fresh (the slot's current `head_offset`), and of the same `kind` —
+    /// see `FieldIndexManager::register`. Each branch holds its own index:
+    /// registering here neither replaces nor disturbs one another branch
+    /// holds for the same field (see `FieldIndexManager`'s module docs).
+    ///
+    /// When another branch already holds this index at the very `head_offset`
+    /// this branch's slot is at — a branch that has not written to a slot it
+    /// inherited, registering what its parent registered — that index is
+    /// copied instead of rebuilt: no materialization, no JSON decode.
     ///
     /// The freshness check runs BEFORE this materializes/parses the slot's
     /// JSON — `head_offset` alone (already cheap: an index lookup, not a
@@ -1103,10 +1419,33 @@ impl StateManager {
             return Ok(());
         }
 
-        let items: Vec<serde_json::Value> = match self.get_state(branch_id, state_id)? {
-            Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
+        if self.field_indexes.write().register_from_sibling(
+            state_id,
+            field_path,
+            kind,
+            branch_id,
+            head_offset,
+        )? {
+            return Ok(());
+        }
+
+        // Decode from the per-item cache when it is current (no log walk,
+        // no second copy of the slot); otherwise materialize.
+        let cached_items = head_offset.and_then(|offset| {
+            let cache_key = format!("{}:{}", branch_id.0, state_id);
+            self.items_cache.write().get(&cache_key, offset)
+        });
+        let items: Vec<serde_json::Value> = match cached_items {
+            Some(cached) => cached
+                .iter()
+                .map(serde_json::from_slice)
+                .collect::<std::result::Result<_, _>>()
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?,
-            _ => Vec::new(),
+            None => match self.get_state_shared(branch_id, state_id)? {
+                Some(state) if !state.data.is_empty() => serde_json::from_slice(&state.data)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?,
+                _ => Vec::new(),
+            },
         };
 
         self.field_indexes.write().register(
@@ -1122,10 +1461,10 @@ impl StateManager {
     /// Query ordinals of a registered `Number` field index within
     /// `[gte, lte]` (either bound optional), scoped to `branch_id`. Returns
     /// `None` if no such index is currently registered FOR `branch_id`
-    /// (never registered, wrong kind, poisoned by a cross-branch write or a
-    /// parse failure, or registered against a *different* branch — a pure
-    /// read after `switch_branch` with no intervening write must never
-    /// serve another branch's ordinals) — distinct from `Some(vec![])`, an
+    /// (never registered there, wrong kind, or poisoned by a parse failure;
+    /// an index another branch holds is never served — a pure read after
+    /// `switch_branch` with no intervening write must never see another
+    /// branch's ordinals) — distinct from `Some(vec![])`, an
     /// index that exists, matches this branch, and has no matches.
     #[allow(clippy::too_many_arguments)]
     pub fn query_field_index_range(
@@ -1188,11 +1527,63 @@ impl StateManager {
     pub fn clear_cache(&self) {
         self.cache.write().clear();
         self.items_cache.write().clear();
+        self.tree_cache.write().clear();
+    }
+
+    /// How many times a state value has been rebuilt from the log since this
+    /// manager was created. A read served from a cache does not count.
+    pub fn reconstruction_count(&self) -> u64 {
+        self.reconstructions.load(Ordering::Relaxed)
     }
 
     /// Get cache statistics.
     pub fn cache_len(&self) -> usize {
         self.cache.read().len()
+    }
+
+    /// Release what is held for a branch that has just been deleted.
+    ///
+    /// Derived data goes at once: the branch's cache entries (values other
+    /// branches still reference stay alive for them) and its field indexes.
+    ///
+    /// Its chain heads are only MARKED here and removed by
+    /// `purge_retired_branches`, which the store calls after it has saved
+    /// the branch list. `state.bin` and `branches.bin` are separate files
+    /// written one after the other; if the heads left `state.bin` first, a
+    /// crash between the two writes would bring the branch back (still
+    /// listed in `branches.bin`) with every state empty. Keeping them until
+    /// the deletion itself is durable means a crash can only bring the
+    /// branch back whole, or leave unreferenced heads behind — never a
+    /// branch stripped of its state.
+    pub fn retire_branch(&self, branch_id: BranchId) {
+        let prefix = format!("{}:", branch_id.0);
+        self.cache.write().pop_prefix(&prefix);
+        self.items_cache.write().pop_prefix(&prefix);
+        self.tree_cache.write().pop_prefix(&prefix);
+        self.field_indexes.write().drop_branch(branch_id);
+        self.retired_branches.lock().push(branch_id);
+    }
+
+    /// Remove the chain heads of every branch retired so far. Call only
+    /// once the deletion of those branches has been durably saved. Returns
+    /// the number of heads removed. The next `save` writes a `state.bin`
+    /// without them.
+    pub fn purge_retired_branches(&self) -> usize {
+        let retired: Vec<BranchId> = std::mem::take(&mut *self.retired_branches.lock());
+        if retired.is_empty() {
+            return 0;
+        }
+        let mut index = self.index.write();
+        retired
+            .into_iter()
+            .filter_map(|branch_id| index.heads.remove_branch(branch_id))
+            .map(|heads| heads.len())
+            .sum()
+    }
+
+    /// Total number of chain heads held, across all branches.
+    pub fn head_count(&self) -> usize {
+        self.index.read().heads.len()
     }
 
     /// Get compaction statistics for a state.
@@ -1201,8 +1592,7 @@ impl StateManager {
     /// and the offset of the oldest operation that's still needed.
     pub fn get_compaction_stats(&self, branch_id: BranchId, state_id: &str) -> Option<CompactionStats> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = index.heads.get(&key)?;
+        let head = index.heads.get(branch_id, state_id)?;
         // Each delta snapshot covers delta_snapshot_every ops; a strategy
         // without delta snapshots never increments delta_snapshots_since_full,
         // so the multiplier is moot there.
@@ -1227,8 +1617,7 @@ impl StateManager {
     /// by creating a full snapshot at the current head.
     pub fn count_chain_operations(&self, branch_id: BranchId, state_id: &str) -> Result<Option<ChainStats>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -1380,7 +1769,7 @@ impl StateManager {
             field_indexes.prune_stale(|state_id, branch_id| {
                 current_index
                     .heads
-                    .get(&(branch_id, state_id.to_string()))
+                    .get(branch_id, state_id)
                     .map(|h| h.head_offset)
             });
             drop(current_index);
@@ -2165,5 +2554,144 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot);
         assert_eq!(head.item_count, 0);
         assert_eq!(head.item_count_at_last_full, 0);
+    }
+    /// `state.bin` compatibility: `BranchHeads` must read the flat
+    /// `(branch_id, state_id) -> head` map every existing store holds, and
+    /// write a map the previous in-memory layout reads back unchanged.
+    #[test]
+    fn test_state_index_wire_format_is_flat_map() {
+        /// `StateIndex` exactly as it was declared through 0.4.0.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyStateIndex {
+            heads: HashMap<(BranchId, String), StateChainHead>,
+            strategies: HashMap<String, StateStrategy>,
+        }
+
+        fn head(n: u64) -> StateChainHead {
+            StateChainHead {
+                head_offset: n,
+                ops_since_delta_snapshot: n + 1,
+                delta_snapshots_since_full: n + 2,
+                last_delta_snapshot_offset: Some(n + 3),
+                last_full_snapshot_offset: if n % 2 == 0 { Some(n + 4) } else { None },
+                has_non_append_since_snapshot: n % 2 == 1,
+                item_count: (n + 5) as usize,
+                item_count_at_last_full: (n + 6) as usize,
+            }
+        }
+
+        let mut legacy = LegacyStateIndex {
+            heads: HashMap::new(),
+            strategies: HashMap::new(),
+        };
+        let mut n = 0;
+        for branch in [1u64, 2, 7, 300] {
+            for state in ["messages", "agent/a/tree", "", "ünïcode"] {
+                legacy.heads.insert((BranchId(branch), state.to_string()), head(n));
+                n += 1;
+            }
+        }
+        legacy.strategies.insert("messages".to_string(), StateStrategy::Snapshot);
+        legacy.strategies.insert(
+            "agent/a/tree".to_string(),
+            StateStrategy::Tree { delta_snapshot_every: 5, full_snapshot_every: 3 },
+        );
+
+        // Old bytes -> new layout.
+        let legacy_bytes = rmp_serde::to_vec(&legacy).unwrap();
+        let index: StateIndex = rmp_serde::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(index.heads.len(), legacy.heads.len());
+        for ((branch, state), expected) in &legacy.heads {
+            let got = index.heads.get(*branch, state).expect("head survived");
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        }
+        assert_eq!(index.strategies.len(), 2);
+
+        // New bytes -> old layout.
+        let new_bytes = rmp_serde::to_vec(&index).unwrap();
+        assert_eq!(
+            new_bytes.len(),
+            legacy_bytes.len(),
+            "same encoding, entry order aside"
+        );
+        let back: LegacyStateIndex = rmp_serde::from_slice(&new_bytes).unwrap();
+        assert_eq!(back.heads.len(), legacy.heads.len());
+        for (key, expected) in &legacy.heads {
+            assert_eq!(format!("{:?}", back.heads[key]), format!("{expected:?}"));
+        }
+        assert_eq!(back.strategies.len(), 2);
+
+        // An empty index round-trips too (a store with no state writes yet).
+        let empty = rmp_serde::to_vec(&StateIndex::default()).unwrap();
+        let legacy_empty = rmp_serde::to_vec(&LegacyStateIndex {
+            heads: HashMap::new(),
+            strategies: HashMap::new(),
+        })
+        .unwrap();
+        assert_eq!(empty, legacy_empty);
+        assert!(rmp_serde::from_slice::<StateIndex>(&legacy_empty).unwrap().heads.is_empty());
+    }
+
+    #[test]
+    fn test_copy_heads_selection() {
+        let (_dir, _log, manager) = setup_test();
+        let parent = BranchId(1);
+        let other = BranchId(9);
+        let head = |n: u64| StateChainHead {
+            head_offset: n,
+            ops_since_delta_snapshot: 3,
+            delta_snapshots_since_full: 2,
+            last_delta_snapshot_offset: Some(n),
+            last_full_snapshot_offset: Some(1),
+            has_non_append_since_snapshot: true,
+            item_count: 10,
+            item_count_at_last_full: 4,
+        };
+        for (i, id) in ["a/1", "a/2", "a0", "ab", "b/1", "shared"].iter().enumerate() {
+            manager.insert_head_for_branch(parent, id, head(100 + i as u64));
+            manager.insert_head_for_branch(other, id, head(900 + i as u64));
+        }
+
+        let ids = |branch| -> Vec<String> {
+            manager.selected_heads(branch, None).into_iter().map(|(id, _)| id).collect()
+        };
+
+        // Everything.
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(2), None), 6);
+        assert_eq!(ids(BranchId(2)), ids(parent));
+
+        // Exact ids and prefixes, overlapping, plus names that match nothing.
+        let selection = StateSelection {
+            state_ids: vec!["shared".into(), "a/1".into(), "missing".into()],
+            state_prefixes: vec!["a/".into(), "a/1".into(), "zzz".into()],
+        };
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(3), Some(&selection)), 3);
+        assert_eq!(ids(BranchId(3)), vec!["a/1", "a/2", "shared"]);
+        // Verbatim, accounting included, and taken from the parent — not
+        // from another branch holding the same state ids.
+        for (id, got) in manager.selected_heads(BranchId(3), None) {
+            let expected = manager.get_head(parent, &id).unwrap();
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        }
+        assert_eq!(
+            manager
+                .selected_heads(parent, Some(&selection))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["a/1", "a/2", "shared"]
+        );
+
+        // Empty selection inherits nothing; so does an unknown parent.
+        assert_eq!(
+            manager.copy_heads_for_branch(parent, BranchId(4), Some(&StateSelection::default())),
+            0
+        );
+        assert!(ids(BranchId(4)).is_empty());
+        assert_eq!(manager.copy_heads_for_branch(BranchId(77), BranchId(5), None), 0);
+
+        // The empty prefix selects every state.
+        let all = StateSelection { state_ids: vec![], state_prefixes: vec![String::new()] };
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(6), Some(&all)), 6);
     }
 }

@@ -4,12 +4,18 @@
 //! reconstruction where k = updates since last snapshot, regardless
 //! of total events in the store.
 
+mod cache;
 mod field_index;
 mod manager;
 mod operations;
 
+pub use cache::StateItems;
 pub use field_index::{FieldIndexKind, FieldIndexManager};
 pub use manager::{
-    ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
+    BranchHeads, ChainStats, CompactionStats, SnapshotNeeded, StateChainHead, StateIndex,
+    StateManager, StateSelection,
 };
 pub use operations::{apply_operation, materialize_operations};
+pub(crate) use operations::{
+    array_len_after, array_len_from, materialize_operations_tagged, snapshot_item_count,
+};

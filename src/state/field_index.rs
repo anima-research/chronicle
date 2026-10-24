@@ -16,20 +16,26 @@
 //! `field_path` is a JSON-pointer string (RFC 6901), e.g. `/timestamp` or
 //! `/metadata/external/channelId`, resolved via [`serde_json::Value::pointer`].
 //!
-//! **Branch scoping:** the map is keyed by `(state_id, field_path)` alone —
-//! only one branch's view of a slot can have a live index at a time. Each
-//! [`FieldIndex`] remembers the `BranchId` it was built against; any
-//! mutating op for the same `state_id` arriving on a *different* branch
-//! poisons (drops) that index instead of silently mixing the two branches'
-//! ordinals into one structure. This is deliberately conservative: ordinary
-//! branch-and-switch usage (this store's headline feature) must never leave
-//! a query returning ordinals that belong to a different branch's array.
-//! Querying a poisoned/never-registered index returns `None` (see the
+//! **Branch scoping:** indexes are per branch. Each branch that registers a
+//! `(state_id, field_path)` index gets its own, built from and maintained
+//! against that branch's view of the slot. A mutating op on one branch
+//! updates that branch's indexes only: it neither touches nor drops an index
+//! another branch holds for the same `state_id`, so a parent's index keeps
+//! answering correctly while any number of child branches write to their own
+//! continuation of the slot. Nothing is built for a branch that did not ask:
+//! a new branch starts with no indexes, and querying a branch that has none
+//! (never registered there, or poisoned) returns `None` (see the
 //! `query_*`/`value_counts` docs) so callers can tell "no index" from "index
-//! says zero matches" and re-register for the branch they're on.
+//! says zero matches" and register for the branch they're on. A query never
+//! serves another branch's ordinals.
 //!
-//! **Freshness:** `register` treats an existing index as fresh only if its
-//! `kind`, `branch_id`, AND the slot's `head_offset` at last maintenance all
+//! Registering on a branch whose slot is at the same chain head as another
+//! branch's already-built index for that field (a child that has not written
+//! to the slot since it forked, typically) copies that index instead of
+//! decoding the slot again — the same log offset means the same content.
+//!
+//! **Freshness:** `register` treats a branch's existing index as fresh only
+//! if its `kind` AND the slot's `head_offset` at last maintenance both
 //! match — not just item count. Count-only freshness would miss the case
 //! where a count-preserving Edit landed after `state.bin` was durably saved
 //! but before `state-indexes.bin` was (the two are separate, non-atomic
@@ -123,9 +129,10 @@ fn remove_ordinal(list: &mut Vec<u32>, ordinal: u32) {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FieldIndex {
     kind: FieldIndexKind,
-    /// The branch this index's content reflects. A mutating op for the same
-    /// `state_id` on any other branch poisons (drops) this index rather than
-    /// applying — see the module docs' "Branch scoping" note.
+    /// The branch this index belongs to and whose view of the slot its
+    /// content reflects. Also the key the manager files it under — it is
+    /// part of the persisted record, which is how a loaded entry finds its
+    /// branch (see `FieldIndexManager`'s on-disk note).
     branch_id: BranchId,
     /// Offset of the state-chain head record this index was last maintained
     /// against (`None` only for a freshly-registered index over an empty,
@@ -253,14 +260,86 @@ fn validate_field_path(field_path: &str) -> Result<()> {
     }
 }
 
-/// Owns every registered field index across every state slot, keyed by
-/// `(state_id, field_path)`. See the module docs for the branch-scoping and
-/// freshness rules this type enforces.
+/// The indexes of one branch: `state_id -> field_path -> index`.
+type BranchIndexes = HashMap<String, HashMap<String, FieldIndex>>;
+
+/// Owns every registered field index across every branch and state slot,
+/// keyed `branch -> state_id -> field_path`. See the module docs for the
+/// branch-scoping and freshness rules this type enforces.
+///
+/// **On-disk format:** `state-indexes.bin` (version 2) holds one map from
+/// `(state_id, field_path)` to an index that carries its own `branch_id`.
+/// That shape is kept: this type writes the same map, with one entry per
+/// branch that holds an index for the pair (so a key can repeat), and reads
+/// it by filing each entry under the `branch_id` inside it. A file written
+/// by 0.4.0 (at most one entry per key) loads unchanged. 0.4.0 reading a
+/// file with a repeated key keeps one of the entries and checks it against
+/// its own branch as usual — the others are simply not loaded there, which
+/// is safe for derived data.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FieldIndexManager {
-    indexes: HashMap<(String, String), FieldIndex>,
+    #[serde(
+        serialize_with = "serialize_indexes",
+        deserialize_with = "deserialize_indexes"
+    )]
+    indexes: HashMap<BranchId, BranchIndexes>,
     #[serde(skip)]
     checkpoint: Checkpoint,
+}
+
+fn serialize_indexes<S: serde::Serializer>(
+    indexes: &HashMap<BranchId, BranchIndexes>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let len: usize = indexes
+        .values()
+        .flat_map(|states| states.values())
+        .map(|fields| fields.len())
+        .sum();
+    let mut map = serializer.serialize_map(Some(len))?;
+    for states in indexes.values() {
+        for (state_id, fields) in states {
+            for (field_path, index) in fields {
+                map.serialize_entry(&(state_id, field_path), index)?;
+            }
+        }
+    }
+    map.end()
+}
+
+fn deserialize_indexes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HashMap<BranchId, BranchIndexes>, D::Error> {
+    struct IndexesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for IndexesVisitor {
+        type Value = HashMap<BranchId, BranchIndexes>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of (state_id, field_path) to field index")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut indexes: HashMap<BranchId, BranchIndexes> = HashMap::new();
+            while let Some(((state_id, field_path), index)) =
+                map.next_entry::<(String, String), FieldIndex>()?
+            {
+                indexes
+                    .entry(index.branch_id)
+                    .or_default()
+                    .entry(state_id)
+                    .or_default()
+                    .insert(field_path, index);
+            }
+            Ok(indexes)
+        }
+    }
+
+    deserializer.deserialize_map(IndexesVisitor)
 }
 
 impl FieldIndexManager {
@@ -268,29 +347,41 @@ impl FieldIndexManager {
         Self::default()
     }
 
-    /// Whether any field is registered for `state_id` — a cheap gate so
-    /// `record_update`'s per-op hooks can skip parsing item bytes entirely
-    /// when nothing is indexed for the mutated slot.
+    /// Whether any field is registered for `state_id` on ANY branch.
     pub fn has_indexes_for(&self, state_id: &str) -> bool {
-        self.indexes.keys().any(|(sid, _)| sid == state_id)
-    }
-
-    fn matching_keys(&self, state_id: &str) -> Vec<(String, String)> {
         self.indexes
-            .keys()
-            .filter(|(sid, _)| sid == state_id)
-            .cloned()
-            .collect()
+            .values()
+            .any(|states| states.get(state_id).is_some_and(|fields| !fields.is_empty()))
     }
 
-    /// `true` if `key` is registered and was built against `branch_id`.
-    fn branch_matches(&self, key: &(String, String), branch_id: BranchId) -> bool {
-        self.indexes.get(key).map(|i| i.branch_id) == Some(branch_id)
+    /// Whether any field is registered for `state_id` on `branch_id` — a
+    /// cheap gate (two hash lookups, no allocation) so `record_update`'s
+    /// per-op hooks can skip parsing item bytes entirely when nothing is
+    /// indexed for the mutated slot on the branch being written.
+    pub fn has_indexes_on(&self, state_id: &str, branch_id: BranchId) -> bool {
+        self.fields(state_id, branch_id)
+            .is_some_and(|fields| !fields.is_empty())
+    }
+
+    fn fields(&self, state_id: &str, branch_id: BranchId) -> Option<&HashMap<String, FieldIndex>> {
+        self.indexes.get(&branch_id)?.get(state_id)
+    }
+
+    fn fields_mut(
+        &mut self,
+        state_id: &str,
+        branch_id: BranchId,
+    ) -> Option<&mut HashMap<String, FieldIndex>> {
+        self.indexes.get_mut(&branch_id)?.get_mut(state_id)
+    }
+
+    fn get(&self, state_id: &str, field_path: &str, branch_id: BranchId) -> Option<&FieldIndex> {
+        self.fields(state_id, branch_id)?.get(field_path)
     }
 
     /// Whether a `register` call with these exact `(kind, branch_id,
     /// head_offset)` would be a no-op — i.e. an index for `(state_id,
-    /// field_path)` is already registered and matches all three.
+    /// field_path)` is already registered on `branch_id` and matches both.
     ///
     /// Exposed separately from `register` (which also takes this same
     /// no-op path internally) so a caller that would otherwise have to
@@ -310,20 +401,18 @@ impl FieldIndexManager {
         branch_id: BranchId,
         head_offset: Option<u64>,
     ) -> bool {
-        match self.indexes.get(&(state_id.to_string(), field_path.to_string())) {
-            Some(existing) => {
-                existing.kind == kind
-                    && existing.branch_id == branch_id
-                    && existing.head_offset == head_offset
-            }
+        match self.get(state_id, field_path, branch_id) {
+            Some(existing) => existing.kind == kind && existing.head_offset == head_offset,
             None => false,
         }
     }
 
-    /// Register a field index, building it fresh from `current_items` if
-    /// it isn't already registered and fresh for `branch_id` — same `kind`,
-    /// same `branch_id`, AND the same `head_offset` as last maintained
+    /// Register a field index on `branch_id`, building it fresh from
+    /// `current_items` if that branch doesn't already hold a fresh one —
+    /// same `kind` AND the same `head_offset` as last maintained
     /// (idempotent no-op only in that exact case; see module docs).
+    /// Indexes other branches hold for the same `(state_id, field_path)`
+    /// are left alone.
     ///
     /// `current_items` is only consumed on the non-fresh (rebuild) path —
     /// see `is_fresh`'s doc if you can check freshness before your caller
@@ -343,23 +432,86 @@ impl FieldIndexManager {
             return Ok(()); // already fresh
         }
 
-        let key = (state_id.to_string(), field_path.to_string());
         let mut index = FieldIndex::new(kind, branch_id, head_offset);
         index.rebuild(field_path, current_items);
-        self.indexes.insert(key, index);
+        self.insert(state_id, field_path, index);
         Ok(())
     }
 
-    /// Drop every field index registered for `state_id` — used when an item
-    /// in the slot can't be parsed as JSON at all (so `by_ordinal` alignment
-    /// can't be maintained for ANY field on that slot going forward) or when
-    /// an incremental op reveals internal desync (e.g. an Edit ordinal past
-    /// the index's recorded length). Fails closed: a poisoned index is gone,
-    /// not silently wrong — the next `register` rebuilds it from scratch.
+    fn insert(&mut self, state_id: &str, field_path: &str, index: FieldIndex) {
+        self.indexes
+            .entry(index.branch_id)
+            .or_default()
+            .entry(state_id.to_string())
+            .or_default()
+            .insert(field_path.to_string(), index);
+    }
+
+    /// Register `(state_id, field_path)` on `branch_id` by copying an index
+    /// another branch already holds for the same field, kind and
+    /// `head_offset`. Returns `false` (and changes nothing) if no branch
+    /// holds one.
+    ///
+    /// The same chain head offset means the same slot content, and an index
+    /// is always exactly the index of the content at its `head_offset`, so
+    /// the copy is what a fresh build on `branch_id` would produce — without
+    /// materializing and JSON-decoding the slot. This is the common case
+    /// for a branch that registers before it first writes to a slot it
+    /// inherited: its parent's index is at the very same offset.
+    ///
+    /// The copy is a private one (O(index size) time and memory): from here
+    /// on each branch maintains its own.
+    pub fn register_from_sibling(
+        &mut self,
+        state_id: &str,
+        field_path: &str,
+        kind: FieldIndexKind,
+        branch_id: BranchId,
+        head_offset: Option<u64>,
+    ) -> Result<bool> {
+        validate_field_path(field_path)?;
+        let donor = self.indexes.iter().find_map(|(other, states)| {
+            if *other == branch_id {
+                return None;
+            }
+            states
+                .get(state_id)?
+                .get(field_path)
+                .filter(|index| index.kind == kind && index.head_offset == head_offset)
+        });
+        let mut index = match donor {
+            Some(index) => index.clone(),
+            None => return Ok(false),
+        };
+        index.branch_id = branch_id;
+        self.insert(state_id, field_path, index);
+        Ok(true)
+    }
+
+    /// Drop every field index registered for `state_id`, on every branch.
+    /// Fails closed: a poisoned index is gone, not silently wrong — the next
+    /// `register` rebuilds it from scratch. See `poison_state_on` for the
+    /// single-branch form the write path uses.
     pub fn poison_state(&mut self, state_id: &str) {
-        for key in self.matching_keys(state_id) {
-            self.indexes.remove(&key);
+        for states in self.indexes.values_mut() {
+            states.remove(state_id);
         }
+    }
+
+    /// Drop every field index registered for `state_id` on `branch_id` —
+    /// used when an item written to the slot on that branch can't be parsed
+    /// as JSON at all (so `by_ordinal` alignment can't be maintained for ANY
+    /// field on that branch's view of the slot going forward). Other
+    /// branches' indexes for the same slot never saw that item and stay.
+    pub fn poison_state_on(&mut self, state_id: &str, branch_id: BranchId) {
+        if let Some(states) = self.indexes.get_mut(&branch_id) {
+            states.remove(state_id);
+        }
+    }
+
+    /// Drop every index held for `branch_id` (the branch was deleted).
+    pub fn drop_branch(&mut self, branch_id: BranchId) {
+        self.indexes.remove(&branch_id);
     }
 
     /// Advance the tracked `head_offset` for every index registered for
@@ -371,35 +523,25 @@ impl FieldIndexManager {
     /// (which compares a loaded index's stored `head_offset` against the
     /// real chain's current one) would treat an otherwise still-correct
     /// index as stale — and discard it — purely because a DeltaSnapshot
-    /// happened since it was last touched. A branch mismatch still poisons,
-    /// same as every other op.
+    /// happened since it was last touched.
     pub fn touch_head_offset(&mut self, state_id: &str, branch_id: BranchId, offset: u64) {
-        for key in self.matching_keys(state_id) {
-            if !self.branch_matches(&key, branch_id) {
-                self.indexes.remove(&key);
-                continue;
-            }
-            if let Some(index) = self.indexes.get_mut(&key) {
+        if let Some(fields) = self.fields_mut(state_id, branch_id) {
+            for index in fields.values_mut() {
                 index.head_offset = Some(offset);
             }
         }
     }
 
     /// Incrementally index one appended item, at `offset` (the log offset of
-    /// the record this Append was written as) on `branch_id`. Any index for
-    /// `state_id` registered on a different branch is poisoned instead of
-    /// updated.
+    /// the record this Append was written as) on `branch_id`. Indexes other
+    /// branches hold for `state_id` are not touched.
     pub fn on_append(&mut self, state_id: &str, branch_id: BranchId, offset: u64, item: &serde_json::Value) {
-        for key in self.matching_keys(state_id) {
-            if !self.branch_matches(&key, branch_id) {
-                self.indexes.remove(&key);
-                continue;
+        if let Some(fields) = self.fields_mut(state_id, branch_id) {
+            for (field_path, index) in fields.iter_mut() {
+                let value = extract_indexed_value(item, field_path, index.kind);
+                index.push(value);
+                index.head_offset = Some(offset);
             }
-            let field_path = key.1.clone();
-            let index = self.indexes.get_mut(&key).expect("just matched");
-            let value = extract_indexed_value(item, &field_path, index.kind);
-            index.push(value);
-            index.head_offset = Some(offset);
         }
     }
 
@@ -409,7 +551,7 @@ impl FieldIndexManager {
     /// out-of-range ordinal (relative to this index's own `by_ordinal`,
     /// which should always track the slot's length exactly) means the index
     /// has desynced from the slot for some other reason — poisoned rather
-    /// than silently left short, same as a branch mismatch.
+    /// than silently left short.
     pub fn on_edit(
         &mut self,
         state_id: &str,
@@ -418,25 +560,20 @@ impl FieldIndexManager {
         ordinal: u32,
         new_value: &serde_json::Value,
     ) {
-        for key in self.matching_keys(state_id) {
-            if !self.branch_matches(&key, branch_id) {
-                self.indexes.remove(&key);
-                continue;
-            }
+        if let Some(fields) = self.fields_mut(state_id, branch_id) {
             let i = ordinal as usize;
-            let len = self.indexes.get(&key).expect("just matched").by_ordinal.len();
-            if i >= len {
-                self.indexes.remove(&key);
-                continue;
-            }
-            let field_path = key.1.clone();
-            let index = self.indexes.get_mut(&key).expect("just matched");
-            let old_value = index.by_ordinal[i].clone();
-            index.remove_from_reverse(ordinal, &old_value);
-            let extracted = extract_indexed_value(new_value, &field_path, index.kind);
-            index.insert_into_reverse(ordinal, &extracted);
-            index.by_ordinal[i] = extracted;
-            index.head_offset = Some(offset);
+            fields.retain(|field_path, index| {
+                if i >= index.by_ordinal.len() {
+                    return false;
+                }
+                let old_value = index.by_ordinal[i].clone();
+                index.remove_from_reverse(ordinal, &old_value);
+                let extracted = extract_indexed_value(new_value, field_path, index.kind);
+                index.insert_into_reverse(ordinal, &extracted);
+                index.by_ordinal[i] = extracted;
+                index.head_offset = Some(offset);
+                true
+            });
         }
     }
 
@@ -454,12 +591,11 @@ impl FieldIndexManager {
     /// of shifts, or lazily-applied offsets) if redact-heavy workloads on
     /// multi-million-item indexes show up.
     pub fn on_redact(&mut self, state_id: &str, branch_id: BranchId, offset: u64, start: u32, end: u32) {
-        for key in self.matching_keys(state_id) {
-            if !self.branch_matches(&key, branch_id) {
-                self.indexes.remove(&key);
-                continue;
-            }
-            let index = self.indexes.get_mut(&key).expect("just matched");
+        let fields = match self.fields_mut(state_id, branch_id) {
+            Some(fields) => fields,
+            None => return,
+        };
+        for index in fields.values_mut() {
             let len = index.by_ordinal.len();
             let start_c = (start as usize).min(len);
             let end_c = (end as usize).min(len);
@@ -494,12 +630,12 @@ impl FieldIndexManager {
         }
     }
 
-    /// Full rebuild of every field registered for `state_id` (that matches
-    /// `branch_id` — others are poisoned), from `items` (the slot's new
-    /// complete content) at `offset`. Used for `Set`/`Snapshot` ops
-    /// (compaction's snapshot included — ordinals and values are unchanged
-    /// by a compacting snapshot, so this is a correctness-preserving
-    /// rebuild, not a semantic change).
+    /// Full rebuild of every field registered for `state_id` on
+    /// `branch_id`, from `items` (the slot's new complete content) at
+    /// `offset`. Used for `Set`/`Snapshot` ops (compaction's snapshot
+    /// included — ordinals and values are unchanged by a compacting
+    /// snapshot, so this is a correctness-preserving rebuild, not a
+    /// semantic change).
     pub fn on_full_replace<'a>(
         &mut self,
         state_id: &str,
@@ -507,19 +643,13 @@ impl FieldIndexManager {
         offset: u64,
         items: impl Iterator<Item = &'a serde_json::Value>,
     ) {
-        let keys = self.matching_keys(state_id);
-        if keys.is_empty() {
-            return;
-        }
+        let fields = match self.fields_mut(state_id, branch_id) {
+            Some(fields) if !fields.is_empty() => fields,
+            _ => return,
+        };
         let items: Vec<&serde_json::Value> = items.collect();
-        for key in keys {
-            if !self.branch_matches(&key, branch_id) {
-                self.indexes.remove(&key);
-                continue;
-            }
-            let field_path = key.1.clone();
-            let index = self.indexes.get_mut(&key).expect("just matched");
-            index.rebuild(&field_path, items.iter().copied());
+        for (field_path, index) in fields.iter_mut() {
+            index.rebuild(field_path, items.iter().copied());
             index.head_offset = Some(offset);
         }
     }
@@ -527,11 +657,11 @@ impl FieldIndexManager {
     /// Ordinals with a `Number` field in `[gte, lte]` (either bound
     /// optional), in ascending (or, if `reverse`, descending) value order.
     /// Returns `None` if no such `Number` index is currently registered for
-    /// `branch_id` (never registered, wrong kind, poisoned, OR registered
-    /// against a *different* branch — a pure read after `switch_branch`
-    /// with no intervening write must never serve another branch's
+    /// `branch_id` (never registered there, wrong kind, or poisoned — an
+    /// index another branch holds for the same field is never served: a
+    /// pure read after `switch_branch` must not see another branch's
     /// ordinals) — distinct from `Some(vec![])`, which means the index
-    /// exists, matches this branch, and genuinely has no matches in range.
+    /// exists for this branch and genuinely has no matches in range.
     #[allow(clippy::too_many_arguments)]
     pub fn query_range(
         &self,
@@ -544,8 +674,8 @@ impl FieldIndexManager {
         offset: Option<usize>,
         reverse: bool,
     ) -> Option<Vec<u32>> {
-        let index = self.indexes.get(&(state_id.to_string(), field_path.to_string()))?;
-        if index.kind != FieldIndexKind::Number || index.branch_id != branch_id {
+        let index = self.get(state_id, field_path, branch_id)?;
+        if index.kind != FieldIndexKind::Number {
             return None;
         }
 
@@ -572,7 +702,7 @@ impl FieldIndexManager {
     /// Ordinals with a `String` field equal to `value`. Returns `None` if no
     /// such `String` index is currently registered for `branch_id` — see
     /// `query_range`'s doc for the `None` vs `Some(vec![])` distinction and
-    /// why `branch_id` is checked here too.
+    /// why another branch's index is never served.
     pub fn query_eq(
         &self,
         state_id: &str,
@@ -582,8 +712,8 @@ impl FieldIndexManager {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Option<Vec<u32>> {
-        let index = self.indexes.get(&(state_id.to_string(), field_path.to_string()))?;
-        if index.kind != FieldIndexKind::String || index.branch_id != branch_id {
+        let index = self.get(state_id, field_path, branch_id)?;
+        if index.kind != FieldIndexKind::String {
             return None;
         }
 
@@ -594,16 +724,15 @@ impl FieldIndexManager {
     /// Distinct values and their ordinal counts for a registered `String`
     /// field index, sorted by value. O(index size) — no content decoding.
     /// Returns `None` if no such `String` index is currently registered for
-    /// `branch_id` (see `query_range`'s doc for why branch is checked here
-    /// too).
+    /// `branch_id`.
     pub fn value_counts(
         &self,
         state_id: &str,
         field_path: &str,
         branch_id: BranchId,
     ) -> Option<Vec<(String, u32)>> {
-        let index = self.indexes.get(&(state_id.to_string(), field_path.to_string()))?;
-        if index.kind != FieldIndexKind::String || index.branch_id != branch_id {
+        let index = self.get(state_id, field_path, branch_id)?;
+        if index.kind != FieldIndexKind::String {
             return None;
         }
 
@@ -719,17 +848,15 @@ impl FieldIndexManager {
     where
         F: FnMut(&str, BranchId) -> Option<u64>,
     {
-        let stale_keys: Vec<(String, String)> = self
-            .indexes
-            .iter()
-            .filter(|((state_id, _), index)| {
-                current_head_offset(state_id, index.branch_id) != index.head_offset
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in stale_keys {
-            self.indexes.remove(&key);
+        for (branch_id, states) in self.indexes.iter_mut() {
+            for (state_id, fields) in states.iter_mut() {
+                fields.retain(|_, index| {
+                    current_head_offset(state_id, *branch_id) == index.head_offset
+                });
+            }
+            states.retain(|_, fields| !fields.is_empty());
         }
+        self.indexes.retain(|_, states| !states.is_empty());
     }
 }
 
@@ -1026,25 +1153,173 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_branch_write_poisons_index() {
-        // Regression for the branch-corruption bug: an index registered on
-        // MAIN must be poisoned (not silently updated) by an op on SIDE for
-        // the same state_id.
+    fn test_cross_branch_write_leaves_other_branch_index_intact() {
+        // An index registered on MAIN must be neither updated nor dropped by
+        // an op on SIDE for the same state_id: MAIN's ordinals stay exactly
+        // MAIN's. (Until indexes became per-branch, a cross-branch write
+        // dropped the index; it must still never contaminate it.)
         let mut mgr = FieldIndexManager::new();
         let data = items(&[json!({"v": 1}), json!({"v": 2}), json!({"v": 3})]);
         mgr.register("messages", "/v", FieldIndexKind::Number, MAIN, Some(30), data.iter())
             .unwrap();
         assert!(mgr.query_range("messages", "/v", MAIN, None, None, None, None, false).is_some());
 
-        // A write on a different branch for the same state_id.
+        // Writes of every kind on a different branch for the same state_id.
         mgr.on_append("messages", SIDE, 40, &json!({"v": 4}));
+        mgr.on_edit("messages", SIDE, 41, 0, &json!({"v": 100}));
+        mgr.on_redact("messages", SIDE, 42, 0, 2);
+        mgr.on_full_replace("messages", SIDE, 43, [json!({"v": 7})].iter());
+        mgr.touch_head_offset("messages", SIDE, 44);
+        mgr.poison_state_on("messages", SIDE);
 
-        // MAIN's index is gone, not silently extended with SIDE's item.
+        // MAIN's index is intact: not extended with SIDE's item, not edited,
+        // not shifted, not replaced, not re-stamped, not dropped.
         assert_eq!(
             mgr.query_range("messages", "/v", MAIN, None, None, None, None, false),
-            None,
-            "cross-branch write must poison, never contaminate, the other branch's index"
+            Some(vec![0, 1, 2]),
+            "a cross-branch write must neither contaminate nor drop the other branch's index"
         );
+        assert_eq!(
+            mgr.query_range("messages", "/v", MAIN, Some(1.0), Some(1.0), None, None, false),
+            Some(vec![0])
+        );
+        assert!(mgr.is_fresh("messages", "/v", FieldIndexKind::Number, MAIN, Some(30)));
+        // And none of that manufactured an index for SIDE.
+        assert_eq!(mgr.query_range("messages", "/v", SIDE, None, None, None, None, false), None);
+        assert!(!mgr.has_indexes_on("messages", SIDE));
+    }
+
+    #[test]
+    fn test_branches_hold_independent_indexes_for_the_same_field() {
+        let mut mgr = FieldIndexManager::new();
+        let data = items(&[json!({"v": 1}), json!({"v": 2})]);
+        mgr.register("messages", "/v", FieldIndexKind::Number, MAIN, Some(20), data.iter())
+            .unwrap();
+        mgr.register("messages", "/v", FieldIndexKind::Number, SIDE, Some(20), data.iter())
+            .unwrap();
+
+        mgr.on_append("messages", MAIN, 30, &json!({"v": 3}));
+        mgr.on_append("messages", SIDE, 31, &json!({"v": 50}));
+        mgr.on_redact("messages", SIDE, 32, 0, 1);
+
+        assert_eq!(
+            mgr.query_range("messages", "/v", MAIN, None, None, None, None, false),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            mgr.query_range("messages", "/v", MAIN, Some(50.0), None, None, None, false),
+            Some(vec![])
+        );
+        // SIDE: [2, 50] after the redact.
+        assert_eq!(
+            mgr.query_range("messages", "/v", SIDE, Some(50.0), None, None, None, false),
+            Some(vec![1])
+        );
+        assert_eq!(
+            mgr.query_range("messages", "/v", SIDE, Some(1.0), Some(1.0), None, None, false),
+            Some(vec![])
+        );
+
+        // Dropping one branch leaves the other.
+        mgr.drop_branch(SIDE);
+        assert_eq!(mgr.query_range("messages", "/v", SIDE, None, None, None, None, false), None);
+        assert!(mgr.query_range("messages", "/v", MAIN, None, None, None, None, false).is_some());
+    }
+
+    #[test]
+    fn test_register_from_sibling_copies_only_a_matching_index() {
+        let mut mgr = FieldIndexManager::new();
+        let data = items(&[json!({"v": 1, "c": "a"}), json!({"v": 2, "c": "b"})]);
+        mgr.register("messages", "/v", FieldIndexKind::Number, MAIN, Some(20), data.iter())
+            .unwrap();
+
+        // Different head offset, different kind, different field: no donor.
+        assert!(!mgr.register_from_sibling("messages", "/v", FieldIndexKind::Number, SIDE, Some(21)).unwrap());
+        assert!(!mgr.register_from_sibling("messages", "/v", FieldIndexKind::String, SIDE, Some(20)).unwrap());
+        assert!(!mgr.register_from_sibling("messages", "/c", FieldIndexKind::Number, SIDE, Some(20)).unwrap());
+        assert!(!mgr.register_from_sibling("other", "/v", FieldIndexKind::Number, SIDE, Some(20)).unwrap());
+        // A branch is not its own sibling.
+        assert!(!mgr.register_from_sibling("messages", "/v", FieldIndexKind::Number, MAIN, Some(20)).unwrap());
+        assert!(!mgr.has_indexes_on("messages", SIDE));
+        assert!(mgr.register_from_sibling("messages", "bad-path", FieldIndexKind::Number, SIDE, Some(20)).is_err());
+
+        // Same field, kind and offset: copied, then independent.
+        assert!(mgr.register_from_sibling("messages", "/v", FieldIndexKind::Number, SIDE, Some(20)).unwrap());
+        assert!(mgr.is_fresh("messages", "/v", FieldIndexKind::Number, SIDE, Some(20)));
+        assert_eq!(
+            mgr.query_range("messages", "/v", SIDE, None, None, None, None, false),
+            Some(vec![0, 1])
+        );
+        mgr.on_append("messages", SIDE, 30, &json!({"v": 3}));
+        assert_eq!(
+            mgr.query_range("messages", "/v", SIDE, None, None, None, None, false),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            mgr.query_range("messages", "/v", MAIN, None, None, None, None, false),
+            Some(vec![0, 1])
+        );
+    }
+
+    /// `state-indexes.bin` compatibility in both directions, against the
+    /// manager layout 0.4.0 persisted (one index per `(state_id, field_path)`).
+    #[test]
+    fn test_wire_format_matches_legacy_layout() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyManager {
+            indexes: HashMap<(String, String), FieldIndex>,
+        }
+
+        let data = items(&[json!({"t": 1, "c": "a"}), json!({"t": 2, "c": "b"}), json!({"t": 3, "c": "a"})]);
+        let mut build = FieldIndexManager::new();
+        build.register("messages", "/t", FieldIndexKind::Number, MAIN, Some(300), data.iter()).unwrap();
+        build.register("messages", "/c", FieldIndexKind::String, MAIN, Some(300), data.iter()).unwrap();
+        build.register("other", "/t", FieldIndexKind::Number, SIDE, None, std::iter::empty()).unwrap();
+
+        let mut legacy = LegacyManager { indexes: HashMap::new() };
+        for (state, field, branch) in [("messages", "/t", MAIN), ("messages", "/c", MAIN), ("other", "/t", SIDE)] {
+            legacy.indexes.insert(
+                (state.to_string(), field.to_string()),
+                build.get(state, field, branch).unwrap().clone(),
+            );
+        }
+
+        // 0.4.0 bytes -> this layout: every index lands under its own branch.
+        let legacy_bytes = rmp_serde::to_vec(&legacy).unwrap();
+        let loaded: FieldIndexManager = rmp_serde::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(
+            loaded.query_range("messages", "/t", MAIN, Some(2.0), None, None, None, false),
+            Some(vec![1, 2])
+        );
+        assert_eq!(loaded.query_eq("messages", "/c", MAIN, "a", None, None), Some(vec![0, 2]));
+        assert_eq!(loaded.query_range("other", "/t", SIDE, None, None, None, None, false), Some(vec![]));
+        assert_eq!(loaded.query_range("messages", "/t", SIDE, None, None, None, None, false), None);
+
+        // This layout -> 0.4.0: same encoding when no key repeats.
+        let new_bytes = rmp_serde::to_vec(&build).unwrap();
+        assert_eq!(new_bytes.len(), legacy_bytes.len());
+        let back: LegacyManager = rmp_serde::from_slice(&new_bytes).unwrap();
+        assert_eq!(back.indexes.len(), 3);
+        assert_eq!(back.indexes[&("other".to_string(), "/t".to_string())].branch_id, SIDE);
+
+        // Two branches indexing the same field: this layout keeps both
+        // across a round trip; 0.4.0 still parses the file and keeps one,
+        // labelled with the branch it really belongs to.
+        build.register("messages", "/t", FieldIndexKind::Number, SIDE, Some(400), data[..1].iter()).unwrap();
+        let bytes = rmp_serde::to_vec(&build).unwrap();
+        let both: FieldIndexManager = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            both.query_range("messages", "/t", MAIN, None, None, None, None, false),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(both.query_range("messages", "/t", SIDE, None, None, None, None, false), Some(vec![0]));
+        let old: LegacyManager = rmp_serde::from_slice(&bytes).unwrap();
+        let kept = &old.indexes[&("messages".to_string(), "/t".to_string())];
+        match kept.branch_id {
+            MAIN => assert_eq!((kept.head_offset, kept.by_ordinal.len()), (Some(300), 3)),
+            SIDE => assert_eq!((kept.head_offset, kept.by_ordinal.len()), (Some(400), 1)),
+            other => panic!("unexpected branch {other:?}"),
+        }
     }
 
     #[test]
