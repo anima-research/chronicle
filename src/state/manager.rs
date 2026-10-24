@@ -101,10 +101,17 @@ pub struct StateChainHead {
     pub has_non_append_since_snapshot: bool,
 
     /// Current number of items in the state (for O(1) length queries via
-    /// `get_state_len`). Updated on each Append (+1), Redact (-(end-start)),
-    /// and Set/Snapshot (=value.len). Exact for AppendLog; for Tree states it
-    /// is an upper-bound estimate between full snapshots (overwrites count as
-    /// inserts) and is corrected from the snapshot bytes at each full.
+    /// `get_state_len`). Updated on each Append (+1), Redact (minus the items
+    /// of `[start, end)` that exist: both ends clamped to the count), and a
+    /// full Snapshot or a Set of an array (=its length). Exact for an
+    /// AppendLog written with its own operations (Appends, Edits, Redacts,
+    /// and Sets and Snapshots of arrays), except a count an older build
+    /// stored before Redacts were clamped: loading keeps a stored count as it
+    /// is, so that one can stay low until a full Snapshot or array Set counts
+    /// the items again. For Tree states it is an estimate between full
+    /// snapshots (an overwrite counts as an insert, and a remove as a removal
+    /// whether or not the path existed) and is corrected from the snapshot
+    /// bytes at each full.
     /// Snapshot spacing does NOT read this field — it reads
     /// `item_count_at_last_full`, which is always stamped from parsed
     /// snapshot bytes and therefore exact.
@@ -446,7 +453,7 @@ impl StateManager {
             }
             StateOperation::TreeSet { .. } => {
                 head.ops_since_delta_snapshot += 1;
-                // Upper-bound estimate: overwrites count as inserts (newness is
+                // An estimate: overwrites count as inserts (newness is
                 // unknown here without the tree contents). Corrected from the
                 // parsed snapshot bytes at each full snapshot. Consumed by
                 // `get_state_len` only; snapshot spacing reads the exact

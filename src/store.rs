@@ -586,8 +586,13 @@ impl Store {
 
     /// Update a state and record it.
     ///
-    /// The operation is validated by applying it to the current state before
-    /// recording. This ensures only valid operations are written to the log.
+    /// The operation is checked against what the index holds, not applied,
+    /// before it's recorded: an Edit's index against the state's length, and a
+    /// Tree operation against its strategy. Other operations are recorded as
+    /// given, and one that can't be applied, such as an Append of bytes that
+    /// aren't JSON, shows when the state is next materialized. That can be
+    /// this call's own auto-snapshot, so an error can come back for an
+    /// operation already recorded (issue #39).
     ///
     /// Snapshots are automatically created when thresholds are reached.
     pub fn update_state(
@@ -680,7 +685,8 @@ impl Store {
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
         // - Append: Always succeeds, no validation needed
         // - Edit: Just check index < len
-        // - Redact: Check start <= end <= len
+        // - Redact: No validation: when it's applied, a range past the end is
+        //   clamped to the length and a reversed one removes nothing
         // - Set/Snapshot/DeltaSnapshot: No validation needed
         match &operation {
             StateOperation::Edit { index, .. } => {
@@ -695,7 +701,7 @@ impl Store {
             StateOperation::Redact { start, end } => {
                 // Note: Out-of-bounds or start > end redacts are allowed and will be
                 // no-ops or clamped during apply_operation. This is intentional for
-                // flexibility - the actual validation happens at reconstruction time.
+                // flexibility.
                 let _ = (start, end); // Suppress unused warnings
             }
             StateOperation::TreeSet { .. }
