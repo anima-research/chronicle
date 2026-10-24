@@ -565,8 +565,8 @@ impl StateManager {
                         state_id,
                         branch_id,
                         offset,
-                        *start as u32,
-                        *end as u32,
+                        *start,
+                        *end,
                     );
                 }
                 StateOperation::Set(data)
