@@ -590,7 +590,9 @@ impl Store {
     /// before it's recorded: an Edit's index against the state's length, and a
     /// Tree operation against its strategy. Other operations are recorded as
     /// given, and one that can't be applied, such as an Append of bytes that
-    /// aren't JSON, shows when the state is next materialized.
+    /// aren't JSON, shows when the state is next materialized. That can be
+    /// this call's own auto-snapshot, so an error can come back for an
+    /// operation already recorded (issue #39).
     ///
     /// Snapshots are automatically created when thresholds are reached.
     pub fn update_state(
