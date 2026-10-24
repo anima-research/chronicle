@@ -95,9 +95,37 @@ fn changes() -> Vec<(&'static str, fn(&Store), Vec<Value>)> {
     ]
 }
 
-/// Each change, made on main and then branched from main's head: the branch
-/// reads main's value, through the point its first delta would come due,
-/// then through a full snapshot of its own and the delta after it.
+/// On a branch that should start as `before`: append 2 and 3, the point its
+/// first delta would come due (held off), then take a full snapshot of its
+/// own and append 4 and 5, whose delta the test checks was taken, reading
+/// the value and count at each step.
+fn branch_reads_through_its_snapshots(store: &Store, name: &str, before: Vec<Value>) {
+    assert_eq!(value(store), before, "{name}: setup: the branch starts as main was at its point");
+    let mut expected = before;
+    for v in [2, 3] {
+        append(store, json!(v));
+        expected.push(json!(v));
+    }
+    assert_eq!(value(store), expected, "{name}");
+    assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}");
+    let stats = store.get_compaction_stats("s").unwrap();
+    assert_eq!(
+        (stats.last_full_snapshot_offset, stats.last_delta_snapshot_offset),
+        (None, None),
+        "{name}: the first delta was held off, and no snapshot taken in its place"
+    );
+    store.compact_state("s").unwrap();
+    for v in [4, 5] {
+        append(store, json!(v));
+        expected.push(json!(v));
+    }
+    let stats = store.get_compaction_stats("s").unwrap();
+    assert_eq!(stats.delta_snapshots_since_full, 1, "{name}: setup: a delta after the branch's full");
+    assert_eq!(value(store), expected, "{name}");
+    assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}");
+}
+
+/// Each change, made on main and then branched from main's head.
 #[test]
 fn a_fork_keeps_each_change_from_before_its_point() {
     for (name, change, before) in changes() {
@@ -106,23 +134,24 @@ fn a_fork_keeps_each_change_from_before_its_point() {
         append_0_and_1_and_their_delta(&store);
         change(&store);
         fork(&store);
-        assert_eq!(value(&store), before, "{name}: setup: the fork starts as main was");
-        let mut expected = before.clone();
-        for v in [2, 3] {
-            append(&store, json!(v));
-            expected.push(json!(v));
-        }
-        assert_eq!(value(&store), expected, "{name}");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}");
+        branch_reads_through_its_snapshots(&store, name, before);
+    }
+}
+
+/// Each change, made on main, then main moves on past a full snapshot of its
+/// own, and the branch is made at the point just after the change.
+#[test]
+fn a_fork_at_a_past_point_keeps_each_change_from_before_it() {
+    for (name, change, before) in changes() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        append_0_and_1_and_their_delta(&store);
+        change(&store);
+        let at = store.current_branch().head;
         store.compact_state("s").unwrap();
-        for v in [4, 5] {
-            append(&store, json!(v));
-            expected.push(json!(v));
-        }
-        let stats = store.get_compaction_stats("s").unwrap();
-        assert_eq!(stats.delta_snapshots_since_full, 1, "{name}: setup: a delta after the branch's full");
-        assert_eq!(value(&store), expected, "{name}");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}");
+        append(&store, json!(6));
+        fork_at(&store, at);
+        branch_reads_through_its_snapshots(&store, name, before);
     }
 }
 
@@ -138,6 +167,9 @@ fn due_after(setup: impl FnOnce(&Store)) -> Option<SnapshotNeeded> {
     store.snapshot_needed("s")
 }
 
+/// This passes before the fix too, where record_update already set the flag
+/// for each of the three: it guards the flag's move into is_non_append_change,
+/// and isn't evidence for the branch fix.
 #[test]
 fn each_change_holds_its_states_deltas_off() {
     for (name, change, _) in changes() {
@@ -192,7 +224,8 @@ fn a_fork_at_a_past_point_inherits_the_hold_its_parent_had_there() {
         // Main's own hold ends with a full snapshot after the branch's point.
         store.compact_state("s").unwrap();
         append(store, json!(6));
-        assert_eq!(store.snapshot_needed("s"), None, "setup: main's count since its full is low");
+        append(store, json!(7));
+        assert_eq!(store.snapshot_needed("s"), Some(SnapshotNeeded::Delta), "setup: main's hold has ended");
         fork_at(store, at);
     });
     assert_eq!(due, None);
