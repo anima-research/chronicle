@@ -3440,6 +3440,45 @@ mod tests {
         assert_eq!(retrieved.payload, record.payload);
     }
 
+    // Open reads each record twice: the log's validating scan, then the
+    // index rebuild. The rebuild's iterator used to read every record a
+    // second time to find where it ended, so open read each one three times.
+    #[test]
+    fn open_reads_each_record_once_to_validate_and_once_to_index() {
+        use crate::records::RECORD_DECODES;
+        let dir = TempDir::new().unwrap();
+        {
+            let store = Store::create(test_config(&dir)).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "log".to_string(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 10,
+                        full_snapshot_every: 4,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for i in 0..40 {
+                let input = RecordInput::json("event", &json!({ "n": i })).unwrap();
+                store.append(input).unwrap();
+                store
+                    .update_state("log", StateOperation::Append(format!("{i}").into_bytes()))
+                    .unwrap();
+            }
+        }
+        let records = reopen(test_config(&dir)).log.iter().count() as u64;
+        assert!(
+            records > 80,
+            "40 records, 40 appends and their snapshots: {records}"
+        );
+
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        let store = reopen(test_config(&dir));
+        assert_eq!(RECORD_DECODES.with(|decodes| decodes.get()), 2 * records);
+        assert_eq!(store.get_state_len("log").unwrap(), Some(40));
+    }
+
     #[test]
     fn test_store_blob() {
         let dir = TempDir::new().unwrap();
