@@ -189,6 +189,9 @@ impl Store {
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
+        // A directory created over an earlier store can hold staging files
+        // its interrupted blob stores left. The lock is held, as at open.
+        blobs.remove_staging_files();
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
 
@@ -229,6 +232,9 @@ impl Store {
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
+        // Likewise, no blob store is in progress, so the blob directory's
+        // staging files were left by interrupted ones.
+        blobs.remove_staging_files();
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
 

@@ -395,9 +395,9 @@ fn ownership_refused(error: &io::Error) -> bool {
 }
 
 /// Sync the directory a checkpoint was renamed in, so that the rename
-/// survives a power loss.
+/// survives a power loss. Blob stores sync theirs with it too.
 #[cfg(unix)]
-fn sync_directory(directory: &File) -> io::Result<()> {
+pub(crate) fn sync_directory(directory: &File) -> io::Result<()> {
     match directory.sync_all() {
         Err(error) if directory_sync_refused(&error) => Ok(()),
         other => other,
@@ -421,7 +421,7 @@ fn directory_sync_refused(error: &io::Error) -> bool {
 /// EACCES (src/backend/storage/file/fd.c), and SQLite's unixSync goes on
 /// when it can't open the directory (src/os_unix.c).
 #[cfg(unix)]
-fn directory_open_refused(error: &io::Error) -> bool {
+pub(crate) fn directory_open_refused(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
 }
 
