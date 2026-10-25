@@ -1,12 +1,3 @@
-//! A branch made at a past sequence (`create_branch_at`) reads the parent's
-//! value at that point, and keeps reading it through the snapshots the
-//! branch takes later. An append-log delta snapshot holds only the Appends
-//! since the last snapshot, and reconstruction reads it in place of every
-//! operation behind it, so no delta may be taken across a Redact, an Edit or
-//! a Set. A branch that inherits one from after the parent's last full
-//! snapshot holds its deltas off until a full snapshot of its own, as the
-//! parent does.
-
 use chronicle::{
     SnapshotNeeded, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
 };
@@ -21,7 +12,6 @@ fn config(dir: &TempDir, create: bool) -> StoreConfig {
     }
 }
 
-/// A store whose state "s" takes a delta snapshot every two operations.
 fn store(dir: &TempDir) -> Store {
     let store = Store::create(config(dir, true)).unwrap();
     store
@@ -49,19 +39,15 @@ fn value(store: &Store) -> Vec<Value> {
     serde_json::from_slice(&store.get_state("s").unwrap().unwrap()).unwrap()
 }
 
-/// Branch "child" from main at `at`, and switch to it.
 fn fork_at(store: &Store, at: chronicle::Sequence) {
     store.create_branch_at("child", "main", at).unwrap();
     store.switch_branch("child").unwrap();
 }
 
-/// Branch "child" from main at main's head, and switch to it.
 fn fork(store: &Store) {
     fork_at(store, store.current_branch().head);
 }
 
-/// Append 0 and 1, and take their delta snapshot: auto-snapshots take it
-/// themselves, and with them off this does.
 fn append_0_and_1_and_their_delta(store: &Store) {
     append(store, json!(0));
     append(store, json!(1));
@@ -70,14 +56,10 @@ fn append_0_and_1_and_their_delta(store: &Store) {
     }
 }
 
-/// The changes a delta can't carry, each made after `append_0_and_1_and_their_delta`,
-/// with the value the state then holds.
 fn changes() -> Vec<(&'static str, fn(&Store), Vec<Value>)> {
     vec![
         ("Redact", |store| {
             op(store, StateOperation::Redact { start: 1, end: 100 });
-            // An Append after the Redact, so the Redact isn't the branch's
-            // own head.
             append(store, json!(5));
         }, vec![json!(0), json!(5)]),
         ("Edit", |store| {
@@ -87,18 +69,12 @@ fn changes() -> Vec<(&'static str, fn(&Store), Vec<Value>)> {
             );
         }, vec![json!("edited"), json!(1)]),
         ("Set", |store| {
-            // An Append between the delta and the Set: a delta walking past
-            // the Set would carry it back after the Set's value.
             append(store, json!(7));
             op(store, StateOperation::Set(serde_json::to_vec(&json!([9])).unwrap()));
         }, vec![json!(9)]),
     ]
 }
 
-/// On a branch that should start as `before`: append 2 and 3, the point its
-/// first delta would come due (held off), then take a full snapshot of its
-/// own and append 4 and 5, whose delta the test checks was taken, reading
-/// the value and count at each step.
 fn branch_reads_through_its_snapshots(store: &Store, name: &str, before: Vec<Value>) {
     assert_eq!(value(store), before, "{name}: setup: the branch starts as main was at its point");
     let mut expected = before;
@@ -125,7 +101,6 @@ fn branch_reads_through_its_snapshots(store: &Store, name: &str, before: Vec<Val
     assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}");
 }
 
-/// Each change, made on main and then branched from main's head.
 #[test]
 fn a_fork_keeps_each_change_from_before_its_point() {
     for (name, change, before) in changes() {
@@ -138,8 +113,6 @@ fn a_fork_keeps_each_change_from_before_its_point() {
     }
 }
 
-/// Each change, made on main, then main moves on past a full snapshot of its
-/// own, and the branch is made at the point just after the change.
 #[test]
 fn a_fork_at_a_past_point_keeps_each_change_from_before_it() {
     for (name, change, before) in changes() {
@@ -155,8 +128,6 @@ fn a_fork_at_a_past_point_keeps_each_change_from_before_it() {
     }
 }
 
-/// Without auto-snapshots, `snapshot_needed` once two more Appends are made
-/// after `setup` shows whether deltas are held off.
 fn due_after(setup: impl FnOnce(&Store)) -> Option<SnapshotNeeded> {
     let dir = TempDir::new().unwrap();
     let store = store(&dir);
@@ -167,9 +138,6 @@ fn due_after(setup: impl FnOnce(&Store)) -> Option<SnapshotNeeded> {
     store.snapshot_needed("s")
 }
 
-/// This passes before the fix too, where record_update already set the flag
-/// for each of the three: it guards the flag's move into is_non_append_change,
-/// and isn't evidence for the branch fix.
 #[test]
 fn each_change_holds_its_states_deltas_off() {
     for (name, change, _) in changes() {
@@ -177,8 +145,6 @@ fn each_change_holds_its_states_deltas_off() {
             append_0_and_1_and_their_delta(store);
             change(store);
         });
-        // No delta, and no early full either: the raw tail grows until the
-        // size-aware full.
         assert_eq!(due, None, "{name}");
     }
 }
@@ -201,7 +167,6 @@ fn a_fork_keeps_its_hold_on_deltas_across_a_reopen() {
     let store = store(&dir);
     store.set_auto_snapshot(false);
     append_0_and_1_and_their_delta(&store);
-    // The Redact is the branch's own head here.
     op(&store, StateOperation::Redact { start: 1, end: 100 });
     fork(&store);
     store.sync().unwrap();
@@ -221,7 +186,6 @@ fn a_fork_at_a_past_point_inherits_the_hold_its_parent_had_there() {
         append_0_and_1_and_their_delta(store);
         op(store, StateOperation::Redact { start: 1, end: 100 });
         let at = store.current_branch().head;
-        // Main's own hold ends with a full snapshot after the branch's point.
         store.compact_state("s").unwrap();
         append(store, json!(6));
         append(store, json!(7));
@@ -258,7 +222,6 @@ fn a_change_behind_the_last_full_snapshot_doesnt_hold_a_forks_deltas_off() {
     let due = due_after(|store| {
         append_0_and_1_and_their_delta(store);
         op(store, StateOperation::Redact { start: 0, end: 1 });
-        // A full snapshot behind the fork point consolidates the Redact.
         store.compact_state("s").unwrap();
         append(store, json!(5));
         fork(store);

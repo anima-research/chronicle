@@ -461,8 +461,6 @@ impl FieldIndexManager {
             }
             let index = self.indexes.get_mut(&key).expect("just matched");
             let len = index.by_ordinal.len();
-            // Clamped as the stored value clamps them, before any narrowing
-            // to an ordinal, so a range past the end removes only what's there.
             let start_c = start.min(len);
             let end_c = end.min(len);
             if start_c >= end_c {

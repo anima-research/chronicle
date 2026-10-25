@@ -82,16 +82,9 @@ enum BranchEvent {
     Deleted { name: String },
 }
 
-/// Where a branch made at a past sequence starts a state's chain
-/// (`create_branch_at`).
 struct ChainInfoAt {
-    /// The parent's last update to the state at or before that sequence.
     head_offset: u64,
-    /// The number of items the state held there.
     item_count: usize,
-    /// Whether a non-Append change lies between that update and the last full
-    /// snapshot or Set behind it (a Set is itself such a change): what the
-    /// parent's head records there when its own flag is right.
     non_append_since_snapshot: bool,
 }
 
@@ -879,10 +872,6 @@ impl Store {
         Ok(Some(state))
     }
 
-    /// Find the chain head info at a historical sequence.
-    ///
-    /// Used by `create_branch_at` to point a new branch at an existing chain position
-    /// without writing new records. Returns None if no state existed at that sequence.
     fn find_chain_info_at(
         &self,
         branch_id: crate::types::BranchId,
@@ -899,14 +888,6 @@ impl Store {
         let mut found_offset: Option<u64> = None;
         let mut operations = Vec::new();
         let mut hit_snapshot = false;
-        // Whether a change a delta can't carry lies between the head and the
-        // last full snapshot (or Set) behind it, where the walk ends. It is
-        // read from the chain, not from the parent's saved flag, so it's right
-        // for a parent whose own flag is wrong. The walk goes on past delta
-        // snapshots: on a chain the store wrote, a delta is taken only while
-        // the flag is clear, so only Appends lie behind it, but a delta a
-        // caller wrote, or one a branch took before branches inherited the
-        // flag, can have such a change behind it.
         let mut non_append_since_snapshot = false;
 
         while let Some(offset) = current_offset {
@@ -1424,12 +1405,6 @@ impl Store {
                             )?;
                             Ok(Some(record))
                         }
-                        // The head said only Appends since its last snapshot,
-                        // and the chain disagrees: a branch made at a past
-                        // sequence before branches inherited the flag, or a
-                        // head saved before a Set set the flag (a9677a1). A
-                        // full snapshot keeps the change, and clears the
-                        // flag, which is then true of the chain.
                         None => full(),
                     }
                 }
@@ -1444,10 +1419,7 @@ impl Store {
         Ok(())
     }
 
-    /// Compute items added since the last delta or full snapshot, or None when
-    /// a Redact, Edit or Set (`is_non_append_change`) lies in that stretch:
-    /// a delta holds only Appends, so one built across such a change would
-    /// bring back what it removed or replaced.
+    /// Compute items added since the last delta or full snapshot.
     ///
     /// This walks the chain collecting Append operations until hitting a snapshot.
     fn compute_delta_items(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
@@ -2522,16 +2494,9 @@ mod tests {
         }
     }
 
-    /// A head that says only Appends since its last snapshot while its chain
-    /// holds a Redact, an Edit or a Set there, as a branch made at a past
-    /// sequence was saved before branches inherited the parent's flag: when
-    /// its delta comes due, the store takes a full snapshot instead, so the
-    /// change holds.
     #[test]
     fn a_head_whose_flag_missed_a_change_takes_a_full_snapshot_not_a_delta() {
         let n = |v: i64| serde_json::to_vec(&json!(v)).unwrap();
-        // Each change, after Append 0 and Append 1 (whose delta is taken),
-        // and what the branch reads after it appends 2 and 3.
         let cases: Vec<(&str, Vec<StateOperation>, serde_json::Value)> = vec![
             ("Redact", vec![StateOperation::Redact { start: 1, end: 100 }], json!([0, 2, 3])),
             (
@@ -2539,8 +2504,6 @@ mod tests {
                 vec![StateOperation::Edit { index: 0, new_value: serde_json::to_vec(&json!("e")).unwrap() }],
                 json!(["e", 1, 2, 3]),
             ),
-            // An Append before the Set, which a delta walking past the Set
-            // would carry back.
             (
                 "Set",
                 vec![StateOperation::Append(n(7)), StateOperation::Set(serde_json::to_vec(&json!([9])).unwrap())],
@@ -2569,7 +2532,6 @@ mod tests {
             let child = store.create_branch_at("child", "main", store.current_branch().head).unwrap();
             let head = store.state.get_head(child.id, "s").unwrap();
             assert!(head.has_non_append_since_snapshot, "{name}: setup: the branch inherits the flag");
-            // As create_branch_at saved such a branch before.
             store.state.set_head_for_branch(child.id, "s", head.head_offset, head.item_count, false);
             store.switch_branch("child").unwrap();
             for v in [2, 3] {
