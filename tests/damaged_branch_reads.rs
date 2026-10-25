@@ -185,6 +185,9 @@ fn a_field_index_an_earlier_release_saved_is_built_again() {
     store.register_state_field_index("s", "/id", chronicle::FieldIndexKind::String).unwrap();
     store.sync().unwrap();
     drop(store);
+    let store = Store::open(config(&dir, false)).unwrap();
+    assert_eq!(store.query_state_index_eq("s", "/id", "b", None, None), Some(vec![1]), "setup: this release's file is taken up");
+    drop(store);
     let path = dir.path().join("store").join("state-indexes.bin");
     let mut file = std::fs::read(&path).unwrap();
     assert_eq!(&file[..4], b"SFI\0", "setup: the index file");
