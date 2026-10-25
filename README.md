@@ -80,7 +80,7 @@ A registration is kept in the store, so on a store opened again, `registerState`
 
 ### Blobs
 
-`storeBlob` keeps bytes under their SHA-256 hash, so the same content is stored once, and `getBlob` reads them back. `getBlob` checks the file's checksum and hash, and throws for a file that isn't whole; storing the same content again replaces such a file.
+`storeBlob` keeps bytes under their SHA-256 hash, so the same content is stored once, and `getBlob` reads them back. `getBlob` checks the file's checksum and hash, and throws for a file that isn't whole; storing the same content again replaces such a file. A content type longer than 65,535 bytes is refused. An open store keeps the blobs it wrote or read most recently in memory (`blobCacheSize` of them, 1,000 by default) and answers from there, so damage done to a blob's file from outside the store shows only once the blob leaves that cache or the store is reopened.
 
 ### Subscriptions
 

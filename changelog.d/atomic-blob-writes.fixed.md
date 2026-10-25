@@ -19,9 +19,11 @@
   length is an error rather than an allocation of that many bytes, which
   aborted the process for a length near `u64::MAX`. Its errors are otherwise
   the ones it gave before.
-- A blob's content type longer than 65,535 bytes is refused with an
-  `InvalidOperation` error before anything is written. Its length field
-  wrapped, and the file written couldn't be read.
+- `storeBlob` refuses a content type longer than 65,535 bytes with an
+  `InvalidOperation` error before it does anything else, whether or not the
+  content is already stored. For new content its length field wrapped, and
+  the file written couldn't be read; for stored content the call returned
+  the hash.
 - The blob file format is unchanged, so existing stores keep opening, and
   earlier releases open a store this version wrote. A leftover
   `.chronicle-blob-*` file lies beside the shards, where the blob listing
