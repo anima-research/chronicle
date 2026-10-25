@@ -206,3 +206,65 @@ fn branch_at_keeps_inherited_set_across_child_delta_snapshot() {
         vec![json!("x"), json!("y")],
     );
 }
+
+fn append_many(store: &Store, values: &[&str]) {
+    store
+        .update_state(
+            "messages",
+            StateOperation::AppendMany(values.iter().map(|v| serde_json::to_vec(&json!(v)).unwrap()).collect()),
+        )
+        .unwrap();
+}
+
+/// A batch on the inherited chain is append-only, so it doesn't stop the
+/// child's delta snapshots, and they keep every one of its items.
+#[test]
+fn branch_at_keeps_an_inherited_batch_across_child_delta_snapshot() {
+    run_case(
+        |store| {
+            append_many(store, &["d", "e", "f"]);
+            append(store, json!("g"));
+        },
+        vec![json!("a"), json!("b"), json!("c"), json!("d"), json!("e"), json!("f"), json!("g")],
+    );
+}
+
+/// The chain head `create_branch_at` rebuilds counts a batch before the cut
+/// as one operation and all of its items, exactly as the parent's head
+/// counted it, whether the cut falls on the batch or after it.
+#[test]
+fn branch_at_counts_a_batch_before_the_cut_as_the_parent_did() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    seed_with_full_snapshot(&store);
+    append_many(&store, &["d", "e", "f"]);
+    let on_batch = store.current_branch().head;
+    let at_batch = (
+        store.get_compaction_stats("messages").unwrap(),
+        store.get_state_len("messages").unwrap(),
+    );
+    append(&store, json!("g"));
+    append_many(&store, &["h", "i"]);
+    let at_head = store.current_branch().head;
+
+    store.create_branch("control", None).unwrap();
+    store.create_branch_at("historical", "main", at_head).unwrap();
+    store.create_branch_at("on-batch", "main", on_batch).unwrap();
+
+    let control = {
+        store.switch_branch("control").unwrap();
+        (store.get_compaction_stats("messages").unwrap(), store.get_state_len("messages").unwrap())
+    };
+    assert_eq!(control.0.ops_since_last_full_snapshot, 3, "two batches and an append");
+    assert_eq!(control.1, Some(9));
+    store.switch_branch("historical").unwrap();
+    let historical = (store.get_compaction_stats("messages").unwrap(), store.get_state_len("messages").unwrap());
+    assert_eq!(format!("{historical:?}"), format!("{control:?}"));
+
+    store.switch_branch("on-batch").unwrap();
+    let cut = (store.get_compaction_stats("messages").unwrap(), store.get_state_len("messages").unwrap());
+    assert_eq!(format!("{cut:?}"), format!("{at_batch:?}"));
+    assert_eq!(cut.0.ops_since_last_full_snapshot, 1);
+    assert_eq!(cut.1, Some(6));
+    assert_eq!(read(&store), ["a", "b", "c", "d", "e", "f"].map(|v| json!(v)).to_vec());
+}

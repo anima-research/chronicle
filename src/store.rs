@@ -59,8 +59,25 @@ pub struct CompactionSummary {
 /// Magic bytes for store manifest.
 const STORE_MAGIC: &[u8; 4] = b"RST\0";
 
-/// Current store format version.
+/// Store format version of a store every release reads: the MANIFEST is the
+/// magic and this byte. A new store starts at it, and stays at it until it
+/// first holds something a build without a format feature can't read.
 const STORE_VERSION: u8 = 1;
+
+/// Store format version of a store whose MANIFEST also names format
+/// features: after the magic and this byte, a little-endian `u64` of feature
+/// bits. Builds that know only version 1 refuse such a store at open
+/// ("Unsupported store version: 2"), before they read any of it, instead of
+/// meeting a record they can't decode part way through the log. This build
+/// refuses a feature bit it doesn't know the same way.
+const STORE_VERSION_FEATURES: u8 = 2;
+
+/// Format feature: the log holds `StateOperation::AppendMany` records. Set
+/// in the MANIFEST before the first one is written.
+const FEATURE_APPEND_MANY: u64 = 1 << 0;
+
+/// Every format feature this build reads.
+const KNOWN_FEATURES: u64 = FEATURE_APPEND_MANY;
 
 /// Admission state protected by the store's write mutex.
 #[derive(Default)]
@@ -74,6 +91,11 @@ struct WriteState {
     /// Subscribers hear of it once one does, as its caller does. At most one
     /// is ever pending, since a mutation first finishes a failed checkpoint.
     pending_branch_event: Option<BranchEvent>,
+
+    /// The format features the MANIFEST on disk names (0 for a version 1
+    /// manifest). A write that needs one it lacks rewrites the MANIFEST
+    /// first; see `Store::require_features`.
+    features: u64,
 }
 
 /// A branch change to announce once a checkpoint persists it.
@@ -180,7 +202,7 @@ impl Store {
     /// Open an existing store.
     pub fn open(config: StoreConfig) -> Result<Self> {
         // Verify manifest
-        Self::verify_manifest(&config.path)?;
+        let mut features = Self::verify_manifest(&config.path)?;
 
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
@@ -254,6 +276,8 @@ impl Store {
         let mut undecodable = 0u64;
         let mut first_undecodable = None;
         let mut on_missing_branches = 0u64;
+        // Format features the replayed tail's operations need.
+        let mut replayed_features = 0u64;
         let index = RecordIndex::rebuild_from_log_with(
             config.path.join("records.idx"),
             &log,
@@ -272,6 +296,7 @@ impl Store {
                     first_undecodable.get_or_insert(offset);
                     return Ok(());
                 };
+                replayed_features |= Self::features_of(&update.operation);
 
                 // Earlier releases saved a branch only at sync, so a crash can
                 // leave updates on a branch that branches.bin doesn't hold.
@@ -327,6 +352,21 @@ impl Store {
                  nothing can read those branches"
             );
         }
+        // The MANIFEST names a feature before the first record that needs it
+        // is written, so this finds nothing missing unless that rewrite was
+        // lost, as a power loss can lose a rename that wasn't synced. The
+        // tail past the checkpoint is all this sees; it marks the store
+        // again so an older build still refuses it.
+        let missing = replayed_features & !features;
+        if missing != 0 {
+            tracing::warn!(
+                features = missing,
+                "the log holds records whose format features the MANIFEST doesn't name; \
+                 naming them now"
+            );
+            features |= missing;
+            Self::write_manifest_features(&config.path, features)?;
+        }
         let unregistered_states: Vec<_> = unregistered.into_iter().collect();
         let recovery = match log.recovery() {
             Some(torn) => Some(RecoveryReport {
@@ -360,7 +400,10 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
-            write_lock: Mutex::new(WriteState::default()),
+            write_lock: Mutex::new(WriteState {
+                features,
+                ..WriteState::default()
+            }),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery,
         })
@@ -664,6 +707,14 @@ impl Store {
     /// this call's own auto-snapshot, so an error can come back for an
     /// operation already recorded (issue #39).
     ///
+    /// An `AppendMany` with no items is refused. The first `AppendMany` a
+    /// store records also rewrites its MANIFEST, before the record is
+    /// written, to format version 2 with the batch feature named, so a build
+    /// that predates the operation refuses the store when it opens it. A
+    /// store that never holds one keeps version 1, which every release
+    /// opens. If that rewrite fails, the error is returned and nothing is
+    /// recorded.
+    ///
     /// Snapshots are automatically created when thresholds are reached.
     pub fn update_state(
         &self,
@@ -802,8 +853,17 @@ impl Store {
 
         let operation = operation_builder(next_id, next_seq)?;
 
+        if operation.contains_empty_batch() {
+            return Err(StoreError::InvalidOperation(
+                "AppendMany needs at least one item: an empty batch would be a record that \
+                 appends nothing"
+                    .into(),
+            ));
+        }
+
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
-        // - Append: Always succeeds, no validation needed
+        // - Append, AppendMany: Always succeed, no validation needed (beyond
+        //   the batch holding an item, above)
         // - Edit: Just check index < len
         // - Redact: No validation: when it's applied, a range past the end is
         //   clamped to the length and a reversed one removes nothing
@@ -842,9 +902,16 @@ impl Store {
                     )));
                 }
             }
-            // Append, Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
+            // Append, AppendMany, Set, Snapshot, DeltaSnapshot,
+            // TreeDeltaSnapshot - no validation needed
             _ => {}
         }
+
+        // A record a build without one of the format features can't read
+        // goes into the log only once the MANIFEST names that feature, so
+        // such a build refuses the store at open instead of part way
+        // through it. If the MANIFEST can't be rewritten, nothing is written.
+        self.require_features(&mut write, Self::features_of(&operation))?;
 
         // Create the state update record payload
         let update = StateUpdateRecord {
@@ -1381,7 +1448,8 @@ impl Store {
         }
 
         // Collect items walking backwards until we have enough
-        // We need to handle: Append (add 1), DeltaSnapshot (add N), Snapshot (stop), Redact/Edit (complex)
+        // We need to handle: Append (add 1), AppendMany and DeltaSnapshot
+        // (add N), Snapshot (stop), Redact/Edit (complex)
         let mut items_collected: Vec<serde_json::Value> = Vec::new();
         let mut current_offset = Some(head.head_offset);
         let mut need_full_reconstruct = false;
@@ -1401,6 +1469,7 @@ impl Store {
 
             match &update.operation {
                 StateOperation::Append(_)
+                | StateOperation::AppendMany(_)
                 | StateOperation::Edit { .. }
                 | StateOperation::Redact { .. }
                     if hit_delta => {}
@@ -1408,6 +1477,18 @@ impl Store {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     items_collected.push(value);
+                }
+                StateOperation::AppendMany(items) => {
+                    // Newest first, as the walk collects; only as many as
+                    // the tail still needs.
+                    for item in items.iter().rev() {
+                        if items_collected.len() >= count {
+                            break;
+                        }
+                        let value: serde_json::Value = serde_json::from_slice(item)
+                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                        items_collected.push(value);
+                    }
                 }
                 StateOperation::DeltaSnapshot(data) => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
@@ -1479,96 +1560,6 @@ impl Store {
         // Reverse since we collected in reverse order
         items_collected.reverse();
         Ok(Some(serde_json::to_vec(&items_collected)?))
-    }
-
-    /// Legacy implementation for reference - walks entire chain
-    #[allow(dead_code)]
-    fn get_state_tail_full_reconstruct(&self, state_id: &str, count: usize) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
-        let head = match self.state.get_head(branch_id, state_id) {
-            Some(h) => h,
-            None => return Ok(None),
-        };
-
-        if count == 0 {
-            return Ok(Some(serde_json::to_vec(&Vec::<serde_json::Value>::new())?));
-        }
-
-        // Collect all items in proper order by traversing the chain
-        let mut all_items: Vec<serde_json::Value> = Vec::new();
-        let mut current_offset = Some(head.head_offset);
-        let mut hit_snapshot = false;
-
-        // First pass: collect operations in reverse order
-        let mut ops: Vec<StateOperation> = Vec::new();
-
-        while let Some(offset) = current_offset {
-            let record = self.log.read_at(offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Both replace the entire state - nothing older matters
-                    ops.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) => {
-                    ops.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    if !hit_snapshot {
-                        ops.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
-
-        // Apply operations in forward order (reverse of collection order)
-        ops.reverse();
-        for op in ops {
-            match op {
-                StateOperation::Append(item) => {
-                    let value: serde_json::Value = serde_json::from_slice(&item)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    all_items.push(value);
-                }
-                StateOperation::Snapshot(data) | StateOperation::DeltaSnapshot(data) => {
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    all_items.extend(arr);
-                }
-                StateOperation::Set(data) => {
-                    // Set replaces the entire state
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    all_items = arr;
-                }
-                StateOperation::Redact { start, end } => {
-                    let start = start.min(all_items.len());
-                    let end = end.min(all_items.len());
-                    if start < end {
-                        all_items.drain(start..end);
-                    }
-                }
-                StateOperation::Edit { index, new_value } => {
-                    if index < all_items.len() {
-                        let value: serde_json::Value = serde_json::from_slice(&new_value)
-                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                        all_items[index] = value;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Take the last `count` items
-        let start = all_items.len().saturating_sub(count);
-        let tail: Vec<_> = all_items[start..].to_vec();
-
-        Ok(Some(serde_json::to_vec(&tail)?))
     }
 
     /// Iterate over items in an AppendLog state without loading all into memory.
@@ -1842,7 +1833,10 @@ impl Store {
 
     /// Compute items added since the last delta or full snapshot.
     ///
-    /// This walks the chain collecting Append operations until hitting a snapshot.
+    /// This walks the chain collecting the items of Append and AppendMany
+    /// operations until hitting a snapshot. A delta snapshot replaces every
+    /// operation it covers on later reads, so an append-only operation this
+    /// walk skipped would lose its items.
     fn compute_delta_items(&self, branch_id: BranchId, state_id: &str) -> Result<Vec<u8>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
@@ -1862,6 +1856,15 @@ impl Store {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     appended_items.push(value);
+                }
+                StateOperation::AppendMany(items) => {
+                    // Newest first, like the walk: the reverse below puts
+                    // the batch back in its own order.
+                    for item in items.iter().rev() {
+                        let value: serde_json::Value = serde_json::from_slice(item)
+                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                        appended_items.push(value);
+                    }
                 }
                 StateOperation::Snapshot(_) | StateOperation::DeltaSnapshot(_) => {
                     // Hit a snapshot, stop collecting
@@ -2697,6 +2700,29 @@ impl Store {
         self.sync_locked(&mut write)
     }
 
+    /// Make the MANIFEST name `required` format features before a record
+    /// that needs them is written. A no-op once it names them all, so it
+    /// writes the MANIFEST at most once per feature over the store's life.
+    /// Call only while holding write_lock.
+    fn require_features(&self, write: &mut WriteState, required: u64) -> Result<()> {
+        if required & !write.features == 0 {
+            return Ok(());
+        }
+        let features = write.features | required;
+        Self::write_manifest_features(&self.config.path, features)?;
+        write.features = features;
+        Ok(())
+    }
+
+    /// The format features a store must name to hold `operation`.
+    fn features_of(operation: &StateOperation) -> u64 {
+        if operation.contains_append_many() {
+            FEATURE_APPEND_MANY
+        } else {
+            0
+        }
+    }
+
     /// Finish a failed metadata checkpoint before admitting another mutation.
     fn retry_metadata_checkpoint(&self, write: &mut WriteState) -> Result<()> {
         if write.checkpoint_required {
@@ -2965,7 +2991,22 @@ impl Store {
         Ok(())
     }
 
-    fn verify_manifest(path: &Path) -> Result<()> {
+    /// Rewrite the MANIFEST as format version 2 naming `features`. It goes
+    /// through a new file beside it, synced and renamed over it, so a crash
+    /// leaves the old MANIFEST or the new one, never a torn one; on Unix the
+    /// directory is synced too, so the new one is on disk before this
+    /// returns. A version 1 store is never written back: features are only
+    /// ever added.
+    fn write_manifest_features(path: &Path, features: u64) -> Result<()> {
+        crate::atomic_file::Checkpoint::default().save(
+            &path.join("MANIFEST"),
+            &[STORE_MAGIC, &[STORE_VERSION_FEATURES], &features.to_le_bytes()],
+        )
+    }
+
+    /// Check the MANIFEST and return the format features it names (none
+    /// for version 1).
+    fn verify_manifest(path: &Path) -> Result<u64> {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
@@ -2979,14 +3020,29 @@ impl Store {
 
         let mut version = [0u8; 1];
         file.read_exact(&mut version)?;
-        if version[0] != STORE_VERSION {
-            return Err(StoreError::InvalidFormat(format!(
-                "Unsupported store version: {}",
-                version[0]
-            )));
+        match version[0] {
+            STORE_VERSION => Ok(0),
+            STORE_VERSION_FEATURES => {
+                let mut bits = [0u8; 8];
+                file.read_exact(&mut bits).map_err(|e| {
+                    StoreError::InvalidFormat(format!(
+                        "Store manifest version 2 is too short to hold its format features: {e}"
+                    ))
+                })?;
+                let features = u64::from_le_bytes(bits);
+                let unknown = features & !KNOWN_FEATURES;
+                if unknown != 0 {
+                    return Err(StoreError::InvalidFormat(format!(
+                        "Store uses format features this build can't read (bits {unknown:#x}); \
+                         it was written by a newer chronicle"
+                    )));
+                }
+                Ok(features)
+            }
+            other => Err(StoreError::InvalidFormat(format!(
+                "Unsupported store version: {other}"
+            ))),
         }
-
-        Ok(())
     }
 
     // LOCK is opened without truncating it, and nothing is written to it. It
@@ -3126,6 +3182,13 @@ impl StateItemIterator {
                     let value: serde_json::Value = serde_json::from_slice(&item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer.push(value);
+                }
+                StateOperation::AppendMany(items) => {
+                    for item in items {
+                        let value: serde_json::Value = serde_json::from_slice(&item)
+                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                        self.items_buffer.push(value);
+                    }
                 }
                 StateOperation::Snapshot(data) | StateOperation::DeltaSnapshot(data) => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
@@ -3638,7 +3701,8 @@ mod tests {
     /// it, and its chain still links back through the appends it covers. A
     /// tail longer than the newest delta must skip those appends and take
     /// its older items from the delta before, as reconstruction does, not
-    /// collect the covered appends a second time.
+    /// collect the covered appends a second time. Batches and single
+    /// appends alike.
     #[test]
     fn test_get_state_tail_past_a_delta_snapshot() {
         let dir = TempDir::new().unwrap();
@@ -3651,6 +3715,14 @@ mod tests {
             },
             initial_value: None,
         }).unwrap();
+        store.register_state(StateRegistration {
+            id: "batched".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 2,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        }).unwrap();
 
         // Deltas after 3, 6 and 9; 10 and 11 are newer than the last.
         for i in 1..=11 {
@@ -3658,13 +3730,51 @@ mod tests {
                 serde_json::to_vec(&i).unwrap()
             )).unwrap();
         }
-        assert_eq!(store.get_compaction_stats("items").unwrap().delta_snapshots_since_full, 3);
-
-        for count in 1..=11 {
-            let tail = store.get_state_tail("items", count).unwrap().unwrap();
-            let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
-            assert_eq!(arr, ((12 - count as i32)..=11).collect::<Vec<_>>(), "tail of {count}");
+        // Batches [1,2] [3]: delta; [4,5] [6,7,8]: delta; [9,10,11].
+        for batch in [&[1, 2][..], &[3], &[4, 5], &[6, 7, 8], &[9, 10, 11]] {
+            store.update_state("batched", StateOperation::AppendMany(
+                batch.iter().map(|i| serde_json::to_vec(i).unwrap()).collect()
+            )).unwrap();
         }
+        assert_eq!(store.get_compaction_stats("items").unwrap().delta_snapshots_since_full, 3);
+        assert_eq!(store.get_compaction_stats("batched").unwrap().delta_snapshots_since_full, 2);
+
+        for id in ["items", "batched"] {
+            for count in 1..=11 {
+                let tail = store.get_state_tail(id, count).unwrap().unwrap();
+                let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
+                assert_eq!(arr, ((12 - count as i32)..=11).collect::<Vec<_>>(), "{id}: tail of {count}");
+            }
+        }
+    }
+
+    /// The items a delta snapshot is built from: every item of every batch
+    /// since the last snapshot, in order, between the single appends.
+    #[test]
+    fn test_compute_delta_items_takes_every_item_of_a_batch() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        }).unwrap();
+        let main = store.current_branch().id;
+
+        store.update_state("items", StateOperation::Append(b"0".to_vec())).unwrap();
+        store.compact_state("items").unwrap();
+        store.update_state("items", StateOperation::Append(b"1".to_vec())).unwrap();
+        store.update_state("items", StateOperation::AppendMany(
+            vec![b"2".to_vec(), b"{\"b\":3, \"a\":3}".to_vec(), b"4".to_vec()]
+        )).unwrap();
+        store.update_state("items", StateOperation::Append(b"5".to_vec())).unwrap();
+        store.update_state("items", StateOperation::AppendMany(vec![b"6".to_vec()])).unwrap();
+
+        let delta = store.compute_delta_items(main, "items").unwrap();
+        assert_eq!(delta, br#"[1,2,{"a":3,"b":3},4,5,6]"#);
     }
 
     #[test]

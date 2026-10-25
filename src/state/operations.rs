@@ -117,6 +117,16 @@ pub(crate) fn materialize_operations_tagged(ops: Vec<StateOperation>) -> Result<
                     .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                 acc.as_arr()?.push(item_value);
             }
+            StateOperation::AppendMany(items) => {
+                // Exactly the `Append` arm once per item, so an empty batch
+                // leaves the value as it was (bytes included) and a bad item
+                // fails the same way its own `Append` would.
+                for item in items {
+                    let item_value: serde_json::Value = serde_json::from_slice(&item)
+                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                    acc.as_arr()?.push(item_value);
+                }
+            }
             StateOperation::DeltaSnapshot(delta_items) => {
                 let delta_arr: Vec<serde_json::Value> = serde_json::from_slice(&delta_items)
                     .map_err(|e| StoreError::Deserialization(e.to_string()))?;
@@ -258,6 +268,12 @@ pub(crate) fn array_len_from(base: usize, ops: &[StateOperation]) -> Option<usiz
                 }
                 len += 1;
             }
+            StateOperation::AppendMany(items) => {
+                if !items.iter().all(|item| is_json(item)) {
+                    return None;
+                }
+                len += items.len();
+            }
             StateOperation::DeltaSnapshot(items) => {
                 len += json_array_len(items)?;
             }
@@ -325,6 +341,28 @@ pub fn apply_operation(state: Vec<u8>, operation: StateOperation) -> Result<Vec<
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?;
 
             arr.push(item_value);
+
+            serde_json::to_vec(&arr).map_err(|e| StoreError::Serialization(e.to_string()))
+        }
+
+        StateOperation::AppendMany(items) => {
+            // No items: the value is left exactly as it was, as no `Append`
+            // at all would leave it.
+            if items.is_empty() {
+                return Ok(state);
+            }
+            let mut arr: Vec<serde_json::Value> = if state.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_slice(&state)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?
+            };
+
+            for item in items {
+                let item_value: serde_json::Value = serde_json::from_slice(&item)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                arr.push(item_value);
+            }
 
             serde_json::to_vec(&arr).map_err(|e| StoreError::Serialization(e.to_string()))
         }
@@ -698,6 +736,42 @@ mod tests {
         let arr: Vec<i32> = serde_json::from_slice(&state).unwrap();
         assert_eq!(arr, vec![1, 2, 3, 4, 5]);
     }
+
+    #[test]
+    fn test_append_many() {
+        let state = serde_json::to_vec(&json!([1])).unwrap();
+        let op = StateOperation::AppendMany(vec![b"2".to_vec(), b"{\"b\":1, \"a\":[3]}".to_vec()]);
+        let state = apply_operation(state, op).unwrap();
+        assert_eq!(state, br#"[1,2,{"a":[3],"b":1}]"#);
+
+        // Onto nothing: the same as its items appended one by one.
+        let op = StateOperation::AppendMany(vec![b"\"x\"".to_vec()]);
+        assert_eq!(apply_operation(Vec::new(), op).unwrap(), br#"["x"]"#);
+
+        // An empty batch changes nothing, not even the bytes of a value
+        // that isn't an array.
+        for state in [Vec::new(), b"\"scalar\"".to_vec(), b"[ 1 ]".to_vec()] {
+            assert_eq!(
+                apply_operation(state.clone(), StateOperation::AppendMany(vec![])).unwrap(),
+                state
+            );
+            assert_eq!(
+                materialize_operations(vec![
+                    StateOperation::Set(state.clone()),
+                    StateOperation::AppendMany(vec![]),
+                ])
+                .unwrap(),
+                state
+            );
+        }
+
+        // A bad item fails the batch, as its own Append would.
+        assert!(matches!(
+            apply_operation(Vec::new(), StateOperation::AppendMany(vec![b"1".to_vec(), b"{".to_vec()])),
+            Err(StoreError::Deserialization(_))
+        ));
+    }
+
     /// `array_len_after` must agree with real materialization wherever it
     /// answers, and decline (`None`) wherever materialization would not
     /// produce a plain array.
@@ -722,6 +796,18 @@ mod tests {
                 StateOperation::Append(b"2".to_vec()),
             ],
             vec![StateOperation::Set(arr(json!([])))],
+            vec![
+                StateOperation::AppendMany(vec![b"1".to_vec(), b"[2, 3]".to_vec(), b"{}".to_vec()]),
+                StateOperation::Append(b"4".to_vec()),
+                StateOperation::AppendMany(vec![b"5".to_vec()]),
+                StateOperation::Redact { start: 0, end: 2 },
+                StateOperation::AppendMany(vec![]),
+            ],
+            vec![
+                StateOperation::Snapshot(arr(json!([1, 2]))),
+                StateOperation::AppendMany(vec![b"3".to_vec(), b"4".to_vec()]),
+                StateOperation::Edit { index: 3, new_value: b"9".to_vec() },
+            ],
         ];
         for ops in cases {
             let expected: Vec<serde_json::Value> = {
@@ -739,6 +825,11 @@ mod tests {
             vec![StateOperation::Append(b"not json".to_vec())],
             vec![StateOperation::Append(b"1".to_vec()), StateOperation::Edit { index: 1, new_value: b"2".to_vec() }],
             vec![StateOperation::Append(b"1".to_vec()), StateOperation::Edit { index: 0, new_value: b"{".to_vec() }],
+            vec![StateOperation::AppendMany(vec![b"1".to_vec(), b"not json".to_vec()])],
+            vec![
+                StateOperation::AppendMany(vec![b"1".to_vec()]),
+                StateOperation::Edit { index: 1, new_value: b"2".to_vec() },
+            ],
             // Tree ops are not length-decidable.
             vec![StateOperation::TreeRemove { path: "a".to_string() }],
         ];

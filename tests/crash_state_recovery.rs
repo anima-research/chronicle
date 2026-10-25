@@ -61,6 +61,15 @@ fn append(store: &Store, id: &str, value: Value) {
         .unwrap();
 }
 
+fn append_many(store: &Store, id: &str, values: &[Value]) {
+    store
+        .update_state(
+            id,
+            StateOperation::AppendMany(values.iter().map(|v| serde_json::to_vec(v).unwrap()).collect()),
+        )
+        .unwrap();
+}
+
 fn set(store: &Store, id: &str, value: Value) {
     store
         .update_state(id, StateOperation::Set(serde_json::to_vec(&value).unwrap()))
@@ -245,6 +254,52 @@ fn crash_writer() {
             )
             .unwrap();
         }
+        "batch" => {
+            // Batches past the checkpoint, crossing delta and full
+            // snapshots, beside single appends, an edit and a redact, with a
+            // field index kept on the slot.
+            append(&store, "items", json!({"n": 0}));
+            store
+                .register_state_field_index("items", "/n", FieldIndexKind::Number)
+                .unwrap();
+            store.sync().unwrap();
+            for n in 1..8 {
+                append_many(
+                    &store,
+                    "items",
+                    &[json!({"n": n * 10}), json!({"n": n * 10 + 1}), json!({"n": n * 10 + 2})],
+                );
+                append(&store, "items", json!({"n": n * 10 + 3}));
+            }
+            store
+                .update_state(
+                    "items",
+                    StateOperation::Edit {
+                        index: 2,
+                        new_value: br#"{"n":5}"#.to_vec(),
+                    },
+                )
+                .unwrap();
+            store
+                .update_state("items", StateOperation::Redact { start: 4, end: 6 })
+                .unwrap();
+            append_many(&store, "items", &[json!({"n": 7}), json!({"n": 8})]);
+            std::fs::write(
+                path.join("expected.json"),
+                serde_json::to_vec(&observe(&store)).unwrap(),
+            )
+            .unwrap();
+        }
+        "batch-torn" => {
+            store.set_auto_snapshot(false);
+            for n in 0..5 {
+                append(&store, "items", json!(n));
+            }
+            store.sync().unwrap();
+            append_many(&store, "items", &[json!(5), json!(6), json!(7)]);
+            append_many(&store, "items", &[json!(8), json!(9)]);
+            assert_eq!(store.get_state_len("items").unwrap(), Some(10));
+        }
         "delete" => {
             store.set_auto_snapshot(false);
             append(&store, "items", json!(0));
@@ -368,6 +423,56 @@ fn replay_restores_mixed_operations_snapshots_and_field_index() {
             Some(br#"[{"n":0}]"#.to_vec())
         );
     }
+}
+
+/// Batches written past the checkpoint replay whole, with the snapshot
+/// accounting and field index they had, on every open until a checkpoint
+/// covers them. The child's MANIFEST rewrite is undone here first, as a
+/// power loss can undo an unsynced rename: replaying a batch marks the
+/// MANIFEST again.
+#[test]
+fn replay_restores_batches_and_marks_the_manifest_again() {
+    let dir = TempDir::new().unwrap();
+    crash(dir.path(), "batch");
+    let manifest = dir.path().join("MANIFEST");
+    assert_eq!(&std::fs::read(&manifest).unwrap()[..5], b"RST\0\x02");
+    std::fs::write(&manifest, b"RST\0\x01").unwrap();
+
+    let expected: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("expected.json")).unwrap()).unwrap();
+    for _ in 0..2 {
+        let store = open_store(dir.path()).unwrap();
+        assert_eq!(observe(&store), expected);
+        assert_eq!(value(&store, "items").as_array().unwrap().len(), 1 + 7 * 4 - 2 + 2);
+        assert_eq!(&std::fs::read(&manifest).unwrap()[..5], b"RST\0\x02");
+    }
+}
+
+/// A batch is one record, so a torn tail drops it whole: none of its items
+/// survive, and the batch before it survives whole.
+#[test]
+fn a_torn_batch_is_dropped_whole() {
+    let dir = TempDir::new().unwrap();
+    crash(dir.path(), "batch-torn");
+    let log_path = dir.path().join("records.log");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log_path)
+        .unwrap();
+    file.set_len(file.metadata().unwrap().len() - 3).unwrap();
+    drop(file);
+    let store = open_store(dir.path()).unwrap();
+    assert_eq!(value(&store, "items"), json!([0, 1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(store.get_state_len("items").unwrap(), Some(8));
+    assert!(store.recovery().is_some());
+    store.set_auto_snapshot(false);
+    append_many(&store, "items", &[json!(98), json!(99)]);
+    // Five appends and the surviving batch took sequences 1 to 6.
+    assert_eq!(store.current_branch().head, Sequence(7));
+    assert_eq!(
+        value(&store, "items"),
+        json!([0, 1, 2, 3, 4, 5, 6, 7, 98, 99])
+    );
 }
 
 #[test]

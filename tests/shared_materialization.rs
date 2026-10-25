@@ -306,7 +306,8 @@ fn rejoin(bytes: &[u8]) -> Vec<u8> {
 
 /// Whatever mix of writes, forks, reads and cache drops happens, every
 /// cached read must return byte for byte what a cache-less rebuild from the
-/// log returns.
+/// log returns. The writes include batches (`AppendMany`) among the single
+/// appends.
 #[test]
 fn cached_reads_equal_cold_reads_under_a_random_workload() {
     for seed in [1u64, 7, 42, 1234, 99999] {
@@ -400,6 +401,20 @@ fn cached_reads_equal_cold_reads_under_a_random_workload() {
                     branches.push((id, child_name, model));
                 }
                 87..=88 => store.clear_state_caches(),
+                89..=95 => {
+                    // A batch of the same payloads, one record.
+                    let raws: Vec<&[u8]> = (0..1 + rnd(4)).map(|_| raw_items[rnd(raw_items.len())]).collect();
+                    store
+                        .update_state_on(
+                            branch,
+                            "messages",
+                            StateOperation::AppendMany(raws.iter().map(|raw| raw.to_vec()).collect()),
+                        )
+                        .unwrap();
+                    for raw in raws {
+                        branches[b].2.push(serde_json::from_slice(raw).unwrap());
+                    }
+                }
                 _ => {}
             }
 

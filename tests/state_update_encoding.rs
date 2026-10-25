@@ -187,6 +187,55 @@ fn json_wire_format_unchanged_by_serde_bytes() {
     assert_eq!(&bytes, br#"{"Append":[104,105]}"#);
 }
 
+/// A batch round-trips through MessagePack item for item, each item stored
+/// as a raw `bin` payload (framing overhead only, as for one `Append`).
+#[test]
+fn msgpack_roundtrip_of_a_batch() {
+    let items = vec![b"{\"a\":1}".to_vec(), Vec::new(), vec![b'x'; 32 * 1024], b"7".to_vec()];
+    let orig = update(StateOperation::AppendMany(items.clone()));
+    let (payload, encoding) = orig.encode().unwrap();
+    assert_eq!(encoding, PayloadEncoding::MessagePack);
+    let raw_len: usize = items.iter().map(Vec::len).sum();
+    assert!(
+        payload.len() < raw_len + 256,
+        "msgpack should be ~raw size, got {} for {} raw bytes",
+        payload.len(),
+        raw_len
+    );
+
+    let decoded = StateUpdateRecord::decode(&record_with(payload, encoding)).unwrap();
+    assert_eq!(decoded.record_id, orig.record_id);
+    assert_eq!(decoded.prev_update_offset, orig.prev_update_offset);
+    match decoded.operation {
+        StateOperation::AppendMany(got) => assert_eq!(got, items),
+        other => panic!("wrong op after roundtrip: {:?}", other),
+    }
+}
+
+/// In JSON a batch is an array of the integer arrays one `Append` would
+/// carry, and such a payload decodes under the JSON fallback too.
+#[test]
+fn json_shape_of_a_batch() {
+    let op = StateOperation::AppendMany(vec![b"hi".to_vec(), b"1".to_vec()]);
+    let bytes = serde_json::to_vec(&op).unwrap();
+    assert_eq!(&bytes, br#"{"AppendMany":[[104,105],[49]]}"#);
+
+    let handwritten = br#"{
+        "record_id": 7,
+        "global_sequence": 42,
+        "state_id": "messages",
+        "prev_update_offset": 1234,
+        "operation": { "AppendMany": [[104, 105], [49]] },
+        "timestamp": 1700000000000000
+    }"#;
+    let decoded =
+        StateUpdateRecord::decode(&record_with(handwritten.to_vec(), PayloadEncoding::Raw)).unwrap();
+    match decoded.operation {
+        StateOperation::AppendMany(items) => assert_eq!(items, vec![b"hi".to_vec(), b"1".to_vec()]),
+        other => panic!("wrong op: {:?}", other),
+    }
+}
+
 /// End-to-end through a real store on disk: writes are MessagePack-tagged,
 /// and a cold reopen reconstructs from those records.
 #[test]
@@ -260,6 +309,38 @@ fn fast_path_matches_materialization_bytes() {
             "fast path diverged from materialization at item {}",
             i
         );
+    }
+}
+
+/// A batch at the head serves its last item the same way, byte-identical to
+/// the materialization path; any other index of the batch falls back.
+#[test]
+fn fast_path_serves_the_last_item_of_a_head_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir);
+    register_log(&store, "log");
+    let mut n = 0;
+    for size in [1usize, 3, 2, 5] {
+        let items: Vec<Vec<u8>> = (0..size)
+            .map(|_| {
+                n += 1;
+                serde_json::to_vec(&json!({"n": n, "zeta": "later-key", "alpha": [1, 2, 3]})).unwrap()
+            })
+            .collect();
+        store.update_state("log", StateOperation::AppendMany(items)).unwrap();
+        store.clear_state_caches();
+        let before = store.state_reconstruction_count();
+        let fast = store.get_state_item("log", n - 1).unwrap().unwrap();
+        assert_eq!(store.state_reconstruction_count(), before, "served from the head batch");
+        let slow = last_item_via_materialization(&store, "log");
+        assert_eq!(String::from_utf8_lossy(&fast), String::from_utf8_lossy(&slow));
+        if size > 1 {
+            store.clear_state_caches();
+            let earlier: serde_json::Value =
+                serde_json::from_slice(&store.get_state_item("log", n - 2).unwrap().unwrap()).unwrap();
+            assert_eq!(earlier["n"], n - 1);
+            assert_eq!(store.state_reconstruction_count(), before + 2);
+        }
     }
 }
 
