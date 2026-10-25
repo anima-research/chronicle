@@ -851,53 +851,8 @@ impl StateManager {
     }
 
     /// Reconstruct state by traversing chain from disk.
-    ///
-    /// For AppendLog with incremental snapshots:
-    /// - Full Snapshot: Stop traversal completely, use as base
-    /// - DeltaSnapshot: Consolidates ops before it; continue to find more deltas/full snapshot
-    /// - Regular ops: Collect only if before any snapshot
-    ///
-    /// Reconstruction: base_snapshot + delta_snapshots + recent_ops
     fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<Vec<u8>> {
-        let mut operations = Vec::new();
-        let mut current_offset = Some(head_offset);
-        let mut hit_snapshot = false; // Once we hit any snapshot, stop collecting regular ops
-
-        // Follow chain backwards, collecting operations
-        while let Some(offset) = current_offset {
-            let record = log.read_at(offset)?;
-
-            // Parse the state update from the record payload
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Full-state terminal: both Snapshot and Set replace the
-                    // entire state in materialize_operations, so anything older
-                    // is superseded. Add it and stop. Walking past a Set was the
-                    // bug that made cold reconstruction of Snapshot-strategy
-                    // states O(full chain) — those states are written via Set
-                    // and never get a periodic Snapshot, so the walk ran to
-                    // sequence 0. Mirrors get_state_tail's Set handling.
-                    operations.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
-                    // Delta snapshot - add it and continue looking for more snapshots
-                    // but stop collecting regular operations
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    // Regular operation - only collect if we haven't hit a snapshot yet
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
+        let mut operations = super::ChainWalk::new(log, head_offset, None).collect::<Result<Vec<_>>>()?;
 
         // Apply operations in forward order (reverse of collection order),
         // decoding once and encoding once — per-op application made cold

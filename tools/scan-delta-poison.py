@@ -4,19 +4,22 @@
 Background (see commits a9677a1 + 5f270d0): before the fix, a DeltaSnapshot
 written after a Set (or Edit/Redact that the head metadata lost track of)
 walked past the replacement and durably captured resurrected pre-Set items.
-The fixed code prevents NEW poisoned deltas but does not heal chains that
-already contain one — and the next full Snapshot bakes the resurrection into
-the base state permanently.
+The fixed code prevents NEW poisoned deltas, and chronicle's reads now use a
+DeltaSnapshot only when the raw ops behind it are all Appends, so a chain
+that holds one reads its true value. A full Snapshot an earlier release took
+over a poisoned delta baked the resurrection into the base state, and that
+stays.
 
 This scanner is READ-ONLY. For every state chain in records.log it computes:
 
-  as-code  — the state exactly as chronicle reconstructs it (base full
-             Snapshot + DeltaSnapshots + trailing raw ops), and
+  as-code  — the state as chronicle reconstructs it (base full Snapshot or
+             Set, then each DeltaSnapshot whose raw ops back to the snapshot
+             before it are all Appends, or else those raw ops, then the
+             trailing raw ops), and
   raw-truth — a replay of raw ops only (Append/Set/Edit/Redact/Delta),
              ignoring every Snapshot/DeltaSnapshot, which are purely derived.
 
-A mismatch means the chain is poisoned (by a bad delta, or by a full
-snapshot that baked a bad delta in). It also reports suspect windows
+A mismatch means the chain is poisoned: a full snapshot baked a bad delta in. It also reports suspect windows
 (Set/Edit/Redact followed by a DeltaSnapshot with no full Snapshot between)
 even when the head state happens to currently match.
 
@@ -127,17 +130,45 @@ def walk_chain(records, head_offset):
 def reconstruct_as_code(chain):
     """Mimic StateManager::reconstruct_from_disk on this chain."""
     collected = []
-    hit_snapshot = False
-    for rec in reversed(chain):
-        name = op_name(rec["operation"])
-        if name == "Snapshot":
-            collected.append(rec["operation"])
+    behind_tree = False
+    i = len(chain) - 1
+    while i >= 0:
+        op = chain[i]["operation"]
+        name = op_name(op)
+        if name in ("Snapshot", "Set"):
+            collected.append(op)
             break
-        if name in ("DeltaSnapshot", "TreeDeltaSnapshot"):
-            collected.append(rec["operation"])
-            hit_snapshot = True
-        elif not hit_snapshot:
-            collected.append(rec["operation"])
+        if name == "TreeDeltaSnapshot":
+            collected.append(op)
+            behind_tree = True
+            i -= 1
+            continue
+        if name == "DeltaSnapshot":
+            stretch, carried, ends = [], True, False
+            j = i - 1
+            while j >= 0:
+                o = chain[j]["operation"]
+                n = op_name(o)
+                if n in ("Snapshot", "DeltaSnapshot", "TreeDeltaSnapshot"):
+                    break
+                stretch.append(o)
+                if n in NON_APPEND_RAW:
+                    carried = False
+                if n == "Set":
+                    ends = True
+                    break
+                j -= 1
+            if carried:
+                collected.append(op)
+            else:
+                collected.extend(stretch)
+            if ends:
+                break
+            i = j
+            continue
+        if not behind_tree:
+            collected.append(op)
+        i -= 1
     collected.reverse()
     state = None
     for op in collected:
