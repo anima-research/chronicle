@@ -150,6 +150,27 @@ fn each_change_holds_its_states_deltas_off() {
 }
 
 #[test]
+fn a_delta_holds_its_states_deltas_off_and_a_forks() {
+    let delta = |store: &Store| {
+        append_0_and_1_and_their_delta(store);
+        append(store, json!(7));
+        op(
+            store,
+            StateOperation::Delta { old_hash: chronicle::Hash([0; 32]), new_value: serde_json::to_vec(&json!([9])).unwrap() },
+        );
+    };
+    assert_eq!(due_after(delta), None, "the state's own");
+    assert_eq!(
+        due_after(|store| {
+            delta(store);
+            fork(store);
+        }),
+        None,
+        "a fork's"
+    );
+}
+
+#[test]
 fn a_fork_inherits_its_parents_hold_on_deltas_for_each_change() {
     for (name, change, _) in changes() {
         let due = due_after(|store| {

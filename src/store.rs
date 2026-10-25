@@ -2431,8 +2431,7 @@ impl StateItemIterator {
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer.extend(arr);
                 }
-                StateOperation::Set(data) => {
-                    // Set replaces the entire state
+                StateOperation::Set(data) | StateOperation::Delta { new_value: data, .. } => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer = arr;
@@ -2507,6 +2506,17 @@ mod tests {
             (
                 "Set",
                 vec![StateOperation::Append(n(7)), StateOperation::Set(serde_json::to_vec(&json!([9])).unwrap())],
+                json!([9, 2, 3]),
+            ),
+            (
+                "Delta",
+                vec![
+                    StateOperation::Append(n(7)),
+                    StateOperation::Delta {
+                        old_hash: crate::types::Hash([0; 32]),
+                        new_value: serde_json::to_vec(&json!([9])).unwrap(),
+                    },
+                ],
                 json!([9, 2, 3]),
             ),
         ];

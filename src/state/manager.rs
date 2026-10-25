@@ -34,7 +34,10 @@ const DEFAULT_CACHE_SIZE: usize = 1000;
 pub(crate) fn is_non_append_change(op: &StateOperation) -> bool {
     matches!(
         op,
-        StateOperation::Redact { .. } | StateOperation::Edit { .. } | StateOperation::Set(_)
+        StateOperation::Redact { .. }
+            | StateOperation::Edit { .. }
+            | StateOperation::Set(_)
+            | StateOperation::Delta { .. }
     )
 }
 
@@ -101,8 +104,8 @@ pub struct StateChainHead {
     /// File offset of most recent full snapshot.
     pub last_full_snapshot_offset: Option<u64>,
 
-    /// Whether a Redact, an Edit or a Set lies in this state's chain since its
-    /// last full snapshot. While true, an `append_log` state takes no delta
+    /// Whether a Redact, an Edit, a Set or a Delta lies in this state's chain
+    /// since its last full snapshot. While true, an `append_log` state takes no delta
     /// snapshot. Any full snapshot clears it.
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
@@ -960,15 +963,6 @@ impl StateManager {
                 if ops_covered_since_full >= full_interval {
                     Some(SnapshotNeeded::Full)
                 } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
-                    // Delta snapshots only track Append operations, so after a
-                    // non-Append op (Edit, Redact, Set) no delta may be taken
-                    // until a full resets the chain — a delta would walk past
-                    // the mutation and resurrect older values. We do NOT force
-                    // an early full for it (historically that meant a full
-                    // snapshot of the whole state every delta interval while
-                    // edits kept occurring — O(N²/D) disk): the raw tail just
-                    // grows until the size-aware full above fires, and
-                    // single-pass materialization keeps reading it O(N).
                     if head.has_non_append_since_snapshot {
                         None
                     } else {
@@ -1037,8 +1031,8 @@ impl StateManager {
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
     /// `has_non_append_since_snapshot` is whether the parent's chain holds a
-    /// Redact, an Edit or a Set from that position back to its last full
-    /// snapshot or Set.
+    /// Redact, an Edit, a Set or a Delta from that position back to its last
+    /// full snapshot or Set.
     pub fn set_head_for_branch(
         &self,
         branch_id: BranchId,
