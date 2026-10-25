@@ -46,6 +46,14 @@ try {
   assert.equal(manifestVersion(), 2, 'the first batch marks the MANIFEST');
   ok('appendManyToStateJson: one record holding the batch, items at firstOrdinal + i, MANIFEST marked');
 
+  // A create aimed at the open store fails on the lock before it writes
+  // anything. It used to rewrite MANIFEST to version 1 first, dropping the mark.
+  const manifestBytes = () => fs.readFileSync(path.join(storePath, 'MANIFEST'));
+  const marked = manifestBytes();
+  assert.throws(() => JsStore.create({ path: storePath }), /locked/i);
+  assert.deepEqual(manifestBytes(), marked, 'the failed create left the MANIFEST as it was');
+  ok('JsStore.create on the open store fails on the lock and leaves the MANIFEST marked');
+
   for (let round = 0; round < 5; round++) {
     const items = Array.from({ length: round + 1 }, (_, k) => ({ round, k }));
     const before = store.getStateLen('log');
@@ -117,6 +125,8 @@ try {
   // A reopened store has cold caches: the batched read must still match.
   const records = [a.record, d.record, afterRedact.record];
   store.close();
+  assert.throws(() => JsStore.create({ path: storePath }), /already holds a Chronicle store/);
+  assert.deepEqual(manifestBytes(), marked, 'a create over the closed store is refused and leaves the mark');
   store = JsStore.open({ path: storePath });
   assert.equal(manifestVersion(), 2);
   assert.deepEqual(store.getStateItemsJson('log', [len - 1]), [model[len - 1]], 'the last item alone, cold');

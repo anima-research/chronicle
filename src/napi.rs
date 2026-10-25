@@ -479,7 +479,9 @@ impl JsStore {
         }
     }
 
-    /// Create a new store at the given path.
+    /// Create a new store at the given path. Refuses a path that already holds
+    /// a store (its MANIFEST, records.log, state.bin or branches.bin); use
+    /// `openOrCreate` or `open` for a store that may exist.
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {

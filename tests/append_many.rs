@@ -556,3 +556,71 @@ fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
     assert_eq!(value(&store, "log"), json!([0, 1, 2]));
     assert_eq!(&manifest(&path)[..5], b"RST\0\x02");
 }
+
+/// A create aimed at a store that's open fails on the lock before it writes
+/// anything. It used to rewrite the MANIFEST to version 1 first; the open
+/// handle already named the feature, so later batches didn't mark it again,
+/// and once they were behind the checkpoint no open did either, so a build
+/// that predates batches opened the store and failed reading it.
+#[test]
+fn a_create_aimed_at_an_open_batched_store_leaves_its_manifest_alone() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let marked;
+    {
+        let store = Store::create(config(&path)).unwrap();
+        register(&store, "log", 50, 10);
+        store.update_state("log", batch(&[json!(1), json!(2), json!(3)])).unwrap();
+        marked = manifest(&path);
+        assert_eq!(&marked[..5], b"RST\0\x02");
+
+        let created = Store::create(config(&path));
+        assert!(
+            matches!(created, Err(StoreError::Locked)),
+            "got {:?}",
+            created.err().map(|e| e.to_string())
+        );
+        assert_eq!(manifest(&path), marked, "the failed create left the MANIFEST as it was");
+
+        store.update_state("log", batch(&[json!(4)])).unwrap();
+        assert_eq!(manifest(&path), marked);
+    }
+    let store = Store::open(config(&path)).unwrap();
+    assert_eq!(value(&store, "log"), json!([1, 2, 3, 4]));
+    drop(store);
+    assert_eq!(manifest(&path), marked);
+    assert_eq!(
+        older_build_opens(&manifest(&path)),
+        Err("Unsupported store version: 2".to_string()),
+        "an older build still refuses the store"
+    );
+}
+
+/// A create over a closed batched store is refused, and the store, its
+/// MANIFEST's mark among it, is left as it was.
+#[test]
+fn a_create_over_a_closed_batched_store_is_refused_and_keeps_its_mark() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = Store::create(config(&path)).unwrap();
+        register(&store, "log", 50, 10);
+        store.update_state("log", batch(&[json!(1), json!(2)])).unwrap();
+    }
+    let marked = manifest(&path);
+    assert_eq!(&marked[..5], b"RST\0\x02");
+
+    match Store::create(config(&path)) {
+        Err(StoreError::InvalidOperation(message)) => {
+            assert!(message.contains("already holds a Chronicle store"), "{message}")
+        }
+        Err(other) => panic!("expected InvalidOperation, got {other:?}"),
+        Ok(_) => panic!("create made a new store over an existing one"),
+    }
+    assert_eq!(manifest(&path), marked);
+
+    let store = Store::open(config(&path)).unwrap();
+    assert_eq!(value(&store, "log"), json!([1, 2]));
+    drop(store);
+    assert_eq!(manifest(&path), marked);
+}

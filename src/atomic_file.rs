@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 /// Starts the name of every staging file: a save writes one beside its
 /// checkpoint and renames it over the checkpoint.
-const STAGING_PREFIX: &str = ".chronicle-checkpoint-";
+pub(crate) const STAGING_PREFIX: &str = ".chronicle-checkpoint-";
 
 /// How many symbolic links a save follows to the file it replaces. Linux
 /// bounds a path lookup the same way, failing with ELOOP.
