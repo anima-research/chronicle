@@ -1059,22 +1059,8 @@ impl StateManager {
 
         // Head-record fast path: last item + Append head.
         if head.item_count > 0 && index == head.item_count - 1 {
-            let log = self
-                .log
-                .as_ref()
-                .ok_or_else(|| StoreError::NotInitialized)?;
-            let record = log.read_at(head.head_offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-            match update.operation {
-                StateOperation::Append(item) => return Ok(Some(item)),
-                // A batch at the head ends with the last item, as the last
-                // of its items appended one at a time would.
-                StateOperation::AppendMany(mut items) if !items.is_empty() => {
-                    return Ok(items.pop());
-                }
-                // Non-Append head (Edit / Redact / snapshot / Set): the last
-                // item isn't recoverable from the head record alone.
-                _ => {}
+            if let Some(item) = self.last_item_from_head(&head)? {
+                return Ok(Some(item));
             }
         }
 
@@ -1083,6 +1069,81 @@ impl StateManager {
             Some(items) => Ok(items.get(index).map(|item| item.to_vec())),
             None => Ok(None),
         }
+    }
+
+    /// Point lookups of several AppendLog items in one call: for each
+    /// ordinal in `ordinals`, in the order given, what `get_state_item`
+    /// returns for it, `None` where it is out of range or the state has no
+    /// value on this branch. Ordinals may repeat and come in any order.
+    ///
+    /// Every answer comes from one version of the state, and the version is
+    /// read once: from the warm item cache when it is current; from the head
+    /// record alone when every ordinal asked for is the last one, as
+    /// `get_state_item`'s fast path serves it; and otherwise from one
+    /// materialization, cached for later reads. So a batch of ordinals costs
+    /// at most what one cold `get_state_item` costs, not one each. The bytes
+    /// are the same as `get_state_item`'s for items written in serde_json's
+    /// own spelling; an item written in another comes back as written from
+    /// the head record and re-serialized from the rest, as there.
+    pub fn get_state_items_by_ordinal(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let head = {
+            let idx = self.index.read();
+            match idx.heads.get(branch_id, state_id) {
+                Some(h) => h.clone(),
+                None => return Ok(vec![None; ordinals.len()]),
+            }
+        };
+        let pick = |items: &StateItems| -> Vec<Option<Vec<u8>>> {
+            ordinals
+                .iter()
+                .map(|&i| items.get(i).map(|item| item.to_vec()))
+                .collect()
+        };
+
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(pick(&cached));
+        }
+
+        // Only the last item asked for (an empty request is not this case):
+        // the head record may hold it, as for `get_state_item`.
+        if let Some(last) = head.item_count.checked_sub(1) {
+            if !ordinals.is_empty() && ordinals.iter().all(|&i| i == last) {
+                if let Some(item) = self.last_item_from_head(&head)? {
+                    return Ok(vec![Some(item); ordinals.len()]);
+                }
+            }
+        }
+
+        match self.get_state_items(branch_id, state_id)? {
+            Some(items) => Ok(pick(&items)),
+            None => Ok(vec![None; ordinals.len()]),
+        }
+    }
+
+    /// The state's last item, read from its head record alone, when that
+    /// record is an `Append` or an `AppendMany`; `None` for any other head
+    /// (Edit / Redact / snapshot / Set), whose last item the record alone
+    /// doesn't give.
+    fn last_item_from_head(&self, head: &StateChainHead) -> Result<Option<Vec<u8>>> {
+        let log = self
+            .log
+            .as_ref()
+            .ok_or_else(|| StoreError::NotInitialized)?;
+        let record = log.read_at(head.head_offset)?;
+        let update = StateUpdateRecord::decode(&record)?;
+        Ok(match update.operation {
+            StateOperation::Append(item) => Some(item),
+            // A batch at the head ends with the last item, as the last of its
+            // items appended one at a time would.
+            StateOperation::AppendMany(mut items) => items.pop(),
+            _ => None,
+        })
     }
 
     /// Get the current value of a Tree state as its decoded path→entry map.

@@ -128,7 +128,8 @@ pub enum StoreEvent {
         total_length: Option<usize>,
     },
 
-    /// A state delta (change operation).
+    /// A state delta (change operation): one per recorded operation, so a
+    /// batched append (`AppendMany`) is one event holding all its items.
     StateDelta {
         state_id: String,
         operation: StateOperation,

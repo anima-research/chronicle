@@ -12,8 +12,8 @@
   replays a batch the `MANIFEST` doesn't name, as when a power loss undid
   the rewrite, names it again.
   **Who needs to act:** anyone who may roll a host back to an earlier
-  chronicle after the host has written a batch. Nothing writes one yet: the
-  Node API gains it separately, and context-manager's presentation index is
+  chronicle after the host has written a batch, from Rust or with the Node
+  API's `appendManyToStateJson`. context-manager's presentation index is
   meant to be its first writer.
   **Migration:** none going forward. Going back, there is none for a store
   that holds a batch: keep a copy of the store from before the upgrade if a

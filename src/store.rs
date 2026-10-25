@@ -41,6 +41,20 @@ impl Default for StoreConfig {
     }
 }
 
+/// What a batched append to an append-log state recorded
+/// (`Store::append_many_to_state` and its forms).
+#[derive(Clone, Debug)]
+pub struct AppendedBatch {
+    /// The one record that holds the whole batch, at one sequence.
+    pub record: Record,
+    /// The ordinal the batch's first item took: the state's length on the
+    /// branch, as `get_state_len` counts it, just before the batch, read
+    /// under the same lock as the write. Item `i` of the batch is at
+    /// `first_ordinal + i`, so a caller has every item's ordinal without a
+    /// read.
+    pub first_ordinal: usize,
+}
+
 /// Summary of compaction potential across all states.
 #[derive(Clone, Debug)]
 pub struct CompactionSummary {
@@ -544,6 +558,21 @@ impl Store {
         }
     }
 
+    /// Get several records by ID in one call: for each ID, in the order
+    /// given, what `get_record` returns for it, `None` for an ID with no
+    /// record. IDs may repeat. Store-wide, like `get_record`. The IDs are
+    /// looked up together and the records read under one hold of the log
+    /// file, rather than one each.
+    pub fn get_records(&self, ids: &[RecordId]) -> Result<Vec<Option<Record>>> {
+        let offsets = self.index.get_offsets_by_id(ids);
+        let found: Vec<u64> = offsets.iter().flatten().copied().collect();
+        let mut records = self.log.read_many_at(&found)?.into_iter();
+        Ok(offsets
+            .iter()
+            .map(|offset| offset.and_then(|_| records.next()))
+            .collect())
+    }
+
     /// Get the IDs of a type's records across all branches, in ascending ID
     /// order, which is log order.
     pub fn get_records_by_type(&self, record_type: &str) -> Vec<RecordId> {
@@ -813,6 +842,73 @@ impl Store {
             let bytes = serde_json::to_vec(&item)?;
             Ok(StateOperation::Append(bytes))
         })
+    }
+
+    /// Append several items to an AppendLog state as one record, at one
+    /// sequence (a `StateOperation::AppendMany`), and say which ordinals
+    /// they took. See `AppendedBatch::first_ordinal`.
+    ///
+    /// Every read sees the batch as it would see the same items appended one
+    /// at a time. It counts as one operation toward the state's snapshot
+    /// cadence, and the first batch a store records marks its MANIFEST so
+    /// that releases which predate batches refuse the store (see
+    /// `update_state`). Each item must be one JSON value, as for an
+    /// `Append`. An empty batch is refused with `InvalidOperation` and
+    /// writes nothing.
+    pub fn append_many_to_state(
+        &self,
+        state_id: &str,
+        items: Vec<Vec<u8>>,
+    ) -> Result<AppendedBatch> {
+        self.append_many_to_state_on(self.branches.current_id(), state_id, items)
+    }
+
+    /// `append_many_to_state` against the given branch.
+    pub fn append_many_to_state_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items: Vec<Vec<u8>>,
+    ) -> Result<AppendedBatch> {
+        let mut first_ordinal = 0;
+        let record = self.update_state_with_builder(branch_id, state_id, false, None, |_, _| {
+            // The builder runs under `write_lock`, so no other write to this
+            // state can land between this count and the batch.
+            first_ordinal = self
+                .state
+                .get_head(branch_id, state_id)
+                .map(|h| h.item_count)
+                .unwrap_or(0);
+            Ok(StateOperation::AppendMany(items))
+        })?;
+        Ok(AppendedBatch {
+            record,
+            first_ordinal,
+        })
+    }
+
+    /// `append_many_to_state` with each item given as a JSON value,
+    /// serialized as `serde_json` writes it.
+    pub fn append_many_to_state_json(
+        &self,
+        state_id: &str,
+        items: &[serde_json::Value],
+    ) -> Result<AppendedBatch> {
+        self.append_many_to_state_json_on(self.branches.current_id(), state_id, items)
+    }
+
+    /// `append_many_to_state_json` against the given branch.
+    pub fn append_many_to_state_json_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items: &[serde_json::Value],
+    ) -> Result<AppendedBatch> {
+        let items = items
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.append_many_to_state_on(branch_id, state_id, items)
     }
 
     /// Core update path. Builds the operation via a closure that receives the
@@ -1415,6 +1511,32 @@ impl Store {
         // from the head record in O(1) instead of re-materializing the whole
         // state (see StateManager::get_state_item).
         self.state.get_state_item(branch_id, state_id, index)
+    }
+
+    /// Several items of an AppendLog state by ordinal, as raw JSON bytes, in
+    /// one call: for each ordinal, in the order given, the item
+    /// `get_state_item` returns for it, `None` where the ordinal is out of
+    /// range or the state has no value. Ordinals may repeat and come in any
+    /// order. All of them are answered from one version of the state, read
+    /// at most once (see `StateManager::get_state_items_by_ordinal`).
+    pub fn get_state_items_by_ordinal(
+        &self,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.get_state_items_by_ordinal_on(self.branches.current_id(), state_id, ordinals)
+    }
+
+    /// `get_state_items_by_ordinal` against the given branch.
+    pub fn get_state_items_by_ordinal_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.branch_by_id(branch_id)?;
+        self.state
+            .get_state_items_by_ordinal(branch_id, state_id, ordinals)
     }
 
     /// Get the last N items from an AppendLog state.

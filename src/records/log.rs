@@ -344,6 +344,20 @@ impl RecordLog {
         Self::read_record(&mut *file)
     }
 
+    /// Read the records at several offsets, in the order given, taking the
+    /// file lock once for them all rather than once per record. Each offset
+    /// must be a record boundary, as for `read_at`.
+    pub fn read_many_at(&self, offsets: &[u64]) -> Result<Vec<Record>> {
+        let mut file = self.file.write();
+        offsets
+            .iter()
+            .map(|&offset| {
+                file.seek(SeekFrom::Start(offset))?;
+                Self::read_record(&mut *file)
+            })
+            .collect()
+    }
+
     /// Iterate all records from the beginning.
     pub fn iter(&self) -> RecordIterator<'_> {
         self.iter_from(0)
