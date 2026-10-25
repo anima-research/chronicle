@@ -1385,6 +1385,11 @@ impl Store {
         let mut items_collected: Vec<serde_json::Value> = Vec::new();
         let mut current_offset = Some(head.head_offset);
         let mut need_full_reconstruct = false;
+        // Past a delta snapshot, the chain runs through the operations it
+        // already holds, back to the snapshot before it: those are skipped,
+        // as reconstruction skips them, or their items would be collected
+        // a second time.
+        let mut hit_delta = false;
 
         while let Some(offset) = current_offset {
             if items_collected.len() >= count {
@@ -1395,6 +1400,10 @@ impl Store {
             let update = StateUpdateRecord::decode(&record)?;
 
             match &update.operation {
+                StateOperation::Append(_)
+                | StateOperation::Edit { .. }
+                | StateOperation::Redact { .. }
+                    if hit_delta => {}
                 StateOperation::Append(item) => {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
@@ -1412,6 +1421,7 @@ impl Store {
                             break;
                         }
                     }
+                    hit_delta = true;
                 }
                 StateOperation::Snapshot(data) => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
@@ -3622,6 +3632,39 @@ mod tests {
         let tail = store.get_state_tail("items", 0).unwrap().unwrap();
         let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
         assert_eq!(arr, Vec::<i32>::new());
+    }
+
+    /// A delta snapshot holds the items appended since the snapshot before
+    /// it, and its chain still links back through the appends it covers. A
+    /// tail longer than the newest delta must skip those appends and take
+    /// its older items from the delta before, as reconstruction does, not
+    /// collect the covered appends a second time.
+    #[test]
+    fn test_get_state_tail_past_a_delta_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 3,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        }).unwrap();
+
+        // Deltas after 3, 6 and 9; 10 and 11 are newer than the last.
+        for i in 1..=11 {
+            store.update_state("items", StateOperation::Append(
+                serde_json::to_vec(&i).unwrap()
+            )).unwrap();
+        }
+        assert_eq!(store.get_compaction_stats("items").unwrap().delta_snapshots_since_full, 3);
+
+        for count in 1..=11 {
+            let tail = store.get_state_tail("items", count).unwrap().unwrap();
+            let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
+            assert_eq!(arr, ((12 - count as i32)..=11).collect::<Vec<_>>(), "tail of {count}");
+        }
     }
 
     #[test]
