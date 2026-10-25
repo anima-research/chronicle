@@ -1,7 +1,9 @@
 // Node test for the batched calls, through the napi binding:
 // appendManyToStateJson (a batch of items as one record, and the index its
-// first item took), getStateItemsJson (several items by index in one call)
-// and getRecords (several records by ID in one call).
+// first item took), appendManyToStateJsonWithIdentity (the same, with that
+// record's id and sequence written into each item), getStateItemsJson
+// (several items by index in one call) and getRecords (several records by
+// ID in one call).
 //
 //   npm run build && node test-batches.mjs
 //
@@ -151,6 +153,89 @@ try {
   ok('getRecords: one entry per ID, in order, null for an unknown ID; a malformed ID throws');
 
   store.close();
+
+  // --- appendManyToStateJsonWithIdentity -----------------------------------
+  // A fresh store, so the MANIFEST mark can be watched from the start.
+  const idPath = path.join(dir, 'identity');
+  const idManifest = () => fs.readFileSync(path.join(idPath, 'MANIFEST'))[4];
+  store = JsStore.openOrCreate({ path: idPath });
+  for (const id of ['win', 'win-single']) {
+    store.registerState({ id, strategy: 'append_log', deltaSnapshotEvery: 3, fullSnapshotEvery: 4 });
+    store.registerStateFieldIndex(id, '/id', 'string');
+    store.appendToStateJsonWithIdentity(id, { id: 'm0' }, 'by', 'at');
+  }
+  assert.equal(idManifest(), 1, 'single identity appends keep MANIFEST version 1');
+
+  const entries = [{ id: 'm1' }, { id: 'm2', by: 'stale', at: -1 }, { retract: 'm0' }, { id: 'm3', n: 3 }];
+  const singleRecords = entries.map((entry) => store.appendToStateJsonWithIdentity('win-single', entry, 'by', 'at'));
+  const stamped = store.appendManyToStateJsonWithIdentity('win', entries, 'by', 'at');
+  assert.equal(stamped.firstOrdinal, 1);
+  assert.equal(stamped.record.recordType, 'state_update');
+  assert.equal(idManifest(), 2, 'the first identity batch marks the MANIFEST');
+  const stamp = (entry, record) => ({ ...entry, by: record.id, at: record.sequence });
+  for (const [i, entry] of entries.entries()) {
+    const item = store.getStateItemJson('win', stamped.firstOrdinal + i);
+    assert.deepEqual(item, stamp(entry, stamped.record), `entry ${i} carries the batch's record`);
+    const single = store.getStateItemJson('win-single', 1 + i);
+    assert.deepEqual(single, stamp(entry, singleRecords[i]), `entry ${i} alone carries its own record`);
+    const { by: _b, at: _a, ...rest } = item;
+    const { by: _sb, at: _sa, ...singleRest } = single;
+    assert.deepEqual(rest, singleRest, `entry ${i}: the same item apart from the stamps`);
+  }
+  const recorded = JSON.parse(store.getStateUpdateJson(stamped.record.id));
+  assert.equal(recorded.global_sequence, stamped.record.sequence);
+  assert.deepEqual(
+    recorded.operation.AppendMany.map(decode),
+    entries.map((entry) => stamp(entry, stamped.record)),
+    'the one record holds every stamped item',
+  );
+  ok('appendManyToStateJsonWithIdentity: every item stamped with the one record, items at firstOrdinal + i, MANIFEST marked');
+
+  for (const handle of ['win', 'win-single']) {
+    assert.deepEqual(store.queryStateIndexEq(handle, '/id', 'm0', {}), [0], handle);
+    assert.deepEqual(store.queryStateIndexEq(handle, '/id', 'm1', {}), [1], handle);
+    assert.deepEqual(store.queryStateIndexEq(handle, '/id', 'm2', {}), [2], handle);
+    assert.deepEqual(store.queryStateIndexEq(handle, '/id', 'm3', {}), [4], handle);
+  }
+  ok('a field index on the items\' own id answers each item\'s ordinal, batched as single');
+
+  const cut = (name, at) => {
+    store.createBranchAtWithStates(name, 'main', at, { stateIds: ['win'] });
+    return store.view(name).getStateLen('win');
+  };
+  assert.equal(cut('before-batch', stamped.record.sequence - 1), 1, 'a cut before the batch drops all of it');
+  assert.equal(cut('at-batch', stamped.record.sequence), 1 + entries.length, 'a cut at its sequence keeps all of it');
+  ok('a branch cut by the batch\'s stamped sequence keeps or drops the whole batch');
+
+  const idSeq = store.currentSequence();
+  assert.throws(() => store.appendManyToStateJsonWithIdentity('win', [], 'by', 'at'), /AppendMany needs at least one item/);
+  assert.throws(
+    () => store.appendManyToStateJsonWithIdentity('win', [{ id: 'm9' }, ['not', 'an', 'object']], 'by', 'at'),
+    /JSON object: item 1 of the batch/,
+  );
+  assert.throws(() => store.appendManyToStateJsonWithIdentity('win', ['m9'], 'by', 'at'), /JSON object/);
+  assert.equal(store.currentSequence(), idSeq, 'a refused batch writes nothing');
+  assert.equal(store.getStateLen('win'), 1 + entries.length);
+  assert.deepEqual(store.queryStateIndexEq('win', '/id', 'm9', {}), []);
+  ok('an empty batch, or one with an item that isn\'t an object, throws and writes nothing');
+
+  store.createBranch('id-side');
+  const idSide = store.view('id-side');
+  store.appendManyToStateJsonWithIdentity('win', [{ id: 'main-only' }], 'by', 'at');
+  const sideBatch = idSide.appendManyToStateJsonWithIdentity('win', [{ id: 's1' }, { id: 's2' }], 'by', 'at');
+  assert.equal(sideBatch.firstOrdinal, 1 + entries.length, 'the side branch does not hold the main batch');
+  assert.deepEqual(idSide.getStateItemJson('win', sideBatch.firstOrdinal + 1), stamp({ id: 's2' }, sideBatch.record));
+  assert.equal(store.getStateLen('win'), 2 + entries.length, 'main is unchanged');
+  ok('on a view, an identity batch counts and stamps on the view\'s branch');
+
+  const before = store.getStateJson('win');
+  store.close();
+  store = JsStore.open({ path: idPath });
+  assert.deepEqual(store.getStateJson('win'), before, 'the stamped items after a reopen');
+  assert.equal(idManifest(), 2);
+  store.close();
+  ok('the stamped items read back after a reopen');
+
   console.log('\n✅ All batch tests passed!');
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });

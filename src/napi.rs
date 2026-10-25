@@ -84,7 +84,8 @@ impl From<Record> for JsRecord {
     }
 }
 
-/// What `appendManyToStateJson` recorded.
+/// What `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`
+/// recorded.
 #[napi(object)]
 pub struct JsAppendedBatch {
     /// The one record that holds the whole batch, at one sequence.
@@ -331,9 +332,9 @@ pub struct JsStoreEvent {
     /// `operation`, keyed by its variant name. An item's bytes are an array
     /// of integers: `{"Append": [..]}` for one item, and
     /// `{"AppendMany": [[..], [..], ..]}` for a batch from
-    /// `appendManyToStateJson`, which is one event for the whole batch at its
-    /// one sequence. A subscriber that follows an append log by its deltas
-    /// needs both.
+    /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`, which
+    /// is one event for the whole batch at its one sequence. A subscriber
+    /// that follows an append log by its deltas needs both.
     pub data: String,
 }
 
@@ -1150,6 +1151,57 @@ impl JsStore {
         let (store, branch) = self.target()?;
         let batch = store
             .append_many_to_state_json_on(branch, &state_id, &items)
+            .map_err(to_napi_error)?;
+        Ok(JsAppendedBatch {
+            record: batch.record.into(),
+            first_ordinal: batch.first_ordinal as i64,
+        })
+    }
+
+    /// Append several JSON objects to an AppendLog state as one record, at
+    /// one sequence, writing that record's id and sequence into each of them
+    /// first, and return the record with the index the first item took
+    /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`. It is the batched
+    /// form of `appendToStateJsonWithIdentity`, as `appendManyToStateJson`
+    /// is of `appendToStateJson`.
+    ///
+    /// Each item is stamped as `appendToStateJsonWithIdentity` stamps its
+    /// one item: `idField` receives the record id (as a string, matching
+    /// `JsRecord.id`), `sequenceField` the sequence (as a number), and
+    /// existing values at those keys are overwritten. The batch is one
+    /// record, so every item of it carries the same id and sequence, those
+    /// of `record`. A branch cut by an item's sequence (`createBranchAt` at
+    /// it keeps the item, at the one before drops it) keeps or drops the
+    /// whole batch with it.
+    ///
+    /// Otherwise it is `appendManyToStateJson`: reads see the stamped items
+    /// as if each had been appended alone, the batch counts as one operation
+    /// toward the snapshot cadence, and subscribers get one "state_delta"
+    /// event for it. Throws, writing nothing, for an empty `items` or an
+    /// item that isn't a JSON object.
+    ///
+    /// The first batch a store records, by this call or
+    /// `appendManyToStateJson`, changes its format: the store's `MANIFEST`
+    /// goes to version 2, and releases from before batched appends refuse to
+    /// open it. A store that never records a batch keeps the format they
+    /// open.
+    #[napi]
+    pub fn append_many_to_state_json_with_identity(
+        &self,
+        state_id: String,
+        items: Vec<serde_json::Value>,
+        id_field: String,
+        sequence_field: String,
+    ) -> Result<JsAppendedBatch> {
+        let (store, branch) = self.target()?;
+        let batch = store
+            .append_many_to_state_json_with_identity_on(
+                branch,
+                &state_id,
+                &items,
+                &id_field,
+                &sequence_field,
+            )
             .map_err(to_napi_error)?;
         Ok(JsAppendedBatch {
             record: batch.record.into(),

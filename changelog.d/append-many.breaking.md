@@ -22,9 +22,9 @@
   still does.
   **Who needs to act:** anyone who may roll a host back to an earlier
   chronicle after the host has written a batch, from Rust or with the Node
-  API's `appendManyToStateJson`. context-manager's presentation index is
-  meant to be its first writer. A host rolled back must not call `create`
-  on a store it means to open.
+  API's `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`.
+  context-manager's presentation index is meant to be its first writer. A
+  host rolled back must not call `create` on a store it means to open.
   **Migration:** none going forward. Going back, there is none for a store
   that holds a batch: keep a copy of the store from before the upgrade if a
   rollback must stay possible. A crash between the `MANIFEST` rewrite and the

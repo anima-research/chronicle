@@ -290,6 +290,36 @@ fn crash_writer() {
             )
             .unwrap();
         }
+        "identity-batch" => {
+            // Identity batches and single identity appends past the
+            // checkpoint, crossing delta and full snapshots, with the
+            // record each one took written down beside the store.
+            store
+                .append_to_state_json_with_identity("items", json!({"n": 0}), "by", "at")
+                .unwrap();
+            store
+                .register_state_field_index("items", "/n", FieldIndexKind::Number)
+                .unwrap();
+            store.sync().unwrap();
+            let mut taken = Vec::new();
+            for n in 1..7u64 {
+                let items = [json!({"n": n * 10}), json!({"n": n * 10 + 1, "by": "stale"})];
+                let batch = store
+                    .append_many_to_state_json_with_identity("items", &items, "by", "at")
+                    .unwrap();
+                taken.push(json!([batch.record.id.0.to_string(), batch.record.sequence.0, items.len()]));
+                let single = store
+                    .append_to_state_json_with_identity("items", json!({"n": n * 10 + 2}), "by", "at")
+                    .unwrap();
+                taken.push(json!([single.id.0.to_string(), single.sequence.0, 1]));
+            }
+            std::fs::write(
+                path.join("expected.json"),
+                serde_json::to_vec(&observe(&store)).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(path.join("taken.json"), serde_json::to_vec(&taken).unwrap()).unwrap();
+        }
         "batch-torn" => {
             store.set_auto_snapshot(false);
             for n in 0..5 {
@@ -445,6 +475,42 @@ fn replay_restores_batches_and_marks_the_manifest_again() {
         assert_eq!(observe(&store), expected);
         assert_eq!(value(&store, "items").as_array().unwrap().len(), 1 + 7 * 4 - 2 + 2);
         assert_eq!(&std::fs::read(&manifest).unwrap()[..5], b"RST\0\x02");
+    }
+}
+
+/// Identity batches written past the checkpoint replay with the stamps
+/// they were written with: every item still names the record that holds
+/// it, and a batch's items all name its one record. The first open replays
+/// them from the log; the second reads them from the checkpoint the first
+/// one's close saved.
+#[test]
+fn replay_keeps_the_stamps_of_identity_batches() {
+    let dir = TempDir::new().unwrap();
+    crash(dir.path(), "identity-batch");
+    let expected: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("expected.json")).unwrap()).unwrap();
+    let taken: Vec<(String, u64, usize)> =
+        serde_json::from_slice(&std::fs::read(dir.path().join("taken.json")).unwrap()).unwrap();
+    for open in 0..2 {
+        let store = open_store(dir.path()).unwrap();
+        assert_eq!(observe(&store), expected, "open {open}");
+        let items = value(&store, "items");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1 + 6 * 3, "open {open}");
+        let mut ordinal = 1;
+        for (id, sequence, count) in &taken {
+            for item in &items[ordinal..ordinal + count] {
+                assert_eq!(item["by"], json!(id), "open {open}: ordinal {ordinal}");
+                assert_eq!(item["at"], json!(sequence), "open {open}: ordinal {ordinal}");
+            }
+            let record = store
+                .get_record(RecordId(id.parse().unwrap()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.sequence, Sequence(*sequence));
+            ordinal += count;
+        }
+        assert_eq!(&std::fs::read(dir.path().join("MANIFEST")).unwrap()[..5], b"RST\0\x02");
     }
 }
 

@@ -42,7 +42,8 @@ impl Default for StoreConfig {
 }
 
 /// What a batched append to an append-log state recorded
-/// (`Store::append_many_to_state` and its forms).
+/// (`Store::append_many_to_state` and its forms, and
+/// `Store::append_many_to_state_json_with_identity`).
 #[derive(Clone, Debug)]
 pub struct AppendedBatch {
     /// The one record that holds the whole batch, at one sequence.
@@ -890,24 +891,7 @@ impl Store {
         sequence_field: &str,
     ) -> Result<Record> {
         self.update_state_with_builder(branch_id, state_id, false, None, move |id, seq| {
-            let mut item = item;
-            let map = match &mut item {
-                serde_json::Value::Object(map) => map,
-                _ => {
-                    return Err(StoreError::InvalidOperation(
-                        "payload must be a JSON object".into(),
-                    ));
-                }
-            };
-            map.insert(
-                id_field.to_string(),
-                serde_json::Value::String(id.0.to_string()),
-            );
-            map.insert(
-                sequence_field.to_string(),
-                serde_json::Value::Number(serde_json::Number::from(seq.0)),
-            );
-            let bytes = serde_json::to_vec(&item)?;
+            let bytes = stamp_identity(item, id_field, sequence_field, id, seq)?;
             Ok(StateOperation::Append(bytes))
         })
     }
@@ -938,21 +922,7 @@ impl Store {
         state_id: &str,
         items: Vec<Vec<u8>>,
     ) -> Result<AppendedBatch> {
-        let mut first_ordinal = 0;
-        let record = self.update_state_with_builder(branch_id, state_id, false, None, |_, _| {
-            // The builder runs under `write_lock`, so no other write to this
-            // state can land between this count and the batch.
-            first_ordinal = self
-                .state
-                .get_head(branch_id, state_id)
-                .map(|h| h.item_count)
-                .unwrap_or(0);
-            Ok(StateOperation::AppendMany(items))
-        })?;
-        Ok(AppendedBatch {
-            record,
-            first_ordinal,
-        })
+        self.append_batch_with_builder(branch_id, state_id, move |_, _| Ok(items))
     }
 
     /// `append_many_to_state` with each item given as a JSON value,
@@ -977,6 +947,102 @@ impl Store {
             .map(serde_json::to_vec)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.append_many_to_state_on(branch_id, state_id, items)
+    }
+
+    /// Append several JSON objects to an AppendLog state as one record, at
+    /// one sequence, writing that record's id and sequence into each of them
+    /// first: the batched form of `append_to_state_json_with_identity`, as
+    /// `append_many_to_state_json` is of a plain JSON append.
+    ///
+    /// Each item is stamped exactly as `append_to_state_json_with_identity`
+    /// stamps its one item: `id_field` receives the record id as a string,
+    /// `sequence_field` the sequence as a number, existing values at those
+    /// keys are overwritten, and the object is serialized as `serde_json`
+    /// writes it. The batch is one record, so every item of it carries the
+    /// same id and sequence, those of the record that holds it. A reader
+    /// that cuts by an item's sequence (`create_branch_at` at that
+    /// sequence keeps the item, at the one before drops it) keeps or drops
+    /// the whole batch with it.
+    ///
+    /// Otherwise it is `append_many_to_state_json`: reads see the items as
+    /// the same stamped objects appended one at a time, the batch counts as
+    /// one operation toward the snapshot cadence, the returned
+    /// `AppendedBatch` says which ordinals they took, and the first batch a
+    /// store records marks its MANIFEST so that releases which predate
+    /// batches refuse the store (see `update_state`). A store that never
+    /// records a batch, by this call or another, keeps the format every
+    /// release opens.
+    ///
+    /// Refused with `InvalidOperation`, writing nothing, when `items` is
+    /// empty or any item isn't a JSON object.
+    pub fn append_many_to_state_json_with_identity(
+        &self,
+        state_id: &str,
+        items: &[serde_json::Value],
+        id_field: &str,
+        sequence_field: &str,
+    ) -> Result<AppendedBatch> {
+        self.append_many_to_state_json_with_identity_on(
+            self.branches.current_id(),
+            state_id,
+            items,
+            id_field,
+            sequence_field,
+        )
+    }
+
+    /// `append_many_to_state_json_with_identity` against the given branch.
+    pub fn append_many_to_state_json_with_identity_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items: &[serde_json::Value],
+        id_field: &str,
+        sequence_field: &str,
+    ) -> Result<AppendedBatch> {
+        self.append_batch_with_builder(branch_id, state_id, |id, seq| {
+            if let Some(at) = items.iter().position(|item| !item.is_object()) {
+                return Err(StoreError::InvalidOperation(format!(
+                    "payload must be a JSON object: item {} of the batch is not",
+                    at
+                )));
+            }
+            items
+                .iter()
+                .map(|item| stamp_identity(item.clone(), id_field, sequence_field, id, seq))
+                .collect()
+        })
+    }
+
+    /// The batched appends' common path: records the items `items_builder`
+    /// gives, which may name the `(record_id, sequence)` the batch is about
+    /// to take, as one `AppendMany` through `update_state_with_builder`, and
+    /// reads the first ordinal under the same lock.
+    fn append_batch_with_builder<F>(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items_builder: F,
+    ) -> Result<AppendedBatch>
+    where
+        F: FnOnce(RecordId, Sequence) -> Result<Vec<Vec<u8>>>,
+    {
+        let mut first_ordinal = 0;
+        let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
+            let items = items_builder(id, seq)?;
+            // The builder runs under `write_lock`, so no other write to this
+            // state can land between this count and the batch.
+            first_ordinal = self
+                .state
+                .get_head(branch_id, state_id)
+                .map(|h| h.item_count)
+                .unwrap_or(0);
+            Ok(StateOperation::AppendMany(items))
+        })?;
+        Ok(AppendedBatch {
+            record,
+            first_ordinal,
+        })
     }
 
     /// Core update path. Builds the operation via a closure that receives the
@@ -3280,6 +3346,34 @@ impl Store {
 
         Ok(lock_file)
     }
+}
+
+/// The item an identity append stores: `item`, which must be a JSON object,
+/// with the record id it is about to be written under at `id_field` (as a
+/// string, matching the napi `JsRecord.id` shape) and that record's sequence
+/// at `sequence_field` (as a number), serialized as `serde_json` writes it.
+/// Existing values at those keys are overwritten. The single and the batched
+/// identity appends both stamp through this, so an item reads the same
+/// whichever wrote it, given the same record.
+fn stamp_identity(
+    mut item: serde_json::Value,
+    id_field: &str,
+    sequence_field: &str,
+    id: RecordId,
+    seq: Sequence,
+) -> Result<Vec<u8>> {
+    let map = item.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidOperation("payload must be a JSON object".into())
+    })?;
+    map.insert(
+        id_field.to_string(),
+        serde_json::Value::String(id.0.to_string()),
+    );
+    map.insert(
+        sequence_field.to_string(),
+        serde_json::Value::Number(serde_json::Number::from(seq.0)),
+    );
+    Ok(serde_json::to_vec(&item)?)
 }
 
 /// What a failed `try_lock_exclusive` on LOCK means. fs2 reports another

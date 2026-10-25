@@ -1030,8 +1030,8 @@ impl StateManager {
     /// same `serde_json::Value`, and Value objects are BTreeMap-backed so
     /// key order is canonical. Asserted by the fast/slow equivalence test.
     /// That holds for a writer that serializes its items with serde_json,
-    /// as `append_to_state_json_with_identity` does; bytes written in
-    /// another spelling come back as written.
+    /// as `append_to_state_json_with_identity` and its batched form do;
+    /// bytes written in another spelling come back as written.
     ///
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),
