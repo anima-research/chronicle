@@ -801,9 +801,7 @@ impl Store {
     /// before it's recorded: an Edit's index against the state's length, and a
     /// Tree operation against its strategy. Other operations are recorded as
     /// given, and one that can't be applied, such as an Append of bytes that
-    /// aren't JSON, shows when the state is next materialized. That can be
-    /// this call's own auto-snapshot, so an error can come back for an
-    /// operation already recorded (issue #39).
+    /// aren't JSON, shows when the state is next materialized.
     ///
     /// An `AppendMany` with no items is refused. The first `AppendMany` a
     /// store records also rewrites its MANIFEST, before the record is
@@ -813,7 +811,17 @@ impl Store {
     /// opens. If that rewrite fails, the error is returned and nothing is
     /// recorded.
     ///
-    /// Snapshots are automatically created when thresholds are reached.
+    /// Snapshots are created automatically when the state's thresholds are
+    /// reached, by the write that reaches them, once its record is written
+    /// (unless `set_auto_snapshot(false)`). A recorded write never returns
+    /// an error from that snapshot (issue #39). If the snapshot fails, on a
+    /// full disk, say, or because it materializes an item that doesn't
+    /// parse, the failure is logged as a `tracing` warning and the write
+    /// returns its record. The snapshot stays due, so the next write to the
+    /// state on that branch tries it again. A state whose snapshot keeps
+    /// failing, such as one holding an Append that isn't JSON, logs a
+    /// warning at each write that finds a snapshot due, and takes none
+    /// until a `Set` replaces its value.
     pub fn update_state(
         &self,
         state_id: &str,
@@ -865,6 +873,12 @@ impl Store {
     /// id as a string (matching the napi `JsRecord.id` shape); `sequence_field`
     /// receives the assigned sequence as a number. Existing values at those
     /// keys are overwritten.
+    ///
+    /// An `item` that isn't a JSON object is refused with `InvalidOperation`
+    /// and writes nothing. Once the item is recorded, the call returns its
+    /// record: if the snapshot the write takes after it fails, that is
+    /// logged and the next write tries it again, as for `update_state`
+    /// (issue #39).
     pub fn append_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -906,7 +920,9 @@ impl Store {
     /// that releases which predate batches refuse the store (see
     /// `update_state`). Each item must be one JSON value, as for an
     /// `Append`. An empty batch is refused with `InvalidOperation` and
-    /// writes nothing.
+    /// writes nothing. Once the batch is recorded, the call returns it: if
+    /// the snapshot the write takes after it fails, that is logged and the
+    /// next write tries it again, as for `update_state` (issue #39).
     pub fn append_many_to_state(
         &self,
         state_id: &str,
@@ -974,7 +990,10 @@ impl Store {
     /// release opens.
     ///
     /// Refused with `InvalidOperation`, writing nothing, when `items` is
-    /// empty or any item isn't a JSON object.
+    /// empty or any item isn't a JSON object. Once the batch is recorded,
+    /// the call returns it: if the snapshot the write takes after it fails,
+    /// that is logged and the next write tries it again, as for
+    /// `update_state` (issue #39).
     pub fn append_many_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -1200,12 +1219,29 @@ impl Store {
 
         // Auto-snapshot if needed (based on strategy thresholds)
         // Done after indices/branch update so the snapshot sees consistent state
+        //
+        // The write is recorded by now, so the snapshot's failure isn't
+        // returned (issue #39): a caller that got an error would take the
+        // write for one that didn't happen, and one that retried a write that
+        // isn't idempotent would make it twice. It is logged instead. The
+        // snapshot stays due, since only a snapshot record resets the state's
+        // count of operations since the last one, so the next write to the
+        // state on this branch checks the thresholds again and tries it.
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(write);
             // Same branch as the write above — never the cursor, which may
             // point elsewhere (or have moved) by now.
-            self.auto_snapshot_if_needed(branch.id, state_id)?;
+            if let Err(error) = self.auto_snapshot_if_needed(branch.id, state_id) {
+                tracing::warn!(
+                    %error,
+                    state_id,
+                    branch = %branch.name,
+                    sequence = next_seq.0,
+                    "the snapshot after a recorded state write failed: the write stands and \
+                     returns its record, and the next write to the state tries the snapshot again"
+                );
+            }
         }
 
         Ok(record)

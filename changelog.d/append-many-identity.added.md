@@ -10,8 +10,11 @@
   branch cut by an item's sequence keeps or drops the whole batch. Reads see
   the stamped items as if each had been appended alone, and field indexes
   take each at its own ordinal. An empty `items`, or an item that isn't an
-  object, throws and writes nothing, and leaves the `MANIFEST` alone. Like
-  any batch, the first one a store records moves its `MANIFEST` to version 2
-  (see Breaking); a store that only ever takes single identity appends keeps
-  version 1. In Rust: `Store::append_many_to_state_json_with_identity(_on)`,
-  which returns an `AppendedBatch`.
+  object, throws and writes nothing, and leaves the `MANIFEST` alone. Once
+  the batch is recorded the call returns it: a failure of the snapshot the
+  write takes after its record is logged and tried again by the next write,
+  not thrown (see Fixed, #39). Like any batch, the first one a store records
+  moves its `MANIFEST` to version 2 (see Breaking); a store that only ever
+  takes single identity appends keeps version 1. In Rust:
+  `Store::append_many_to_state_json_with_identity(_on)`, which returns an
+  `AppendedBatch`.

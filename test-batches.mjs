@@ -3,7 +3,8 @@
 // first item took), appendManyToStateJsonWithIdentity (the same, with that
 // record's id and sequence written into each item), getStateItemsJson
 // (several items by index in one call) and getRecords (several records by
-// ID in one call).
+// ID in one call). Also that a write whose own threshold snapshot fails still
+// returns its record (issue #39).
 //
 //   npm run build && node test-batches.mjs
 //
@@ -235,6 +236,75 @@ try {
   assert.equal(idManifest(), 2);
   store.close();
   ok('the stamped items read back after a reopen');
+
+  // --- a write whose own snapshot fails --------------------------------------
+  // A write that reaches the state's snapshot cadence takes the snapshot
+  // right after its record. If that snapshot fails, the write is recorded
+  // all the same, so it returns its record and doesn't throw (issue #39); the
+  // snapshot stays due for the next write. An item that isn't JSON makes
+  // every snapshot that reads it fail, as a full disk would.
+  const writeIn = (form, handle, items) => {
+    if (form === 'identity-batch') return handle.appendManyToStateJsonWithIdentity('s', items, 'by', 'at').record;
+    if (form === 'identity-single') return handle.appendToStateJsonWithIdentity('s', items[0], 'by', 'at');
+    return handle.appendManyToStateJson('s', items).record;
+  };
+  for (const form of ['identity-batch', 'identity-single', 'plain-batch']) {
+    const failPath = path.join(dir, `snapshot-fails-${form}`);
+    store = JsStore.openOrCreate({ path: failPath });
+    // A delta every 2 operations: the write after the poison is the second.
+    store.registerState({ id: 's', strategy: 'append_log', deltaSnapshotEvery: 2, fullSnapshotEvery: 10 });
+    store.appendToState('s', Buffer.from('not json'));
+    const seq = store.currentSequence();
+    const written = form === 'identity-single' ? 1 : 2;
+
+    const record = writeIn(form, store, [{ id: 'a' }, { id: 'b' }]);
+    assert.equal(record.sequence, seq + 1, form);
+    assert.equal(store.currentSequence(), record.sequence, `${form}: no snapshot record followed`);
+    assert.equal(store.getStateLen('s'), 1 + written, form);
+    const held = JSON.parse(store.getStateUpdateJson(record.id)).operation;
+    const heldItems = form === 'identity-single' ? [held.Append] : held.AppendMany;
+    const expected = [{ id: 'a' }, { id: 'b' }].slice(0, written);
+    assert.deepEqual(
+      heldItems.map(decode),
+      form === 'plain-batch' ? expected : expected.map((item) => stamp(item, record)),
+      `${form}: the record holds the write`,
+    );
+
+    // Still due: the next write tries the snapshot again, fails again on
+    // the poison, and returns too.
+    const next = writeIn(form, store, [{ id: 'c' }]);
+    assert.equal(next.sequence, record.sequence + 1, form);
+    assert.equal(store.currentSequence(), next.sequence, form);
+    store.close();
+
+    store = JsStore.open({ path: failPath });
+    assert.equal(store.currentSequence(), next.sequence, `${form}: the writes survive a reopen`);
+    assert.equal(store.getStateLen('s'), 2 + written, form);
+    assert.equal(writeIn(form, store, [{ id: 'd' }]).sequence, next.sequence + 1, `${form}: after the reopen too`);
+    store.close();
+  }
+  ok('a write whose own snapshot fails returns its record, and the writes stay recorded across a reopen');
+
+  // The snapshot a failure left due is taken by the next write that can
+  // take it. A full snapshot every 2 operations reads the whole value, so
+  // it fails on the poison until a set replaces the value.
+  const retryPath = path.join(dir, 'snapshot-retried');
+  store = JsStore.openOrCreate({ path: retryPath });
+  store.registerState({ id: 's', strategy: 'append_log', deltaSnapshotEvery: 2, fullSnapshotEvery: 1 });
+  store.appendToState('s', Buffer.from('not json'));
+  const failed = store.appendManyToStateJsonWithIdentity('s', [{ id: 'a' }], 'by', 'at');
+  assert.equal(store.currentSequence(), failed.record.sequence, 'the snapshot failed, nothing followed');
+  const value = [{ id: 'a' }, { id: 'b' }];
+  const set = store.setStateJson('s', value);
+  assert.equal(store.currentSequence(), set.sequence + 1, 'the set, then the snapshot left due');
+  const updates = store.getRecordIdsByType('state_update');
+  const snapshot = JSON.parse(store.getStateUpdateJson(updates[updates.length - 1])).operation;
+  assert.deepEqual(decode(snapshot.Snapshot), value, 'a full snapshot of the value the set wrote');
+  const later = store.appendManyToStateJsonWithIdentity('s', [{ id: 'c' }], 'by', 'at');
+  assert.equal(store.currentSequence(), later.record.sequence, 'the snapshot reset the count');
+  assert.deepEqual(store.getStateJson('s'), [...value, stamp({ id: 'c' }, later.record)]);
+  store.close();
+  ok('the snapshot a failure left due is taken by the next write that can take it');
 
   console.log('\n✅ All batch tests passed!');
 } finally {

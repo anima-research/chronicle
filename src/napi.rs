@@ -1114,6 +1114,13 @@ impl JsStore {
     /// `appendToStateJson` + `editStateItem` when the caller wants each
     /// stored item to carry its own chronicle identity — it avoids the
     /// follow-up Edit that would otherwise promote every snapshot to Full.
+    ///
+    /// Throws, writing nothing, for an `item` that isn't a JSON object.
+    /// Once the item is recorded the call returns its record. A write that
+    /// reaches the state's snapshot cadence takes the snapshot after its
+    /// record, and if that snapshot fails the call still returns: the store
+    /// logs a `tracing` warning, and the next write to the state tries the
+    /// snapshot again (issue #39).
     #[napi]
     pub fn append_to_state_json_with_identity(
         &self,
@@ -1137,7 +1144,11 @@ impl JsStore {
     /// `appendToStateJson`, in order. The batch counts as one operation
     /// toward the state's snapshot cadence, and subscribers get one
     /// "state_delta" event for it (see `JsStoreEvent.data`). Throws, writing
-    /// nothing, for an empty `items`.
+    /// nothing, for an empty `items`. Once the batch is recorded the call
+    /// returns it. A write that reaches the snapshot cadence takes the
+    /// snapshot after its record, and if that snapshot fails the call still
+    /// returns: the store logs a `tracing` warning, and the next write to
+    /// the state tries the snapshot again (issue #39).
     ///
     /// The first batch a store records changes its format: the store's
     /// `MANIFEST` goes to version 2, and releases from before batched
@@ -1178,7 +1189,11 @@ impl JsStore {
     /// as if each had been appended alone, the batch counts as one operation
     /// toward the snapshot cadence, and subscribers get one "state_delta"
     /// event for it. Throws, writing nothing, for an empty `items` or an
-    /// item that isn't a JSON object.
+    /// item that isn't a JSON object. Once the batch is recorded the call
+    /// returns it. A write that reaches the snapshot cadence takes the
+    /// snapshot after its record, and if that snapshot fails the call still
+    /// returns: the store logs a `tracing` warning, and the next write to
+    /// the state tries the snapshot again (issue #39).
     ///
     /// The first batch a store records, by this call or
     /// `appendManyToStateJson`, changes its format: the store's `MANIFEST`
