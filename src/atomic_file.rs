@@ -444,17 +444,17 @@ pub(crate) fn sync_directory_at(directory: &Path) -> io::Result<()> {
 /// here outside this lock, and a save of it whose stage this removes fails,
 /// leaving its checkpoint as it was.
 pub(crate) fn remove_staging_files(directory: &Path) {
-    remove_files_staged_as(directory, STAGING_PREFIX, "checkpoint");
+    remove_files_staged_as(directory, STAGING_PREFIX, "checkpoint", "save");
 }
 
-pub(crate) fn remove_files_staged_as(directory: &Path, prefix: &str, what: &str) {
+pub(crate) fn remove_files_staged_as(directory: &Path, prefix: &str, what: &str, by: &str) {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
             tracing::warn!(
                 directory = %directory.display(),
                 %error,
-                "could not look for {what} staging files left by interrupted writes"
+                "could not look for {what} staging files left by interrupted {by}s"
             );
             return;
         }
@@ -471,12 +471,12 @@ pub(crate) fn remove_files_staged_as(directory: &Path, prefix: &str, what: &str)
         match fs::remove_file(&path) {
             Ok(()) => tracing::warn!(
                 path = %path.display(),
-                "removed a {what} staging file left by an interrupted write"
+                "removed a {what} staging file left by an interrupted {by}"
             ),
             Err(error) => tracing::warn!(
                 path = %path.display(),
                 %error,
-                "could not remove a {what} staging file left by an interrupted write"
+                "could not remove a {what} staging file left by an interrupted {by}"
             ),
         }
     }

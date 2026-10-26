@@ -76,15 +76,33 @@ fn content_length_past_the_end(mut file: Vec<u8>) -> Vec<u8> {
     file
 }
 
+fn content_type_length_cut_to_16_bits(file: Vec<u8>) -> Vec<u8> {
+    let content_type_length = u16::from_le_bytes([file[5], file[6]]) as usize;
+    let mut cut = file[..5].to_vec();
+    cut.extend_from_slice(&((u16::MAX as usize + 1) as u16).to_le_bytes());
+    cut.extend(vec![b't'; u16::MAX as usize + 1]);
+    cut.extend_from_slice(&file[7 + content_type_length..]);
+    cut
+}
+
 #[test]
 fn storing_the_content_again_replaces_a_copy_that_cannot_be_read_back() {
-    let damages: [(&str, fn(Vec<u8>) -> Vec<u8>); 4] = [
-        ("cut short", cut_short),
-        ("a flipped content byte", last_content_byte_flipped),
-        ("another magic", magic_replaced),
-        ("a content length past the end", content_length_past_the_end),
+    let damages: [(&str, fn(Vec<u8>) -> Vec<u8>, bool); 5] = [
+        ("cut short", cut_short, true),
+        ("a flipped content byte", last_content_byte_flipped, false),
+        ("another magic", magic_replaced, false),
+        (
+            "a content length past the end",
+            content_length_past_the_end,
+            true,
+        ),
+        (
+            "a content type of 65,536 bytes written with its length cut to 16 bits",
+            content_type_length_cut_to_16_bits,
+            true,
+        ),
     ];
-    for (damage, damaged) in damages {
+    for (damage, damaged, names_the_file) in damages {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("store");
         let store = Store::create(config(&path)).unwrap();
@@ -94,15 +112,20 @@ fn storing_the_content_again_replaces_a_copy_that_cannot_be_read_back() {
         fs::write(&file, damaged(fs::read(&file).unwrap())).unwrap();
 
         let store = reopen(&path);
-        assert!(
-            store.get_blob(&hash).is_err(),
-            "{damage}: the damaged copy read back"
-        );
+        match store.get_blob(&hash) {
+            Err(StoreError::InvalidFormat(message)) if names_the_file => assert!(
+                message.contains(&file.display().to_string()),
+                "{damage}: {message}"
+            ),
+            Err(_) if !names_the_file => {}
+            other => panic!("{damage}: expected an error naming the file, got {other:?}"),
+        }
         assert_eq!(
             store.store_blob(CONTENT, CONTENT_TYPE).unwrap(),
             hash,
             "{damage}"
         );
+        assert_eq!(files_under_blobs(&path), vec![file.clone()], "{damage}");
         drop(store);
 
         let blob = reopen(&path).get_blob(&hash).unwrap();
@@ -131,6 +154,7 @@ fn storing_the_content_again_replaces_a_file_holding_another_blob() {
     let store = reopen(&path);
     assert!(store.get_blob(&hash).is_err());
     store.store_blob(CONTENT, CONTENT_TYPE).unwrap();
+    assert_eq!(files_under_blobs(&path).len(), 1);
     drop(store);
 
     let blob = reopen(&path).get_blob(&hash).unwrap();
@@ -179,14 +203,15 @@ fn a_content_type_too_long_to_record_is_refused_and_nothing_is_stored() {
     let path = dir.path().join("store");
     let store = Store::create(config(&path)).unwrap();
     let longest = "t".repeat(usize::from(u16::MAX));
-    let too_long = format!("{longest}t");
-
-    match store.store_blob(CONTENT, &too_long) {
+    let too_long_in_two_byte_characters = "é".repeat(usize::from(u16::MAX) / 2 + 1);
+    let refused = |result: chronicle::Result<Hash>| match result {
         Err(StoreError::InvalidOperation(message)) => {
             assert!(message.contains("65535"), "{message}")
         }
         other => panic!("expected the content type to be refused, got {other:?}"),
-    }
+    };
+
+    refused(store.store_blob(CONTENT, &too_long_in_two_byte_characters));
     assert!(store
         .get_blob(&Hash::from_bytes(CONTENT))
         .unwrap()
@@ -194,12 +219,88 @@ fn a_content_type_too_long_to_record_is_refused_and_nothing_is_stored() {
     assert_eq!(files_under_blobs(&path), Vec::<PathBuf>::new());
 
     let hash = store.store_blob(CONTENT, &longest).unwrap();
+    refused(store.store_blob(CONTENT, &too_long_in_two_byte_characters));
     drop(store);
     let blob = reopen(&path).get_blob(&hash).unwrap().unwrap();
     assert_eq!(
         (blob.content.as_slice(), blob.content_type),
         (CONTENT, longest)
     );
+}
+
+#[test]
+fn a_store_leaves_a_directory_at_the_blobs_name_and_says_so() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = Hash::from_bytes(CONTENT);
+    let at_its_name = path
+        .join("blobs")
+        .join(hash.shard_prefix())
+        .join(hash.to_hex());
+    fs::create_dir_all(&at_its_name).unwrap();
+
+    match store.store_blob(CONTENT, CONTENT_TYPE) {
+        Err(StoreError::Io(error)) => assert!(
+            error.to_string().contains("isn't a regular file"),
+            "{error}"
+        ),
+        other => panic!("expected the store to refuse, got {other:?}"),
+    }
+    assert!(at_its_name.is_dir());
+    assert!(store.get_blob(&hash).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_returns_at_once_when_a_fifo_is_at_the_blobs_name() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = Hash::from_bytes(CONTENT);
+    let shard = path.join("blobs").join(hash.shard_prefix());
+    fs::create_dir_all(&shard).unwrap();
+    let fifo = std::ffi::CString::new(shard.join(hash.to_hex()).as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid, NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    match store.store_blob(CONTENT, CONTENT_TYPE) {
+        Err(StoreError::Io(error)) => assert!(
+            error.to_string().contains("isn't a regular file"),
+            "{error}"
+        ),
+        other => panic!("expected the store to refuse, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_whose_rename_fails_leaves_no_file_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = Hash::from_bytes(CONTENT);
+    let shard = path.join("blobs").join(hash.shard_prefix());
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let stored = store.store_blob(CONTENT, CONTENT_TYPE);
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o755)).unwrap();
+
+    match stored {
+        Err(StoreError::Io(error)) => assert!(
+            error.to_string().contains("cannot rename the new blob"),
+            "{error}"
+        ),
+        other => panic!("expected the rename to fail, got {other:?}"),
+    }
+    assert_eq!(files_under_blobs(&path), Vec::<PathBuf>::new());
 }
 
 #[cfg(unix)]
@@ -225,7 +326,7 @@ fn store_past_the_size_limit_in_a_child(path: &Path, ignore_sigxfsz: bool) -> st
 
 #[cfg(unix)]
 #[test]
-fn a_store_killed_partway_leaves_the_blob_missing_and_the_next_open_clears_what_it_wrote() {
+fn a_store_killed_partway_leaves_the_blob_missing_and_the_next_open_clears_its_staging_file() {
     use std::os::unix::process::ExitStatusExt;
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
@@ -244,16 +345,25 @@ fn a_store_killed_partway_leaves_the_blob_missing_and_the_next_open_clears_what_
         String::from_utf8_lossy(&child.stderr)
     );
 
+    let lost = Hash::from_bytes(&larger_than_the_limit());
+    let left = files_under_blobs(&path);
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(left.contains(&kept_file), "{left:?}");
+    assert!(
+        left.iter()
+            .all(|file| file.file_name().unwrap().to_str() != Some(&*lost.to_hex())),
+        "{left:?}"
+    );
+
     let store = reopen(&path);
     assert_eq!(files_under_blobs(&path), vec![kept_file]);
-    let lost = Hash::from_bytes(&larger_than_the_limit());
     assert!(store.get_blob(&lost).unwrap().is_none());
     assert_eq!(store.get_blob(&kept).unwrap().unwrap().content, CONTENT);
 }
 
 #[cfg(unix)]
 #[test]
-fn a_store_that_fails_partway_leaves_nothing_behind() {
+fn a_store_that_fails_partway_leaves_no_file_behind() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     drop(Store::create(config(&path)).unwrap());
