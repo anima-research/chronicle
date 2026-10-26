@@ -1203,7 +1203,8 @@ impl Store {
 
     /// Compute items added since the last delta or full snapshot.
     ///
-    /// This walks the chain collecting Append operations until hitting a snapshot.
+    /// This walks the chain collecting Append operations until hitting a snapshot,
+    /// and returns None if it meets a Redact, an Edit, a Set or a Delta first.
     fn compute_delta_items(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
             Some(h) => h,

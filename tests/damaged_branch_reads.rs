@@ -210,6 +210,22 @@ fn a_delta_with_only_appends_behind_it_stands_for_them() {
     assert_eq!(value(&store), vec![json!(0), json!(1), json!(2), json!(3), json!(4)]);
     let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", 3).unwrap().unwrap()).unwrap();
     assert_eq!(tail, vec![json!(2), json!(3), json!(4)], "a tail no longer than asked, whatever the stored count");
+    let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", 2).unwrap().unwrap()).unwrap();
+    assert_eq!(tail, vec![json!(3), json!(4)], "a tail short of the stored count, taken through the deltas");
+}
+
+#[test]
+fn a_tail_reaching_a_redact_reads_past_it() {
+    let dir = TempDir::new().unwrap();
+    let store = store(&dir);
+    store.set_auto_snapshot(false);
+    for v in 0..4 {
+        append(&store, json!(v));
+    }
+    op(&store, StateOperation::Redact { start: 3, end: 4 });
+    append(&store, json!(4));
+    let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", 3).unwrap().unwrap()).unwrap();
+    assert_eq!(tail, vec![json!(1), json!(2), json!(4)]);
 }
 
 #[test]
