@@ -62,6 +62,11 @@ fn cut_inside_its_header(file: Vec<u8>) -> Vec<u8> {
     file[..6].to_vec()
 }
 
+fn version_zero(mut file: Vec<u8>) -> Vec<u8> {
+    file[4] = 0;
+    file
+}
+
 fn last_content_byte_flipped(mut file: Vec<u8>) -> Vec<u8> {
     let checksum_starts = file.len() - 4;
     file[checksum_starts - 1] ^= 0xff;
@@ -91,8 +96,9 @@ fn content_type_length_cut_to_16_bits(file: Vec<u8>) -> Vec<u8> {
 
 #[test]
 fn storing_the_content_again_replaces_a_copy_that_cannot_be_read_back() {
-    let damages: [(&str, fn(Vec<u8>) -> Vec<u8>, bool); 6] = [
+    let damages: [(&str, fn(Vec<u8>) -> Vec<u8>, bool); 7] = [
         ("cut short", cut_short, true),
+        ("a format version of 0", version_zero, true),
         ("cut inside its header", cut_inside_its_header, true),
         ("a flipped content byte", last_content_byte_flipped, false),
         ("another magic", magic_replaced, false),
@@ -389,7 +395,8 @@ fn a_store_leaves_a_blob_file_in_a_newer_format_and_says_so() {
     let store = reopen(&path);
     match store.store_blob(CONTENT, CONTENT_TYPE) {
         Err(StoreError::InvalidFormat(message)) => {
-            assert!(message.contains("Unsupported blob version: 2"), "{message}")
+            assert!(message.contains("Unsupported blob version 2"), "{message}");
+            assert!(message.contains(&*file.to_string_lossy()), "{message}");
         }
         other => panic!("expected the store to refuse, got {other:?}"),
     }

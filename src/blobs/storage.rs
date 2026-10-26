@@ -102,7 +102,7 @@ impl BlobStorage {
     /// is itself replaced by the blob, leaving any target as it was; one that
     /// loops is an error. Anything else at the blob's name or a link's target,
     /// a file that can't be opened or read at all, or a blob file in a format
-    /// version this chronicle doesn't read, such as one a newer chronicle
+    /// version newer than this chronicle reads, such as one a newer chronicle
     /// wrote, is an error and is left as it is. A blob whose content is in the
     /// cache is taken as stored without reading its file, while a regular file,
     /// or a link to one, is at its name. A content type longer than 65,535
@@ -334,11 +334,21 @@ impl BlobStorage {
         // Read version
         let mut version = [0u8; 1];
         file.read_exact(&mut version).map_err(read_error(path))?;
-        if version[0] != BLOB_VERSION {
+        if version[0] > BLOB_VERSION {
             return Err(StoreError::InvalidFormat(format!(
-                "{UNSUPPORTED_VERSION}: {}",
-                version[0]
+                "{UNSUPPORTED_VERSION} {} in {}: a newer chronicle may have written it, and this one doesn't read it, so storing the same bytes leaves the file as it is",
+                version[0],
+                path.display()
             )));
+        }
+        if version[0] != BLOB_VERSION {
+            return Err(damaged(
+                path,
+                &format!(
+                    "its header names blob format version {}, which no chronicle writes",
+                    version[0]
+                ),
+            ));
         }
 
         // Read content type
