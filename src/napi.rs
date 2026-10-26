@@ -536,8 +536,11 @@ impl JsStore {
     // --- Blobs ---
 
     /// Store a blob and return its hash. Bytes already stored are left as
-    /// they are, unless their file is cut short or damaged, which is
-    /// replaced. Throws for a content type longer than 65,535 bytes.
+    /// they are, unless their file is cut short, damaged or holds other
+    /// bytes, which is replaced; bytes read or stored since the store opened
+    /// may be taken as stored from memory. Throws when something other than a
+    /// regular file is at the blob's name, and for a content type longer than
+    /// 65,535 bytes.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -549,7 +552,8 @@ impl JsStore {
 
     /// Get a blob by hash. A blob read or stored since the store opened may
     /// be answered from memory. Otherwise it throws when the blob's file is
-    /// cut short or damaged, and storing the same bytes again replaces it.
+    /// cut short or damaged, which storing the same bytes again replaces, or
+    /// when something other than a regular file is at its name.
     #[napi]
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;

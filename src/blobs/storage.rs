@@ -48,6 +48,7 @@ impl BlobStorage {
     /// Create a new blob storage at the given path.
     pub fn new(path: impl AsRef<Path>, cache_size: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let existed = path.is_dir();
         fs::create_dir_all(&path)?;
 
         let cache_size = NonZeroUsize::new(cache_size.max(1)).unwrap();
@@ -55,12 +56,12 @@ impl BlobStorage {
         Ok(Self {
             path,
             cache: Mutex::new(LruCache::new(cache_size)),
-            entry_synced: AtomicBool::new(false),
+            entry_synced: AtomicBool::new(existed),
             shards: (0..=u8::MAX)
                 .map(|_| ShardDurability {
-                    entry_synced: AtomicBool::new(false),
-                    renames_begun: AtomicU64::new(1),
-                    renames_finished: AtomicU64::new(1),
+                    entry_synced: AtomicBool::new(true),
+                    renames_begun: AtomicU64::new(0),
+                    renames_finished: AtomicU64::new(0),
                     renames_synced: AtomicU64::new(0),
                 })
                 .collect(),
@@ -74,18 +75,26 @@ impl BlobStorage {
     /// blob under that name: one that stops before its rename leaves the blob
     /// as it was. A store killed before its rename leaves its staging file
     /// (`.chronicle-blob-*`), which the next [`Store::open`](crate::Store::open)
-    /// removes. On Unix, before this returns, the directories holding the
-    /// blob's name have been synced since that name was made, where the system
-    /// syncs directories and this account may open them. A sync that fails
-    /// returns an error with the blob already in place, and storing the blob
-    /// again tries the sync again.
+    /// removes where it can list the blob directory. On Unix, before this
+    /// returns, the directories holding the blob's name have been synced since
+    /// this `BlobStorage` last made or renamed anything into them, where the
+    /// system syncs directories and this account may open them. What an
+    /// earlier process made is taken as it is, and two `BlobStorage`s writing
+    /// one directory at once, which a `Store`'s lock rules out, don't see each
+    /// other's renames.
+    /// A sync that fails before the rename returns an error with nothing
+    /// stored; one that fails after it returns an error with the blob in
+    /// place, and storing the blob again tries the sync again.
     ///
     /// When the blob's file is already there and reads back as `content`, it
     /// is left as it is, content type included, and so is one whose content
-    /// is in the cache, while its file is there. A file that's cut short,
-    /// damaged or holds other bytes is replaced. Anything else at the blob's
-    /// name, or a file that can't be opened or read at all, is an error and is
-    /// left as it is. A content type longer than 65,535 bytes is refused.
+    /// is in the cache, while a regular file is at its name. A file that's cut
+    /// short, damaged or holds other bytes is replaced. A symbolic link at the
+    /// blob's name is followed: one that leads to a file is read through it,
+    /// and one that leads nowhere is replaced by the blob. Anything else at
+    /// the blob's name, or a file that can't be opened or read at all, is an
+    /// error and is left as it is. A content type longer than 65,535 bytes is
+    /// refused.
     pub fn store(&self, content: &[u8], content_type: &str) -> Result<Hash> {
         let content_type_len = u16::try_from(content_type.len()).map_err(|_| {
             StoreError::InvalidOperation(format!(
@@ -96,7 +105,8 @@ impl BlobStorage {
         let hash = Hash::from_bytes(content);
         let blob_path = self.blob_path(&hash);
 
-        let readable = (self.cache.lock().contains(&hash) && blob_path.exists())
+        let readable = (self.cache.lock().contains(&hash)
+            && fs::metadata(&blob_path).is_ok_and(|metadata| metadata.is_file()))
             || match Self::read_file(&blob_path) {
                 Ok(Some(stored)) if stored.content == content => {
                     self.cache.lock().put(hash, stored);
@@ -136,12 +146,15 @@ impl BlobStorage {
         content_type_len: u16,
     ) -> Result<()> {
         let shard_dir = self.shard_path(hash);
+        if !shard_dir.is_dir() {
+            self.shard(hash).entry_synced.store(false, Ordering::SeqCst);
+        }
         fs::create_dir_all(&shard_dir)?;
         self.sync_shard_entry(hash).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot sync the blob directory {} before storing a blob: {error}",
+                    "cannot sync the directories holding {} before storing a blob: {error}",
                     self.path.display()
                 ),
             )
@@ -272,7 +285,7 @@ impl BlobStorage {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "{} isn't a regular file, so it isn't read as a blob or replaced",
+                        "{} isn't a regular file, so it isn't read as a blob or replaced; remove it to store this blob",
                         path.display()
                     ),
                 )
@@ -280,7 +293,13 @@ impl BlobStorage {
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot look at the blob file {}: {error}", path.display()),
+                )
+                .into())
+            }
         }
         let mut file = match File::open(path) {
             Ok(file) => file,

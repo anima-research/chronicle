@@ -58,6 +58,10 @@ fn cut_short(file: Vec<u8>) -> Vec<u8> {
     file[..file.len() / 2].to_vec()
 }
 
+fn cut_inside_its_header(file: Vec<u8>) -> Vec<u8> {
+    file[..6].to_vec()
+}
+
 fn last_content_byte_flipped(mut file: Vec<u8>) -> Vec<u8> {
     let checksum_starts = file.len() - 4;
     file[checksum_starts - 1] ^= 0xff;
@@ -87,8 +91,9 @@ fn content_type_length_cut_to_16_bits(file: Vec<u8>) -> Vec<u8> {
 
 #[test]
 fn storing_the_content_again_replaces_a_copy_that_cannot_be_read_back() {
-    let damages: [(&str, fn(Vec<u8>) -> Vec<u8>, bool); 5] = [
+    let damages: [(&str, fn(Vec<u8>) -> Vec<u8>, bool); 6] = [
         ("cut short", cut_short, true),
+        ("cut inside its header", cut_inside_its_header, true),
         ("a flipped content byte", last_content_byte_flipped, false),
         ("another magic", magic_replaced, false),
         (
@@ -261,7 +266,8 @@ fn a_store_returns_at_once_when_a_fifo_is_at_the_blobs_name() {
     let hash = Hash::from_bytes(CONTENT);
     let shard = path.join("blobs").join(hash.shard_prefix());
     fs::create_dir_all(&shard).unwrap();
-    let fifo = std::ffi::CString::new(shard.join(hash.to_hex()).as_os_str().as_bytes()).unwrap();
+    let at_its_name = shard.join(hash.to_hex());
+    let fifo = std::ffi::CString::new(at_its_name.as_os_str().as_bytes()).unwrap();
     // SAFETY: a valid, NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
@@ -272,6 +278,46 @@ fn a_store_returns_at_once_when_a_fifo_is_at_the_blobs_name() {
         ),
         other => panic!("expected the store to refuse, got {other:?}"),
     }
+    use std::os::unix::fs::FileTypeExt;
+    assert!(fs::symlink_metadata(&at_its_name)
+        .unwrap()
+        .file_type()
+        .is_fifo());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_leaves_a_blob_file_it_may_not_read_and_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    store.store_blob(CONTENT, CONTENT_TYPE).unwrap();
+    drop(store);
+    let file = the_one_blob_file(&path);
+    let stored = Handle::from_path(&file).unwrap();
+    let bytes = fs::read(&file).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let refused = reopen(&path).store_blob(CONTENT, CONTENT_TYPE);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    match refused {
+        Err(StoreError::Io(error)) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            )
+        }
+        other => panic!("expected the store to refuse, got {other:?}"),
+    }
+    assert_eq!(Handle::from_path(&file).unwrap(), stored);
+    assert_eq!(fs::read(&file).unwrap(), bytes);
 }
 
 #[cfg(unix)]
@@ -380,6 +426,31 @@ fn a_store_that_fails_partway_leaves_no_file_behind() {
     assert_eq!(files_under_blobs(&path), Vec::<PathBuf>::new());
     let lost = Hash::from_bytes(&larger_than_the_limit());
     assert!(reopen(&path).get_blob(&lost).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_that_fails_partway_leaves_the_file_it_was_replacing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    drop(Store::create(config(&path)).unwrap());
+    let lost = Hash::from_bytes(&larger_than_the_limit());
+    let shard = path.join("blobs").join(lost.shard_prefix());
+    fs::create_dir_all(&shard).unwrap();
+    let damaged = shard.join(lost.to_hex());
+    fs::write(&damaged, b"a damaged blob").unwrap();
+
+    let child = store_past_the_size_limit_in_a_child(&path, true);
+    assert_eq!(
+        child.status.code(),
+        Some(73),
+        "child failed: {}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    assert_eq!(files_under_blobs(&path), vec![damaged.clone()]);
+    assert_eq!(fs::read(&damaged).unwrap(), b"a damaged blob");
 }
 
 #[cfg(unix)]
