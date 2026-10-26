@@ -17,8 +17,10 @@
   short of the length of `getState`'s value marks such a branch, though a
   later Redact that runs past the count can bring the two level without
   removing those items. After an Edit, the edit stays lost, and nothing
-  marks the branch. A later Redact or Edit applies to that reading as under
-  earlier releases, which also refuse an Edit at or past the count.
+  marks the branch. After a `Delta`, which only Rust callers can write, the
+  reading holds the values it replaced. A later Redact or Edit applies to
+  that reading as under earlier releases, which also refuse an Edit at or
+  past the count.
 - `getStateTail` no longer returns some items twice. Once it had taken a
   delta snapshot's items and needed more, it read on into the Appends that
   snapshot stood for and returned them again: on a state taking a delta
