@@ -539,8 +539,8 @@ impl JsStore {
     /// they are, unless their file is cut short, damaged or holds other
     /// bytes, which is replaced; bytes read or stored since the store opened
     /// may be taken as stored from memory. Throws when something other than a
-    /// regular file is at the blob's name, and for a content type longer than
-    /// 65,535 bytes.
+    /// regular file is at the blob's name, when its file can't be read, and
+    /// for a content type longer than 65,535 bytes.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;

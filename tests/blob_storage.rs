@@ -256,6 +256,97 @@ fn a_store_leaves_a_directory_at_the_blobs_name_and_says_so() {
     assert!(store.get_blob(&hash).is_err());
 }
 
+#[test]
+fn a_store_of_cached_bytes_refuses_a_directory_at_the_blobs_name() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    store.store_blob(CONTENT, CONTENT_TYPE).unwrap();
+    let file = the_one_blob_file(&path);
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+
+    match store.store_blob(CONTENT, CONTENT_TYPE) {
+        Err(StoreError::Io(error)) => assert!(
+            error.to_string().contains("isn't a regular file"),
+            "{error}"
+        ),
+        other => panic!("expected the store to refuse, got {other:?}"),
+    }
+    assert!(file.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_replaces_a_link_to_nothing_at_the_blobs_name() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = Hash::from_bytes(CONTENT);
+    let shard = path.join("blobs").join(hash.shard_prefix());
+    fs::create_dir_all(&shard).unwrap();
+    let at_its_name = shard.join(hash.to_hex());
+    std::os::unix::fs::symlink(dir.path().join("nothing here"), &at_its_name).unwrap();
+
+    assert_eq!(store.store_blob(CONTENT, CONTENT_TYPE).unwrap(), hash);
+    drop(store);
+
+    assert!(fs::symlink_metadata(&at_its_name).unwrap().is_file());
+    assert!(!dir.path().join("nothing here").exists());
+    let blob = reopen(&path).get_blob(&hash).unwrap();
+    assert_eq!(blob.unwrap().content, CONTENT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_reads_through_a_link_to_a_good_blob_file_and_leaves_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = store.store_blob(CONTENT, CONTENT_TYPE).unwrap();
+    drop(store);
+    let file = the_one_blob_file(&path);
+    let elsewhere = dir.path().join("elsewhere");
+    fs::rename(&file, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+
+    let store = reopen(&path);
+    assert_eq!(store.store_blob(CONTENT, CONTENT_TYPE).unwrap(), hash);
+    drop(store);
+
+    assert!(fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let blob = reopen(&path).get_blob(&hash).unwrap();
+    assert_eq!(blob.unwrap().content, CONTENT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blob_directory_the_account_may_not_read_still_takes_stores() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    drop(Store::create(config(&path)).unwrap());
+    let blobs = path.join("blobs");
+    fs::set_permissions(&blobs, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let store = reopen(&path);
+    let stored = store.store_blob(CONTENT, CONTENT_TYPE);
+    drop(store);
+    let read = reopen(&path).get_blob(&Hash::from_bytes(CONTENT));
+    fs::set_permissions(&blobs, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let hash = stored.unwrap();
+    assert_eq!(read.unwrap().unwrap().content, CONTENT);
+    assert_eq!(hash, Hash::from_bytes(CONTENT));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_store_returns_at_once_when_a_fifo_is_at_the_blobs_name() {
@@ -430,27 +521,49 @@ fn a_store_that_fails_partway_leaves_no_file_behind() {
 
 #[cfg(unix)]
 #[test]
-fn a_store_that_fails_partway_leaves_the_file_it_was_replacing() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("store");
-    drop(Store::create(config(&path)).unwrap());
-    let lost = Hash::from_bytes(&larger_than_the_limit());
-    let shard = path.join("blobs").join(lost.shard_prefix());
-    fs::create_dir_all(&shard).unwrap();
-    let damaged = shard.join(lost.to_hex());
-    fs::write(&damaged, b"a damaged blob").unwrap();
+fn a_store_that_stops_partway_leaves_the_file_it_was_replacing() {
+    use std::os::unix::process::ExitStatusExt;
+    for killed in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        drop(Store::create(config(&path)).unwrap());
+        let lost = Hash::from_bytes(&larger_than_the_limit());
+        let shard = path.join("blobs").join(lost.shard_prefix());
+        fs::create_dir_all(&shard).unwrap();
+        let damaged = shard.join(lost.to_hex());
+        fs::write(&damaged, b"a damaged blob").unwrap();
 
-    let child = store_past_the_size_limit_in_a_child(&path, true);
-    assert_eq!(
-        child.status.code(),
-        Some(73),
-        "child failed: {}{}",
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&child.stderr)
-    );
+        let child = store_past_the_size_limit_in_a_child(&path, !killed);
+        let ended = if killed {
+            child.status.signal() == Some(libc::SIGXFSZ)
+        } else {
+            child.status.code() == Some(73)
+        };
+        assert!(
+            ended,
+            "killed {killed}: child: {:?} {}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
 
-    assert_eq!(files_under_blobs(&path), vec![damaged.clone()]);
-    assert_eq!(fs::read(&damaged).unwrap(), b"a damaged blob");
+        assert_eq!(
+            fs::read(&damaged).unwrap(),
+            b"a damaged blob",
+            "killed {killed}"
+        );
+        drop(reopen(&path));
+        assert_eq!(
+            files_under_blobs(&path),
+            vec![damaged.clone()],
+            "killed {killed}"
+        );
+        assert_eq!(
+            fs::read(&damaged).unwrap(),
+            b"a damaged blob",
+            "killed {killed}"
+        );
+    }
 }
 
 #[cfg(unix)]
