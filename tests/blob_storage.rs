@@ -310,6 +310,8 @@ fn a_store_reads_through_a_link_to_a_good_blob_file_and_leaves_it() {
     fs::rename(&file, &elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
 
+    let target_bytes = fs::read(&elsewhere).unwrap();
+
     let store = reopen(&path);
     assert_eq!(store.store_blob(CONTENT, CONTENT_TYPE).unwrap(), hash);
     drop(store);
@@ -318,8 +320,58 @@ fn a_store_reads_through_a_link_to_a_good_blob_file_and_leaves_it() {
         .unwrap()
         .file_type()
         .is_symlink());
+    assert_eq!(fs::read(&elsewhere).unwrap(), target_bytes);
     let blob = reopen(&path).get_blob(&hash).unwrap();
     assert_eq!(blob.unwrap().content, CONTENT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_replaces_a_link_to_a_damaged_file_and_leaves_its_target() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = store.store_blob(CONTENT, CONTENT_TYPE).unwrap();
+    drop(store);
+    let file = the_one_blob_file(&path);
+    let elsewhere = dir.path().join("elsewhere");
+    let damaged = cut_short(fs::read(&file).unwrap());
+    fs::write(&elsewhere, &damaged).unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+
+    let store = reopen(&path);
+    assert_eq!(store.store_blob(CONTENT, CONTENT_TYPE).unwrap(), hash);
+    drop(store);
+
+    assert!(fs::symlink_metadata(&file).unwrap().is_file());
+    assert_eq!(fs::read(&elsewhere).unwrap(), damaged);
+    let blob = reopen(&path).get_blob(&hash).unwrap();
+    assert_eq!(blob.unwrap().content, CONTENT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_refuses_a_link_that_loops_and_leaves_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = Hash::from_bytes(CONTENT);
+    let shard = path.join("blobs").join(hash.shard_prefix());
+    fs::create_dir_all(&shard).unwrap();
+    let at_its_name = shard.join(hash.to_hex());
+    std::os::unix::fs::symlink(&at_its_name, &at_its_name).unwrap();
+
+    assert!(matches!(
+        store.store_blob(CONTENT, CONTENT_TYPE),
+        Err(StoreError::Io(_))
+    ));
+    assert!(matches!(store.get_blob(&hash), Err(StoreError::Io(_))));
+    assert_eq!(
+        fs::read_link(&at_its_name).unwrap(),
+        at_its_name,
+        "the link is left as it was"
+    );
 }
 
 #[cfg(unix)]
@@ -552,6 +604,13 @@ fn a_store_that_stops_partway_leaves_the_file_it_was_replacing() {
             b"a damaged blob",
             "killed {killed}"
         );
+        let before_the_sweep = files_under_blobs(&path);
+        if killed {
+            assert_eq!(before_the_sweep.len(), 2, "{before_the_sweep:?}");
+            assert!(before_the_sweep.contains(&damaged));
+        } else {
+            assert_eq!(before_the_sweep, vec![damaged.clone()]);
+        }
         drop(reopen(&path));
         assert_eq!(
             files_under_blobs(&path),

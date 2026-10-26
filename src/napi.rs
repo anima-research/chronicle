@@ -538,9 +538,14 @@ impl JsStore {
     /// Store a blob and return its hash. Bytes already stored are left as
     /// they are, unless their file is cut short, damaged or holds other
     /// bytes, which is replaced; bytes read or stored since the store opened
-    /// may be taken as stored from memory. Throws when something other than a
-    /// regular file is at the blob's name, when its file can't be read, and
-    /// for a content type longer than 65,535 bytes.
+    /// may be taken as stored from memory. A symbolic link at the blob's name
+    /// is read through, and one that leads nowhere is replaced. Throws when
+    /// something other than a regular file, such as a directory, is at the
+    /// blob's name or a link's target, when its file can't be read, when
+    /// writing or syncing the blob fails, and for a content type longer than
+    /// 65,535 bytes. A sync that fails after the blob is in place still
+    /// throws, and storing the blob again before the store closes tries the
+    /// sync again.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -553,7 +558,8 @@ impl JsStore {
     /// Get a blob by hash. A blob read or stored since the store opened may
     /// be answered from memory. Otherwise it throws when the blob's file is
     /// cut short or damaged, which storing the same bytes again replaces, or
-    /// when something other than a regular file is at its name.
+    /// when something other than a regular file is at its name or a link's
+    /// target. A symbolic link that leads nowhere reads as no blob.
     #[napi]
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;

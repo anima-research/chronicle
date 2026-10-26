@@ -93,16 +93,17 @@ impl BlobStorage {
     /// an error with the blob in place. Either way, storing the blob again
     /// through this `BlobStorage` tries the sync again.
     ///
-    /// When the blob's file is already there and reads back as `content`, it
-    /// is left as it is, content type included. So is a blob whose content is
-    /// in the cache, while a regular file is at its name, without reading
-    /// that file. A file that's cut short, damaged or holds other bytes is
-    /// replaced. A symbolic link at the blob's name is read through: one whose
-    /// target reads back as `content` is left, and one whose target is cut
-    /// short, damaged, holds other bytes or doesn't exist is itself replaced
-    /// by the blob, leaving any target as it was. Anything else at the blob's
-    /// name, or a file that can't be opened or read at all, is an error and is
-    /// left as it is. A content type longer than 65,535 bytes is refused.
+    /// When the blob's file is already there and reads back as `content`, it is
+    /// left as it is, content type included. A file that's cut short, damaged
+    /// or holds other bytes is replaced. A symbolic link at the blob's name is
+    /// read through: one whose target reads back as `content` is left, and one
+    /// whose target is cut short, damaged, holds other bytes or doesn't exist
+    /// is itself replaced by the blob, leaving any target as it was; one that
+    /// loops is an error. Anything else at the blob's name or a link's target,
+    /// or a file that can't be opened or read at all, is an error and is left
+    /// as it is. A blob whose content is in the cache is taken as stored
+    /// without reading its file, while a regular file, or a link to one, is at
+    /// its name. A content type longer than 65,535 bytes is refused.
     pub fn store(&self, content: &[u8], content_type: &str) -> Result<Hash> {
         let content_type_len = u16::try_from(content_type.len()).map_err(|_| {
             StoreError::InvalidOperation(format!(
