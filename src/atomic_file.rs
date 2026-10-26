@@ -425,6 +425,15 @@ fn directory_open_refused(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
 }
 
+#[cfg(unix)]
+pub(crate) fn sync_directory_at(directory: &Path) -> io::Result<()> {
+    match File::open(directory) {
+        Ok(directory) => sync_directory(&directory),
+        Err(error) if directory_open_refused(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Remove the staging files that interrupted saves left in the store
 /// directory. The caller holds the store lock, so no save of this store is in
 /// progress, and nothing reads them. One that can't be removed is reported
@@ -435,13 +444,17 @@ fn directory_open_refused(error: &io::Error) -> bool {
 /// here outside this lock, and a save of it whose stage this removes fails,
 /// leaving its checkpoint as it was.
 pub(crate) fn remove_staging_files(directory: &Path) {
+    remove_files_staged_as(directory, STAGING_PREFIX, "checkpoint", "save");
+}
+
+pub(crate) fn remove_files_staged_as(directory: &Path, prefix: &str, what: &str, by: &str) {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
             tracing::warn!(
                 directory = %directory.display(),
                 %error,
-                "could not look for checkpoint staging files left by interrupted saves"
+                "could not look for {what} staging files left by interrupted {by}s"
             );
             return;
         }
@@ -450,7 +463,7 @@ pub(crate) fn remove_staging_files(directory: &Path) {
         let staged = entry
             .file_name()
             .as_encoded_bytes()
-            .starts_with(STAGING_PREFIX.as_bytes());
+            .starts_with(prefix.as_bytes());
         if !staged || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
@@ -458,12 +471,12 @@ pub(crate) fn remove_staging_files(directory: &Path) {
         match fs::remove_file(&path) {
             Ok(()) => tracing::warn!(
                 path = %path.display(),
-                "removed a checkpoint staging file left by an interrupted save"
+                "removed a {what} staging file left by an interrupted {by}"
             ),
             Err(error) => tracing::warn!(
                 path = %path.display(),
                 %error,
-                "could not remove a checkpoint staging file left by an interrupted save"
+                "could not remove a {what} staging file left by an interrupted {by}"
             ),
         }
     }
