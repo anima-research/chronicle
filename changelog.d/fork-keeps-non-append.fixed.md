@@ -3,9 +3,9 @@
   made there. The branch started as if its append-log state had seen only
   Appends since its last snapshot, so its first delta snapshot walked past
   such a change, and from then on the branch read back what the change had
-  removed or replaced. The branch now inherits the parent's record of such a
-  change, and takes no delta snapshot until its next full one, just as the
-  parent takes none. A branch made before this release may have that record
+  removed or replaced. The branch now takes that record from the chain at
+  its point, and takes no delta snapshot until its next full one, as the
+  parent does. A branch made before this release may have that record
   wrong: when its delta snapshot comes due across such a change, the store
   now takes a full snapshot of its value instead.
 - A branch that already took such a delta snapshot under an earlier release
@@ -13,11 +13,12 @@
   holds items the change had removed, while `getStateLen` counts without
   them, so a read bounded by the count, such as `getStateSlice` up to the
   length, misses the newest items until the branch's next full snapshot,
-  which then keeps that reading and counts it. Comparing `getStateLen` with
-  the length of `getState`'s value finds such a branch before then. After
-  an Edit, the edit stays lost, and nothing marks the branch. A Redact or an
-  Edit a caller positions against that reading still lands on the item it
-  chose.
+  which then keeps that reading and counts it. Until then, `getStateLen`
+  short of the length of `getState`'s value marks such a branch, though a
+  later Redact that runs past the count can bring the two level without
+  removing those items. After an Edit, the edit stays lost, and nothing
+  marks the branch. A later Redact or Edit applies to that reading as under
+  earlier releases, which also refuse an Edit at or past the count.
 - `getStateTail` no longer returns some items twice. Once it had taken a
   delta snapshot's items and needed more, it read on into the Appends that
   snapshot stood for and returned them again: on a state taking a delta

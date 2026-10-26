@@ -1,3 +1,4 @@
+use super::is_non_append_change;
 use crate::error::Result;
 use crate::records::RecordLog;
 use crate::types::{Sequence, StateOperation, StateUpdateRecord};
@@ -8,6 +9,7 @@ pub(crate) struct ChainWalk<'a> {
     at: Option<Sequence>,
     first: Option<u64>,
     behind_delta: bool,
+    changed_behind_delta: bool,
     done: bool,
 }
 
@@ -19,12 +21,17 @@ impl<'a> ChainWalk<'a> {
             at,
             first: None,
             behind_delta: false,
+            changed_behind_delta: false,
             done: false,
         }
     }
 
     pub(crate) fn first_offset(&self) -> Option<u64> {
         self.first
+    }
+
+    pub(crate) fn changed_behind_delta(&self) -> bool {
+        self.changed_behind_delta
     }
 
     fn read(&mut self) -> Option<Result<StateOperation>> {
@@ -77,7 +84,9 @@ impl Iterator for ChainWalk<'_> {
                     self.behind_delta = true;
                     return Some(Ok(op));
                 }
-                _ if self.behind_delta => {}
+                _ if self.behind_delta => {
+                    self.changed_behind_delta |= is_non_append_change(&op);
+                }
                 _ => return Some(Ok(op)),
             }
         }

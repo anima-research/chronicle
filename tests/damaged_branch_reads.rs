@@ -170,10 +170,12 @@ fn a_branch_made_from_a_damaged_branch_starts_from_its_reading() {
         store.switch_branch("grandchild").unwrap();
         assert_reads(&store, &reading, &format!("{name}: at the point"));
         assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: its count at the point");
+        store.set_auto_snapshot(false);
         for v in 4..8 {
             append(&store, json!(v));
             reading.push(json!(v));
         }
+        assert_eq!(store.snapshot_needed("s"), None, "{name}: the change behind the old delta holds its deltas off");
         assert_reads(&store, &reading, &format!("{name}: after four appends"));
         assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: its count after four appends");
     }
@@ -240,6 +242,8 @@ fn a_tail_reaching_a_delta_reads_the_value_it_set() {
     assert_eq!(value(&store), vec![json!(9), json!(8), json!(2), json!(3)], "setup");
     let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", 3).unwrap().unwrap()).unwrap();
     assert_eq!(tail, vec![json!(8), json!(2), json!(3)]);
+    let items: Vec<Value> = store.iter_state_items("s").unwrap().unwrap().map(|item| item.unwrap()).collect();
+    assert_eq!(items, vec![json!(9), json!(8), json!(2), json!(3)], "iter_state_items applies the Delta");
 }
 
 #[test]
