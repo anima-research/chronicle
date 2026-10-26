@@ -535,7 +535,9 @@ impl JsStore {
 
     // --- Blobs ---
 
-    /// Store a blob and return its hash.
+    /// Store a blob and return its hash. Bytes already stored are left as
+    /// they are, unless their file can't be read back, which is replaced.
+    /// Throws for a content type longer than 65,535 bytes.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -545,7 +547,9 @@ impl JsStore {
         Ok(hash.to_string())
     }
 
-    /// Get a blob by hash.
+    /// Get a blob by hash. Throws when the blob's file can't be read back,
+    /// such as one cut short or damaged; storing the same bytes again
+    /// replaces it.
     #[napi]
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
