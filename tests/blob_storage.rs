@@ -374,6 +374,33 @@ fn a_store_refuses_a_link_that_loops_and_leaves_it() {
     );
 }
 
+#[test]
+fn a_store_leaves_a_blob_file_in_a_newer_format_and_says_so() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let store = Store::create(config(&path)).unwrap();
+    let hash = store.store_blob(CONTENT, CONTENT_TYPE).unwrap();
+    drop(store);
+    let file = the_one_blob_file(&path);
+    let mut newer = fs::read(&file).unwrap();
+    newer[4] = 2;
+    fs::write(&file, &newer).unwrap();
+
+    let store = reopen(&path);
+    match store.store_blob(CONTENT, CONTENT_TYPE) {
+        Err(StoreError::InvalidFormat(message)) => {
+            assert!(message.contains("Unsupported blob version: 2"), "{message}")
+        }
+        other => panic!("expected the store to refuse, got {other:?}"),
+    }
+    assert!(matches!(
+        store.get_blob(&hash),
+        Err(StoreError::InvalidFormat(_))
+    ));
+    drop(store);
+    assert_eq!(fs::read(&file).unwrap(), newer);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_blob_directory_the_account_may_not_read_still_takes_stores() {
@@ -536,7 +563,14 @@ fn a_store_killed_partway_leaves_the_blob_missing_and_the_next_open_clears_its_s
 
     let lost = Hash::from_bytes(&larger_than_the_limit());
     let left = files_under_blobs(&path);
-    assert_eq!(left.len(), 2, "{left:?}");
+    // On macOS, SIGXFSZ can arrive after the failed write has returned, so the
+    // store may already have removed its staging file when the child dies.
+    let staging_left = if cfg!(target_os = "macos") {
+        0..=1
+    } else {
+        1..=1
+    };
+    assert!(staging_left.contains(&(left.len() - 1)), "{left:?}");
     assert!(left.contains(&kept_file), "{left:?}");
     assert!(
         left.iter()
@@ -606,7 +640,17 @@ fn a_store_that_stops_partway_leaves_the_file_it_was_replacing() {
         );
         let before_the_sweep = files_under_blobs(&path);
         if killed {
-            assert_eq!(before_the_sweep.len(), 2, "{before_the_sweep:?}");
+            // On macOS, SIGXFSZ can arrive after the failed write has returned,
+            // so the store may already have removed its staging file.
+            let staging_left = if cfg!(target_os = "macos") {
+                0..=1
+            } else {
+                1..=1
+            };
+            assert!(
+                staging_left.contains(&(before_the_sweep.len() - 1)),
+                "{before_the_sweep:?}"
+            );
             assert!(before_the_sweep.contains(&damaged));
         } else {
             assert_eq!(before_the_sweep, vec![damaged.clone()]);

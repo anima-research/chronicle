@@ -15,6 +15,7 @@ const BLOB_MAGIC: &[u8; 4] = b"BLB\0";
 
 /// Current blob format version.
 const BLOB_VERSION: u8 = 1;
+const UNSUPPORTED_VERSION: &str = "Unsupported blob version";
 
 const STAGING_PREFIX: &str = ".chronicle-blob-";
 
@@ -100,10 +101,12 @@ impl BlobStorage {
     /// whose target is cut short, damaged, holds other bytes or doesn't exist
     /// is itself replaced by the blob, leaving any target as it was; one that
     /// loops is an error. Anything else at the blob's name or a link's target,
-    /// or a file that can't be opened or read at all, is an error and is left
-    /// as it is. A blob whose content is in the cache is taken as stored
-    /// without reading its file, while a regular file, or a link to one, is at
-    /// its name. A content type longer than 65,535 bytes is refused.
+    /// a file that can't be opened or read at all, or a blob file in a format
+    /// version this chronicle doesn't read, such as one a newer chronicle
+    /// wrote, is an error and is left as it is. A blob whose content is in the
+    /// cache is taken as stored without reading its file, while a regular file,
+    /// or a link to one, is at its name. A content type longer than 65,535
+    /// bytes is refused.
     pub fn store(&self, content: &[u8], content_type: &str) -> Result<Hash> {
         let content_type_len = u16::try_from(content_type.len()).map_err(|_| {
             StoreError::InvalidOperation(format!(
@@ -333,7 +336,7 @@ impl BlobStorage {
         file.read_exact(&mut version).map_err(read_error(path))?;
         if version[0] != BLOB_VERSION {
             return Err(StoreError::InvalidFormat(format!(
-                "Unsupported blob version: {}",
+                "{UNSUPPORTED_VERSION}: {}",
                 version[0]
             )));
         }
@@ -456,10 +459,11 @@ impl BlobStorage {
 }
 
 fn unreadable(error: &StoreError) -> bool {
-    matches!(
-        error,
-        StoreError::InvalidFormat(_) | StoreError::ChecksumMismatch { .. }
-    )
+    match error {
+        StoreError::InvalidFormat(message) => !message.starts_with(UNSUPPORTED_VERSION),
+        StoreError::ChecksumMismatch { .. } => true,
+        _ => false,
+    }
 }
 
 fn damaged(path: &Path, what: &str) -> StoreError {
