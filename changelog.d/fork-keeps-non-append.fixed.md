@@ -8,21 +8,16 @@
   parent takes none. A branch made before this release may have that record
   wrong: when its delta snapshot comes due across such a change, the store
   now takes a full snapshot of its value instead.
-- A branch that already took such a delta snapshot reads its true value
-  again. Reads use a delta snapshot only when the operations it stands for
-  are all Appends, and read those operations otherwise. Under earlier
-  releases, such a branch's value held the items that came back while
-  `getStateLen` counted without them after a Redact or a Set, so a read
-  bounded by the count, such as `getStateSlice` up to the length, missed its
-  newest items; an undone Edit left no such sign. Its next full snapshot,
-  whether size-aware or `compactState`'s, now stores its true value. A
-  branch whose damage a full snapshot already stored reads it from then on,
-  and no count check finds it, since that snapshot counted the value as it
-  read it. A branch made from it with `createBranchAt` at a point before
-  that snapshot reads its true value and what it did up to then. Field
-  indexes an earlier release saved (`state-indexes.bin`) are built again
-  when next registered, since one may have been built from a value that
-  this release reads differently.
+- A branch that already took such a delta snapshot under an earlier release
+  keeps reading what it read there. After a Redact or a `Set`, that reading
+  holds items the change had removed, while `getStateLen` counts without
+  them, so a read bounded by the count, such as `getStateSlice` up to the
+  length, misses the newest items until the branch's next full snapshot,
+  which then keeps that reading and counts it. Comparing `getStateLen` with
+  the length of `getState`'s value finds such a branch before then. After
+  an Edit, the edit stays lost, and nothing marks the branch. A Redact or an
+  Edit a caller positions against that reading still lands on the item it
+  chose.
 - `getStateTail` no longer returns some items twice. Once it had taken a
   delta snapshot's items and needed more, it read on into the Appends that
   snapshot stood for and returned them again: on a state taking a delta

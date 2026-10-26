@@ -66,20 +66,28 @@ fn reopened(store: Store, dir: &TempDir) -> Store {
     store
 }
 
-fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>)> {
+fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>, Option<usize>)> {
     vec![
-        ("Redact", vec![StateOperation::Redact { start: 1, end: 100 }], json!([2]), vec![json!(0), json!(2), json!(3)]),
+        (
+            "Redact",
+            vec![StateOperation::Redact { start: 1, end: 100 }],
+            json!([2]),
+            vec![json!(0), json!(1), json!(2), json!(3)],
+            Some(3),
+        ),
         (
             "Edit",
             vec![StateOperation::Edit { index: 1, new_value: bytes(json!("edited")) }],
             json!([2]),
-            vec![json!(0), json!("edited"), json!(2), json!(3)],
+            vec![json!(0), json!(1), json!(2), json!(3)],
+            Some(4),
         ),
         (
             "Set",
             vec![StateOperation::Append(bytes(json!(7))), StateOperation::Set(bytes(json!([9])))],
             json!([7, 2]),
-            vec![json!(9), json!(2), json!(3)],
+            vec![json!(9), json!(7), json!(2), json!(3)],
+            Some(3),
         ),
         (
             "Delta",
@@ -88,72 +96,101 @@ fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>)> {
                 StateOperation::Delta { old_hash: chronicle::Hash([0; 32]), new_value: bytes(json!([9])) },
             ],
             json!([7, 2]),
-            vec![json!(9), json!(2), json!(3)],
+            vec![json!(0), json!(1), json!(7), json!(2), json!(3)],
+            None,
         ),
     ]
 }
 
+fn assert_reads(store: &Store, expected: &[Value], what: &str) {
+    assert_eq!(value(store), expected, "{what}: get_state");
+    let slice: Vec<Value> =
+        serde_json::from_slice(&store.get_state_slice("s", 0, expected.len()).unwrap().unwrap()).unwrap();
+    assert_eq!(slice, expected, "{what}: get_state_slice");
+    let items: Vec<Value> = store.iter_state_items("s").unwrap().unwrap().map(|item| item.unwrap()).collect();
+    assert_eq!(items, expected, "{what}: iter_state_items");
+    for n in 1..=expected.len() {
+        let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", n).unwrap().unwrap()).unwrap();
+        assert_eq!(tail, expected[expected.len() - n..], "{what}: get_state_tail({n})");
+    }
+}
+
 #[test]
-fn a_damaged_branch_reads_its_true_value() {
-    for (name, change, old_delta, expected) in cases() {
+fn a_damaged_branch_reads_as_it_did() {
+    for (name, change, old_delta, reading, count) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
-        assert_eq!(value(&store), expected, "{name}: get_state");
-        let slice: Vec<Value> =
-            serde_json::from_slice(&store.get_state_slice("s", 0, expected.len()).unwrap().unwrap()).unwrap();
-        assert_eq!(slice, expected, "{name}: get_state_slice");
-        let items: Vec<Value> = store.iter_state_items("s").unwrap().unwrap().map(|item| item.unwrap()).collect();
-        assert_eq!(items, expected, "{name}: iter_state_items");
-        for n in 1..=expected.len() {
-            let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", n).unwrap().unwrap()).unwrap();
-            assert_eq!(tail, expected[expected.len() - n..], "{name}: get_state_tail({n})");
-        }
-        if name != "Delta" {
-            assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}: get_state_len");
+        assert_reads(&store, &reading, name);
+        if let Some(count) = count {
+            assert_eq!(store.get_state_len("s").unwrap(), Some(count), "{name}: get_state_len as it was");
         }
     }
 }
 
 #[test]
-fn a_damaged_branch_reads_its_true_value_at_a_past_sequence() {
-    for (name, change, old_delta, mut expected) in cases() {
+fn a_damaged_branch_reads_as_it_did_at_a_past_sequence() {
+    for (name, change, old_delta, mut reading, _) in cases() {
         let dir = TempDir::new().unwrap();
         let store = damaged_branch(&dir, &change, old_delta);
         let before_3 = chronicle::Sequence(store.current_branch().head.0 - 1);
         let store = reopened(store, &dir);
-        expected.pop();
+        reading.pop();
         let at: Vec<Value> = serde_json::from_slice(&store.get_state_at("s", before_3).unwrap().unwrap()).unwrap();
-        assert_eq!(at, expected, "{name}");
+        assert_eq!(at, reading, "{name}");
     }
 }
 
 #[test]
-fn a_branch_made_from_a_damaged_branch_starts_from_its_true_value() {
-    for (name, change, old_delta, mut expected) in cases() {
+fn a_later_redact_or_edit_on_a_damaged_branch_takes_the_item_its_position_names_there() {
+    for (name, change, old_delta, reading, _) in cases() {
+        let at = if name == "Delta" { 1 } else { 2 };
+        let mut removed = reading.clone();
+        removed.remove(at);
+        let mut edited = reading.clone();
+        edited[at] = json!("edited later");
+        for (later, operation, expected) in [
+            ("Redact", StateOperation::Redact { start: at, end: at + 1 }, removed),
+            ("Edit", StateOperation::Edit { index: at, new_value: bytes(json!("edited later")) }, edited),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let store = damaged_branch(&dir, &change, old_delta.clone());
+            op(&store, operation);
+            let store = reopened(store, &dir);
+            assert_reads(&store, &expected, &format!("{name}, then a later {later}"));
+        }
+    }
+}
+
+#[test]
+fn a_branch_made_from_a_damaged_branch_starts_from_its_reading() {
+    for (name, change, old_delta, mut reading, _) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
         store.create_branch_at("grandchild", "child", store.current_branch().head).unwrap();
         store.switch_branch("grandchild").unwrap();
-        assert_eq!(value(&store), expected, "{name}: its value at the point");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}: its count at the point");
-        store.set_auto_snapshot(false);
-        append(&store, json!(4));
-        append(&store, json!(5));
-        assert_eq!(store.snapshot_needed("s"), None, "{name}: no delta is due across the change");
-        expected.extend([json!(4), json!(5)]);
-        assert_eq!(value(&store), expected, "{name}");
+        assert_reads(&store, &reading, &format!("{name}: at the point"));
+        assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: its count at the point");
+        for v in 4..8 {
+            append(&store, json!(v));
+            reading.push(json!(v));
+        }
+        assert_reads(&store, &reading, &format!("{name}: after four appends"));
+        assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: its count after four appends");
     }
 }
 
 #[test]
-fn a_full_snapshot_of_a_damaged_branch_keeps_its_true_value() {
-    for (name, change, old_delta, expected) in cases() {
+fn a_full_snapshot_of_a_damaged_branch_keeps_its_reading() {
+    for (name, change, old_delta, reading, _) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
+        let full_before = store.get_compaction_stats("s").unwrap().last_full_snapshot_offset;
         store.compact_state("s").unwrap();
+        let full_after = store.get_compaction_stats("s").unwrap().last_full_snapshot_offset;
+        assert!(full_after.is_some() && full_after != full_before, "{name}: setup, a full snapshot taken");
         let store = reopened(store, &dir);
-        assert_eq!(value(&store), expected, "{name}");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(expected.len()), "{name}: the full snapshot's count");
+        assert_reads(&store, &reading, name);
+        assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: the full snapshot's count");
     }
 }
 
@@ -173,30 +210,6 @@ fn a_delta_with_only_appends_behind_it_stands_for_them() {
     assert_eq!(value(&store), vec![json!(0), json!(1), json!(2), json!(3), json!(4)]);
     let tail: Vec<Value> = serde_json::from_slice(&store.get_state_tail("s", 3).unwrap().unwrap()).unwrap();
     assert_eq!(tail, vec![json!(2), json!(3), json!(4)], "a tail no longer than asked, whatever the stored count");
-}
-
-#[test]
-fn a_field_index_an_earlier_release_saved_is_built_again() {
-    let dir = TempDir::new().unwrap();
-    let store = store(&dir);
-    for id in ["a", "b"] {
-        append(&store, json!({ "id": id }));
-    }
-    store.register_state_field_index("s", "/id", chronicle::FieldIndexKind::String).unwrap();
-    store.sync().unwrap();
-    drop(store);
-    let store = Store::open(config(&dir, false)).unwrap();
-    assert_eq!(store.query_state_index_eq("s", "/id", "b", None, None), Some(vec![1]), "setup: this release's file is taken up");
-    drop(store);
-    let path = dir.path().join("store").join("state-indexes.bin");
-    let mut file = std::fs::read(&path).unwrap();
-    assert_eq!(&file[..4], b"SFI\0", "setup: the index file");
-    file[4] = 2;
-    std::fs::write(&path, file).unwrap();
-    let store = Store::open(config(&dir, false)).unwrap();
-    assert_eq!(store.query_state_index_eq("s", "/id", "b", None, None), None, "not taken up");
-    store.register_state_field_index("s", "/id", chronicle::FieldIndexKind::String).unwrap();
-    assert_eq!(store.query_state_index_eq("s", "/id", "b", None, None), Some(vec![1]));
 }
 
 #[test]

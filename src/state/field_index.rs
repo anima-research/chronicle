@@ -48,7 +48,12 @@ use std::path::Path;
 /// Magic bytes for the persisted state field-index file.
 const FIELD_INDEX_MAGIC: &[u8; 4] = b"SFI\0";
 
-const FIELD_INDEX_VERSION: u8 = 3;
+/// Current field-index file format version. Bumped from 1 -> 2 when
+/// `branch_id`/`head_offset` were added to the persisted shape (never
+/// released, so no real back-compat burden — bumped anyway so a leftover
+/// v1 file fails the version check and loads as `None` rather than
+/// misparsing).
+const FIELD_INDEX_VERSION: u8 = 2;
 
 /// The declared type of a registered field index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

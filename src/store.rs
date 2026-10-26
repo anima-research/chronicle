@@ -940,10 +940,10 @@ impl Store {
 
     /// Get the last N items from an AppendLog state.
     ///
-    /// Reads back from the head only as far as it needs, and through the
-    /// stretch behind each delta snapshot it takes items from: O(count +
-    /// recent_ops + one stretch per such delta). Returns at most `count`
-    /// items.
+    /// Reads back from the head only as far as it needs: O(count +
+    /// recent_ops). Where it meets a Redact, Edit, Set or Delta, or `count`
+    /// reaches the stored item count, it reads the whole value instead.
+    /// Returns at most `count` items.
     pub fn get_state_tail(&self, state_id: &str, count: usize) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
         let head = match self.state.get_head(branch_id, state_id) {
