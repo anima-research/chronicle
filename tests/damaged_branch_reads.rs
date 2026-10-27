@@ -66,28 +66,28 @@ fn reopened(store: Store, dir: &TempDir) -> Store {
     store
 }
 
-fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>, Option<usize>)> {
+fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>, usize)> {
     vec![
         (
             "Redact",
             vec![StateOperation::Redact { start: 1, end: 100 }],
             json!([2]),
             vec![json!(0), json!(1), json!(2), json!(3)],
-            Some(3),
+            3,
         ),
         (
             "Edit",
             vec![StateOperation::Edit { index: 1, new_value: bytes(json!("edited")) }],
             json!([2]),
             vec![json!(0), json!(1), json!(2), json!(3)],
-            Some(4),
+            4,
         ),
         (
             "Set",
             vec![StateOperation::Append(bytes(json!(7))), StateOperation::Set(bytes(json!([9])))],
             json!([7, 2]),
             vec![json!(9), json!(7), json!(2), json!(3)],
-            Some(3),
+            3,
         ),
         (
             "Delta",
@@ -97,7 +97,7 @@ fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>, Option<
             ],
             json!([7, 2]),
             vec![json!(0), json!(1), json!(7), json!(2), json!(3)],
-            None,
+            3,
         ),
     ]
 }
@@ -121,9 +121,7 @@ fn a_damaged_branch_reads_as_it_did() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
         assert_reads(&store, &reading, name);
-        if let Some(count) = count {
-            assert_eq!(store.get_state_len("s").unwrap(), Some(count), "{name}: get_state_len as it was");
-        }
+        assert_eq!(store.get_state_len("s").unwrap(), Some(count), "{name}: get_state_len as it was");
     }
 }
 

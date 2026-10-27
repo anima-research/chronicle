@@ -2319,6 +2319,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_head_an_earlier_release_left_across_a_change_keeps_its_reading_and_takes_deltas() {
+        let n = |v: i64| serde_json::to_vec(&json!(v)).unwrap();
+        let read = |store: &Store| -> serde_json::Value { serde_json::from_slice(&store.get_state("s").unwrap().unwrap()).unwrap() };
+        let reads_alike = |store: &Store, expected: &serde_json::Value, what: &str| {
+            let len = expected.as_array().unwrap().len();
+            assert_eq!(&read(store), expected, "{what}: get_state");
+            let slice: serde_json::Value = serde_json::from_slice(&store.get_state_slice("s", 0, len).unwrap().unwrap()).unwrap();
+            assert_eq!(&slice, expected, "{what}: get_state_slice");
+            let items: Vec<serde_json::Value> = store.iter_state_items("s").unwrap().unwrap().map(|i| i.unwrap()).collect();
+            assert_eq!(&json!(items), expected, "{what}: iter_state_items");
+            for k in 1..=len {
+                let tail: serde_json::Value = serde_json::from_slice(&store.get_state_tail("s", k).unwrap().unwrap()).unwrap();
+                assert_eq!(tail, json!(expected.as_array().unwrap()[len - k..]), "{what}: get_state_tail({k})");
+            }
+        };
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "s".to_string(),
+                strategy: crate::types::StateStrategy::AppendLog { delta_snapshot_every: 2, full_snapshot_every: 100 },
+                initial_value: None,
+            })
+            .unwrap();
+        for v in [0, 1] {
+            store.update_state("s", StateOperation::Append(n(v))).unwrap();
+        }
+        store.update_state("s", StateOperation::Redact { start: 1, end: 100 }).unwrap();
+        store.set_auto_snapshot(false);
+        for v in [2, 3] {
+            store.update_state("s", StateOperation::Append(n(v))).unwrap();
+        }
+        store.update_state("s", StateOperation::DeltaSnapshot(serde_json::to_vec(&json!([2, 3])).unwrap())).unwrap();
+        let main = store.current_branch().id;
+        let head = store.state.get_head(main, "s").unwrap();
+        store.state.set_head_for_branch(main, "s", head.head_offset, head.item_count, false);
+        store.sync().unwrap();
+        drop(store);
+        let store = Store::open(StoreConfig { create_if_missing: false, ..test_config(&dir) }).unwrap();
+        let head = store.state.get_head(main, "s").unwrap();
+        assert!(!head.has_non_append_since_snapshot, "setup: the head holds false, as an earlier release saved it");
+        let old = json!([0, 1, 2, 3]);
+        reads_alike(&store, &old, "at the old head");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(3), "its count, short of the reading");
+        store.set_auto_snapshot(false);
+        for v in [4, 5] {
+            store.update_state("s", StateOperation::Append(n(v))).unwrap();
+        }
+        assert_eq!(store.snapshot_needed("s"), Some(crate::state::SnapshotNeeded::Delta), "a delta comes due on top of the old one");
+        let deltas = store.get_compaction_stats("s").unwrap().delta_snapshots_since_full;
+        store.create_snapshot_if_needed("s").unwrap();
+        let stats = store.get_compaction_stats("s").unwrap();
+        assert_eq!((stats.delta_snapshots_since_full, stats.last_full_snapshot_offset), (deltas + 1, None), "it was taken as a delta");
+        drop(store);
+        let store = Store::open(StoreConfig { create_if_missing: false, ..test_config(&dir) }).unwrap();
+        reads_alike(&store, &json!([0, 1, 2, 3, 4, 5]), "after the new delta and a reopen");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(5));
+    }
+
     /// Opens a store this process closed a moment ago. A child that a
     /// concurrent test spawns shares this process's open files until it
     /// execs, the store's LOCK among them, so the lock can still be held

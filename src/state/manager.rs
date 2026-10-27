@@ -107,8 +107,11 @@ pub struct StateChainHead {
     /// Whether a Redact, an Edit, a Set or a Delta lies in this state's chain
     /// since its last full snapshot. While true, an `append_log` state takes no delta
     /// snapshot. Any full snapshot clears it. A head an earlier release saved
-    /// may hold false with such a change in its chain; when a delta snapshot
-    /// comes due there, the store takes a full one instead.
+    /// may hold false with such a change in its chain. When a delta snapshot
+    /// comes due across such a change, the store takes a full one instead;
+    /// where the change already lies behind a delta snapshot that release
+    /// took, the store goes on taking delta snapshots, which keep the reading
+    /// that delta gives.
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
