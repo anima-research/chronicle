@@ -82,6 +82,12 @@ enum BranchEvent {
     Deleted { name: String },
 }
 
+struct ChainInfoAt {
+    head_offset: u64,
+    item_count: usize,
+    non_append_since_snapshot: bool,
+}
+
 /// The main record store.
 ///
 /// Provides a unified interface for:
@@ -817,51 +823,9 @@ impl Store {
             None => return Ok(None),
         };
 
-        // Walk chain backwards, collecting operations at or before target sequence
-        let mut operations = Vec::new();
-        let mut current_offset = Some(head.head_offset);
-        let mut hit_snapshot = false;
-        let mut found_any = false;
-
-        while let Some(offset) = current_offset {
-            let record = self.log.read_at(offset)?;
-
-            // Skip if this record is after the target sequence
-            if record.sequence > at_sequence {
-                // Parse just to get prev_update_offset
-                let update = StateUpdateRecord::decode(&record)?;
-                current_offset = update.prev_update_offset;
-                continue;
-            }
-
-            found_any = true;
-
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Full-state terminal (Set replaces state exactly like
-                    // Snapshot in materialize_operations); stop the walk. Not
-                    // treating Set as terminal here made Snapshot-strategy
-                    // reconstruction O(full chain). Mirrors get_state_tail.
-                    operations.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
-
-        if !found_any {
+        let mut walk = crate::state::ChainWalk::new(&self.log, head.head_offset, Some(at_sequence));
+        let mut operations = (&mut walk).collect::<Result<Vec<_>>>()?;
+        if walk.first_offset().is_none() {
             // State didn't exist at that sequence
             return Ok(None);
         }
@@ -873,72 +837,25 @@ impl Store {
         Ok(Some(state))
     }
 
-    /// Find the chain head info (offset and item count) at a historical sequence.
-    ///
-    /// Used by `create_branch_at` to point a new branch at an existing chain position
-    /// without writing new records. Returns `(head_offset, item_count)` or None if
-    /// no state existed at that sequence.
     fn find_chain_info_at(
         &self,
         branch_id: crate::types::BranchId,
         state_id: &str,
         at_sequence: Sequence,
-    ) -> Result<Option<(u64, usize)>> {
+    ) -> Result<Option<ChainInfoAt>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
         };
 
-        // Walk chain to find the last update at or before target sequence
-        let mut current_offset = Some(head.head_offset);
-        let mut found_offset: Option<u64> = None;
-        let mut operations = Vec::new();
-        let mut hit_snapshot = false;
-
-        while let Some(offset) = current_offset {
-            let record = self.log.read_at(offset)?;
-
-            let update = StateUpdateRecord::decode(&record)?;
-
-            // Skip if this record is after the target sequence
-            if record.sequence > at_sequence {
-                current_offset = update.prev_update_offset;
-                continue;
-            }
-
-            // This is the first record at or before target - it becomes our head
-            if found_offset.is_none() {
-                found_offset = Some(offset);
-            }
-
-            // Collect operations to compute item_count
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Full-state terminal (Set replaces state exactly like
-                    // Snapshot in materialize_operations); stop the walk. Not
-                    // treating Set as terminal here made Snapshot-strategy
-                    // reconstruction O(full chain). Mirrors get_state_tail.
-                    operations.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
-
-        let head_offset = match found_offset {
+        let mut walk = crate::state::ChainWalk::new(&self.log, head.head_offset, Some(at_sequence));
+        let mut operations = (&mut walk).collect::<Result<Vec<_>>>()?;
+        let head_offset = match walk.first_offset() {
             Some(o) => o,
             None => return Ok(None), // No state at that sequence
         };
+        let non_append_since_snapshot =
+            operations.iter().any(crate::state::is_non_append_change) || walk.changed_behind_delta();
 
         // Reconstruct state to count items (single materialization pass)
         operations.reverse();
@@ -962,7 +879,7 @@ impl Store {
             }
         };
 
-        Ok(Some((head_offset, item_count)))
+        Ok(Some(ChainInfoAt { head_offset, item_count, non_append_since_snapshot }))
     }
 
     /// Get the length of an AppendLog state without loading all items.
@@ -1031,8 +948,10 @@ impl Store {
 
     /// Get the last N items from an AppendLog state.
     ///
-    /// This is O(count + recent_ops) - only traverses as far back as needed.
-    /// For states with many items but few recent changes, this is very fast.
+    /// Reads back from the head only as far as it needs, decoding each
+    /// snapshot or Set it takes items from. Where it meets a Redact, an Edit
+    /// or a Delta, or `count` reaches the stored item count, it reads the
+    /// whole value instead. Returns at most `count` items.
     pub fn get_state_tail(&self, state_id: &str, count: usize) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
         let head = match self.state.get_head(branch_id, state_id) {
@@ -1045,82 +964,42 @@ impl Store {
         }
 
         // Fast path: if requesting more items than exist, use full reconstruction
-        if count >= head.item_count {
-            return self.get_state(state_id);
-        }
+        let mut need_full_reconstruct = count >= head.item_count;
 
         // Collect items walking backwards until we have enough
-        // We need to handle: Append (add 1), DeltaSnapshot (add N), Snapshot (stop), Redact/Edit (complex)
         let mut items_collected: Vec<serde_json::Value> = Vec::new();
-        let mut current_offset = Some(head.head_offset);
-        let mut need_full_reconstruct = false;
+        let mut walk = crate::state::ChainWalk::new(&self.log, head.head_offset, None);
+        let take_last = |items_collected: &mut Vec<serde_json::Value>, data: &[u8]| -> Result<()> {
+            let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let need = count - items_collected.len();
+            let start = arr.len().saturating_sub(need);
+            items_collected.extend(arr[start..].iter().rev().cloned());
+            Ok(())
+        };
 
-        while let Some(offset) = current_offset {
-            if items_collected.len() >= count {
-                break;
-            }
-
-            let record = self.log.read_at(offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
+        while !need_full_reconstruct && items_collected.len() < count {
+            let op = match walk.next() {
+                Some(op) => op?,
+                None => break,
+            };
+            match &op {
                 StateOperation::Append(item) => {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     items_collected.push(value);
                 }
-                StateOperation::DeltaSnapshot(data) => {
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    // Take from end of delta to fill our need
-                    let need = count - items_collected.len();
-                    let start = arr.len().saturating_sub(need);
-                    for item in arr[start..].iter().rev() {
-                        items_collected.push(item.clone());
-                        if items_collected.len() >= count {
-                            break;
-                        }
-                    }
-                }
-                StateOperation::Snapshot(data) => {
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    // Take from end of snapshot
-                    let need = count - items_collected.len();
-                    let start = arr.len().saturating_sub(need);
-                    for item in arr[start..].iter().rev() {
-                        items_collected.push(item.clone());
-                        if items_collected.len() >= count {
-                            break;
-                        }
-                    }
-                    break; // Full snapshot - we're done
-                }
-                StateOperation::Set(data) => {
-                    // Set replaces the entire state - it is a full-state
-                    // terminal, exactly like Snapshot. Walking past it would
-                    // resurrect replaced items.
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    let need = count - items_collected.len();
-                    let start = arr.len().saturating_sub(need);
-                    for item in arr[start..].iter().rev() {
-                        items_collected.push(item.clone());
-                        if items_collected.len() >= count {
-                            break;
-                        }
-                    }
+                StateOperation::DeltaSnapshot(data) => take_last(&mut items_collected, data)?,
+                StateOperation::Snapshot(data) | StateOperation::Set(data) => {
+                    take_last(&mut items_collected, data)?;
                     break; // Full state - we're done
                 }
-                StateOperation::Edit { .. } | StateOperation::Redact { .. } => {
-                    // Edit/Redact make tail optimization complex - fall back to full reconstruct
+                op if crate::state::is_non_append_change(op) => {
                     need_full_reconstruct = true;
                     break;
                 }
                 _ => {}
             }
-
-            current_offset = update.prev_update_offset;
         }
 
         if need_full_reconstruct {
@@ -1138,96 +1017,6 @@ impl Store {
         // Reverse since we collected in reverse order
         items_collected.reverse();
         Ok(Some(serde_json::to_vec(&items_collected)?))
-    }
-
-    /// Legacy implementation for reference - walks entire chain
-    #[allow(dead_code)]
-    fn get_state_tail_full_reconstruct(&self, state_id: &str, count: usize) -> Result<Option<Vec<u8>>> {
-        let branch_id = self.branches.current_branch().id;
-        let head = match self.state.get_head(branch_id, state_id) {
-            Some(h) => h,
-            None => return Ok(None),
-        };
-
-        if count == 0 {
-            return Ok(Some(serde_json::to_vec(&Vec::<serde_json::Value>::new())?));
-        }
-
-        // Collect all items in proper order by traversing the chain
-        let mut all_items: Vec<serde_json::Value> = Vec::new();
-        let mut current_offset = Some(head.head_offset);
-        let mut hit_snapshot = false;
-
-        // First pass: collect operations in reverse order
-        let mut ops: Vec<StateOperation> = Vec::new();
-
-        while let Some(offset) = current_offset {
-            let record = self.log.read_at(offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Both replace the entire state - nothing older matters
-                    ops.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) => {
-                    ops.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    if !hit_snapshot {
-                        ops.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
-
-        // Apply operations in forward order (reverse of collection order)
-        ops.reverse();
-        for op in ops {
-            match op {
-                StateOperation::Append(item) => {
-                    let value: serde_json::Value = serde_json::from_slice(&item)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    all_items.push(value);
-                }
-                StateOperation::Snapshot(data) | StateOperation::DeltaSnapshot(data) => {
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    all_items.extend(arr);
-                }
-                StateOperation::Set(data) => {
-                    // Set replaces the entire state
-                    let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
-                        .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                    all_items = arr;
-                }
-                StateOperation::Redact { start, end } => {
-                    let start = start.min(all_items.len());
-                    let end = end.min(all_items.len());
-                    if start < end {
-                        all_items.drain(start..end);
-                    }
-                }
-                StateOperation::Edit { index, new_value } => {
-                    if index < all_items.len() {
-                        let value: serde_json::Value = serde_json::from_slice(&new_value)
-                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                        all_items[index] = value;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Take the last `count` items
-        let start = all_items.len().saturating_sub(count);
-        let tail: Vec<_> = all_items[start..].to_vec();
-
-        Ok(Some(serde_json::to_vec(&tail)?))
     }
 
     /// Iterate over items in an AppendLog state without loading all into memory.
@@ -1369,17 +1158,19 @@ impl Store {
     ) -> Result<Option<Record>> {
         use crate::state::SnapshotNeeded;
 
+        let full = || -> Result<Option<Record>> {
+            let current = self.get_state(state_id)?.unwrap_or_default();
+            let record = self.update_state_internal(
+                state_id,
+                StateOperation::Snapshot(current),
+                skip_auto,
+            )?;
+            Ok(Some(record))
+        };
+
         match self.state.snapshot_needed(self.branches.current_branch().id, state_id) {
             None => Ok(None),
-            Some(SnapshotNeeded::Full) => {
-                let current = self.get_state(state_id)?.unwrap_or_default();
-                let record = self.update_state_internal(
-                    state_id,
-                    StateOperation::Snapshot(current),
-                    skip_auto,
-                )?;
-                Ok(Some(record))
-            }
+            Some(SnapshotNeeded::Full) => full(),
             Some(SnapshotNeeded::Delta) => {
                 // Check if this is a Tree strategy (uses TreeDeltaSnapshot) or AppendLog (uses DeltaSnapshot)
                 let is_tree = matches!(
@@ -1395,13 +1186,17 @@ impl Store {
                     )?;
                     Ok(Some(record))
                 } else {
-                    let delta_items = self.compute_delta_items(state_id)?;
-                    let record = self.update_state_internal(
-                        state_id,
-                        StateOperation::DeltaSnapshot(delta_items),
-                        skip_auto,
-                    )?;
-                    Ok(Some(record))
+                    match self.compute_delta_items(state_id)? {
+                        Some(delta_items) => {
+                            let record = self.update_state_internal(
+                                state_id,
+                                StateOperation::DeltaSnapshot(delta_items),
+                                skip_auto,
+                            )?;
+                            Ok(Some(record))
+                        }
+                        None => full(),
+                    }
                 }
             }
         }
@@ -1416,11 +1211,13 @@ impl Store {
 
     /// Compute items added since the last delta or full snapshot.
     ///
-    /// This walks the chain collecting Append operations until hitting a snapshot.
-    fn compute_delta_items(&self, state_id: &str) -> Result<Vec<u8>> {
+    /// This walks the chain collecting Append operations until hitting a full or
+    /// delta snapshot, and returns None if it meets a Redact, an Edit, a Set or a
+    /// Delta first.
+    fn compute_delta_items(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
             Some(h) => h,
-            None => return Ok(serde_json::to_vec(&Vec::<serde_json::Value>::new())?),
+            None => return Ok(Some(serde_json::to_vec(&Vec::<serde_json::Value>::new())?)),
         };
 
         // Walk chain backwards, collecting append operations until snapshot
@@ -1441,10 +1238,8 @@ impl Store {
                     // Hit a snapshot, stop collecting
                     break;
                 }
-                _ => {
-                    // Other operations (Edit, Redact) - for now, fall back to full state
-                    // This is a simplification; proper delta handling would track edits too
-                }
+                op if crate::state::is_non_append_change(op) => return Ok(None),
+                _ => {}
             }
 
             current_offset = update.prev_update_offset;
@@ -1453,7 +1248,9 @@ impl Store {
         // Reverse since we collected in reverse order
         appended_items.reverse();
 
-        serde_json::to_vec(&appended_items).map_err(|e| StoreError::Serialization(e.to_string()))
+        serde_json::to_vec(&appended_items)
+            .map(Some)
+            .map_err(|e| StoreError::Serialization(e.to_string()))
     }
 
     /// Compute tree operations since the last delta or full snapshot.
@@ -1886,16 +1683,19 @@ impl Store {
         }
         let mut heads = Vec::new();
         for state_id in self.state.state_ids() {
-            if let Some((head_offset, item_count)) =
-                self.find_chain_info_at(parent.id, &state_id, at)?
-            {
-                heads.push((state_id, head_offset, item_count));
+            if let Some(info) = self.find_chain_info_at(parent.id, &state_id, at)? {
+                heads.push((state_id, info));
             }
         }
         let new_branch = self.branches.create_branch_at(name, from, at)?;
-        for (state_id, head_offset, item_count) in heads {
-            self.state
-                .set_head_for_branch(new_branch.id, &state_id, head_offset, item_count);
+        for (state_id, info) in heads {
+            self.state.set_head_for_branch(
+                new_branch.id,
+                &state_id,
+                info.head_offset,
+                info.item_count,
+                info.non_append_since_snapshot,
+            );
         }
 
         write.checkpoint_required = true;
@@ -2380,34 +2180,8 @@ impl StateItemIterator {
         }
 
         // Two-pass approach: collect operations, reverse, apply
-        let mut ops: Vec<StateOperation> = Vec::new();
-        let mut current_offset = Some(self.head_offset);
-        let mut hit_snapshot = false;
-
-        // Pass 1: Collect operations in reverse order
-        while let Some(offset) = current_offset {
-            let record = self.log.read_at(offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Both replace the entire state - nothing older matters
-                    ops.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) => {
-                    ops.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    if !hit_snapshot {
-                        ops.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
+        let mut ops = crate::state::ChainWalk::new(&self.log, self.head_offset, None)
+            .collect::<Result<Vec<_>>>()?;
 
         // Pass 2: Apply operations in forward order
         ops.reverse();
@@ -2423,8 +2197,7 @@ impl StateItemIterator {
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer.extend(arr);
                 }
-                StateOperation::Set(data) => {
-                    // Set replaces the entire state
+                StateOperation::Set(data) | StateOperation::Delta { new_value: data, .. } => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer = arr;
@@ -2484,6 +2257,134 @@ mod tests {
             blob_cache_size: 100,
             create_if_missing: true,
         }
+    }
+
+    #[test]
+    fn a_head_whose_flag_missed_a_change_takes_a_full_snapshot_not_a_delta() {
+        let n = |v: i64| serde_json::to_vec(&json!(v)).unwrap();
+        let cases: Vec<(&str, Vec<StateOperation>, serde_json::Value)> = vec![
+            ("Redact", vec![StateOperation::Redact { start: 1, end: 100 }], json!([0, 2, 3])),
+            (
+                "Edit",
+                vec![StateOperation::Edit { index: 0, new_value: serde_json::to_vec(&json!("e")).unwrap() }],
+                json!(["e", 1, 2, 3]),
+            ),
+            (
+                "Set",
+                vec![StateOperation::Append(n(7)), StateOperation::Set(serde_json::to_vec(&json!([9])).unwrap())],
+                json!([9, 2, 3]),
+            ),
+            (
+                "Delta",
+                vec![
+                    StateOperation::Append(n(7)),
+                    StateOperation::Delta {
+                        old_hash: crate::types::Hash([0; 32]),
+                        new_value: serde_json::to_vec(&json!([9])).unwrap(),
+                    },
+                ],
+                json!([9, 2, 3]),
+            ),
+        ];
+        for (name, change, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            let store = Store::create(test_config(&dir)).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "s".to_string(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 2,
+                        full_snapshot_every: 100,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for v in [0, 1] {
+                store.update_state("s", StateOperation::Append(n(v))).unwrap();
+            }
+            for op in change {
+                store.update_state("s", op).unwrap();
+            }
+            let child = store.create_branch_at("child", "main", store.current_branch().head).unwrap();
+            let head = store.state.get_head(child.id, "s").unwrap();
+            assert!(head.has_non_append_since_snapshot, "{name}: setup: the branch inherits the flag");
+            store.state.set_head_for_branch(child.id, "s", head.head_offset, head.item_count, false);
+            store.switch_branch("child").unwrap();
+            for v in [2, 3] {
+                store.update_state("s", StateOperation::Append(n(v))).unwrap();
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&store.get_state("s").unwrap().unwrap()).unwrap();
+            assert_eq!(value, expected, "{name}");
+            let head = store.state.get_head(child.id, "s").unwrap();
+            assert!(head.last_full_snapshot_offset.is_some(), "{name}: the snapshot that came due was a full one");
+            assert!(!head.has_non_append_since_snapshot, "{name}");
+            assert_eq!(
+                store.get_state_len("s").unwrap(),
+                Some(expected.as_array().unwrap().len()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_head_an_earlier_release_left_across_a_change_keeps_its_reading_and_takes_deltas() {
+        let n = |v: i64| serde_json::to_vec(&json!(v)).unwrap();
+        let read = |store: &Store| -> serde_json::Value { serde_json::from_slice(&store.get_state("s").unwrap().unwrap()).unwrap() };
+        let reads_alike = |store: &Store, expected: &serde_json::Value, what: &str| {
+            let len = expected.as_array().unwrap().len();
+            assert_eq!(&read(store), expected, "{what}: get_state");
+            let slice: serde_json::Value = serde_json::from_slice(&store.get_state_slice("s", 0, len).unwrap().unwrap()).unwrap();
+            assert_eq!(&slice, expected, "{what}: get_state_slice");
+            let items: Vec<serde_json::Value> = store.iter_state_items("s").unwrap().unwrap().map(|i| i.unwrap()).collect();
+            assert_eq!(&json!(items), expected, "{what}: iter_state_items");
+            for k in 1..=len {
+                let tail: serde_json::Value = serde_json::from_slice(&store.get_state_tail("s", k).unwrap().unwrap()).unwrap();
+                assert_eq!(tail, json!(expected.as_array().unwrap()[len - k..]), "{what}: get_state_tail({k})");
+            }
+        };
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "s".to_string(),
+                strategy: crate::types::StateStrategy::AppendLog { delta_snapshot_every: 2, full_snapshot_every: 100 },
+                initial_value: None,
+            })
+            .unwrap();
+        for v in [0, 1] {
+            store.update_state("s", StateOperation::Append(n(v))).unwrap();
+        }
+        store.update_state("s", StateOperation::Redact { start: 1, end: 100 }).unwrap();
+        store.set_auto_snapshot(false);
+        for v in [2, 3] {
+            store.update_state("s", StateOperation::Append(n(v))).unwrap();
+        }
+        store.update_state("s", StateOperation::DeltaSnapshot(serde_json::to_vec(&json!([2, 3])).unwrap())).unwrap();
+        let main = store.current_branch().id;
+        let head = store.state.get_head(main, "s").unwrap();
+        store.state.set_head_for_branch(main, "s", head.head_offset, head.item_count, false);
+        store.sync().unwrap();
+        drop(store);
+        let store = reopen(test_config(&dir));
+        let head = store.state.get_head(main, "s").unwrap();
+        assert!(!head.has_non_append_since_snapshot, "setup: the head holds false, as an earlier release saved it");
+        let old = json!([0, 1, 2, 3]);
+        reads_alike(&store, &old, "at the old head");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(3), "its count, short of the reading");
+        store.set_auto_snapshot(false);
+        for v in [4, 5] {
+            store.update_state("s", StateOperation::Append(n(v))).unwrap();
+        }
+        assert_eq!(store.snapshot_needed("s"), Some(crate::state::SnapshotNeeded::Delta), "a delta comes due on top of the old one");
+        let deltas = store.get_compaction_stats("s").unwrap().delta_snapshots_since_full;
+        store.create_snapshot_if_needed("s").unwrap();
+        let stats = store.get_compaction_stats("s").unwrap();
+        assert_eq!((stats.delta_snapshots_since_full, stats.last_full_snapshot_offset), (deltas + 1, None), "it was taken as a delta");
+        drop(store);
+        let store = reopen(test_config(&dir));
+        reads_alike(&store, &json!([0, 1, 2, 3, 4, 5]), "after the new delta and a reopen");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(5));
     }
 
     /// Opens a store this process closed a moment ago. A child that a
