@@ -9,22 +9,26 @@
   snapshot comes due across such a change, the store now takes a full
   snapshot of its value instead.
 - A branch that already took such a delta snapshot under an earlier release
-  keeps reading what it read there. After a Redact or a `Set`, that reading
-  holds items the change had removed, while `getStateLen` counts without
+  reads as it did under 0.4.0. After a Redact or a `Set`, that reading can
+  hold items the change had removed, while `getStateLen` counts without
   them, so a read bounded by the count, such as `getStateSlice` up to the
   length, misses the newest items until the branch's next full snapshot,
   which then keeps that reading and counts it. Until then, `getStateLen`
-  short of the length of `getState`'s value marks such a branch, though a
-  later Redact that runs past the count can bring the two level without
-  removing those items. After an Edit, the edit stays lost, and nothing
-  marks the branch. After a `Delta`, which only Rust callers can write, the
-  reading holds the values it replaced. A later Redact or Edit applies to
-  that reading as under earlier releases, which also refuse an Edit at or
-  past the count. On such a branch, `getStateItemJson` at `getStateLen()`
-  less one can answer with the newest item rather than the one at that
-  position in the reading, depending on what the store has cached, as under
-  earlier releases. `compactState` on the branch makes `getStateLen` count
-  the reading, and keeps the reading.
+  short of the length of `getStateJson`'s array marks such a branch, though
+  a later Redact that runs past the count can bring the two level without
+  removing those items. A branch that 0.2.2 or an earlier release damaged
+  after an Append and a `Set` can instead have a `getStateLen` above that
+  length. After an Edit, the edit stays lost, and nothing marks the branch.
+  After a `Delta`, which only Rust callers can write, the reading holds the
+  values it replaced. A later Redact or Edit applies to that reading as
+  under 0.4.0, which also refuses an Edit at or past the count; only the
+  count that a Redact running past the count leaves can differ, as this
+  release's fix to that count says. On such a branch, while the newest
+  operation on it is an Append, with no snapshot taken since,
+  `getStateItemJson` at `getStateLen()` less one can answer with that
+  appended item rather than the one at that position in the reading,
+  depending on what the store has cached, as under 0.4.0. `compactState` on
+  the branch makes `getStateLen` count the reading, and keeps the reading.
 - `getStateTail` no longer returns some items twice. Once it had taken a
   delta snapshot's items and needed more, it read on into the Appends that
   snapshot stood for and returned them again: on a state taking a delta
