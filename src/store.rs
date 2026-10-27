@@ -134,27 +134,80 @@ pub struct Store {
 
 impl Store {
     /// Open an existing store or create a new one.
+    ///
+    /// A directory holds a store when it holds its `MANIFEST`, and is opened.
+    /// Without one, it is created into (when `create_if_missing` is set) only
+    /// if it is missing or holds nothing but what a new store can sit beside:
+    /// `lost+found` (a fresh volume's root), Finder's `.DS_Store`, and the `LOCK` and `blobs/` a
+    /// create leaves when it stops before its manifest. A directory holding
+    /// anything else, such as a mistaken path to a project, isn't taken for a
+    /// place to put a store; one holding a store's data files without a
+    /// `MANIFEST` is refused as a damaged store.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.exists() {
-            Self::open(config)
-        } else if config.create_if_missing {
+        if config.path.join("MANIFEST").exists() {
+            return Self::open(config);
+        }
+        if let Some(other) = Self::foreign_entry(&config.path) {
+            return Err(StoreError::InvalidFormat(format!(
+                "{} has no MANIFEST and holds {other}, so it isn't a Chronicle store or an empty place for one",
+                config.path.display()
+            )));
+        }
+        if config.create_if_missing {
             Self::create(config)
         } else {
             Err(StoreError::NotInitialized)
         }
     }
 
+    /// An entry a new store can't sit beside, in a directory with no MANIFEST:
+    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs`, the
+    /// staging file of a manifest save that was interrupted, and a store's own
+    /// data files
+    /// (which [`Store::create`] refuses as a damaged store, naming the file).
+    fn foreign_entry(path: &Path) -> Option<String> {
+        let allowed = |name: &str| {
+            ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
+                || Self::STORE_FILES.contains(&name)
+                || name.starts_with(crate::atomic_file::STAGING_PREFIX)
+        };
+        fs::read_dir(path).ok()?.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|name| !allowed(name))
+    }
+
     /// Create a new store.
+    ///
+    /// Refuses a directory that already holds a store: creating over one
+    /// used to keep its records but publish empty state and branch indexes
+    /// over its own at the first sync (#34). Use [`Store::open`] or
+    /// [`Store::open_or_create`] for a store that may exist.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
-        fs::create_dir_all(config.path.join("blobs"))?;
 
-        // Write manifest
-        Self::write_manifest(&config.path)?;
-
-        // Acquire lock
+        // The lock comes first, so a create aimed at a store another process
+        // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
+        if let Some(found) = Self::STORE_FILES.iter().find(|f| config.path.join(f).exists()) {
+            return Err(StoreError::InvalidOperation(if *found == "MANIFEST" {
+                format!(
+                    "create: {} already holds a Chronicle store; open it with open or open_or_create",
+                    config.path.display()
+                )
+            } else {
+                format!(
+                    "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over",
+                    config.path.display()
+                )
+            }));
+        }
+
+        // With the lock held, staging files here were left by interrupted
+        // saves, a create's own manifest save among them (as open sweeps them).
+        crate::atomic_file::remove_staging_files(&config.path);
+        fs::create_dir_all(config.path.join("blobs"))?;
+        Self::write_manifest(&config.path)?;
 
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
@@ -2043,24 +2096,31 @@ impl Store {
 
     // --- Private Helpers ---
 
+    /// The files whose presence means a directory already holds a store.
+    const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
+
+    // Published whole, through a staging file renamed over it, so a crash
+    // mid-write can't leave a MANIFEST that create refuses and open can't read.
     fn write_manifest(path: &Path) -> Result<()> {
-        use std::io::Write;
-
-        let manifest_path = path.join("MANIFEST");
-        let mut file = File::create(manifest_path)?;
-
-        file.write_all(STORE_MAGIC)?;
-        file.write_all(&[STORE_VERSION])?;
-        file.sync_all()?;
-
-        Ok(())
+        crate::atomic_file::Checkpoint::default().save(&path.join("MANIFEST"), &[STORE_MAGIC, &[STORE_VERSION]])
     }
 
     fn verify_manifest(path: &Path) -> Result<()> {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
-        let mut file = File::open(manifest_path)?;
+        let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StoreError::InvalidFormat(
+                match Self::STORE_FILES.iter().find(|f| path.join(f).exists()) {
+                    Some(found) => format!(
+                        "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
+                        path.display()
+                    ),
+                    None => format!("{} has no MANIFEST, so it isn't a Chronicle store", path.display()),
+                },
+            ),
+            _ => e.into(),
+        })?;
 
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
