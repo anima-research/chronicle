@@ -23,12 +23,17 @@
   values it replaced. A later Redact or Edit applies to that reading as
   under 0.4.0, which also refuses an Edit at or past the count; only the
   count that a Redact running past the count leaves can differ, as this
-  release's fix to that count says. On such a branch, while the newest
-  operation on it is an Append, with no snapshot taken since,
-  `getStateItemJson` at `getStateLen()` less one can answer with that
-  appended item rather than the one at that position in the reading,
-  depending on what the store has cached, as under 0.4.0. `compactState` on
-  the branch makes `getStateLen` count the reading, and keeps the reading.
+  release's fix to that count says. On a branch counted above its reading,
+  an Edit at an index past the reading's end but below the count is
+  accepted, after which `getState` fails with a corruption error, as under
+  0.4.0; `compactState` before any such Edit avoids it. On any branch that
+  took such a delta snapshot, while the newest operation on it is an Append,
+  with no snapshot taken since, `getStateItemJson` at `getStateLen()` less
+  one can answer with that appended item rather than what the reading holds
+  at that position, depending on what the store has cached, as under 0.4.0.
+  On a branch counted above its reading, the reading holds nothing there,
+  and the call otherwise answers null. `compactState` on the branch makes
+  `getStateLen` count the reading, and keeps the reading.
 - `getStateTail` no longer returns some items twice. Once it had taken a
   delta snapshot's items and needed more, it read on into the Appends that
   snapshot stood for and returned them again: on a state taking a delta
