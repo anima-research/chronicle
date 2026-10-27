@@ -1,10 +1,7 @@
-//! A blob's file is written under a staging name in `blobs/` and renamed into
-//! its shard, so a crash leaves it whole or absent. These go through the
-//! store: a torn file that an in-place write left is replaced by the next
-//! store of its content after a reopen, opening the store removes the
-//! staging files that interrupted stores left, but only with the lock held,
-//! and a store whose rename fails removes its own. A content type too long
-//! for its field is refused whatever the store holds.
+//! What a store's open does with the blob staging files that interrupted
+//! stores left, and the content-type limit for content a store already holds,
+//! through the store. tests/blob_storage.rs covers the blob write itself:
+//! damaged copies, links, stores that stop partway and a failed rename.
 
 use chronicle::{Hash, Store, StoreConfig, StoreError};
 use std::fs;
@@ -50,36 +47,6 @@ fn staged(store: &Path) -> usize {
             name.to_string_lossy().starts_with(".chronicle-blob-")
         })
         .count()
-}
-
-#[test]
-fn a_torn_blob_is_replaced_by_storing_its_content_after_a_reopen() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("store");
-    let content: Vec<u8> = (0..50_000u32).map(|i| (i % 249) as u8).collect();
-    let hash = {
-        let store = Store::create(config(&path)).unwrap();
-        store.store_blob(&content, "image/png").unwrap()
-    };
-    let file = blob_file(&path, &hash);
-    let whole = fs::read(&file).unwrap();
-    // What a crash in an in-place write leaves: the file cut short.
-    fs::write(&file, &whole[..whole.len() / 3]).unwrap();
-
-    let store = reopen(&path);
-    assert!(store.blob_exists(&hash), "a file is there, whole or not");
-    assert!(store.get_blob(&hash).is_err());
-    assert_eq!(store.store_blob(&content, "image/png").unwrap(), hash);
-    assert_eq!(fs::read(&file).unwrap(), whole);
-    drop(store);
-
-    let store = reopen(&path);
-    let blob = store.get_blob(&hash).unwrap().unwrap();
-    assert_eq!(blob.content, content);
-    assert_eq!(blob.content_type, "image/png");
-    let stats = store.stats().unwrap();
-    assert_eq!(stats.blob_count, 1);
-    assert_eq!(stats.blob_size_bytes, whole.len() as u64);
 }
 
 #[test]
@@ -155,34 +122,4 @@ fn a_content_type_too_long_is_refused_whether_or_not_the_content_is_stored() {
     );
     assert!(!store.blob_exists(&Hash::from_bytes(b"new")));
     assert_eq!(staged(&path), 0);
-}
-
-// A store whose rename fails, here because a directory is in the way at the
-// blob's path, returns the error, removes its staging file and leaves the
-// directory. Once the path is clear, the next store writes the blob.
-#[test]
-fn a_store_whose_rename_fails_removes_its_staging_file() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("store");
-    let store = Store::create(config(&path)).unwrap();
-    let hash = Hash::from_bytes(b"blocked");
-    let file = blob_file(&path, &hash);
-    fs::create_dir_all(file.join("in the way")).unwrap();
-
-    let error = store.store_blob(b"blocked", "text/plain").unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("cannot rename the new blob file over"),
-        "{error}"
-    );
-    assert_eq!(staged(&path), 0);
-    assert!(file.join("in the way").is_dir());
-
-    fs::remove_dir_all(&file).unwrap();
-    assert_eq!(store.store_blob(b"blocked", "text/plain").unwrap(), hash);
-    assert_eq!(staged(&path), 0);
-    drop(store);
-    let blob = reopen(&path).get_blob(&hash).unwrap().unwrap();
-    assert_eq!(blob.content, b"blocked");
 }

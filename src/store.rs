@@ -293,8 +293,6 @@ impl Store {
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
-        // Likewise, no blob store is in progress, so the blob directory's
-        // staging files were left by interrupted ones.
         blobs.remove_staging_files();
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
@@ -743,12 +741,12 @@ impl Store {
 
     // --- Blob Operations ---
 
-    /// Store a blob.
+    /// Store a blob, as [`BlobStorage::store`] does.
     pub fn store_blob(&self, content: &[u8], content_type: &str) -> Result<Hash> {
         self.blobs.store(content, content_type)
     }
 
-    /// Get a blob by hash.
+    /// Get a blob by hash, as [`BlobStorage::get`] does.
     pub fn get_blob(&self, hash: &Hash) -> Result<Option<Blob>> {
         self.blobs.get(hash)
     }

@@ -4,35 +4,26 @@ use crate::error::{Result, StoreError};
 use crate::types::{Blob, Hash};
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-#[cfg(any(unix, test))]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Magic bytes for blob files.
 const BLOB_MAGIC: &[u8; 4] = b"BLB\0";
 
 /// Current blob format version.
 const BLOB_VERSION: u8 = 1;
+const UNSUPPORTED_VERSION: &str = "Unsupported blob version";
 
-/// Starts the name of every staging file: a store writes a new blob file
-/// under one in the blob directory, beside the shards, and renames it into
-/// its shard.
 const STAGING_PREFIX: &str = ".chronicle-blob-";
-
-/// Makes the next store in this process exit while it writes its staging
-/// file, so a test can see what a crash there leaves.
-#[cfg(test)]
-static EXIT_WHILE_WRITING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 thread_local! {
     /// The directories this thread's stores have synced, in order, so unit
-    /// tests can see which syncs a store makes.
+    /// tests can see which syncs a store makes. A directory this account may
+    /// not open is listed too, as the sync it went without.
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -54,18 +45,26 @@ struct CachedBlob {
     content_type: String,
 }
 
+struct ShardDurability {
+    creations_begun: AtomicU64,
+    creations_finished: AtomicU64,
+    creations_synced: AtomicU64,
+    renames_begun: AtomicU64,
+    renames_finished: AtomicU64,
+    renames_synced: AtomicU64,
+}
+
 /// Content-addressed blob storage.
 pub struct BlobStorage {
     /// Base directory for blobs.
     path: PathBuf,
 
     /// LRU cache for recently accessed blobs. It holds only blobs this
-    /// process wrote, or read from a whole file.
+    /// storage wrote, or read from a whole file.
     cache: Mutex<LruCache<Hash, CachedBlob>>,
 
-    /// Whether a store has said that it went without syncing a directory
-    /// this process may not open.
-    unsynced_directory_reported: AtomicBool,
+    entry_synced: AtomicBool,
+    shards: Box<[ShardDurability]>,
 
     /// The step of a write that a unit test set to fail, once, standing in
     /// for a device error there.
@@ -84,7 +83,17 @@ impl BlobStorage {
         Ok(Self {
             path,
             cache: Mutex::new(LruCache::new(cache_size)),
-            unsynced_directory_reported: AtomicBool::new(false),
+            entry_synced: AtomicBool::new(false),
+            shards: (0..=u8::MAX)
+                .map(|_| ShardDurability {
+                    creations_begun: AtomicU64::new(0),
+                    creations_finished: AtomicU64::new(0),
+                    creations_synced: AtomicU64::new(0),
+                    renames_begun: AtomicU64::new(0),
+                    renames_finished: AtomicU64::new(0),
+                    renames_synced: AtomicU64::new(0),
+                })
+                .collect(),
             #[cfg(test)]
             fails_at: Mutex::new(None),
         })
@@ -92,95 +101,215 @@ impl BlobStorage {
 
     /// Store a blob, returning its hash.
     ///
-    /// The same content is stored once. When a whole file for it is already
-    /// stored, this writes nothing and returns the hash, and the file keeps
-    /// the content type it was first stored with. A file under the hash that
-    /// isn't whole, such as one a crash left while an earlier release wrote
-    /// it in place, is replaced. Whole means what [`BlobStorage::get`]
-    /// checks, so once this returns, `get` returns the content.
+    /// The blob is written whole under a staging name in the blob directory,
+    /// synced, and renamed to its own name, so a store never leaves part of a
+    /// blob under that name: one that stops before its rename leaves the blob
+    /// as it was. A store killed before its rename leaves its staging file
+    /// (`.chronicle-blob-*`), which the next [`Store::open`](crate::Store::open)
+    /// removes where it can list the blob directory.
     ///
-    /// Content in this storage's cache, which holds the blobs it wrote or
-    /// read whole most recently, returns at once without a look at its
-    /// file. Damage done to that file from outside the store after it was
-    /// cached, such as a truncation or a removal, is therefore hidden from
-    /// this storage until the blob leaves the cache or the store is opened
-    /// again: `get` returns the cached content, and this doesn't replace the
-    /// file. Nothing in Chronicle damages a blob's file that way.
+    /// On Unix, before this returns, the blob directory's entry in its parent
+    /// has been synced once by this `BlobStorage`, and the blob's shard
+    /// directory and that directory's entry in the blob directory have been
+    /// synced since this `BlobStorage` last created or renamed anything into
+    /// them, where the system syncs directories and this account may open
+    /// them. What an earlier process made there is taken as it is, and so is
+    /// what another `BlobStorage` on the same directory makes: a `Store`
+    /// holds one, and its lock refuses a second `Store`, but
+    /// `BlobStorage::new` takes no lock. A sync that fails before the rename
+    /// returns an error with nothing stored; one that fails after it returns
+    /// an error with the blob in place. Either way, storing the blob again
+    /// through this `BlobStorage` tries the sync again.
     ///
-    /// A new file is written under a staging name in the blob directory,
-    /// synced, and then renamed to its final path, replacing any file there.
-    /// A crash therefore leaves the blob's file whole or absent, never part
-    /// of it. On Unix the directory it is renamed into is synced too, and so
-    /// is the blob directory when the shard is new, so that a blob whose
-    /// store returned survives a power loss. As for metadata checkpoints,
-    /// that sync is skipped where this process may not open the directory,
-    /// which is logged once, and where the system doesn't sync directories.
-    /// If the rename fails, the staging file is removed, the error is
-    /// returned, and a file that was at the blob's path stays as it was. If
-    /// a sync fails after the rename, this returns the error with the blob
-    /// in place and nothing cached. A later store of the same content then
-    /// finds the file whole and returns the hash without that sync, so the
-    /// failure isn't reported again, and a power loss can still lose the
-    /// blob although that later store returned. The record log, by
-    /// contrast, reports a failed fsync from every later sync until the
-    /// store is reopened. A process killed before the rename leaves its staging
-    /// file, and the next `Store::open` removes it.
-    ///
-    /// The content type is at most 65,535 bytes, the most its length field
-    /// holds. A longer one is refused before anything else is done, whether
-    /// or not the content is already stored, so the refusal doesn't depend
-    /// on what the store holds.
+    /// When the blob's file is already there and reads back as `content`, it is
+    /// left as it is, content type included. A file that's cut short, damaged
+    /// or holds other bytes is replaced. A symbolic link at the blob's name is
+    /// read through: one whose target reads back as `content` is left, and one
+    /// whose target is cut short, damaged, holds other bytes or doesn't exist
+    /// is itself replaced by the blob, leaving any target as it was; one that
+    /// loops is an error. Anything else at the blob's name or a link's target,
+    /// a file that can't be opened or read at all, or a blob file in a format
+    /// version newer than this chronicle reads, such as one a newer chronicle
+    /// wrote, is an error and is left as it is. A blob whose content is in the
+    /// cache is taken as stored without reading its file, while a regular file,
+    /// or a link to one, is at its name. A content type longer than 65,535
+    /// bytes is refused.
     pub fn store(&self, content: &[u8], content_type: &str) -> Result<Hash> {
         let content_type_len = u16::try_from(content_type.len()).map_err(|_| {
             StoreError::InvalidOperation(format!(
-                "a blob's content type is at most {} bytes, and this one is {}",
-                u16::MAX,
+                "a blob's content type can be at most 65535 bytes, and this one is {}, so nothing was stored",
                 content_type.len()
             ))
         })?;
         let hash = Hash::from_bytes(content);
-
-        if self.cache.lock().contains(&hash) {
-            return Ok(hash);
-        }
-
         let blob_path = self.blob_path(&hash);
-        if let Some(stored_type) = self.whole_file_holding(&blob_path, content) {
-            self.cache.lock().put(
-                hash,
-                CachedBlob {
-                    content: content.to_vec(),
-                    content_type: stored_type,
-                },
-            );
-            return Ok(hash);
-        }
 
-        self.write(&hash, &blob_path, content, content_type, content_type_len)?;
-
-        // Add to cache
-        self.cache.lock().put(
-            hash,
-            CachedBlob {
+        let readable = (self.cache.lock().contains(&hash)
+            && fs::metadata(&blob_path).is_ok_and(|metadata| metadata.is_file()))
+            || match Self::read_file(&blob_path) {
+                Ok(Some(stored)) if stored.content == content => {
+                    self.cache.lock().put(hash, stored);
+                    true
+                }
+                Ok(_) => false,
+                Err(error) if unreadable(&error) => false,
+                Err(error) => return Err(error),
+            };
+        if !readable {
+            self.write(&hash, &blob_path, content, content_type, content_type_len)?;
+            self.cache.lock().put(hash, CachedBlob {
                 content: content.to_vec(),
                 content_type: content_type.to_string(),
-            },
-        );
+            });
+            return Ok(hash);
+        }
 
+        self.sync_name(&hash).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "the blob {} is stored, but syncing its directory failed: {error}; storing it again tries the sync again",
+                    blob_path.display()
+                ),
+            )
+        })?;
         Ok(hash)
     }
 
-    /// Get a blob by its hash.
+    fn write(
+        &self,
+        hash: &Hash,
+        blob_path: &Path,
+        content: &[u8],
+        content_type: &str,
+        content_type_len: u16,
+    ) -> Result<()> {
+        let shard_dir = self.shard_path(hash);
+        if !shard_dir.is_dir() {
+            let shard = self.shard(hash);
+            shard.creations_begun.fetch_add(1, Ordering::SeqCst);
+            let created = fs::create_dir_all(&shard_dir);
+            shard.creations_finished.fetch_add(1, Ordering::SeqCst);
+            created?;
+        }
+        self.sync_shard_entry(hash).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot sync the directories holding {}: {error}; nothing was stored, and storing the blob again tries the sync again",
+                    self.path.display()
+                ),
+            )
+        })?;
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o666);
+        let mut staged = tempfile::Builder::new()
+            .prefix(STAGING_PREFIX)
+            .make_in(&self.path, |name| options.open(name))?;
+
+        let file = staged.as_file_mut();
+        file.write_all(BLOB_MAGIC)?;
+        file.write_all(&[BLOB_VERSION])?;
+        file.write_all(&content_type_len.to_le_bytes())?;
+        file.write_all(content_type.as_bytes())?;
+        file.write_all(&(content.len() as u64).to_le_bytes())?;
+        file.write_all(content)?;
+        file.write_all(&crc32fast::hash(content).to_le_bytes())?;
+        file.sync_all()?;
+
+        // std's rename converts long Windows paths, which tempfile's persist
+        // passes to MoveFileExW unconverted.
+        let (file, mut staging) = staged.into_parts();
+        drop(file);
+        let shard = self.shard(hash);
+        shard.renames_begun.fetch_add(1, Ordering::SeqCst);
+        let renamed = self
+            .fail_at(WriteStep::Rename)
+            .and_then(|()| fs::rename(&staging, blob_path));
+        shard.renames_finished.fetch_add(1, Ordering::SeqCst);
+        renamed.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot rename the new blob {} into place: {error}",
+                    blob_path.display()
+                ),
+            )
+        })?;
+        staging.disable_cleanup(true);
+
+        self.fail_at(WriteStep::ShardSync)
+            .and_then(|()| self.sync_name(hash))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "the new blob {} is in place, but syncing its directory failed: {error}; storing it again tries the sync again",
+                        blob_path.display()
+                    ),
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// Fails in place of `step` when a unit test set the next write to fail
+    /// there, once. Otherwise, and always outside unit tests, does nothing.
+    fn fail_at(&self, step: WriteStep) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut fails_at = self.fails_at.lock();
+            if *fails_at == Some(step) {
+                *fails_at = None;
+                return Err(io::Error::other(format!("injected failure at {step:?}")));
+            }
+        }
+        let _ = step;
+        Ok(())
+    }
+
+    fn shard(&self, hash: &Hash) -> &ShardDurability {
+        &self.shards[usize::from(hash.0[0])]
+    }
+
+    fn sync_shard_entry(&self, hash: &Hash) -> io::Result<()> {
+        if !self.entry_synced.load(Ordering::SeqCst) {
+            let parent = self
+                .path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            sync_directory(parent)?;
+            self.entry_synced.store(true, Ordering::SeqCst);
+        }
+        let shard = self.shard(hash);
+        if shard.creations_synced.load(Ordering::SeqCst) < shard.creations_begun.load(Ordering::SeqCst) {
+            let finished = shard.creations_finished.load(Ordering::SeqCst);
+            sync_directory(&self.path)?;
+            shard.creations_synced.fetch_max(finished, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn sync_name(&self, hash: &Hash) -> io::Result<()> {
+        self.sync_shard_entry(hash)?;
+        let shard = self.shard(hash);
+        if shard.renames_synced.load(Ordering::SeqCst) < shard.renames_begun.load(Ordering::SeqCst) {
+            let finished = shard.renames_finished.load(Ordering::SeqCst);
+            sync_directory(&self.shard_path(hash))?;
+            shard.renames_synced.fetch_max(finished, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Get a blob by its hash, or `None` when none is stored under it.
     ///
-    /// The file is read and checked whole: its framing, the checksum stored
-    /// after the content, and that the content hashes to `hash`. A file that
-    /// fails a check is an error every time it is read, until a store of the
-    /// same content replaces it.
-    ///
-    /// A blob in this storage's cache is returned from there without a read
-    /// of its file, so damage done to the file from outside the store after
-    /// the blob was cached shows only once the blob leaves the cache or the
-    /// store is opened again.
+    /// A blob whose content is in the cache is answered from it, without
+    /// reading its file. Otherwise a blob file that's cut short or damaged is
+    /// an error, and storing the same content again replaces it.
     pub fn get(&self, hash: &Hash) -> Result<Option<Blob>> {
         // Check cache first
         if let Some(cached) = self.cache.lock().get(hash).cloned() {
@@ -191,44 +320,139 @@ impl BlobStorage {
             }));
         }
 
-        let mut bytes = match fs::read(self.blob_path(hash)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(stored) = Self::read_file(&self.blob_path(hash))? else {
+            return Ok(None);
         };
-        let (content_type, content) = decode(&bytes)?;
 
-        // Verify hash
-        let computed_hash = Hash::from_bytes(&bytes[content.clone()]);
+        let computed_hash = Hash::from_bytes(&stored.content);
         if &computed_hash != hash {
             return Err(StoreError::HashMismatch {
                 expected: *hash,
                 got: computed_hash,
             });
         }
-        bytes.truncate(content.end);
-        bytes.drain(..content.start);
-        let content = bytes;
 
-        // Add to cache
-        self.cache.lock().put(
-            *hash,
-            CachedBlob {
-                content: content.clone(),
-                content_type: content_type.clone(),
-            },
-        );
+        self.cache.lock().put(*hash, stored.clone());
 
         Ok(Some(Blob {
             hash: *hash,
+            content: stored.content,
+            content_type: stored.content_type,
+        }))
+    }
+
+    fn read_file(path: &Path) -> Result<Option<CachedBlob>> {
+        match fs::metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} isn't a regular file, so it isn't read as a blob or replaced, and storing this blob fails until it's removed from the blob directory",
+                        path.display()
+                    ),
+                )
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot look at the blob file {}: {error}", path.display()),
+                )
+                .into())
+            }
+        }
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let size = file.metadata()?.len();
+
+        // Read and verify magic
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).map_err(read_error(path))?;
+        if &magic != BLOB_MAGIC {
+            return Err(StoreError::InvalidFormat("Invalid blob magic".into()));
+        }
+
+        // Read version
+        let mut version = [0u8; 1];
+        file.read_exact(&mut version).map_err(read_error(path))?;
+        if version[0] > BLOB_VERSION {
+            return Err(StoreError::InvalidFormat(format!(
+                "{UNSUPPORTED_VERSION} {} in {}: a newer chronicle may have written it, and this one doesn't read it, so storing the same bytes leaves the file as it is",
+                version[0],
+                path.display()
+            )));
+        }
+        if version[0] != BLOB_VERSION {
+            return Err(damaged(
+                path,
+                &format!(
+                    "its header names blob format version {}, which no chronicle writes",
+                    version[0]
+                ),
+            ));
+        }
+
+        // Read content type
+        let mut content_type_len_bytes = [0u8; 2];
+        file.read_exact(&mut content_type_len_bytes).map_err(read_error(path))?;
+        let content_type_len = u16::from_le_bytes(content_type_len_bytes) as usize;
+
+        let mut content_type_bytes = vec![0u8; content_type_len];
+        file.read_exact(&mut content_type_bytes).map_err(read_error(path))?;
+        let content_type = String::from_utf8_lossy(&content_type_bytes).into_owned();
+
+        // Read content
+        let mut content_len_bytes = [0u8; 8];
+        file.read_exact(&mut content_len_bytes).map_err(read_error(path))?;
+        let content_len = u64::from_le_bytes(content_len_bytes);
+        let room = size.saturating_sub(4 + 1 + 2 + content_type_len as u64 + 8 + 4);
+        if content_len > room {
+            return Err(damaged(
+                path,
+                &format!("its header names {content_len} bytes of content, more than the file holds"),
+            ));
+        }
+
+        let mut content = vec![0u8; content_len as usize];
+        file.read_exact(&mut content).map_err(read_error(path))?;
+
+        // Read and verify checksum
+        let mut checksum_bytes = [0u8; 4];
+        file.read_exact(&mut checksum_bytes).map_err(read_error(path))?;
+        let stored_checksum = u32::from_le_bytes(checksum_bytes);
+        let computed_checksum = crc32fast::hash(&content);
+
+        if stored_checksum != computed_checksum {
+            return Err(StoreError::ChecksumMismatch {
+                expected: stored_checksum,
+                got: computed_checksum,
+            });
+        }
+
+        Ok(Some(CachedBlob {
             content,
             content_type,
         }))
     }
 
-    /// Check if a blob exists: whether this process holds it, or a file is
-    /// stored under its hash. The file isn't read, so this doesn't say it is
-    /// whole; [`BlobStorage::get`] checks that.
+    /// Remove the staging files that stores killed before their rename left
+    /// in the blob directory. The caller holds the store lock and calls this
+    /// before any store, so none of them is a store in progress. One that
+    /// can't be removed is reported and left, and so are all of them when
+    /// the blob directory can't be listed.
+    pub(crate) fn remove_staging_files(&self) {
+        crate::atomic_file::remove_files_staged_as(&self.path, STAGING_PREFIX, "blob", "store");
+    }
+
+    /// Check if a blob exists: whether this storage has it cached, or
+    /// something is at its name, through a link to its target. Nothing is
+    /// read, so this doesn't say the blob is whole; [`BlobStorage::get`]
+    /// checks that.
     pub fn exists(&self, hash: &Hash) -> bool {
         if self.cache.lock().contains(hash) {
             return true;
@@ -288,212 +512,6 @@ impl BlobStorage {
         Ok(total)
     }
 
-    /// Remove the staging files that stores killed before their rename left
-    /// in the blob directory. The caller holds the store lock and calls this
-    /// before any store, so none of them is a store in progress. One that
-    /// can't be removed is reported and left, and so are all of them when
-    /// the blob directory can't be listed.
-    pub(crate) fn remove_staging_files(&self) {
-        let entries = match fs::read_dir(&self.path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                tracing::warn!(
-                    directory = %self.path.display(),
-                    %error,
-                    "could not look for blob staging files left by interrupted stores"
-                );
-                return;
-            }
-        };
-        for entry in entries.flatten() {
-            let staged = entry
-                .file_name()
-                .as_encoded_bytes()
-                .starts_with(STAGING_PREFIX.as_bytes());
-            if !staged || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            match fs::remove_file(&path) {
-                Ok(()) => tracing::warn!(
-                    path = %path.display(),
-                    "removed a blob staging file left by an interrupted store"
-                ),
-                Err(error) => tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "could not remove a blob staging file left by an interrupted store"
-                ),
-            }
-        }
-    }
-
-    /// The content type of the file at `path`, when it is a whole blob file
-    /// holding `content`. `None` when there is no file, and when there is
-    /// one that can't be read or isn't whole, which the caller replaces.
-    fn whole_file_holding(&self, path: &Path, content: &[u8]) -> Option<String> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "could not read a stored blob file; storing its content again replaces it"
-                );
-                return None;
-            }
-        };
-        let problem = match decode(&bytes) {
-            Ok((content_type, stored)) if bytes[stored.clone()] == *content => {
-                return Some(content_type)
-            }
-            Ok(_) => "it holds other content than its name says".to_string(),
-            Err(error) => error.to_string(),
-        };
-        tracing::warn!(
-            path = %path.display(),
-            problem = %problem,
-            "a stored blob file isn't whole; storing its content again replaces it"
-        );
-        None
-    }
-
-    /// Write the blob file for `content` under a staging name, sync it, and
-    /// rename it to `blob_path`, then sync the shard directory.
-    /// `content_type_len` is the length of `content_type`, which `store`
-    /// checked fits its field.
-    fn write(
-        &self,
-        hash: &Hash,
-        blob_path: &Path,
-        content: &[u8],
-        content_type: &str,
-        content_type_len: u16,
-    ) -> Result<()> {
-        let shard_dir = self.shard_path(hash);
-        if !shard_dir.is_dir() {
-            fs::create_dir_all(&shard_dir)?;
-            self.sync_directory(&self.path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "created the blob shard {}, but syncing the blob directory failed: {error}",
-                        shard_dir.display()
-                    ),
-                )
-            })?;
-        }
-
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        // File::create's mode, 0666 less the umask, which blob files have
-        // always had.
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o666);
-        let mut staged = tempfile::Builder::new()
-            .prefix(STAGING_PREFIX)
-            .make_in(&self.path, |name| options.open(name))?;
-
-        let mut header = Vec::with_capacity(4 + 1 + 2 + content_type.len() + 8);
-        header.extend_from_slice(BLOB_MAGIC);
-        header.push(BLOB_VERSION);
-        header.extend_from_slice(&content_type_len.to_le_bytes());
-        header.extend_from_slice(content_type.as_bytes());
-        header.extend_from_slice(&(content.len() as u64).to_le_bytes());
-        let file = staged.as_file_mut();
-        file.write_all(&header)?;
-        #[cfg(test)]
-        if EXIT_WHILE_WRITING.load(Ordering::Relaxed) {
-            file.write_all(&content[..content.len() / 2])?;
-            file.sync_all()?;
-            std::process::exit(73);
-        }
-        file.write_all(content)?;
-        file.write_all(&crc32fast::hash(content).to_le_bytes())?;
-        file.sync_all()?;
-
-        // If the rename fails, dropping `staging` removes the staging file.
-        // A rename that took effect despite reporting an error has moved the
-        // file off that name, so the removal can't reach the blob.
-        let (file, mut staging) = staged.into_parts();
-        drop(file);
-        self.fail_at(WriteStep::Rename)
-            .and_then(|()| fs::rename(&staging, blob_path))
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot rename the new blob file over {}: {error}",
-                        blob_path.display()
-                    ),
-                )
-            })?;
-        staging.disable_cleanup(true);
-
-        self.fail_at(WriteStep::ShardSync)
-            .and_then(|()| self.sync_directory(&shard_dir))
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "the new blob file {} is in place, but syncing its directory failed: \
-                         {error}",
-                        blob_path.display()
-                    ),
-                )
-                .into()
-            })
-    }
-
-    /// Fails in place of `step` when a unit test set the next write to fail
-    /// there, once. Otherwise, and always outside unit tests, does nothing.
-    fn fail_at(&self, step: WriteStep) -> io::Result<()> {
-        #[cfg(test)]
-        {
-            let mut fails_at = self.fails_at.lock();
-            if *fails_at == Some(step) {
-                *fails_at = None;
-                return Err(io::Error::other(format!("injected failure at {step:?}")));
-            }
-        }
-        let _ = step;
-        Ok(())
-    }
-
-    /// Sync `directory`, so that an entry a store just made in it survives a
-    /// power loss, as metadata checkpoints sync theirs. Where this process
-    /// may not open the directory, the sync is skipped and that is logged
-    /// once; where the system doesn't sync directories, it is skipped
-    /// silently. Windows has no portable directory sync here.
-    fn sync_directory(&self, directory: &Path) -> io::Result<()> {
-        #[cfg(unix)]
-        match fs::File::open(directory) {
-            Ok(handle) => {
-                crate::atomic_file::sync_directory(&handle)?;
-                #[cfg(test)]
-                SYNCED_DIRECTORIES.with(|synced| synced.borrow_mut().push(directory.to_owned()));
-            }
-            Err(error) if crate::atomic_file::directory_open_refused(&error) => {
-                if !self
-                    .unsynced_directory_reported
-                    .swap(true, Ordering::Relaxed)
-                {
-                    tracing::warn!(
-                        directory = %directory.display(),
-                        %error,
-                        "storing blobs without syncing their directory, which this process \
-                         may not open: a power loss may lose the newest blobs"
-                    );
-                }
-            }
-            Err(error) => return Err(error),
-        }
-        #[cfg(not(unix))]
-        let _ = (directory, &self.unsynced_directory_reported);
-        Ok(())
-    }
-
     /// Get the shard directory for a hash.
     fn shard_path(&self, hash: &Hash) -> PathBuf {
         self.path.join(hash.shard_prefix())
@@ -505,67 +523,49 @@ impl BlobStorage {
     }
 }
 
-/// The content type of a blob file's bytes and where its content lies in
-/// them, once the magic, version and lengths fit and the content matches the
-/// checksum stored after it. A length field is checked against the bytes
-/// there are before anything is taken from them, so a damaged one can't ask
-/// for more memory than the file holds. A file that ends early is an
-/// `UnexpectedEof` I/O error, as reading it field by field gave. Bytes past
-/// the checksum are ignored, as they always have been.
-fn decode(bytes: &[u8]) -> Result<(String, Range<usize>)> {
-    let mut at = 0usize;
-    let mut take = |len: usize| -> Result<Range<usize>> {
-        match at.checked_add(len).filter(|&end| end <= bytes.len()) {
-            Some(end) => {
-                let field = at..end;
-                at = end;
-                Ok(field)
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "the blob file ends after {} bytes, before a field of {len} bytes at {at}",
-                    bytes.len()
-                ),
-            )
-            .into()),
+fn unreadable(error: &StoreError) -> bool {
+    match error {
+        StoreError::InvalidFormat(message) => !message.starts_with(UNSUPPORTED_VERSION),
+        StoreError::ChecksumMismatch { .. } => true,
+        _ => false,
+    }
+}
+
+fn damaged(path: &Path, what: &str) -> StoreError {
+    StoreError::InvalidFormat(format!(
+        "blob file {} is damaged: {what}; storing the same bytes again replaces it",
+        path.display()
+    ))
+}
+
+fn read_error(path: &Path) -> impl Fn(io::Error) -> StoreError + '_ {
+    move |error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            damaged(path, "it is cut short")
+        } else {
+            error.into()
         }
-    };
-
-    if bytes[take(4)?] != BLOB_MAGIC[..] {
-        return Err(StoreError::InvalidFormat("Invalid blob magic".into()));
     }
-    let version = bytes[take(1)?.start];
-    if version != BLOB_VERSION {
-        return Err(StoreError::InvalidFormat(format!(
-            "Unsupported blob version: {}",
-            version
-        )));
-    }
+}
 
-    let content_type_len = u16::from_le_bytes(bytes[take(2)?].try_into().unwrap()) as usize;
-    let content_type = String::from_utf8_lossy(&bytes[take(content_type_len)?]).into_owned();
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    crate::atomic_file::sync_directory_at(path)?;
+    #[cfg(test)]
+    SYNCED_DIRECTORIES.with(|synced| synced.borrow_mut().push(path.to_owned()));
+    Ok(())
+}
 
-    let content_len = u64::from_le_bytes(bytes[take(8)?].try_into().unwrap());
-    let content = take(usize::try_from(content_len).unwrap_or(usize::MAX))?;
-
-    // Read and verify checksum
-    let stored_checksum = u32::from_le_bytes(bytes[take(4)?].try_into().unwrap());
-    let computed_checksum = crc32fast::hash(&bytes[content.clone()]);
-    if stored_checksum != computed_checksum {
-        return Err(StoreError::ChecksumMismatch {
-            expected: stored_checksum,
-            got: computed_checksum,
-        });
-    }
-
-    Ok((content_type, content))
+// Windows has no portable directory sync, and checkpoint saves go without it
+// there too.
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// A new storage over the blobs in `dir`, with nothing cached, so its
@@ -603,10 +603,11 @@ mod tests {
 
     // What a crash in an in-place write leaves at a blob's final path, as
     // releases that wrote there could: the file cut short within each field,
-    // or at its full length with the pages that never reached the disk read
-    // back as zeros. Each fails get, and the next store of the content
-    // replaces it. Those releases found a file there and returned, so it
-    // stayed torn and every get failed.
+    // empty, or at its full length with the pages that never reached the
+    // disk read back as zeros. Each fails get, and the next store of the
+    // content replaces it. Those releases found a file there and returned,
+    // so it stayed torn and every get failed. tests/blob_storage.rs covers
+    // other kinds of damage through the store.
     #[test]
     fn a_torn_blob_file_is_replaced_by_the_next_store_of_its_content() {
         let dir = TempDir::new().unwrap();
@@ -653,36 +654,9 @@ mod tests {
         assert_eq!(staged(&dir.path().join("blobs")), 0);
     }
 
-    // A whole file under another content's hash fails get, and a store of
-    // the content its name says replaces it.
-    #[test]
-    fn a_file_holding_other_content_is_replaced() {
-        let dir = TempDir::new().unwrap();
-        let storage = reopened(&dir);
-        let other = storage.store(b"other content", "text/plain").unwrap();
-        let hash = Hash::from_bytes(b"named content");
-        fs::create_dir_all(storage.shard_path(&hash)).unwrap();
-        fs::copy(storage.blob_path(&other), storage.blob_path(&hash)).unwrap();
-
-        assert!(matches!(
-            reopened(&dir).get(&hash),
-            Err(StoreError::HashMismatch { .. })
-        ));
-        assert_eq!(
-            reopened(&dir)
-                .store(b"named content", "text/plain")
-                .unwrap(),
-            hash
-        );
-        assert_eq!(
-            reopened(&dir).get(&hash).unwrap().unwrap().content,
-            b"named content"
-        );
-    }
-
     // A whole file is left as it is: storing its content again from a
     // storage that hasn't read it writes nothing, and the file keeps the
-    // content type it was first stored with.
+    // content type it was first stored with, which the cache then answers.
     #[test]
     fn storing_content_already_held_whole_writes_nothing() {
         let dir = TempDir::new().unwrap();
@@ -698,7 +672,6 @@ mod tests {
         );
         assert_eq!(same_file::Handle::from_path(&path).unwrap(), before);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
-        // The cache answers with what the file holds.
         assert_eq!(
             storage.get(&hash).unwrap().unwrap().content_type,
             "text/plain"
@@ -710,102 +683,9 @@ mod tests {
         assert_eq!(staged(&dir.path().join("blobs")), 0);
     }
 
-    // get's errors for a file that isn't whole are the ones it gave when it
-    // read the file field by field.
-    #[test]
-    fn a_file_that_is_not_whole_fails_get_as_before() {
-        let dir = TempDir::new().unwrap();
-        let hash = reopened(&dir).store(b"some content", "text/plain").unwrap();
-        let path = reopened(&dir).blob_path(&hash);
-        let whole = fs::read(&path).unwrap();
-        let get = |bytes: &[u8]| {
-            fs::write(&path, bytes).unwrap();
-            reopened(&dir).get(&hash).unwrap_err()
-        };
-
-        let mut magic = whole.clone();
-        magic[0] = b'X';
-        assert!(matches!(get(&magic), StoreError::InvalidFormat(m) if m == "Invalid blob magic"));
-        let mut version = whole.clone();
-        version[4] = 9;
-        assert!(
-            matches!(get(&version), StoreError::InvalidFormat(m) if m == "Unsupported blob version: 9")
-        );
-        let mut checksum = whole.clone();
-        *checksum.last_mut().unwrap() ^= 0xff;
-        assert!(matches!(
-            get(&checksum),
-            StoreError::ChecksumMismatch { .. }
-        ));
-        match get(&whole[..whole.len() - 2]) {
-            StoreError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof),
-            other => panic!("expected an early end, got {other:?}"),
-        }
-        // Bytes past the checksum are ignored, as they were.
-        let mut longer = whole.clone();
-        longer.extend_from_slice(b"trailing");
-        fs::write(&path, &longer).unwrap();
-        assert_eq!(
-            reopened(&dir).get(&hash).unwrap().unwrap().content,
-            b"some content"
-        );
-    }
-
-    // A length field damaged to claim more bytes than the file holds fails
-    // the read before anything that size is allocated. Reading field by
-    // field allocated the claimed length, which aborts on u64::MAX.
-    #[test]
-    fn a_damaged_length_field_fails_the_read_without_allocating_it() {
-        let dir = TempDir::new().unwrap();
-        let hash = reopened(&dir).store(b"some content", "text/plain").unwrap();
-        let path = reopened(&dir).blob_path(&hash);
-        let whole = fs::read(&path).unwrap();
-        let content_len_at = 4 + 1 + 2 + "text/plain".len();
-        for (at, claimed) in [
-            (content_len_at, &u64::MAX.to_le_bytes()[..]),
-            (5, &[0xff, 0xff][..]),
-        ] {
-            let mut bytes = whole.clone();
-            bytes[at..at + claimed.len()].copy_from_slice(claimed);
-            fs::write(&path, &bytes).unwrap();
-            match reopened(&dir).get(&hash) {
-                Err(StoreError::Io(error)) => {
-                    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}")
-                }
-                other => panic!("expected the read to fail, got {other:?}"),
-            }
-            reopened(&dir).store(b"some content", "text/plain").unwrap();
-            assert_eq!(fs::read(&path).unwrap(), whole);
-        }
-    }
-
-    // A content type longer than its 16-bit length field is refused before
-    // anything is written. Its length used to wrap, writing a file no read
-    // could parse.
-    #[test]
-    fn a_content_type_too_long_for_its_length_field_is_refused() {
-        let dir = TempDir::new().unwrap();
-        let storage = reopened(&dir);
-        let hash = Hash::from_bytes(b"content");
-        let error = storage
-            .store(b"content", &"x".repeat(u16::MAX as usize + 1))
-            .unwrap_err();
-        assert!(matches!(error, StoreError::InvalidOperation(_)), "{error}");
-        assert!(!storage.exists(&hash));
-        assert_eq!(staged(&dir.path().join("blobs")), 0);
-
-        let longest = "y".repeat(u16::MAX as usize);
-        storage.store(b"content", &longest).unwrap();
-        assert_eq!(
-            reopened(&dir).get(&hash).unwrap().unwrap().content_type,
-            longest
-        );
-    }
-
     // The limit on a content type doesn't depend on what is stored: content
     // this storage has cached, and content whose whole file it finds, are
-    // refused as new content is, and the file is left as it was. Both used
-    // to return the hash.
+    // refused as new content is, and the file is left as it was.
     #[test]
     fn a_content_type_too_long_is_refused_for_content_already_stored() {
         let dir = TempDir::new().unwrap();
@@ -831,12 +711,12 @@ mod tests {
         assert_eq!(staged(&dir.path().join("blobs")), 0);
     }
 
-    // A new blob's store syncs the shard directory it renames the file
-    // into, and first the blob directory when it made the shard, so that the
-    // blob's entry and its shard's survive a power loss. A store that writes
-    // nothing syncs nothing: one of content this storage has cached, or of
-    // content whose whole file it finds. Every other test here passes with
-    // both syncs taken out.
+    // A storage syncs the blob directory's entry in its parent once, the
+    // blob directory when it made a shard there, and the shard when it
+    // renamed a blob into it, each before the store returns. A store that
+    // writes nothing syncs nothing more: one of content this storage has
+    // cached, or of content whose whole file it finds, which in a new
+    // storage syncs only the blob directory's entry.
     #[cfg(unix)]
     #[test]
     fn a_new_blob_syncs_its_shard_and_a_new_shard_the_blob_directory() {
@@ -847,7 +727,10 @@ mod tests {
 
         let first = storage.store(b"first", "text/plain").unwrap();
         let shard = storage.shard_path(&first);
-        assert_eq!(synced_directories(), [blobs.clone(), shard.clone()]);
+        assert_eq!(
+            synced_directories(),
+            [dir.path().to_owned(), blobs.clone(), shard.clone()]
+        );
 
         let neighbour = neighbour_of(b"first");
         let second = storage.store(&neighbour, "text/plain").unwrap();
@@ -855,20 +738,24 @@ mod tests {
         assert_eq!(synced_directories(), [shard.clone()]);
 
         storage.store(b"first", "text/plain").unwrap();
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
         reopened(&dir).store(b"first", "text/plain").unwrap();
         reopened(&dir).store(&neighbour, "image/png").unwrap();
-        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+        assert_eq!(
+            synced_directories(),
+            [dir.path().to_owned(), dir.path().to_owned()]
+        );
 
         // Replacing a torn file goes into a shard that is there already.
         fs::write(storage.blob_path(&first), b"BLB\0").unwrap();
         reopened(&dir).store(b"first", "text/plain").unwrap();
-        assert_eq!(synced_directories(), [shard]);
+        assert_eq!(synced_directories(), [dir.path().to_owned(), shard]);
         assert_eq!(staged(&blobs), 0);
     }
 
     // A rename that fails removes the staging file and returns its error.
-    // Nothing reaches the blob's path, a file that was there stays as it
-    // was, nothing is cached, and the next store writes the blob.
+    // Nothing reaches the blob's path, a damaged file that was there stays
+    // as it was, nothing is cached, and the next store writes the blob.
     #[test]
     fn a_failed_rename_removes_the_staging_file_and_leaves_the_path_as_it_was() {
         let dir = TempDir::new().unwrap();
@@ -880,9 +767,7 @@ mod tests {
         *storage.fails_at.lock() = Some(WriteStep::Rename);
         let error = storage.store(b"renamed", "text/plain").unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("cannot rename the new blob file over"),
+            error.to_string().contains("cannot rename the new blob"),
             "{error}"
         );
         assert_eq!(staged(&blobs), 0);
@@ -907,14 +792,14 @@ mod tests {
 
     // A sync of the shard that fails after the rename returns its error with
     // the blob in place and whole, and nothing cached. The next store of the
-    // content then finds the file whole and returns the hash without that
-    // sync, so the failure isn't reported again: the masking that store's
-    // doc describes.
+    // content through this storage finds the file whole and tries that sync
+    // again, and once it has gone through, a later store makes none.
     #[test]
-    fn a_failed_sync_after_the_rename_returns_the_error_with_the_blob_in_place() {
+    fn a_failed_sync_after_the_rename_is_tried_again_by_the_next_store() {
         let dir = TempDir::new().unwrap();
         let storage = reopened(&dir);
         let hash = Hash::from_bytes(b"in place");
+        let shard = storage.shard_path(&hash);
 
         *storage.fails_at.lock() = Some(WriteStep::ShardSync);
         let error = storage.store(b"in place", "text/plain").unwrap_err();
@@ -934,8 +819,12 @@ mod tests {
 
         synced_directories();
         assert_eq!(storage.store(b"in place", "text/plain").unwrap(), hash);
-        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+        if cfg!(unix) {
+            assert_eq!(synced_directories(), [shard]);
+        }
         assert!(storage.cache.lock().contains(&hash));
+        assert_eq!(storage.store(b"in place", "text/plain").unwrap(), hash);
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
     }
 
     // Stores of one content racing from several storages each stage their
@@ -966,56 +855,6 @@ mod tests {
         let storage = reopened(&dir);
         assert_eq!(fs::read_dir(storage.shard_path(&hash)).unwrap().count(), 1);
         assert_eq!(storage.get(&hash).unwrap().unwrap().content, content);
-    }
-
-    fn interrupted_content() -> Vec<u8> {
-        (0..100_000u32).map(|i| (i % 253) as u8).collect()
-    }
-
-    // This child exits inside a store, half way through writing the
-    // content to its staging file, bypassing every destructor.
-    #[test]
-    fn interrupted_store_child() {
-        let Some(path) = std::env::var_os("CHRONICLE_BLOB_STORE_CHILD_PATH") else {
-            return;
-        };
-        let storage = BlobStorage::new(Path::new(&path), 100).unwrap();
-        EXIT_WHILE_WRITING.store(true, Ordering::Relaxed);
-        storage.store(&interrupted_content(), "image/png").unwrap();
-        panic!("child should exit before the rename");
-    }
-
-    // A store killed while it writes leaves its staging file and nothing at
-    // the blob's final path, so the next store writes the blob whole, and the
-    // sweep at the store's next open removes what was left.
-    #[test]
-    fn a_store_killed_while_writing_leaves_nothing_at_the_final_path() {
-        let dir = TempDir::new().unwrap();
-        let blobs = dir.path().join("blobs");
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "blobs::storage::tests::interrupted_store_child"])
-            .env("CHRONICLE_BLOB_STORE_CHILD_PATH", &blobs)
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(73));
-
-        let content = interrupted_content();
-        let hash = Hash::from_bytes(&content);
-        let storage = reopened(&dir);
-        assert!(!storage.exists(&hash));
-        assert!(storage.get(&hash).unwrap().is_none());
-        assert_eq!(staged(&blobs), 1);
-        // The staging file lies beside the shards, so neither the listing
-        // nor the size counts it.
-        assert!(storage.list().unwrap().is_empty());
-        assert_eq!(storage.total_size().unwrap(), 0);
-
-        assert_eq!(storage.store(&content, "image/png").unwrap(), hash);
-        assert_eq!(reopened(&dir).get(&hash).unwrap().unwrap().content, content);
-        storage.remove_staging_files();
-        assert_eq!(staged(&blobs), 0);
-        assert_eq!(storage.list().unwrap(), vec![hash]);
-        assert_eq!(reopened(&dir).get(&hash).unwrap().unwrap().content, content);
     }
 
     // The sweep removes only regular files with the staging prefix.

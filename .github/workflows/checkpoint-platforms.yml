@@ -8,6 +8,7 @@ on:
       - 'build.rs'
       - 'src/**'
       - 'tests/atomic_metadata.rs'
+      - 'tests/blob_storage.rs'
       - 'tests/lock_file.rs'
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - 'build.rs'
       - 'src/**'
       - 'tests/atomic_metadata.rs'
+      - 'tests/blob_storage.rs'
       - 'tests/lock_file.rs'
   workflow_dispatch:
 
@@ -52,6 +54,9 @@ jobs:
 
       - name: Store checkpoint integration tests
         run: cargo test --test atomic_metadata -- --nocapture
+
+      - name: Blob store tests
+        run: cargo test --test blob_storage -- --nocapture
 
       # LOCK's handling depends on each platform's locks (mandatory on
       # Windows) and file types, so its tests run here too.
