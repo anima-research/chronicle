@@ -1204,8 +1204,9 @@ impl Store {
 
     /// Compute items added since the last delta or full snapshot.
     ///
-    /// This walks the chain collecting Append operations until hitting a snapshot,
-    /// and returns None if it meets a Redact, an Edit, a Set or a Delta first.
+    /// This walks the chain collecting Append operations until hitting a full or
+    /// delta snapshot, and returns None if it meets a Redact, an Edit, a Set or a
+    /// Delta first.
     fn compute_delta_items(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         let head = match self.state.get_head(self.branches.current_branch().id, state_id) {
             Some(h) => h,
@@ -2358,7 +2359,7 @@ mod tests {
         store.state.set_head_for_branch(main, "s", head.head_offset, head.item_count, false);
         store.sync().unwrap();
         drop(store);
-        let store = Store::open(StoreConfig { create_if_missing: false, ..test_config(&dir) }).unwrap();
+        let store = reopen(test_config(&dir));
         let head = store.state.get_head(main, "s").unwrap();
         assert!(!head.has_non_append_since_snapshot, "setup: the head holds false, as an earlier release saved it");
         let old = json!([0, 1, 2, 3]);
@@ -2374,7 +2375,7 @@ mod tests {
         let stats = store.get_compaction_stats("s").unwrap();
         assert_eq!((stats.delta_snapshots_since_full, stats.last_full_snapshot_offset), (deltas + 1, None), "it was taken as a delta");
         drop(store);
-        let store = Store::open(StoreConfig { create_if_missing: false, ..test_config(&dir) }).unwrap();
+        let store = reopen(test_config(&dir));
         reads_alike(&store, &json!([0, 1, 2, 3, 4, 5]), "after the new delta and a reopen");
         assert_eq!(store.get_state_len("s").unwrap(), Some(5));
     }

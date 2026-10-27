@@ -4,10 +4,10 @@
   Appends since its last snapshot, so its first delta snapshot walked past
   such a change, and from then on the branch read back what the change had
   removed or replaced. The branch now takes that record from the chain at
-  its point, and takes no delta snapshot until its next full one, as the
-  parent does. A branch made before this release may have that record
-  wrong: when its delta snapshot comes due across such a change, the store
-  now takes a full snapshot of its value instead.
+  its point, and takes no delta snapshot until its next full one. A branch
+  made before this release may have that record wrong: when its delta
+  snapshot comes due across such a change, the store now takes a full
+  snapshot of its value instead.
 - A branch that already took such a delta snapshot under an earlier release
   keeps reading what it read there. After a Redact or a `Set`, that reading
   holds items the change had removed, while `getStateLen` counts without
