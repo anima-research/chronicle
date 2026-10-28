@@ -792,10 +792,11 @@ impl JsStore {
     /// (`getState` → null, `getStateLen` → null) — and a write to it starts a
     /// fresh chain that shares nothing with the parent's.
     ///
-    /// The cost is proportional to the number of states inherited, not to
-    /// how many states the parent has, how many branches exist, or how much
-    /// history the store holds. With `from` omitted the parent is the
-    /// current branch (on a view, the pinned branch).
+    /// Copying the heads costs in proportion to the number of states
+    /// inherited, not to how many states the parent has, how many branches
+    /// exist, or how much history the store holds; the checkpoint that ends
+    /// the call still saves every branch's heads. With `from` omitted the
+    /// parent is the current branch (on a view, the pinned branch).
     #[napi]
     pub fn create_branch_with_states(
         &self,

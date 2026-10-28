@@ -1,8 +1,14 @@
-- Fork cost no longer grows with the number of branches. State chain heads
-  are held per branch in memory, so `createBranch` copies the parent's heads
-  (or, for a selective fork, just the selected ones) without scanning every
-  head in the store. `state.bin` is unchanged on disk: 0.4.0 stores open as
-  before and a store written by this version opens on 0.4.0.
+- Copying a fork's heads no longer grows with the number of branches. State
+  chain heads are held per branch in memory, so `createBranch` copies the
+  parent's heads (or, for a selective fork, just the selected ones) without
+  scanning every head in the store. The fork still ends in a checkpoint that
+  saves `state.bin`, which holds every branch's state heads, and
+  `branches.bin`, which holds every branch, so a fork's time still grows
+  with the number of branches: forking one append-log state took 5.7 ms with
+  about 100 branches and 19.7 ms with about 1,000 (medians of five, in a
+  debug build with real fsync on Linux). `state.bin`'s format is
+  unchanged: 0.4.0 stores open as before and a store written by this
+  version opens on 0.4.0.
 - `createBranchAt` takes a state's current chain head verbatim, with no chain
   walk, when that state has not changed since the branch point (decided from
   log offsets; applies when the sequence is one the parent branch itself
@@ -15,8 +21,11 @@
   is the number of records written to that state since the snapshot. The
   walk still reads a full snapshot — cost proportional to the state's size —
   when the parent took one after the branch point, when the sequence is one
-  the parent inherited rather than wrote, for tree states, and for parent
-  heads written before 0.4.0 recorded the snapshot's length.
+  the parent inherited rather than wrote, for tree states, for parent heads
+  written before 0.4.0 recorded the snapshot's length, and when a record
+  after the snapshot can't be counted from lengths alone (a `Delta`, which
+  only Rust callers write, or a `Set` whose bytes aren't a JSON array, an
+  empty one included).
 - `createBranch` / `createBranchAt` now hold the store's write lock while
   they capture the branch point and the chain heads, so the two always
   describe the same instant. `createBranchAt` validates the branch name and
