@@ -32,6 +32,16 @@ const STATE_INDEX_VERSION: u8 = 2; // Bumped for new format
 /// Default cache size (number of states).
 const DEFAULT_CACHE_SIZE: usize = 1000;
 
+pub(crate) fn is_non_append_change(op: &StateOperation) -> bool {
+    matches!(
+        op,
+        StateOperation::Redact { .. }
+            | StateOperation::Edit { .. }
+            | StateOperation::Set(_)
+            | StateOperation::Delta { .. }
+    )
+}
+
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotNeeded {
@@ -95,9 +105,14 @@ pub struct StateChainHead {
     /// File offset of most recent full snapshot.
     pub last_full_snapshot_offset: Option<u64>,
 
-    /// Whether there are non-Append operations (Edit, Redact, Set) since the last snapshot.
-    /// When true, a full snapshot should be created instead of a delta snapshot,
-    /// because delta snapshots can only track Append operations.
+    /// Whether a Redact, an Edit, a Set or a Delta lies in this state's chain
+    /// since its last full snapshot. While true, an `append_log` state takes no delta
+    /// snapshot. Any full snapshot clears it. A head an earlier release saved
+    /// may hold false with such a change in its chain. When a delta snapshot
+    /// comes due across such a change, the store takes a full one instead;
+    /// where the change already lies behind a delta snapshot that release
+    /// took, the store goes on taking delta snapshots, which keep the reading
+    /// that delta gives.
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
@@ -550,6 +565,9 @@ impl StateManager {
             .expect("head inserted above");
 
         head.head_offset = offset;
+        if is_non_append_change(operation) {
+            head.has_non_append_since_snapshot = true;
+        }
 
         match operation {
             StateOperation::Snapshot(data) => {
@@ -581,7 +599,6 @@ impl StateManager {
             }
             StateOperation::Redact { start, end } => {
                 head.ops_since_delta_snapshot += 1;
-                head.has_non_append_since_snapshot = true;
                 // Redact removes the items of [start, end) that exist: both
                 // ends are clamped to the length, as the materialized value
                 // clamps them, so a range running past the end removes only
@@ -592,7 +609,6 @@ impl StateManager {
             }
             StateOperation::Edit { .. } => {
                 head.ops_since_delta_snapshot += 1;
-                head.has_non_append_since_snapshot = true;
                 // Edit doesn't change count
             }
             StateOperation::Set(data) => {
@@ -600,8 +616,6 @@ impl StateManager {
                 // Set replaces the entire state. Append-log delta snapshots only
                 // consolidate Append operations, so allowing a delta after Set
                 // would walk past the replacement and resurrect older appends.
-                // Force the next threshold snapshot to contain the full state.
-                head.has_non_append_since_snapshot = true;
                 if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(data) {
                     head.item_count = arr.len();
                 }
@@ -742,8 +756,8 @@ impl StateManager {
                         state_id,
                         branch_id,
                         offset,
-                        *start as u32,
-                        *end as u32,
+                        *start,
+                        *end,
                     );
                 }
                 StateOperation::Set(data)
@@ -1090,54 +1104,9 @@ impl StateManager {
     }
 
     /// Reconstruct state by traversing chain from disk.
-    ///
-    /// For AppendLog with incremental snapshots:
-    /// - Full Snapshot: Stop traversal completely, use as base
-    /// - DeltaSnapshot: Consolidates ops before it; continue to find more deltas/full snapshot
-    /// - Regular ops: Collect only if before any snapshot
-    ///
-    /// Reconstruction: base_snapshot + delta_snapshots + recent_ops
     fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<(Vec<u8>, bool)> {
         self.reconstructions.fetch_add(1, Ordering::Relaxed);
-        let mut operations = Vec::new();
-        let mut current_offset = Some(head_offset);
-        let mut hit_snapshot = false; // Once we hit any snapshot, stop collecting regular ops
-
-        // Follow chain backwards, collecting operations
-        while let Some(offset) = current_offset {
-            let record = log.read_at(offset)?;
-
-            // Parse the state update from the record payload
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Full-state terminal: both Snapshot and Set replace the
-                    // entire state in materialize_operations, so anything older
-                    // is superseded. Add it and stop. Walking past a Set was the
-                    // bug that made cold reconstruction of Snapshot-strategy
-                    // states O(full chain) — those states are written via Set
-                    // and never get a periodic Snapshot, so the walk ran to
-                    // sequence 0. Mirrors get_state_tail's Set handling.
-                    operations.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
-                    // Delta snapshot - add it and continue looking for more snapshots
-                    // but stop collecting regular operations
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    // Regular operation - only collect if we haven't hit a snapshot yet
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
+        let mut operations = super::ChainWalk::new(log, head_offset, None).collect::<Result<Vec<_>>>()?;
 
         // Apply operations in forward order (reverse of collection order),
         // decoding once and encoding once — per-op application made cold
@@ -1201,15 +1170,6 @@ impl StateManager {
                 if ops_covered_since_full >= full_interval {
                     Some(SnapshotNeeded::Full)
                 } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
-                    // Delta snapshots only track Append operations, so after a
-                    // non-Append op (Edit, Redact, Set) no delta may be taken
-                    // until a full resets the chain — a delta would walk past
-                    // the mutation and resurrect older values. We do NOT force
-                    // an early full for it (historically that meant a full
-                    // snapshot of the whole state every delta interval while
-                    // edits kept occurring — O(N²/D) disk): the raw tail just
-                    // grows until the size-aware full above fires, and
-                    // single-pass materialization keeps reading it O(N).
                     if head.has_non_append_since_snapshot {
                         None
                     } else {
@@ -1369,7 +1329,7 @@ impl StateManager {
     /// the chain had at that position — because the accounting decides which
     /// kind of snapshot the branch may take next: starting a branch with
     /// "no non-append ops since the last snapshot" while its inherited chain
-    /// holds an uncovered Edit/Redact/Set lets an append-only delta snapshot
+    /// holds an uncovered Redact/Edit/Set/Delta lets an append-only delta snapshot
     /// walk past that mutation and lose it.
     pub fn insert_head_for_branch(&self, branch_id: BranchId, state_id: &str, head: StateChainHead) {
         let mut index = self.index.write();

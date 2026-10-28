@@ -590,15 +590,15 @@ impl FieldIndexManager {
     /// been exercised at; would want a smarter structure (e.g. a Fenwick/BIT
     /// of shifts, or lazily-applied offsets) if redact-heavy workloads on
     /// multi-million-item indexes show up.
-    pub fn on_redact(&mut self, state_id: &str, branch_id: BranchId, offset: u64, start: u32, end: u32) {
+    pub fn on_redact(&mut self, state_id: &str, branch_id: BranchId, offset: u64, start: usize, end: usize) {
         let fields = match self.fields_mut(state_id, branch_id) {
             Some(fields) => fields,
             None => return,
         };
         for index in fields.values_mut() {
             let len = index.by_ordinal.len();
-            let start_c = (start as usize).min(len);
-            let end_c = (end as usize).min(len);
+            let start_c = start.min(len);
+            let end_c = end.min(len);
             if start_c >= end_c {
                 index.head_offset = Some(offset);
                 continue;
