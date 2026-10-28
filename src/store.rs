@@ -608,6 +608,11 @@ impl Store {
         self.blobs.store(content, content_type)
     }
 
+    #[cfg_attr(not(feature = "napi-bindings"), allow(dead_code))]
+    pub(crate) fn store_blob_chunked(&self, content: &[u8], content_type: &str) -> Result<Hash> {
+        self.blobs.store_chunked(content, content_type)
+    }
+
     /// Get a blob by hash, as [`BlobStorage::get`] does.
     pub fn get_blob(&self, hash: &Hash) -> Result<Option<Blob>> {
         self.blobs.get(hash)

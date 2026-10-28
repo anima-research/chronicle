@@ -50,7 +50,7 @@ store.getBlob(hash);                       // the same bytes
 store.close();
 ```
 
-Every method is synchronous: it runs on the calling thread, and `pollSubscriptionTimeout` blocks it for up to its timeout. The package's `index.d.ts`, generated from `src/napi.rs` with its doc comments, lists every method and its options.
+Every method but `storeBlobAsync` is synchronous: it runs on the calling thread, and `pollSubscriptionTimeout` blocks it for up to its timeout. The package's `index.d.ts`, generated from `src/napi.rs` with its doc comments, lists every method and its options.
 
 ## What a store keeps
 
@@ -78,7 +78,7 @@ A registration is kept in the store, so on a store opened again, `registerState`
 
 ### Blobs
 
-`storeBlob` keeps bytes under their SHA-256 hash, so the same content is stored once, and `getBlob` reads them back.
+`storeBlob` keeps bytes under their SHA-256 hash, so the same content is stored once, and `getBlob` reads them back. `storeBlobAsync` stores them without holding the calling thread: the open store's own thread, which its root handle and views share, takes them one at a time, in the order they're called, and the root's `close()` waits for those already called. With `chunked: true`, it stores content as chunks cut where its own bytes say, so content sharing long runs of bytes with earlier chunked content shares those chunks on disk. A chronicle release without chunked blobs, 0.5.0 and earlier, can't read one.
 
 ### Subscriptions
 
