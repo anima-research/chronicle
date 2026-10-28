@@ -42,6 +42,14 @@ pub(crate) fn is_non_append_change(op: &StateOperation) -> bool {
     )
 }
 
+fn replaced_item_count(data: &[u8]) -> Option<usize> {
+    if data.is_empty() {
+        Some(0)
+    } else {
+        super::operations::json_array_len(data)
+    }
+}
+
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotNeeded {
@@ -117,19 +125,19 @@ pub struct StateChainHead {
     pub has_non_append_since_snapshot: bool,
 
     /// Current number of items in the state (for O(1) length queries via
-    /// `get_state_len`). Updated on each Append (+1), Redact (minus the items
-    /// of `[start, end)` that exist: both ends clamped to the count), and a
-    /// full Snapshot or a Set of an array (=its length). Exact for an
-    /// AppendLog written with its own operations (Appends, Edits, Redacts,
-    /// and Sets and Snapshots of arrays), except a count an older build
-    /// stored before Redacts were clamped: loading keeps a stored count as it
-    /// is, so that one can stay low until a full Snapshot or array Set counts
-    /// the items again. For Tree states it is an estimate between full
-    /// snapshots (an overwrite counts as an insert, and a remove as a removal
-    /// whether or not the path existed) and is corrected from the snapshot
-    /// bytes at each full.
-    /// Snapshot spacing does NOT read this field — it reads
-    /// `item_count_at_last_full`, which is always stamped from parsed
+    /// `get_state_len`). Updated on each Append (+1), Redact (minus the items of
+    /// `[start, end)` that exist: both ends clamped to the count), a full
+    /// Snapshot or a Set or Delta of an array (=its length), and a Set or Delta
+    /// with no bytes (=0). Exact for an AppendLog written with its own operations
+    /// (Appends, Edits, Redacts, and Sets, Deltas and Snapshots of arrays),
+    /// except a count an older build stored before Redacts were clamped or before
+    /// Deltas and empty replaces were counted: loading keeps a stored count as it
+    /// is, so that one can stay wrong until a full Snapshot or an array Set or
+    /// Delta counts the items again. For Tree states it is an estimate between
+    /// full snapshots (an overwrite counts as an insert, and a remove as a
+    /// removal whether or not the path existed) and is corrected from the
+    /// snapshot bytes at each full. Snapshot spacing does NOT read this field —
+    /// it reads `item_count_at_last_full`, which is always stamped from parsed
     /// snapshot bytes and therefore exact.
     #[serde(default)]
     pub item_count: usize,
@@ -588,7 +596,6 @@ impl StateManager {
             }
             StateOperation::DeltaSnapshot(_) => {
                 // Delta snapshot resets op counter, increments delta counter
-                // Note: Delta doesn't change item_count - it consolidates existing items
                 head.ops_since_delta_snapshot = 0;
                 head.delta_snapshots_since_full += 1;
                 head.last_delta_snapshot_offset = Some(offset);
@@ -624,8 +631,8 @@ impl StateManager {
                 // Set replaces the entire state. Append-log delta snapshots only
                 // consolidate Append operations, so allowing a delta after Set
                 // would walk past the replacement and resurrect older appends.
-                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(data) {
-                    head.item_count = arr.len();
+                if let Some(count) = replaced_item_count(data) {
+                    head.item_count = count;
                 }
             }
             StateOperation::TreeSet { .. } => {
@@ -657,9 +664,14 @@ impl StateManager {
                 head.delta_snapshots_since_full += 1;
                 head.last_delta_snapshot_offset = Some(offset);
             }
-            StateOperation::Delta { .. } | StateOperation::Field { .. } => {
+            StateOperation::Delta { new_value, .. } => {
                 head.ops_since_delta_snapshot += 1;
-                // Delta/Field operations for Struct type - don't change count
+                if let Some(count) = replaced_item_count(new_value) {
+                    head.item_count = count;
+                }
+            }
+            StateOperation::Field { .. } => {
+                head.ops_since_delta_snapshot += 1;
             }
         }
 
