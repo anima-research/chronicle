@@ -2574,8 +2574,10 @@ impl Store {
     /// there as a registered-but-empty state does on a `create_empty_branch`
     /// branch, and a write starts a fresh chain.
     ///
-    /// Cost is proportional to the number of states inherited, not to the
-    /// number of states the parent holds or to the number of branches.
+    /// Copying the heads costs in proportion to the number of states
+    /// inherited, not to the number of states the parent holds or to the
+    /// number of branches; the checkpoint that ends the call still saves every
+    /// branch's heads.
     pub fn create_branch_with_states(
         &self,
         name: &str,

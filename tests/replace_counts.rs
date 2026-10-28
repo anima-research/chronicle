@@ -132,3 +132,33 @@ fn a_set_of_an_array_sets_the_length() {
         .unwrap();
     assert_eq!(store.get_state_len("s").unwrap(), Some(3));
 }
+
+#[test]
+fn a_fork_walked_past_a_full_snapshot_reads_it_when_a_delta_stops_the_count() {
+    let dir = TempDir::new().unwrap();
+    let store = store(&dir);
+    store.compact_state("s").unwrap();
+    store
+        .update_state(
+            "s",
+            StateOperation::Edit {
+                index: 3,
+                new_value: serde_json::to_vec(&json!("e")).unwrap(),
+            },
+        )
+        .unwrap();
+    store
+        .update_state("s", delta(&serde_json::to_vec(&json!(["a", "b"])).unwrap()))
+        .unwrap();
+    let at = store.current_branch().head;
+    store
+        .update_state(
+            "s",
+            StateOperation::Append(serde_json::to_vec(&json!("x")).unwrap()),
+        )
+        .unwrap();
+    store.create_branch_at("child", "main", at).unwrap();
+    store.switch_branch("child").unwrap();
+    assert_eq!(items(&store), vec![json!("a"), json!("b")]);
+    assert_eq!(store.get_state_len("s").unwrap(), Some(2));
+}
