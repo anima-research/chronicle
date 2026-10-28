@@ -89,12 +89,16 @@ fn append(store: &Store, id: &str, v: Value) {
         .unwrap();
 }
 
-/// Everything observable about one state on the current branch.
-fn observe(store: &Store, id: &str) -> (Option<Vec<u8>>, Option<usize>, Option<Vec<u8>>, usize) {
+/// Everything observable about one state on the current branch. A tail of a
+/// state that is not an array is an error, observed as its message.
+fn observe(
+    store: &Store,
+    id: &str,
+) -> (Option<Vec<u8>>, Option<usize>, Result<Option<Vec<u8>>, String>, usize) {
     (
         store.get_state(id).unwrap(),
         store.get_state_len(id).unwrap(),
-        store.get_state_tail(id, 3).unwrap(),
+        store.get_state_tail(id, 3).map_err(|e| e.to_string()),
         store.tree_list(id, None).map(|l| l.len()).unwrap_or(0),
     )
 }
