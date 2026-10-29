@@ -14,5 +14,5 @@
     own property order), so a request built from them can change once after
     the upgrade.
   - A store this release writes still opens on 0.5.0, which hands back sorted
-    every object it parses, and re-sorts an append log's items when it
-    snapshots the log after writing to it.
+    every object it parses, and can re-sort the items it writes into a
+    snapshot of an append log.
