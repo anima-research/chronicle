@@ -280,10 +280,11 @@ impl Store {
     /// Open an existing store.
     pub fn open(config: StoreConfig) -> Result<Self> {
         // Verify manifest
-        let mut features = Self::verify_manifest(&config.path)?;
+        Self::verify_manifest(&config.path)?;
 
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
+        let mut features = Self::verify_manifest(&config.path)?;
 
         // With the lock held, no save of this store is in progress, so its
         // own staging files here were left by interrupted saves. The sweep's
