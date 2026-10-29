@@ -60,16 +60,18 @@ fn many(vs: &[serde_json::Value]) -> StateOperation {
 /// `ops` with every `AppendMany` replaced by one `Append` per item, in
 /// order: what the batch must be indistinguishable from.
 fn expand_batches(ops: &[StateOperation]) -> Vec<StateOperation> {
-    let mut out = Vec::new();
-    for op in ops {
-        match op {
-            StateOperation::AppendMany(items) => {
-                out.extend(items.iter().cloned().map(StateOperation::Append))
-            }
-            other => out.push(other.clone()),
-        }
+    ops.iter().flat_map(expand_batch).collect()
+}
+
+fn expand_batch(op: &StateOperation) -> Vec<StateOperation> {
+    match op {
+        StateOperation::AppendMany(items) => items.iter().cloned().map(StateOperation::Append).collect(),
+        StateOperation::Field { name, operation } => expand_batch(operation)
+            .into_iter()
+            .map(|inner| StateOperation::Field { name: name.clone(), operation: Box::new(inner) })
+            .collect(),
+        other => vec![other.clone()],
     }
-    out
 }
 
 /// `check`, and the same ops with their batches expanded into single

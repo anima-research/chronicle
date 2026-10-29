@@ -17,7 +17,9 @@
 //! These tests use only the cursor API so they compile against the unfixed
 //! code; they fail there on the `create_branch_at` child.
 
-use chronicle::{Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig};
+use chronicle::{
+    CompactionStats, Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -95,6 +97,14 @@ fn append_past_delta_threshold(store: &Store) -> Vec<Value> {
 /// children still read `expected_inherited ++ appended` — in-process and
 /// again after a close/reopen (cold reconstruction from the log).
 fn run_case(mutate: impl Fn(&Store), expected_inherited: Vec<Value>) {
+    run_case_then(mutate, expected_inherited, |_, _, _| {});
+}
+
+fn run_case_then(
+    mutate: impl Fn(&Store),
+    expected_inherited: Vec<Value>,
+    after_threshold: impl Fn(&str, &CompactionStats, &CompactionStats),
+) {
     let dir = TempDir::new().unwrap();
     let mut expected_by_branch: Vec<(&str, Vec<Value>)> = Vec::new();
     {
@@ -111,7 +121,9 @@ fn run_case(mutate: impl Fn(&Store), expected_inherited: Vec<Value>) {
             store.switch_branch(branch).unwrap();
             assert_eq!(read(&store), expected_inherited, "{branch}: inherited value at fork");
 
+            let before = store.get_compaction_stats("messages").unwrap();
             let appended = append_past_delta_threshold(&store);
+            after_threshold(branch, &before, &store.get_compaction_stats("messages").unwrap());
             let mut expected = expected_inherited.clone();
             expected.extend(appended);
 
@@ -220,12 +232,19 @@ fn append_many(store: &Store, values: &[&str]) {
 /// child's delta snapshots, and they keep every one of its items.
 #[test]
 fn branch_at_keeps_an_inherited_batch_across_child_delta_snapshot() {
-    run_case(
+    run_case_then(
         |store| {
             append_many(store, &["d", "e", "f"]);
             append(store, json!("g"));
         },
         vec![json!("a"), json!("b"), json!("c"), json!("d"), json!("e"), json!("f"), json!("g")],
+        |branch, before, after| {
+            assert!(
+                after.delta_snapshots_since_full > before.delta_snapshots_since_full,
+                "{branch}: setup: the child took a delta snapshot past the threshold ({before:?} -> {after:?})"
+            );
+            assert_eq!(after.last_full_snapshot_offset, before.last_full_snapshot_offset, "{branch}: and no full");
+        },
     );
 }
 

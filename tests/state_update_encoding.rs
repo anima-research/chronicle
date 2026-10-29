@@ -191,7 +191,7 @@ fn json_wire_format_unchanged_by_serde_bytes() {
 /// as a raw `bin` payload (framing overhead only, as for one `Append`).
 #[test]
 fn msgpack_roundtrip_of_a_batch() {
-    let items = vec![b"{\"a\":1}".to_vec(), Vec::new(), vec![b'x'; 32 * 1024], b"7".to_vec()];
+    let items = vec![b"{\"a\":1}".to_vec(), Vec::new(), vec![0xC8u8; 32 * 1024], b"7".to_vec()];
     let orig = update(StateOperation::AppendMany(items.clone()));
     let (payload, encoding) = orig.encode().unwrap();
     assert_eq!(encoding, PayloadEncoding::MessagePack);

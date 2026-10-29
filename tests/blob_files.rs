@@ -53,18 +53,22 @@ fn staged(store: &Path) -> usize {
 fn open_removes_blob_staging_files_left_by_interrupted_stores() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
+    let stage = path.join("blobs").join(".chronicle-blob-a1B2c3");
     let hash = {
         let store = Store::create(config(&path)).unwrap();
-        store.store_blob(b"kept", "text/plain").unwrap()
+        let hash = store.store_blob(b"kept", "text/plain").unwrap();
+        let before = store.stats().unwrap();
+        fs::write(&stage, b"unfinished blob").unwrap();
+        let during = store.stats().unwrap();
+        assert_eq!(
+            (during.blob_count, during.blob_size_bytes),
+            (before.blob_count, before.blob_size_bytes),
+            "not counted while it is there"
+        );
+        hash
     };
-    // What a store killed before its rename leaves beside the shards.
-    let stage = path.join("blobs").join(".chronicle-blob-a1B2c3");
-    fs::write(&stage, b"unfinished blob").unwrap();
-    {
-        let store = reopen(&path);
-        // Not counted while it is there.
-        assert_eq!(store.stats().unwrap().blob_count, 1);
-    }
+    assert!(stage.exists());
+    drop(reopen(&path));
     assert!(!stage.exists());
     let store = reopen(&path);
     assert_eq!(store.get_blob(&hash).unwrap().unwrap().content, b"kept");
