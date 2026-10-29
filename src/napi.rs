@@ -1213,11 +1213,12 @@ impl JsStore {
     /// returns: the store logs a `tracing` warning, and the next write to
     /// the state tries the snapshot again (issue #39).
     ///
-    /// The first batch a store records, by this call or
-    /// `appendManyToStateJson`, changes its format: the store's `MANIFEST`
-    /// goes to version 2, and releases from before batched appends refuse to
-    /// open it. A store that never records a batch keeps the format they
-    /// open.
+    /// The first batch that passes its checks, by this call or
+    /// `appendManyToStateJson`, changes the store's format: its `MANIFEST`
+    /// goes to version 2 before the batch is written, so even a first batch
+    /// that then fails leaves it there, and releases from before batched
+    /// appends refuse to open it. A store never asked to record a batch keeps
+    /// the format they open.
     #[napi]
     pub fn append_many_to_state_json_with_identity(
         &self,

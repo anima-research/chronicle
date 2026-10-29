@@ -2,9 +2,10 @@
   an append-log state as one record, at one sequence, through
   `update_state`. Every read sees what the same items appended one `Append`
   at a time would give: the value, `get_state_len`, tails, slices, point
-  lookups, iteration, historical reads and forks, delta snapshots, field
-  indexes (each item at its own ordinal), and replay after a crash, which
-  keeps or drops a batch whole. It counts as one operation toward the
+  lookups, iteration, delta snapshots, field indexes (each item at its own
+  ordinal), and replay after a crash, which keeps or drops a batch whole. A
+  historical read or a fork cut by sequence keeps or drops it whole too,
+  since it has one sequence. It counts as one operation toward the
   snapshot cadence, as a `TreeBatch` does, and is append-only, so delta
   snapshots go on as for single appends. The per-item cache advances through
   a batch without re-materializing, and the head-record fast path serves its

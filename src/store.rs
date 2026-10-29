@@ -806,9 +806,10 @@ impl Store {
     /// store records also rewrites its MANIFEST, before the record is
     /// written, to format version 2 with the batch feature named, so a build
     /// that predates the operation refuses the store when it opens it. A
-    /// store that never holds one keeps version 1, which every release
+    /// store never asked to record one keeps version 1, which every release
     /// opens. If that rewrite fails, the error is returned and nothing is
-    /// recorded.
+    /// recorded. If the record then fails to be written, the error is
+    /// returned and the store stays at version 2 with no batch.
     ///
     /// Snapshots are created automatically when the state's thresholds are
     /// reached, by the write that reaches them, once its record is written
@@ -913,10 +914,12 @@ impl Store {
     /// sequence (a `StateOperation::AppendMany`), and say which ordinals
     /// they took. See `AppendedBatch::first_ordinal`.
     ///
-    /// Every read sees the batch as it would see the same items appended one
-    /// at a time. It counts as one operation toward the state's snapshot
-    /// cadence, and the first batch a store records marks its MANIFEST so
-    /// that releases which predate batches refuse the store (see
+    /// Reads see the batch as they would see the same items appended one at
+    /// a time, except that a historical read or a fork cut by sequence keeps
+    /// or drops it whole, as it has one sequence. It counts as one operation
+    /// toward the state's snapshot cadence, and the first batch a store
+    /// records marks its MANIFEST so that releases which predate batches
+    /// refuse the store (see
     /// `update_state`). Each item must be one JSON value, as for an
     /// `Append`. An empty batch is refused with `InvalidOperation` and
     /// writes nothing. Once the batch is recorded, the call returns it: if
@@ -984,8 +987,8 @@ impl Store {
     /// one operation toward the snapshot cadence, the returned
     /// `AppendedBatch` says which ordinals they took, and the first batch a
     /// store records marks its MANIFEST so that releases which predate
-    /// batches refuse the store (see `update_state`). A store that never
-    /// records a batch, by this call or another, keeps the format every
+    /// batches refuse the store (see `update_state`). A store never asked to
+    /// record a batch, by this call or another, keeps the format every
     /// release opens.
     ///
     /// Refused with `InvalidOperation`, writing nothing, when `items` is
