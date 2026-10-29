@@ -1016,9 +1016,10 @@ impl StateManager {
     /// those bytes: it parses them and serializes the result, and a parsed
     /// Value object keeps its keys in the order they were parsed in
     /// (serde_json's `preserve_order`). Asserted by the fast/slow
-    /// equivalence test. An item appended as raw bytes is served as given,
-    /// which may spell it differently (whitespace, number form) from the
-    /// materialization path.
+    /// equivalence test. On the head-record path, an item appended as raw
+    /// bytes is served as given, which may spell it differently (whitespace,
+    /// number form, escapes) from the materialization path and a warm items
+    /// cache.
     ///
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),

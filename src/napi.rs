@@ -36,9 +36,10 @@ use std::sync::Arc;
 /// referenced. `close()` on a view only detaches that view.
 ///
 /// JSON objects you write come back with their keys in the order you wrote
-/// them (for a JavaScript object, its own property order), at every level
-/// and from every method that returns them. Objects stored by 0.5.0 or
-/// earlier keep the order they were stored in.
+/// them (in a JavaScript object, its own property order), at every level
+/// and from every method that returns them. A tree state's entries come
+/// back sorted by path. An object stored by an earlier version keeps the
+/// order it was stored in, which for the JSON-writing methods was sorted.
 #[napi]
 pub struct JsStore {
     /// The open store, shared by the root handle and every view made from

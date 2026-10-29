@@ -225,8 +225,7 @@ fn last_item_via_materialization(store: &Store, state_id: &str) -> Vec<u8> {
 
 /// The fast path (cold caches, immediately after append — exactly the
 /// context-manager write-through pattern) must be byte-identical to the
-/// materialization path, for items whose keys are out of sorted order at the
-/// top and nested, and both keep those keys in the order written.
+/// materialization path.
 #[test]
 fn fast_path_matches_materialization_bytes() {
     let dir = TempDir::new().unwrap();
