@@ -1,6 +1,6 @@
 - `StateOperation::AppendMany(Vec<Vec<u8>>)` (Rust): appends several items to
   an append-log state as one record, at one sequence, through
-  `update_state`. Every read sees what the same items appended one `Append`
+  `update_state`. These reads see what the same items appended one `Append`
   at a time would give: the value, `get_state_len`, tails, slices, point
   lookups, iteration, delta snapshots, field indexes (each item at its own
   ordinal), and replay after a crash, which keeps or drops a batch whole. A

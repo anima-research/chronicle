@@ -1159,7 +1159,9 @@ impl JsStore {
     /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`.
     ///
     /// Reads see the items exactly as if each had been appended with
-    /// `appendToStateJson`, in order. The batch counts as one operation
+    /// `appendToStateJson`, in order, except that a historical read or a
+    /// branch cut by sequence keeps or drops the batch whole, as it has one
+    /// sequence. The batch counts as one operation
     /// toward the state's snapshot cadence, and subscribers get one
     /// "state_delta" event for it (see `JsStoreEvent.data`). Throws, writing
     /// nothing, for an empty `items`. Once the batch is recorded the call
@@ -1213,12 +1215,12 @@ impl JsStore {
     /// returns: the store logs a `tracing` warning, and the next write to
     /// the state tries the snapshot again (issue #39).
     ///
-    /// The first batch that passes its checks, by this call or
-    /// `appendManyToStateJson`, changes the store's format: its `MANIFEST`
-    /// goes to version 2 before the batch is written, so even a first batch
-    /// that then fails leaves it there, and releases from before batched
-    /// appends refuse to open it. A store never asked to record a batch keeps
-    /// the format they open.
+    /// Just before a store's first batch is written, by this call or
+    /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it
+    /// stays there even if that batch then fails, so releases from before
+    /// batched appends refuse to open it. If the move itself fails, the call
+    /// throws and the batch isn't recorded. A store never asked to record a
+    /// batch keeps the format they open.
     #[napi]
     pub fn append_many_to_state_json_with_identity(
         &self,

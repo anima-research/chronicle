@@ -6,7 +6,9 @@
     item took, so item `i` is at `firstOrdinal + i` without a read. That
     index is the state's length just before the batch, read under the write
     lock. Reads see the items as if each were appended with
-    `appendToStateJson`. An empty `items` throws and writes nothing. The
+    `appendToStateJson`, except that a historical read or a branch cut by
+    sequence keeps or drops the batch whole, as it has one sequence. An
+    empty `items` throws and writes nothing. The
     first batch a store records moves its `MANIFEST` to version 2 (see
     Breaking).
   - `getStateItemsJson(stateId, ordinals)` returns, for each index in the
