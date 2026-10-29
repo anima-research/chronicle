@@ -1011,10 +1011,14 @@ impl StateManager {
     /// for the final index, the item is served from the head record alone:
     /// O(one record read) regardless of state size, no cache churn.
     ///
-    /// Byte fidelity: an Append record stores exactly the bytes that
-    /// materialization re-emits for that item — both sides serialize the
-    /// same `serde_json::Value`, and Value objects are BTreeMap-backed so
-    /// key order is canonical. Asserted by the fast/slow equivalence test.
+    /// Byte fidelity: an item appended as a `serde_json::Value` is stored as
+    /// that Value's serialization, and materialization re-emits exactly
+    /// those bytes: it parses them and serializes the result, and a parsed
+    /// Value object keeps its keys in the order they were parsed in
+    /// (serde_json's `preserve_order`). Asserted by the fast/slow
+    /// equivalence test. An item appended as raw bytes is served as given,
+    /// which may spell it differently (whitespace, number form) from the
+    /// materialization path.
     ///
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),

@@ -610,7 +610,7 @@ mod tests {
         assert!(Arc::ptr_eq(&value.chunks[1], &first.chunks[1]));
         assert!(!Arc::ptr_eq(&value.chunks[2], &first.chunks[2]));
         assert!(Arc::ptr_eq(&value.chunks[2][0], &first.chunks[2][0]));
-        assert_eq!(&first[CHUNK * 2 + 1], b"{\"a\":1,\"b\":2}");
+        assert_eq!(&first[CHUNK * 2 + 1], b"{\"b\":2,\"a\":1}");
         assert_eq!(&first[CHUNK * 2 + 3], b"100.0");
         // The original is untouched.
         assert_eq!(&value[CHUNK * 2 + 1], raw[1]);

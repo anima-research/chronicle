@@ -100,8 +100,8 @@ pub fn materialize_operations(ops: Vec<StateOperation>) -> Result<Vec<u8>> {
 /// this crate's own serialization of the decoded value (`true`) or a payload
 /// passed through verbatim from a `Set`/`Snapshot`/`Delta` operation, or
 /// nothing at all (`false`). Verbatim bytes may spell the same JSON
-/// differently from how a later re-materialization would (key order,
-/// whitespace, number form).
+/// differently from how a later re-materialization would (whitespace,
+/// number form).
 pub(crate) fn materialize_operations_tagged(ops: Vec<StateOperation>) -> Result<(Vec<u8>, bool)> {
     let mut acc = Materialized::Raw(Vec::new());
 
