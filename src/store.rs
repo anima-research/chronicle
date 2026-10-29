@@ -225,7 +225,15 @@ impl Store {
         // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
         if let Some(found) = Self::present_store_file(&config.path)? {
-            return Err(StoreError::InvalidOperation(if found == "MANIFEST" {
+            let manifest = config.path.join("MANIFEST");
+            return Err(StoreError::InvalidOperation(if found == "MANIFEST"
+                && matches!(fs::metadata(&manifest), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                format!(
+                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with open or open_or_create",
+                    Self::link_to_nothing(&manifest)
+                )
+            } else if found == "MANIFEST" {
                 format!(
                     "create: {} already holds a Chronicle store; open it with open or open_or_create",
                     config.path.display()
@@ -3198,6 +3206,16 @@ impl Store {
     /// The files whose presence means a directory already holds a store.
     const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
 
+    fn link_to_nothing(link: &Path) -> String {
+        format!(
+            "{} is a symbolic link (to {}) that leads to nothing",
+            link.display(),
+            fs::read_link(link)
+                .map(|target| target.display().to_string())
+                .unwrap_or_else(|_| "a path that can't be read".into())
+        )
+    }
+
     fn present_store_file(path: &Path) -> std::io::Result<Option<&'static str>> {
         for file in Self::STORE_FILES {
             match fs::symlink_metadata(path.join(file)) {
@@ -3245,11 +3263,8 @@ impl Store {
             std::io::ErrorKind::NotFound => match Self::present_store_file(path) {
                 Err(error) => error.into(),
                 Ok(Some("MANIFEST")) => StoreError::InvalidFormat(format!(
-                    "{} is a symbolic link (to {}) that leads to nothing, so the store can't be opened until what it leads to is back (on a volume that isn't mounted, say)",
-                    manifest_path.display(),
-                    fs::read_link(&manifest_path)
-                        .map(|target| target.display().to_string())
-                        .unwrap_or_else(|_| "a path that can't be read".into())
+                    "{}, so the store can't be opened until it leads to the store's MANIFEST again: mount the volume it points into, say, or point the link where that MANIFEST is",
+                    Self::link_to_nothing(&manifest_path)
                 )),
                 Ok(Some(found)) => StoreError::InvalidFormat(format!(
                     "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",

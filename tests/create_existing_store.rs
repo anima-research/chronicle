@@ -272,6 +272,10 @@ fn a_store_file_left_as_a_link_to_nothing_is_refused_and_nothing_is_written_thro
 
         let msg = invalid_operation(Store::create(config(&path)));
         assert!(msg.contains(&*path.to_string_lossy()), "{file}: {msg}");
+        assert!(
+            file != "MANIFEST" || (msg.contains("leads to nothing") && !msg.contains("already holds")),
+            "{file}: {msg}"
+        );
         assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: nothing was written through the link");
         assert!(
             file == "MANIFEST" || fs::symlink_metadata(path.join("MANIFEST")).is_err(),
@@ -315,7 +319,8 @@ fn open_or_create_on_a_path_that_is_a_file_names_it() {
         match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
             Err(StoreError::Io(error)) => assert!(
                 error.kind() == std::io::ErrorKind::NotADirectory
-                    && error.to_string().contains(&*path.to_string_lossy()),
+                    && error.to_string().contains(&*path.to_string_lossy())
+                    && error.to_string().contains("MANIFEST"),
                 "{create_if_missing}: {error}"
             ),
             Err(e) => panic!("{create_if_missing}: expected an I/O error naming the path, got {e}"),
