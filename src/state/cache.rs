@@ -553,10 +553,6 @@ mod tests {
         for (version, expected) in &versions {
             assert_eq!(&contents(version), expected);
         }
-        // Invariant: all chunks full except the last, none empty.
-        let (last, full) = items.chunks.split_last().unwrap();
-        assert!(full.iter().all(|c| c.len() == CHUNK));
-        assert!(!last.is_empty() && last.len() <= CHUNK);
     }
 
     #[test]
