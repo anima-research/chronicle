@@ -523,8 +523,6 @@ fn a_manifest_with_an_unknown_feature_is_refused() {
 #[cfg(unix)]
 #[test]
 fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     let store = Store::create(config(&path)).unwrap();
@@ -535,23 +533,33 @@ fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
     let head = store.current_branch().head;
     let records = store.stats().unwrap().record_count;
 
-    // The manifest is replaced through a new file beside it; a directory
-    // that can't take one makes the replacement fail. (Root ignores the
-    // mode, so the check is skipped there.)
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let probe = std::fs::File::create(path.join("probe")).is_ok();
+    std::fs::rename(path.join("MANIFEST"), path.join("MANIFEST.aside")).unwrap();
+    std::fs::create_dir(path.join("MANIFEST")).unwrap();
     let result = store.update_state("log", batch(&[json!(1), json!(2)]));
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    if probe {
-        return;
+    std::fs::remove_dir(path.join("MANIFEST")).unwrap();
+    std::fs::rename(path.join("MANIFEST.aside"), path.join("MANIFEST")).unwrap();
+    match result {
+        Err(StoreError::Io(error)) => {
+            let message = error.to_string();
+            assert!(
+                message.contains(&*path.join("MANIFEST").to_string_lossy()) && message.contains("not recorded"),
+                "{message}"
+            );
+        }
+        Err(e) => panic!("expected the MANIFEST's I/O error, got {e}"),
+        Ok(_) => panic!("the batch must fail when its manifest mark fails"),
     }
-    assert!(result.is_err(), "the batch must fail when its manifest mark fails");
+    assert_eq!(store.current_branch().head, head);
+    assert_eq!(store.stats().unwrap().record_count, records);
+    assert_eq!(value(&store, "log"), json!([0]));
+    drop(store);
+
+    let store = Store::open(config(&path)).unwrap();
     assert_eq!(store.current_branch().head, head);
     assert_eq!(store.stats().unwrap().record_count, records);
     assert_eq!(value(&store, "log"), json!([0]));
     assert_eq!(manifest(&path), b"RST\0\x01");
 
-    // Once the directory takes the new manifest, the same batch goes through.
     store.update_state("log", batch(&[json!(1), json!(2)])).unwrap();
     assert_eq!(value(&store, "log"), json!([0, 1, 2]));
     assert_eq!(&manifest(&path)[..5], b"RST\0\x02");

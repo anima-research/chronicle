@@ -2914,7 +2914,16 @@ impl Store {
             return Ok(());
         }
         let features = write.features | required;
-        Self::write_manifest_features(&self.config.path, features)?;
+        Self::write_manifest_features(&self.config.path, features).map_err(|error| match error {
+            StoreError::Io(error) => StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot mark {} for batched appends, so the batch was not recorded: {error}",
+                    self.config.path.join("MANIFEST").display()
+                ),
+            )),
+            other => other,
+        })?;
         write.features = features;
         Ok(())
     }
