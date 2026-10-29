@@ -1332,7 +1332,8 @@ impl JsStore {
     /// O(item size) once the per-item cache is warm — unlike `getStateJson`,
     /// which materializes and converts the entire state on every call. Use
     /// this for point lookups in large states. Returns `null` if the state
-    /// doesn't exist or the index is out of range.
+    /// doesn't exist, the index is negative or out of range, or the state's
+    /// value isn't an array.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1358,31 +1359,41 @@ impl JsStore {
 
     /// Get several items of an AppendLog state by index, as JSON, in one
     /// call. The result has one entry per index in `ordinals`, in the order
-    /// given: what `getStateItemJson` returns for that index, or `null` if
-    /// it is negative or out of range, or the state doesn't exist. Indices
-    /// may repeat and come in any order.
+    /// given: what `getStateItemJson` returns for that index, so `null` if
+    /// it is negative or out of range, the state doesn't exist, or the
+    /// state's value isn't an array. Indices may repeat and come in any
+    /// order.
     ///
     /// Every entry comes from the same version of the state, and a cold
     /// state is materialized at most once for the whole call, not once per
-    /// index.
+    /// index. A request with no index that is zero or more (an empty one,
+    /// or one of negative indices only) reads nothing.
     #[napi]
     pub fn get_state_items_json(
         &self,
         state_id: String,
         ordinals: Vec<i64>,
     ) -> Result<Vec<Option<serde_json::Value>>> {
+        // A negative index answers null without a read, as getStateItemJson's
+        // does; only the others go to the store.
+        let asked: Vec<Option<usize>> = ordinals.iter().map(|&i| usize::try_from(i).ok()).collect();
+        let wanted: Vec<usize> = asked.iter().flatten().copied().collect();
+        if wanted.is_empty() {
+            return Ok(vec![None; ordinals.len()]);
+        }
         let (store, branch) = self.target()?;
-        // A negative index answers null; `usize::MAX` is past any state's end.
-        let wanted: Vec<usize> = ordinals
-            .iter()
-            .map(|&i| usize::try_from(i).unwrap_or(usize::MAX))
-            .collect();
-        let items = store
+        let mut items = store
             .get_state_items_by_ordinal_on(branch, &state_id, &wanted)
-            .map_err(to_napi_error)?;
-        items
+            .map_err(to_napi_error)?
+            .into_iter();
+        asked
             .into_iter()
-            .map(|item| {
+            .map(|ordinal| {
+                // One answer per index the store was asked for, in order.
+                let item = match ordinal {
+                    Some(_) => items.next().flatten(),
+                    None => None,
+                };
                 item.map(|bytes| {
                     serde_json::from_slice(&bytes)
                         .map_err(|e| napi::Error::from_reason(e.to_string()))

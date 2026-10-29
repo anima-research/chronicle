@@ -10,11 +10,15 @@
     first batch a store records moves its `MANIFEST` to version 2 (see
     Breaking).
   - `getStateItemsJson(stateId, ordinals)` returns, for each index in the
-    order given, what `getStateItemJson` returns for it, or `null` for an
-    index that is negative or out of range or a state with no value.
-    Indices may repeat and come in any order. All the answers come from one
-    version of the state, which a cold cache materializes once for the
-    call, not once per index.
+    order given, what `getStateItemJson` returns for it: `null` for an
+    index that is negative or out of range, for a state with no value, and
+    for a state whose value isn't an array (see Changed). Indices may
+    repeat and come in any order. All the answers come from one version of
+    the state, which a cold cache materializes at most once for the call,
+    not once per index. A request with no index of zero or more (an empty
+    one, or one of negative indices only) reads nothing. An index past the
+    end costs what it costs `getStateItemJson`: on a cold cache, the one
+    materialization that finds the end.
   - `getRecords(ids)` returns, for each ID in the order given, what
     `getRecord` returns for it, or `null` for an ID with no record. The IDs
     are looked up together and the records read under one hold of the log

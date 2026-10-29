@@ -533,6 +533,120 @@ fn batched_item_reads_on_a_branch_and_on_a_missing_state() {
         .is_empty());
 }
 
+/// A state whose value isn't an array has no item at any ordinal: a single
+/// read and a batched one both answer `None`, for every ordinal and for a
+/// request that mixes ordinals the head's item count calls in range with
+/// ones past it. `get_state_slice` still refuses such a state.
+#[test]
+fn a_state_whose_value_is_not_an_array_has_no_items() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    for id in ["obj", "text"] {
+        store
+            .register_state(StateRegistration {
+                id: id.to_string(),
+                strategy: StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+    }
+    store
+        .update_state("obj", StateOperation::Set(bytes(&json!({ "a": 1 }))))
+        .unwrap();
+    store
+        .update_state("text", StateOperation::Set(bytes(&json!("not a list"))))
+        .unwrap();
+    // An append-log state replaced by an object: the head keeps the count
+    // of three items it had, so ordinal 2 looks like the last item.
+    register(&store, "log", 100, 100);
+    store
+        .append_many_to_state_json("log", &[json!(0), json!(1), json!(2)])
+        .unwrap();
+    store
+        .update_state("log", StateOperation::Set(bytes(&json!({ "b": 2 }))))
+        .unwrap();
+    assert_eq!(store.get_state_len("log").unwrap(), Some(3));
+
+    let ordinals = [0, 1, 2, 3, usize::MAX, 0];
+    for id in ["obj", "text", "log"] {
+        for cold in [true, false] {
+            if cold {
+                store.clear_state_caches();
+            }
+            for &i in &ordinals {
+                assert_eq!(store.get_state_item(id, i).unwrap(), None, "{id}[{i}]");
+            }
+            assert_eq!(
+                store.get_state_items_by_ordinal(id, &ordinals).unwrap(),
+                vec![None; ordinals.len()],
+                "{id}, cold: {cold}"
+            );
+            assert!(store
+                .get_state_items_by_ordinal(id, &[])
+                .unwrap()
+                .is_empty());
+        }
+        assert!(
+            matches!(
+                store.get_state_slice(id, 0, 10),
+                Err(StoreError::Deserialization(_))
+            ),
+            "{id}: the slice still refuses a value that isn't an array"
+        );
+    }
+}
+
+/// An empty request answers an empty list without reading the state, so a
+/// cold state isn't materialized to answer nothing.
+#[test]
+fn an_empty_request_reads_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    register(&store, "log", 100, 100);
+    let items: Vec<Value> = (0..20).map(|i| json!({ "i": i })).collect();
+    store.append_many_to_state_json("log", &items).unwrap();
+    append(&store, "log", &json!("last"));
+
+    store.clear_state_caches();
+    let before = store.state_reconstruction_count();
+    assert!(store
+        .get_state_items_by_ordinal("log", &[])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.state_reconstruction_count(),
+        before,
+        "an empty request materialized the state"
+    );
+
+    // A request mixing ordinals in range with ones past the end answers
+    // each as the single read does, from one materialization.
+    let mixed = [20, 21, 0, usize::MAX, 7, 22, 20];
+    let singles: Vec<Option<Vec<u8>>> = mixed
+        .iter()
+        .map(|&i| store.get_state_item("log", i).unwrap())
+        .collect();
+    assert_eq!(
+        singles,
+        vec![
+            Some(bytes(&json!("last"))),
+            None,
+            Some(bytes(&items[0])),
+            None,
+            Some(bytes(&items[7])),
+            None,
+            Some(bytes(&json!("last"))),
+        ]
+    );
+    store.clear_state_caches();
+    let before = store.state_reconstruction_count();
+    assert_eq!(
+        store.get_state_items_by_ordinal("log", &mixed).unwrap(),
+        singles
+    );
+    assert_eq!(store.state_reconstruction_count(), before + 1);
+}
+
 // ---------------------------------------------------------------------------
 // get_records
 // ---------------------------------------------------------------------------

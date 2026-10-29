@@ -125,6 +125,25 @@ try {
   assert.deepEqual(side.getStateItemsJson('log', [sideLen - 1, sideLen]), [{ side: 2 }, null], 'a view reads its branch');
   ok('getStateItemsJson: one entry per index, in order, null where getStateItemJson is null');
 
+  // A request of negative indices only, and one mixing indices in range with
+  // ones past either end, answer each index as getStateItemJson does.
+  assert.deepEqual(store.getStateItemsJson('log', [-1, -2, -1]), [null, null, null]);
+  const mixed = [-1, len, 0, len - 1, -5, len + 3, 2];
+  assert.deepEqual(store.getStateItemsJson('log', mixed), [null, null, model[0], model[len - 1], null, null, model[2]]);
+  assert.deepEqual(store.getStateItemsJson('log', mixed), mixed.map((i) => store.getStateItemJson('log', i)));
+  // A state whose value isn't an array has no item at any index: both forms
+  // answer null. The batched form used to throw for every request on it,
+  // [-1] and [] included, and the single form for an index of zero or more.
+  store.registerState({ id: 'obj', strategy: 'snapshot' });
+  store.setStateJson('obj', { a: 1 });
+  const objProbes = [0, -1, 1, 5, -3, 0];
+  assert.deepEqual(objProbes.map((i) => store.getStateItemJson('obj', i)), objProbes.map(() => null));
+  assert.deepEqual(store.getStateItemsJson('obj', [-1]), [null]);
+  assert.deepEqual(store.getStateItemsJson('obj', []), []);
+  assert.deepEqual(store.getStateItemsJson('obj', [0]), [null]);
+  assert.deepEqual(store.getStateItemsJson('obj', objProbes), objProbes.map(() => null));
+  ok('getStateItemsJson: negative-only and mixed requests, and a state that is not an array, answer as getStateItemJson does');
+
   // A reopened store has cold caches: the batched read must still match.
   const records = [a.record, d.record, afterRedact.record];
   store.close();

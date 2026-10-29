@@ -1615,7 +1615,8 @@ impl Store {
     /// Get a single item of an AppendLog state by index, as raw JSON bytes.
     ///
     /// O(item size) once the per-item cache is warm (see `get_state_slice`).
-    /// Returns `None` if the state doesn't exist or the index is out of range.
+    /// Returns `None` if the state doesn't exist, the index is out of range,
+    /// or the state's value isn't an array (where `get_state_slice` errors).
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -1637,9 +1638,10 @@ impl Store {
     /// Several items of an AppendLog state by ordinal, as raw JSON bytes, in
     /// one call: for each ordinal, in the order given, the item
     /// `get_state_item` returns for it, `None` where the ordinal is out of
-    /// range or the state has no value. Ordinals may repeat and come in any
-    /// order. All of them are answered from one version of the state, read
-    /// at most once (see `StateManager::get_state_items_by_ordinal`).
+    /// range, the state has no value, or its value isn't an array. Ordinals
+    /// may repeat and come in any order. All of them are answered from one
+    /// version of the state, read at most once, and an empty request reads
+    /// nothing (see `StateManager::get_state_items_by_ordinal`).
     pub fn get_state_items_by_ordinal(
         &self,
         state_id: &str,

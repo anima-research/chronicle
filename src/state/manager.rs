@@ -50,6 +50,16 @@ fn replaced_item_count(data: &[u8]) -> Option<usize> {
     }
 }
 
+/// What `StateManager::lookup_state_items` found for a state.
+enum ItemsLookup {
+    /// The state has no value on the branch.
+    NoValue,
+    /// The state's value isn't a JSON array; the deserialization error.
+    NotArray(String),
+    /// The state's items.
+    Items(Arc<StateItems>),
+}
+
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotNeeded {
@@ -994,16 +1004,41 @@ impl StateManager {
     ///
     /// Returns an error if the state is not a JSON array (e.g. a Snapshot
     /// strategy state holding an object) — matching the behavior of the
-    /// previous slice implementation.
+    /// previous slice implementation. The point lookups (`get_state_item`,
+    /// `get_state_items_by_ordinal`) answer `None` for such a state instead.
     pub fn get_state_items(
         &self,
         branch_id: BranchId,
         state_id: &str,
     ) -> Result<Option<Arc<StateItems>>> {
+        match self.lookup_state_items(branch_id, state_id)? {
+            ItemsLookup::Items(items) => Ok(Some(items)),
+            ItemsLookup::NoValue => Ok(None),
+            ItemsLookup::NotArray(e) => Err(StoreError::Deserialization(e)),
+        }
+    }
+
+    /// `get_state_items` for a point lookup: a state whose value isn't an
+    /// array has no item at any ordinal, so it answers `None`, as a state
+    /// with no value does, where `get_state_items` returns an error.
+    fn state_items_for_lookup(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<StateItems>>> {
+        match self.lookup_state_items(branch_id, state_id)? {
+            ItemsLookup::Items(items) => Ok(Some(items)),
+            ItemsLookup::NoValue | ItemsLookup::NotArray(_) => Ok(None),
+        }
+    }
+
+    /// The body of `get_state_items`, which keeps apart a state with no
+    /// value and one whose value isn't an array.
+    fn lookup_state_items(&self, branch_id: BranchId, state_id: &str) -> Result<ItemsLookup> {
         let index = self.index.read();
         let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
-            None => return Ok(None),
+            None => return Ok(ItemsLookup::NoValue),
         };
         drop(index);
 
@@ -1011,21 +1046,29 @@ impl StateManager {
 
         // Check items cache
         if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
-            return Ok(Some(cached));
+            return Ok(ItemsLookup::Items(cached));
         }
 
         // Materialize the full state once (served from the byte cache when
         // warm), then split into item spans without building a Value tree.
         let state = match self.get_state_shared(branch_id, state_id)? {
             Some(s) => s,
-            None => return Ok(None),
+            None => return Ok(ItemsLookup::NoValue),
         };
 
         let items = if state.data.is_empty() {
             StateItems::from_items(std::iter::empty(), state.canonical)
         } else {
-            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&state.data)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let raw: Vec<&serde_json::value::RawValue> = match serde_json::from_slice(&state.data) {
+                Ok(raw) => raw,
+                // serde_json reports a value of another type (an object, a
+                // string, ...) where it wanted a sequence as a data error;
+                // malformed bytes are a syntax or end-of-input error.
+                Err(e) if e.classify() == serde_json::error::Category::Data => {
+                    return Ok(ItemsLookup::NotArray(e.to_string()))
+                }
+                Err(e) => return Err(StoreError::Deserialization(e.to_string())),
+            };
             StateItems::from_items(raw.iter().map(|r| r.get().as_bytes()), state.canonical)
         };
         let items = Arc::new(items);
@@ -1034,7 +1077,7 @@ impl StateManager {
             .write()
             .put(cache_key, head.head_offset, Arc::clone(&items));
 
-        Ok(Some(items))
+        Ok(ItemsLookup::Items(items))
     }
 
     /// Point lookup of a single AppendLog item.
@@ -1062,7 +1105,9 @@ impl StateManager {
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),
     /// and any other head or non-final index takes the full materialization
-    /// path.
+    /// path. A state whose value isn't an array (a Snapshot state holding an
+    /// object, a Tree state) has no item at any index: `None`, not the
+    /// error `get_state_items` returns for it.
     pub fn get_state_item(
         &self,
         branch_id: BranchId,
@@ -1091,7 +1136,7 @@ impl StateManager {
         }
 
         // Slow path: full materialization (result cached for later reads).
-        match self.get_state_items(branch_id, state_id)? {
+        match self.state_items_for_lookup(branch_id, state_id)? {
             Some(items) => Ok(items.get(index).map(|item| item.to_vec())),
             None => Ok(None),
         }
@@ -1099,15 +1144,19 @@ impl StateManager {
 
     /// Point lookups of several AppendLog items in one call: for each
     /// ordinal in `ordinals`, in the order given, what `get_state_item`
-    /// returns for it, `None` where it is out of range or the state has no
-    /// value on this branch. Ordinals may repeat and come in any order.
+    /// returns for it, `None` where it is out of range, the state has no
+    /// value on this branch, or its value isn't an array. Ordinals may
+    /// repeat and come in any order.
     ///
     /// Every answer comes from one version of the state, and the version is
     /// read once: from the warm item cache when it is current; from the head
     /// record alone when every ordinal asked for is the last one, as
     /// `get_state_item`'s fast path serves it; and otherwise from one
     /// materialization, cached for later reads. So a batch of ordinals costs
-    /// at most what one cold `get_state_item` costs, not one each. The bytes
+    /// at most what one cold `get_state_item` costs, not one each. An empty
+    /// request reads nothing. An ordinal past the end costs what it costs
+    /// `get_state_item`: on a cold cache, the materialization that finds the
+    /// end, as the head's item count isn't exact for every store. The bytes
     /// are the same as `get_state_item`'s for items written in serde_json's
     /// own spelling; an item written in another comes back as written from
     /// the head record and re-serialized from the rest, as there.
@@ -1117,6 +1166,10 @@ impl StateManager {
         state_id: &str,
         ordinals: &[usize],
     ) -> Result<Vec<Option<Vec<u8>>>> {
+        // Nothing asked, nothing read.
+        if ordinals.is_empty() {
+            return Ok(Vec::new());
+        }
         let head = {
             let idx = self.index.read();
             match idx.heads.get(branch_id, state_id) {
@@ -1136,17 +1189,17 @@ impl StateManager {
             return Ok(pick(&cached));
         }
 
-        // Only the last item asked for (an empty request is not this case):
-        // the head record may hold it, as for `get_state_item`.
+        // Only the last item asked for: the head record may hold it, as for
+        // `get_state_item`.
         if let Some(last) = head.item_count.checked_sub(1) {
-            if !ordinals.is_empty() && ordinals.iter().all(|&i| i == last) {
+            if ordinals.iter().all(|&i| i == last) {
                 if let Some(item) = self.last_item_from_head(&head)? {
                     return Ok(vec![Some(item); ordinals.len()]);
                 }
             }
         }
 
-        match self.get_state_items(branch_id, state_id)? {
+        match self.state_items_for_lookup(branch_id, state_id)? {
             Some(items) => Ok(pick(&items)),
             None => Ok(vec![None; ordinals.len()]),
         }
