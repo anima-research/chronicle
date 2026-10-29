@@ -223,3 +223,53 @@ fn opening_a_directory_without_a_manifest_says_what_it_is() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_store_file_left_as_a_link_to_nothing_is_refused_and_nothing_is_written_through_it() {
+    for file in ["MANIFEST", "records.log", "state.bin", "branches.bin"] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let volume = dir.path().join("unmounted");
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(&volume).unwrap();
+        std::os::unix::fs::symlink(volume.join(file), path.join(file)).unwrap();
+
+        let msg = invalid_operation(Store::create(config(&path)));
+        assert!(msg.contains(&*path.to_string_lossy()), "{file}: {msg}");
+        match Store::open_or_create(config(&path)) {
+            Err(StoreError::InvalidOperation(_)) | Err(StoreError::InvalidFormat(_)) => {}
+            Err(e) => panic!("{file}: expected a refusal, got {e}"),
+            Ok(_) => panic!("{file}: open_or_create took a directory holding a link to a missing {file}"),
+        }
+        assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: nothing was written through the link");
+        assert!(
+            file == "MANIFEST" || fs::symlink_metadata(path.join("MANIFEST")).is_err(),
+            "{file}: no MANIFEST was written"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_store_whose_manifest_links_to_nothing_names_the_link() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+    let volume = dir.path().join("unmounted");
+    fs::create_dir(&volume).unwrap();
+    fs::remove_file(path.join("MANIFEST")).unwrap();
+    std::os::unix::fs::symlink(volume.join("MANIFEST"), path.join("MANIFEST")).unwrap();
+
+    for result in [Store::open(config(&path)), Store::open_or_create(config(&path))] {
+        match result {
+            Err(StoreError::InvalidFormat(msg)) => assert!(
+                msg.contains("symbolic link") && msg.contains(&*volume.join("MANIFEST").to_string_lossy()),
+                "{msg}"
+            ),
+            Err(e) => panic!("expected InvalidFormat naming the link, got {e}"),
+            Ok(_) => panic!("opened a store whose MANIFEST links to nothing"),
+        }
+    }
+    assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "nothing was written through the link");
+}

@@ -175,7 +175,7 @@ impl Store {
     /// place to put a store; one holding a store's data files without a
     /// `MANIFEST` is refused as a damaged store.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.join("MANIFEST").exists() {
+        if fs::symlink_metadata(config.path.join("MANIFEST")).is_ok() {
             return Self::open(config);
         }
         if let Some(other) = Self::foreign_entry(&config.path) {
@@ -226,8 +226,8 @@ impl Store {
         // The lock comes first, so a create aimed at a store another process
         // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
-        if let Some(found) = Self::STORE_FILES.iter().find(|f| config.path.join(f).exists()) {
-            return Err(StoreError::InvalidOperation(if *found == "MANIFEST" {
+        if let Some(found) = Self::present_store_file(&config.path) {
+            return Err(StoreError::InvalidOperation(if found == "MANIFEST" {
                 format!(
                     "create: {} already holds a Chronicle store; open it with open or open_or_create",
                     config.path.display()
@@ -3185,6 +3185,13 @@ impl Store {
     /// The files whose presence means a directory already holds a store.
     const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
 
+    fn present_store_file(path: &Path) -> Option<&'static str> {
+        Self::STORE_FILES
+            .iter()
+            .copied()
+            .find(|file| fs::symlink_metadata(path.join(file)).is_ok())
+    }
+
     // Published whole, through a staging file renamed over it, so a crash
     // mid-write can't leave a MANIFEST that create refuses and open can't read.
     // Only create calls it, under the lock and once it has found no MANIFEST,
@@ -3214,7 +3221,14 @@ impl Store {
         let manifest_path = path.join("MANIFEST");
         let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => StoreError::InvalidFormat(
-                match Self::STORE_FILES.iter().find(|f| path.join(f).exists()) {
+                match Self::present_store_file(path) {
+                    Some("MANIFEST") => format!(
+                        "{} is a symbolic link to {}, which doesn't exist, so the store can't be opened until that file is back (on a volume that isn't mounted, say)",
+                        manifest_path.display(),
+                        fs::read_link(&manifest_path)
+                            .map(|target| target.display().to_string())
+                            .unwrap_or_else(|_| "a path that can't be read".into())
+                    ),
                     Some(found) => format!(
                         "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
                         path.display()
