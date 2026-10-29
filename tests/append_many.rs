@@ -436,6 +436,10 @@ fn manifest(dir: &Path) -> Vec<u8> {
     std::fs::read(dir.join("MANIFEST")).unwrap()
 }
 
+fn batches_manifest() -> Vec<u8> {
+    [b"RST\0\x02".as_slice(), &1u64.to_le_bytes()[..]].concat()
+}
+
 #[test]
 fn a_store_without_a_batch_keeps_the_manifest_older_builds_open() {
     let dir = TempDir::new().unwrap();
@@ -540,6 +544,7 @@ fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
     std::fs::rename(path.join("MANIFEST.aside"), path.join("MANIFEST")).unwrap();
     match result {
         Err(StoreError::Io(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
             let message = error.to_string();
             assert!(
                 message.contains(&*path.join("MANIFEST").to_string_lossy()) && message.contains("not recorded"),
@@ -552,17 +557,17 @@ fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
     assert_eq!(store.current_branch().head, head);
     assert_eq!(store.stats().unwrap().record_count, records);
     assert_eq!(value(&store, "log"), json!([0]));
-    drop(store);
-
-    let store = Store::open(config(&path)).unwrap();
-    assert_eq!(store.current_branch().head, head);
-    assert_eq!(store.stats().unwrap().record_count, records);
-    assert_eq!(value(&store, "log"), json!([0]));
     assert_eq!(manifest(&path), b"RST\0\x01");
 
     store.update_state("log", batch(&[json!(1), json!(2)])).unwrap();
     assert_eq!(value(&store, "log"), json!([0, 1, 2]));
-    assert_eq!(&manifest(&path)[..5], b"RST\0\x02");
+    assert_eq!(manifest(&path), batches_manifest());
+    drop(store);
+
+    let store = Store::open(config(&path)).unwrap();
+    assert_eq!(store.stats().unwrap().record_count, records + 1);
+    assert_eq!(value(&store, "log"), json!([0, 1, 2]));
+    assert_eq!(manifest(&path), batches_manifest());
 }
 
 /// A create aimed at a store that's open fails on the lock before it writes
@@ -1130,5 +1135,5 @@ fn a_batch_nested_in_a_field_marks_the_manifest() {
         )
         .unwrap();
     assert_eq!(value(&store, "doc"), json!({"rows": [1, 2]}));
-    assert_eq!(&manifest(dir.path())[..5], b"RST\0\x02");
+    assert_eq!(manifest(dir.path()), batches_manifest());
 }

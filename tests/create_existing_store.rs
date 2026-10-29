@@ -257,13 +257,21 @@ fn a_store_file_left_as_a_link_to_nothing_is_refused_and_nothing_is_written_thro
         fs::create_dir(&volume).unwrap();
         std::os::unix::fs::symlink(volume.join(file), path.join(file)).unwrap();
 
+        for create_if_missing in [true, false] {
+            match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
+                Err(StoreError::InvalidFormat(msg)) => assert!(
+                    msg.contains(file) && msg.contains(if file == "MANIFEST" { "leads to nothing" } else { "damaged" }),
+                    "{file}, {create_if_missing}: {msg}"
+                ),
+                Err(e) => panic!("{file}, {create_if_missing}: expected InvalidFormat, got {e}"),
+                Ok(_) => panic!("{file}, {create_if_missing}: took a directory holding a link to a missing {file}"),
+            }
+        }
+        let left: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [file], "{file}: open_or_create wrote nothing there");
+
         let msg = invalid_operation(Store::create(config(&path)));
         assert!(msg.contains(&*path.to_string_lossy()), "{file}: {msg}");
-        match Store::open_or_create(config(&path)) {
-            Err(StoreError::InvalidFormat(msg)) => assert!(msg.contains(file), "{file}: {msg}"),
-            Err(e) => panic!("{file}: expected InvalidFormat, got {e}"),
-            Ok(_) => panic!("{file}: open_or_create took a directory holding a link to a missing {file}"),
-        }
         assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: nothing was written through the link");
         assert!(
             file == "MANIFEST" || fs::symlink_metadata(path.join("MANIFEST")).is_err(),
@@ -294,4 +302,25 @@ fn opening_a_store_whose_manifest_links_to_nothing_names_the_link() {
         }
     }
     assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "nothing was written through the link");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_or_create_on_a_path_that_is_a_file_names_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("not-a-directory");
+    fs::write(&path, b"someone's file").unwrap();
+
+    for create_if_missing in [true, false] {
+        match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
+            Err(StoreError::Io(error)) => assert!(
+                error.kind() == std::io::ErrorKind::NotADirectory
+                    && error.to_string().contains(&*path.to_string_lossy()),
+                "{create_if_missing}: {error}"
+            ),
+            Err(e) => panic!("{create_if_missing}: expected an I/O error naming the path, got {e}"),
+            Ok(_) => panic!("{create_if_missing}: opened a store at a file"),
+        }
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"someone's file");
 }
