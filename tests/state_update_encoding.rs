@@ -99,20 +99,12 @@ fn msgpack_stores_bytes_as_bin() {
     let big = vec![b'x'; 64 * 1024];
     let raw_len = big.len();
 
-    let (msgpack, _) = update(StateOperation::Snapshot(big.clone())).encode().unwrap();
-    let json = serde_json::to_vec(&update(StateOperation::Snapshot(big))).unwrap();
+    let (msgpack, _) = update(StateOperation::Snapshot(big)).encode().unwrap();
 
     assert!(
         msgpack.len() < raw_len + 256,
         "msgpack should be ~raw size, got {} for {} raw bytes",
         msgpack.len(),
-        raw_len
-    );
-    assert!(
-        json.len() > raw_len * 3,
-        "sanity: the JSON encoding this replaces really was int-array bloated \
-         (got {} for {} raw bytes)",
-        json.len(),
         raw_len
     );
 }

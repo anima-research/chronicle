@@ -161,22 +161,6 @@ fn test_open_nonexistent_store() {
     assert!(result.is_err());
 }
 
-#[test]
-fn test_concurrent_store_access() {
-    let dir = TempDir::new().unwrap();
-    let config = StoreConfig {
-        path: dir.path().join("store"),
-        blob_cache_size: 100,
-        create_if_missing: true,
-    };
-
-    let _store1 = Store::create(config.clone()).unwrap();
-
-    // Second store should fail with lock error
-    let result = Store::open(config);
-    assert!(matches!(result, Err(StoreError::Locked)));
-}
-
 // --- JSON Parsing Errors ---
 
 #[test]

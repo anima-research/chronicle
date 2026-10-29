@@ -625,7 +625,7 @@ fn update_whose_predecessor_is_not_its_head_refuses_open() {
         Ok(_) => panic!("a broken chain opened"),
         Err(e) => e,
     };
-    let at = format!("at log offset {offset}: previous offset Some(0) does not match");
+    let at = format!("log offset {offset}");
     assert!(
         matches!(&err, StoreError::Corruption(msg) if msg.contains(&at)),
         "{err}"

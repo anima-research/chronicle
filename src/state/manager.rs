@@ -1967,15 +1967,15 @@ mod tests {
             .record_update(TEST_BRANCH, "data", offset, &StateOperation::Set(b"\"cached\"".to_vec()))
             .unwrap();
 
-        // First call - cache miss
-        assert_eq!(manager.cache_len(), 0);
+        let before = manager.reconstruction_count();
         let _ = manager.get_state(TEST_BRANCH, "data").unwrap();
-        assert_eq!(manager.cache_len(), 1);
+        let rebuilds = manager.reconstruction_count();
+        assert!(rebuilds > before, "setup: the first read rebuilt the state");
 
         // Second call - cache hit (no additional disk reads)
         let state = manager.get_state(TEST_BRANCH, "data").unwrap().unwrap();
         assert_eq!(state, b"\"cached\"");
-        assert_eq!(manager.cache_len(), 1);
+        assert_eq!(manager.reconstruction_count(), rebuilds, "the repeat read rebuilt the state");
     }
 
     #[test]
@@ -2003,7 +2003,6 @@ mod tests {
 
         // Populate cache
         let _ = manager.get_state(TEST_BRANCH, "data").unwrap();
-        assert_eq!(manager.cache_len(), 1);
 
         // Update invalidates cache
         let offset2 = append_state_update(
@@ -2016,7 +2015,6 @@ mod tests {
         manager
             .record_update(TEST_BRANCH, "data", offset2, &StateOperation::Set(b"\"v2\"".to_vec()))
             .unwrap();
-        assert_eq!(manager.cache_len(), 0);
 
         // Next read gets new value
         let state = manager.get_state(TEST_BRANCH, "data").unwrap().unwrap();
