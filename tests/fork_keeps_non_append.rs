@@ -77,6 +77,10 @@ fn changes() -> Vec<(&'static str, fn(&Store), Vec<Value>)> {
 
 fn branch_reads_through_its_snapshots(store: &Store, name: &str, before: Vec<Value>) {
     assert_eq!(value(store), before, "{name}: setup: the branch starts as main was at its point");
+    // A fork's head carries the snapshot accounting its chain had at the
+    // point, the parent's snapshots included, so "no snapshot taken" is
+    // "the snapshot offsets are still the ones it started with".
+    let at_fork = store.get_compaction_stats("s").unwrap();
     let mut expected = before;
     for v in [2, 3] {
         append(store, json!(v));
@@ -87,7 +91,7 @@ fn branch_reads_through_its_snapshots(store: &Store, name: &str, before: Vec<Val
     let stats = store.get_compaction_stats("s").unwrap();
     assert_eq!(
         (stats.last_full_snapshot_offset, stats.last_delta_snapshot_offset),
-        (None, None),
+        (at_fork.last_full_snapshot_offset, at_fork.last_delta_snapshot_offset),
         "{name}: the first delta was held off, and no snapshot taken in its place"
     );
     store.compact_state("s").unwrap();

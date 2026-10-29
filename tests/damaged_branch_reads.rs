@@ -49,7 +49,12 @@ fn damaged_branch(dir: &TempDir, change: &[StateOperation], old_delta: Value) ->
     for operation in change {
         op(&store, operation.clone());
     }
-    store.create_branch_at("child", "main", store.current_branch().head).unwrap();
+    // Main moves past the point first, so the child's head is rebuilt from
+    // the chain there: a head at or before the branch point is inherited
+    // verbatim, and a Delta's count with it.
+    let at = store.current_branch().head;
+    append(&store, json!("main"));
+    store.create_branch_at("child", "main", at).unwrap();
     store.switch_branch("child").unwrap();
     store.set_auto_snapshot(false);
     append(&store, json!(2));
@@ -164,7 +169,12 @@ fn a_branch_made_from_a_damaged_branch_starts_from_its_reading() {
     for (name, change, old_delta, mut reading, _) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
-        store.create_branch_at("grandchild", "child", store.current_branch().head).unwrap();
+        // The child moves past the point first, so the grandchild's head is
+        // rebuilt from the chain there rather than inherited verbatim with
+        // the child's count.
+        let at = store.current_branch().head;
+        append(&store, json!("child"));
+        store.create_branch_at("grandchild", "child", at).unwrap();
         store.switch_branch("grandchild").unwrap();
         assert_reads(&store, &reading, &format!("{name}: at the point"));
         assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: its count at the point");
