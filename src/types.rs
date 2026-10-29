@@ -300,9 +300,10 @@ pub enum StateOperation {
     Append(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// Append several items to a collection, in order, as one record
-    /// (AppendLog). Every read sees exactly what the same items appended one
-    /// `Append` at a time would give. The record takes one sequence and
-    /// counts as one operation toward the snapshot cadence, as a
+    /// (AppendLog). Reads see what the same items appended one `Append` at a
+    /// time would give, except that a historical read or a fork cut by
+    /// sequence keeps or drops the batch whole. The record takes one
+    /// sequence and counts as one operation toward the snapshot cadence, as a
     /// `TreeBatch` does, whatever its number of items. A batch must hold at
     /// least one item; `update_state` refuses an empty one.
     ///

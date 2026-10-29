@@ -166,6 +166,8 @@ fn each_write_form_returns_its_record_when_its_own_snapshot_fails() {
             assert!(log.contains(WARNING), "{form:?}: {log}");
             assert!(log.contains("state_id=\"s\""), "{form:?}: {log}");
             assert!(log.contains("branch=main"), "{form:?}: {log}");
+            let sequence = format!("sequence={}", record.sequence.0);
+            assert!(log.split_whitespace().any(|field| field == sequence), "{form:?}: {log}");
             assert!(
                 log.contains("Deserialization"),
                 "{form:?}: the cause is logged: {log}"

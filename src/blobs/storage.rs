@@ -241,17 +241,15 @@ impl BlobStorage {
         })?;
         staging.disable_cleanup(true);
 
-        self.fail_at(WriteStep::ShardSync)
-            .and_then(|()| self.sync_name(hash))
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "the new blob {} is in place, but syncing its directory failed: {error}; storing it again tries the sync again",
-                        blob_path.display()
-                    ),
-                )
-            })?;
+        self.sync_name(hash).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "the new blob {} is in place, but syncing its directory failed: {error}; storing it again tries the sync again",
+                    blob_path.display()
+                ),
+            )
+        })?;
 
         Ok(())
     }
@@ -299,6 +297,7 @@ impl BlobStorage {
         let shard = self.shard(hash);
         if shard.renames_synced.load(Ordering::SeqCst) < shard.renames_begun.load(Ordering::SeqCst) {
             let finished = shard.renames_finished.load(Ordering::SeqCst);
+            self.fail_at(WriteStep::ShardSync)?;
             sync_directory(&self.shard_path(hash))?;
             shard.renames_synced.fetch_max(finished, Ordering::SeqCst);
         }
@@ -451,8 +450,7 @@ impl BlobStorage {
 
     /// Check if a blob exists: whether this storage has it cached, or
     /// something is at its name, through a link to its target. Nothing is
-    /// read, so this doesn't say the blob is whole; [`BlobStorage::get`]
-    /// checks that.
+    /// read, so this doesn't say the blob is whole.
     pub fn exists(&self, hash: &Hash) -> bool {
         if self.cache.lock().contains(hash) {
             return true;

@@ -3,10 +3,9 @@
 //! state and branch managers whose first sync published over the store's own,
 //! so a create where an open was meant kept the records and lost every
 //! registration and branch, with no error. Now create takes the lock first and
-//! refuses a directory that holds a store or a store's data files;
-//! open_or_create decides by MANIFEST, so it creates into an empty directory
-//! or a fresh volume's root; and opening a directory with no MANIFEST says
-//! whether it's a damaged store or no store at all.
+//! refuses a directory that holds a store or a store's data files; and
+//! opening a directory with no MANIFEST says whether it's a damaged store or
+//! no store at all.
 
 use chronicle::{StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, StoreError};
 use std::fs;
@@ -79,10 +78,33 @@ fn create_refuses_each_data_file_of_a_store_without_its_manifest() {
             msg.contains(file) && msg.contains("damaged") && msg.contains(&*path.to_string_lossy()),
             "{file}: {msg}"
         );
-        // open_or_create sends it to create (no MANIFEST), which refuses it too.
-        invalid_operation(Store::open_or_create(config(&path)));
         assert_eq!(fs::read(path.join(file)).unwrap(), b"x", "{file} is untouched");
         assert!(!path.join("MANIFEST").exists(), "{file}: no MANIFEST was written");
+    }
+}
+
+#[test]
+fn open_or_create_refuses_a_damaged_store_whatever_create_if_missing_says() {
+    for file in ["records.log", "state.bin", "branches.bin"] {
+        for create_if_missing in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("damaged");
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join(file), b"x").unwrap();
+
+            match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
+                Err(StoreError::InvalidFormat(msg)) => assert!(
+                    msg.contains(file) && msg.contains("damaged") && msg.contains(&*path.to_string_lossy()),
+                    "{file}, create_if_missing {create_if_missing}: {msg}"
+                ),
+                Err(e) => panic!("{file}, create_if_missing {create_if_missing}: expected InvalidFormat, got {e}"),
+                Ok(_) => panic!("{file}, create_if_missing {create_if_missing}: took a damaged store"),
+            }
+            let mut left: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name()).collect();
+            left.sort();
+            assert_eq!(left, [file], "{file}, create_if_missing {create_if_missing}: nothing was written there");
+            assert_eq!(fs::read(path.join(file)).unwrap(), b"x");
+        }
     }
 }
 
@@ -222,4 +244,88 @@ fn opening_a_directory_without_a_manifest_says_what_it_is() {
             Ok(_) => panic!("opened a directory with no MANIFEST"),
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_file_left_as_a_link_to_nothing_is_refused_and_nothing_is_written_through_it() {
+    for file in ["MANIFEST", "records.log", "state.bin", "branches.bin"] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        let volume = dir.path().join("unmounted");
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(&volume).unwrap();
+        std::os::unix::fs::symlink(volume.join(file), path.join(file)).unwrap();
+
+        for create_if_missing in [true, false] {
+            match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
+                Err(StoreError::InvalidFormat(msg)) => assert!(
+                    msg.contains(file) && msg.contains(if file == "MANIFEST" { "leads to nothing" } else { "damaged" }),
+                    "{file}, {create_if_missing}: {msg}"
+                ),
+                Err(e) => panic!("{file}, {create_if_missing}: expected InvalidFormat, got {e}"),
+                Ok(_) => panic!("{file}, {create_if_missing}: took a directory holding a link to a missing {file}"),
+            }
+        }
+        let left: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [file], "{file}: open_or_create wrote nothing there");
+
+        let msg = invalid_operation(Store::create(config(&path)));
+        assert!(msg.contains(&*path.to_string_lossy()), "{file}: {msg}");
+        assert!(
+            file != "MANIFEST" || (msg.contains("leads to nothing") && !msg.contains("already holds")),
+            "{file}: {msg}"
+        );
+        assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: nothing was written through the link");
+        assert!(
+            file == "MANIFEST" || fs::symlink_metadata(path.join("MANIFEST")).is_err(),
+            "{file}: no MANIFEST was written"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_store_whose_manifest_links_to_nothing_names_the_link() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+    let volume = dir.path().join("unmounted");
+    fs::create_dir(&volume).unwrap();
+    fs::remove_file(path.join("MANIFEST")).unwrap();
+    std::os::unix::fs::symlink(volume.join("MANIFEST"), path.join("MANIFEST")).unwrap();
+
+    for result in [Store::open(config(&path)), Store::open_or_create(config(&path))] {
+        match result {
+            Err(StoreError::InvalidFormat(msg)) => assert!(
+                msg.contains("symbolic link") && msg.contains(&*volume.join("MANIFEST").to_string_lossy()),
+                "{msg}"
+            ),
+            Err(e) => panic!("expected InvalidFormat naming the link, got {e}"),
+            Ok(_) => panic!("opened a store whose MANIFEST links to nothing"),
+        }
+    }
+    assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "nothing was written through the link");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_or_create_on_a_path_that_is_a_file_names_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("not-a-directory");
+    fs::write(&path, b"someone's file").unwrap();
+
+    for create_if_missing in [true, false] {
+        match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
+            Err(StoreError::Io(error)) => assert!(
+                error.kind() == std::io::ErrorKind::NotADirectory
+                    && error.to_string().contains(&*path.to_string_lossy())
+                    && error.to_string().contains("MANIFEST"),
+                "{create_if_missing}: {error}"
+            ),
+            Err(e) => panic!("{create_if_missing}: expected an I/O error naming the path, got {e}"),
+            Ok(_) => panic!("{create_if_missing}: opened a store at a file"),
+        }
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"someone's file");
 }

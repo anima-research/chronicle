@@ -166,16 +166,20 @@ pub struct Store {
 impl Store {
     /// Open an existing store or create a new one.
     ///
-    /// A directory holds a store when it holds its `MANIFEST`, and is opened.
-    /// Without one, it is created into (when `create_if_missing` is set) only
-    /// if it is missing or holds nothing but what a new store can sit beside:
-    /// `lost+found` (a fresh volume's root), Finder's `.DS_Store`, and the `LOCK` and `blobs/` a
-    /// create leaves when it stops before its manifest. A directory holding
-    /// anything else, such as a mistaken path to a project, isn't taken for a
-    /// place to put a store; one holding a store's data files without a
-    /// `MANIFEST` is refused as a damaged store.
+    /// A directory that holds any of a store's files (`MANIFEST`,
+    /// `records.log`, `state.bin`, `branches.bin`, a symbolic link counting
+    /// even when its target is missing) is opened, so one whose `MANIFEST`
+    /// is missing or unusable is refused, with open's account of what it
+    /// found, whatever `create_if_missing` says. Otherwise it is created into
+    /// (when `create_if_missing` is set) only if it is missing or holds
+    /// nothing but what a new store can sit beside: `lost+found` (a fresh
+    /// volume's root), Finder's `.DS_Store`, the `LOCK` and `blobs/` a create
+    /// leaves when it stops before its manifest, and a checkpoint's staging
+    /// file, as a create leaves when it stops during its manifest save. A
+    /// directory holding anything else, such as a mistaken path to a project,
+    /// isn't taken for a place to put a store.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.join("MANIFEST").exists() {
+        if Self::present_store_file(&config.path)?.is_some() {
             return Self::open(config);
         }
         if let Some(other) = Self::foreign_entry(&config.path) {
@@ -191,15 +195,9 @@ impl Store {
         }
     }
 
-    /// An entry a new store can't sit beside, in a directory with no MANIFEST:
-    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs`, the
-    /// staging file of a manifest save that was interrupted, and a store's own
-    /// data files
-    /// (which [`Store::create`] refuses as a damaged store, naming the file).
     fn foreign_entry(path: &Path) -> Option<String> {
         let allowed = |name: &str| {
             ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
-                || Self::STORE_FILES.contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
         fs::read_dir(path).ok()?.flatten()
@@ -226,8 +224,16 @@ impl Store {
         // The lock comes first, so a create aimed at a store another process
         // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
-        if let Some(found) = Self::STORE_FILES.iter().find(|f| config.path.join(f).exists()) {
-            return Err(StoreError::InvalidOperation(if *found == "MANIFEST" {
+        if let Some(found) = Self::present_store_file(&config.path)? {
+            let manifest = config.path.join("MANIFEST");
+            return Err(StoreError::InvalidOperation(if found == "MANIFEST"
+                && matches!(fs::metadata(&manifest), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                format!(
+                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with open or open_or_create",
+                    Self::link_to_nothing(&manifest)
+                )
+            } else if found == "MANIFEST" {
                 format!(
                     "create: {} already holds a Chronicle store; open it with open or open_or_create",
                     config.path.display()
@@ -280,10 +286,11 @@ impl Store {
     /// Open an existing store.
     pub fn open(config: StoreConfig) -> Result<Self> {
         // Verify manifest
-        let mut features = Self::verify_manifest(&config.path)?;
+        Self::verify_manifest(&config.path)?;
 
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
+        let mut features = Self::verify_manifest(&config.path)?;
 
         // With the lock held, no save of this store is in progress, so its
         // own staging files here were left by interrupted saves. The sweep's
@@ -805,9 +812,12 @@ impl Store {
     /// store records also rewrites its MANIFEST, before the record is
     /// written, to format version 2 with the batch feature named, so a build
     /// that predates the operation refuses the store when it opens it. A
-    /// store that never holds one keeps version 1, which every release
-    /// opens. If that rewrite fails, the error is returned and nothing is
-    /// recorded.
+    /// store never asked to record one keeps version 1, which every release
+    /// opens. If that rewrite fails, the error is returned and the batch isn't
+    /// recorded; when only the directory sync after its rename failed, the
+    /// MANIFEST is already at version 2. If the record then fails to be
+    /// written, the error is returned and the store stays at version 2 with
+    /// no batch.
     ///
     /// Snapshots are created automatically when the state's thresholds are
     /// reached, by the write that reaches them, once its record is written
@@ -912,10 +922,12 @@ impl Store {
     /// sequence (a `StateOperation::AppendMany`), and say which ordinals
     /// they took. See `AppendedBatch::first_ordinal`.
     ///
-    /// Every read sees the batch as it would see the same items appended one
-    /// at a time. It counts as one operation toward the state's snapshot
-    /// cadence, and the first batch a store records marks its MANIFEST so
-    /// that releases which predate batches refuse the store (see
+    /// Reads see the batch as they would see the same items appended one at
+    /// a time, except that a historical read or a fork cut by sequence keeps
+    /// or drops it whole, as it has one sequence. It counts as one operation
+    /// toward the state's snapshot cadence, and the first batch a store
+    /// records marks its MANIFEST so that releases which predate batches
+    /// refuse the store (see
     /// `update_state`). Each item must be one JSON value, as for an
     /// `Append`. An empty batch is refused with `InvalidOperation` and
     /// writes nothing. Once the batch is recorded, the call returns it: if
@@ -983,8 +995,8 @@ impl Store {
     /// one operation toward the snapshot cadence, the returned
     /// `AppendedBatch` says which ordinals they took, and the first batch a
     /// store records marks its MANIFEST so that releases which predate
-    /// batches refuse the store (see `update_state`). A store that never
-    /// records a batch, by this call or another, keeps the format every
+    /// batches refuse the store (see `update_state`). A store never asked to
+    /// record a batch, by this call or another, keeps the format every
     /// release opens.
     ///
     /// Refused with `InvalidOperation`, writing nothing, when `items` is
@@ -2913,7 +2925,16 @@ impl Store {
             return Ok(());
         }
         let features = write.features | required;
-        Self::write_manifest_features(&self.config.path, features)?;
+        Self::write_manifest_features(&self.config.path, features).map_err(|error| match error {
+            StoreError::Io(error) => StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "the batch was not recorded, because of an error marking {} for batched appends: {error}",
+                    self.config.path.join("MANIFEST").display()
+                ),
+            )),
+            other => other,
+        })?;
         write.features = features;
         Ok(())
     }
@@ -3185,6 +3206,32 @@ impl Store {
     /// The files whose presence means a directory already holds a store.
     const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
 
+    fn link_to_nothing(link: &Path) -> String {
+        format!(
+            "{} is a symbolic link (to {}) that leads to nothing",
+            link.display(),
+            fs::read_link(link)
+                .map(|target| target.display().to_string())
+                .unwrap_or_else(|_| "a path that can't be read".into())
+        )
+    }
+
+    fn present_store_file(path: &Path) -> std::io::Result<Option<&'static str>> {
+        for file in Self::STORE_FILES {
+            match fs::symlink_metadata(path.join(file)) {
+                Ok(_) => return Ok(Some(file)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
+                    ))
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // Published whole, through a staging file renamed over it, so a crash
     // mid-write can't leave a MANIFEST that create refuses and open can't read.
     // Only create calls it, under the lock and once it has found no MANIFEST,
@@ -3213,15 +3260,21 @@ impl Store {
 
         let manifest_path = path.join("MANIFEST");
         let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => StoreError::InvalidFormat(
-                match Self::STORE_FILES.iter().find(|f| path.join(f).exists()) {
-                    Some(found) => format!(
-                        "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
-                        path.display()
-                    ),
-                    None => format!("{} has no MANIFEST, so it isn't a Chronicle store", path.display()),
-                },
-            ),
+            std::io::ErrorKind::NotFound => match Self::present_store_file(path) {
+                Err(error) => error.into(),
+                Ok(Some("MANIFEST")) => StoreError::InvalidFormat(format!(
+                    "{}, so the store can't be opened until it leads to the store's MANIFEST: mount the volume it points into, say, or point the link where that MANIFEST is",
+                    Self::link_to_nothing(&manifest_path)
+                )),
+                Ok(Some(found)) => StoreError::InvalidFormat(format!(
+                    "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
+                    path.display()
+                )),
+                Ok(None) => StoreError::InvalidFormat(format!(
+                    "{} has no MANIFEST, so it isn't a Chronicle store",
+                    path.display()
+                )),
+            },
             _ => e.into(),
         })?;
 
