@@ -1219,8 +1219,10 @@ impl JsStore {
     /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it
     /// stays there even if that batch then fails, so releases from before
     /// batched appends refuse to open it. If the move itself fails, the call
-    /// throws and the batch isn't recorded. A store never asked to record a
-    /// batch keeps the format they open.
+    /// throws and the batch isn't recorded; it throws too if only the
+    /// directory sync after the move fails, with the `MANIFEST` already at
+    /// version 2. A store never asked to record a batch keeps the format they
+    /// open.
     #[napi]
     pub fn append_many_to_state_json_with_identity(
         &self,

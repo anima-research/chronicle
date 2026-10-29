@@ -35,11 +35,12 @@
   host rolled back must not call `create` on a store it means to open.
   **Migration:** none going forward. Going back, there is none for a store
   that holds a batch: keep a copy of the store from before the upgrade if a
-  rollback must stay possible. A first batch that fails after the `MANIFEST`
-  rewrite, by a crash or by an error writing its record (a full disk, say),
-  leaves a version 2 store that holds no batch, which earlier releases
-  refuse all the same. This release refuses a version 2 `MANIFEST` naming a
-  feature it doesn't know, as written by a later one.
+  rollback must stay possible. A first batch that fails once the rewritten
+  `MANIFEST` is in place, by a crash, by an error syncing its directory or by
+  an error writing its record (a full disk, say), leaves a version 2 store
+  that holds no batch, which earlier releases refuse all the same. This
+  release refuses a version 2 `MANIFEST` naming a feature it doesn't know,
+  as written by a later one.
   **Unchanged:** a store never asked to record a batch keeps its version 1
   `MANIFEST` and opens on every earlier release, as before, and existing
   stores open on this one unchanged. The record framing and the encodings of
