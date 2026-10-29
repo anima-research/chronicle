@@ -166,16 +166,19 @@ pub struct Store {
 impl Store {
     /// Open an existing store or create a new one.
     ///
-    /// A directory holds a store when it holds its `MANIFEST`, and is opened.
-    /// Without one, it is created into (when `create_if_missing` is set) only
-    /// if it is missing or holds nothing but what a new store can sit beside:
-    /// `lost+found` (a fresh volume's root), Finder's `.DS_Store`, and the `LOCK` and `blobs/` a
-    /// create leaves when it stops before its manifest. A directory holding
-    /// anything else, such as a mistaken path to a project, isn't taken for a
-    /// place to put a store; one holding a store's data files without a
-    /// `MANIFEST` is refused as a damaged store.
+    /// A directory that holds any of a store's files (`MANIFEST`,
+    /// `records.log`, `state.bin`, `branches.bin`, a symbolic link counting
+    /// even when its target is missing) is opened, so one holding a store's
+    /// data files without a usable `MANIFEST` is refused as a damaged store,
+    /// whatever `create_if_missing` says. Otherwise it is created into (when
+    /// `create_if_missing` is set) only if it is missing or holds nothing but
+    /// what a new store can sit beside: `lost+found` (a fresh volume's root),
+    /// Finder's `.DS_Store`, and the `LOCK` and `blobs/` a create leaves when
+    /// it stops before its manifest. A directory holding anything else, such
+    /// as a mistaken path to a project, isn't taken for a place to put a
+    /// store.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if fs::symlink_metadata(config.path.join("MANIFEST")).is_ok() {
+        if Self::present_store_file(&config.path).is_some() {
             return Self::open(config);
         }
         if let Some(other) = Self::foreign_entry(&config.path) {
@@ -192,14 +195,11 @@ impl Store {
     }
 
     /// An entry a new store can't sit beside, in a directory with no MANIFEST:
-    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs`, the
-    /// staging file of a manifest save that was interrupted, and a store's own
-    /// data files
-    /// (which [`Store::create`] refuses as a damaged store, naming the file).
+    /// anything but `lost+found`, Finder's `.DS_Store`, `LOCK`, `blobs`, and the
+    /// staging file of a manifest save that was interrupted.
     fn foreign_entry(path: &Path) -> Option<String> {
         let allowed = |name: &str| {
             ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
-                || Self::STORE_FILES.contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
         fs::read_dir(path).ok()?.flatten()

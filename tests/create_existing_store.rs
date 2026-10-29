@@ -3,10 +3,9 @@
 //! state and branch managers whose first sync published over the store's own,
 //! so a create where an open was meant kept the records and lost every
 //! registration and branch, with no error. Now create takes the lock first and
-//! refuses a directory that holds a store or a store's data files;
-//! open_or_create decides by MANIFEST, so it creates into an empty directory
-//! or a fresh volume's root; and opening a directory with no MANIFEST says
-//! whether it's a damaged store or no store at all.
+//! refuses a directory that holds a store or a store's data files; and
+//! opening a directory with no MANIFEST says whether it's a damaged store or
+//! no store at all.
 
 use chronicle::{StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, StoreError};
 use std::fs;
@@ -79,10 +78,33 @@ fn create_refuses_each_data_file_of_a_store_without_its_manifest() {
             msg.contains(file) && msg.contains("damaged") && msg.contains(&*path.to_string_lossy()),
             "{file}: {msg}"
         );
-        // open_or_create sends it to create (no MANIFEST), which refuses it too.
-        invalid_operation(Store::open_or_create(config(&path)));
         assert_eq!(fs::read(path.join(file)).unwrap(), b"x", "{file} is untouched");
         assert!(!path.join("MANIFEST").exists(), "{file}: no MANIFEST was written");
+    }
+}
+
+#[test]
+fn open_or_create_refuses_a_damaged_store_whatever_create_if_missing_says() {
+    for file in ["records.log", "state.bin", "branches.bin"] {
+        for create_if_missing in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("damaged");
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join(file), b"x").unwrap();
+
+            match Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }) {
+                Err(StoreError::InvalidFormat(msg)) => assert!(
+                    msg.contains(file) && msg.contains("damaged") && msg.contains(&*path.to_string_lossy()),
+                    "{file}, create_if_missing {create_if_missing}: {msg}"
+                ),
+                Err(e) => panic!("{file}, create_if_missing {create_if_missing}: expected InvalidFormat, got {e}"),
+                Ok(_) => panic!("{file}, create_if_missing {create_if_missing}: took a damaged store"),
+            }
+            let mut left: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name()).collect();
+            left.sort();
+            assert_eq!(left, [file], "{file}, create_if_missing {create_if_missing}: nothing was written there");
+            assert_eq!(fs::read(path.join(file)).unwrap(), b"x");
+        }
     }
 }
 
@@ -238,8 +260,8 @@ fn a_store_file_left_as_a_link_to_nothing_is_refused_and_nothing_is_written_thro
         let msg = invalid_operation(Store::create(config(&path)));
         assert!(msg.contains(&*path.to_string_lossy()), "{file}: {msg}");
         match Store::open_or_create(config(&path)) {
-            Err(StoreError::InvalidOperation(_)) | Err(StoreError::InvalidFormat(_)) => {}
-            Err(e) => panic!("{file}: expected a refusal, got {e}"),
+            Err(StoreError::InvalidFormat(msg)) => assert!(msg.contains(file), "{file}: {msg}"),
+            Err(e) => panic!("{file}: expected InvalidFormat, got {e}"),
             Ok(_) => panic!("{file}: open_or_create took a directory holding a link to a missing {file}"),
         }
         assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: nothing was written through the link");
