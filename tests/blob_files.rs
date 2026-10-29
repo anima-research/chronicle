@@ -58,6 +58,8 @@ fn open_removes_blob_staging_files_left_by_interrupted_stores() {
         let store = Store::create(config(&path)).unwrap();
         let hash = store.store_blob(b"kept", "text/plain").unwrap();
         let before = store.stats().unwrap();
+        assert_eq!(before.blob_count, 1, "the stored blob is counted");
+        assert!(before.blob_size_bytes >= b"kept".len() as u64, "and its bytes: {before:?}");
         fs::write(&stage, b"unfinished blob").unwrap();
         let during = store.stats().unwrap();
         assert_eq!(
