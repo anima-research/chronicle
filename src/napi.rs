@@ -34,6 +34,11 @@ use std::sync::Arc;
 /// for every view at once (they throw "Store has been closed" from then on)
 /// and releases the lock file immediately, however many views are still
 /// referenced. `close()` on a view only detaches that view.
+///
+/// JSON objects you write come back with their keys in the order you wrote
+/// them (for a JavaScript object, its own property order), at every level
+/// and from every method that returns them. Objects stored by 0.5.0 or
+/// earlier keep the order they were stored in.
 #[napi]
 pub struct JsStore {
     /// The open store, shared by the root handle and every view made from
