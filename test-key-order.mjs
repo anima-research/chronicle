@@ -17,7 +17,7 @@ const item = (n) => ({
   mid: 'm',
 });
 const bytesOf = (value) => JSON.stringify(value);
-const RAW_INTEGER_KEYS = '{"b":1,"10":2,"2":{"z":1,"0":2}}';
+const RAW_INTEGER_KEYS = '{"zeta":1,"b":1,"10":2,"2":{"z":1,"0":2,"y":3},"alpha":3}';
 const text = (buffer) => buffer.toString('utf8');
 const list = (entries) => `[${entries.join(',')}]`;
 
@@ -116,7 +116,7 @@ try {
       check(`${label}: getStateItemJson(log, ${i})`, store.getStateItemJson('log', i), JSON.parse(log[i]));
     }
     check(`${label}: getStateSlice(log)`, text(store.getStateSlice('log', 2, 5)), list(log.slice(2, 7)));
-    check(`${label}: getStateTail(log)`, text(store.getStateTail('log', 4)), list(log.slice(-4)));
+    check(`${label}: getStateTail(log)`, text(store.getStateTail('log', 7)), list(log.slice(-7)));
     check(`${label}: getStateJsonAt(log)`, store.getStateJsonAt('log', logAt), JSON.parse(list(logAtBytes)));
     check(`${label}: getStateAt(log)`, text(store.getStateAt('log', logAt)), list(logAtBytes));
 

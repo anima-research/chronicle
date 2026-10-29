@@ -37,9 +37,10 @@ use std::sync::Arc;
 ///
 /// JSON objects you write come back with their keys in the order you wrote
 /// them (in a JavaScript object, its own property order), at every level
-/// and from every method that returns them. A tree state's entries come
-/// back sorted by path. An object stored by an earlier version keeps the
-/// order it was stored in, which for the JSON-writing methods was sorted.
+/// and from every method that returns them. The tree methods keep a tree
+/// state's entries by path, not in the order they were set. An object stored
+/// by an earlier version keeps the order it was stored in, which for the
+/// JSON-writing methods was sorted.
 #[napi]
 pub struct JsStore {
     /// The open store, shared by the root handle and every view made from
