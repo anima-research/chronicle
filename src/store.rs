@@ -3263,7 +3263,7 @@ impl Store {
             std::io::ErrorKind::NotFound => match Self::present_store_file(path) {
                 Err(error) => error.into(),
                 Ok(Some("MANIFEST")) => StoreError::InvalidFormat(format!(
-                    "{}, so the store can't be opened until it leads to the store's MANIFEST again: mount the volume it points into, say, or point the link where that MANIFEST is",
+                    "{}, so the store can't be opened until it leads to the store's MANIFEST: mount the volume it points into, say, or point the link where that MANIFEST is",
                     Self::link_to_nothing(&manifest_path)
                 )),
                 Ok(Some(found)) => StoreError::InvalidFormat(format!(
