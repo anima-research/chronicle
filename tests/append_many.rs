@@ -1106,3 +1106,29 @@ fn an_identity_batch_on_another_branch_counts_and_stamps_there() {
     }
     assert_eq!(store.get_state_len("log").unwrap(), Some(3), "main is unchanged");
 }
+
+#[test]
+fn a_batch_nested_in_a_field_marks_the_manifest() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    store
+        .register_state(StateRegistration {
+            id: "doc".to_string(),
+            strategy: StateStrategy::Snapshot,
+            initial_value: None,
+        })
+        .unwrap();
+    assert_eq!(manifest(dir.path()), b"RST\0\x01");
+
+    store
+        .update_state(
+            "doc",
+            StateOperation::Field {
+                name: "rows".to_string(),
+                operation: Box::new(batch(&[json!(1), json!(2)])),
+            },
+        )
+        .unwrap();
+    assert_eq!(value(&store, "doc"), json!({"rows": [1, 2]}));
+    assert_eq!(&manifest(dir.path())[..5], b"RST\0\x02");
+}
