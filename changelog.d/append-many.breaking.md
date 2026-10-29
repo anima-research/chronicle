@@ -4,13 +4,21 @@
   it, so the first `AppendMany` a store records rewrites its `MANIFEST` from
   format version 1 to version 2, naming the feature, before the record is
   written. An earlier release refuses a version 2 store at open with
-  "Unsupported store version: 2". Without the mark it would fail part way
-  through instead: past the last checkpoint it skips the batch it can't
-  decode, then refuses to open the store, as corrupt, at the next update to
-  the same state; when the batch is that state's newest update there is no
-  next one, so it opens the store, logging only a warning, and that state
-  silently lacks the batch's items. Before the checkpoint, any read of that
-  state that reaches the batch fails with "unknown variant `AppendMany`".
+  "Unsupported store version: 2". Without the mark, what an earlier release
+  does depends on the release and on where the batch lies. Past the last
+  checkpoint, 0.5.0 replays the log's state updates and skips the batch,
+  which it can't decode, logging a warning; then, at the update that follows
+  the batch in that state's chain (its next update on that branch), it
+  refuses to open the store as corrupt ("cannot replay state ... does not
+  match checkpoint/replayed head"). When the batch is that state's newest
+  update there is no next one, so 0.5.0 opens the store, and the state lacks
+  the batch's items with only that warning to say so. Releases before 0.5.0
+  don't replay updates past the last checkpoint at all: they open the store
+  without a word, and the state is what the checkpoint holds, without the
+  batch or any other update to it past the checkpoint. Before the
+  checkpoint, on 0.3.0 to 0.5.0, a read of that state that reaches the batch
+  fails with "unknown variant `AppendMany`"; releases before 0.3.0 can't
+  read the MessagePack state updates 0.3.0 and later write at all.
   An open that replays a batch the `MANIFEST` doesn't name, as when a power
   loss undid the rewrite, names it again, but it sees only the batches past
   the last checkpoint: a mark lost once they are behind it stays lost.
