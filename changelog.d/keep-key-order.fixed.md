@@ -13,6 +13,7 @@
     now come back in the order of their bytes (in a JavaScript object, its
     own property order), so a request built from them can change once after
     the upgrade.
-  - A store this release writes still opens on 0.5.0, which hands back sorted
-    every object it parses, and can re-sort the items it writes into a
-    snapshot of an append log.
+  - A store this release writes still opens on 0.5.0 until it records a
+    batch (the batched append's own entry says what moves the format to
+    version 2); 0.5.0 hands back sorted every object it parses, and can
+    re-sort the items it writes into a snapshot of an append log.
