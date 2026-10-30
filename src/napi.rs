@@ -12,10 +12,13 @@ use crate::{
     StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use napi::bindgen_prelude::*;
+use napi::{Env, JsDeferred, JsObject};
 use napi_derive::napi;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 /// JavaScript-friendly Store wrapper.
 ///
@@ -32,8 +35,8 @@ use std::sync::Arc;
 ///
 /// Lifetime: the root owns the store. `close()` on the root closes the store
 /// for every view at once (they throw "Store has been closed" from then on)
-/// and releases the lock file immediately, however many views are still
-/// referenced. `close()` on a view only detaches that view.
+/// and releases the lock file before it returns, however many views are
+/// still referenced. `close()` on a view only detaches that view.
 ///
 /// JSON objects you write come back with their keys in the order you wrote
 /// them (in a JavaScript object, its own property order), at every level
@@ -47,13 +50,86 @@ pub struct JsStore {
     /// it. The root's `close()` empties the slot, which is what closes the
     /// store for all of them and lets the `Store` (and its lock file) drop
     /// even while views are still alive.
-    shared: Arc<RwLock<Option<Arc<Store>>>>,
+    shared: Arc<RwLock<Option<OpenStore>>>,
     /// The branch this handle is pinned to; `None` on the root handle.
     pinned: Option<PinnedBranch>,
     /// Set once `close()` has been called on a view.
     detached: bool,
     /// Active subscription handles, stored by ID.
     subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
+}
+
+struct OpenStore {
+    store: Arc<Store>,
+    blob_writer: Mutex<Option<BlobWriter>>,
+}
+
+type ResolveHash = Box<dyn FnOnce(Env) -> Result<String> + Send>;
+
+struct BlobJob {
+    content: Vec<u8>,
+    content_type: String,
+    chunked: bool,
+    done: JsDeferred<String, ResolveHash>,
+}
+
+struct BlobWriter {
+    jobs: crossbeam_channel::Sender<BlobJob>,
+    thread: JoinHandle<()>,
+}
+
+impl BlobWriter {
+    fn start(store: Arc<Store>) -> Result<Self> {
+        let (jobs, queue) = crossbeam_channel::unbounded::<BlobJob>();
+        let thread = std::thread::Builder::new()
+            .name("chronicle-blob-writer".into())
+            .spawn(move || {
+                for job in queue {
+                    let BlobJob {
+                        content,
+                        content_type,
+                        chunked,
+                        done,
+                    } = job;
+                    let stored = catch_unwind(AssertUnwindSafe(|| {
+                        if chunked {
+                            store.store_blob_chunked(&content, &content_type)
+                        } else {
+                            store.store_blob(&content, &content_type)
+                        }
+                    }));
+                    match stored {
+                        Ok(Ok(hash)) => {
+                            let hash = hash.to_string();
+                            done.resolve(Box::new(move |_| Ok(hash)));
+                        }
+                        Ok(Err(error)) => done.reject(to_napi_error(error)),
+                        Err(_) => done.reject(napi::Error::from_reason(
+                            "storing the blob panicked partway, so it may or may not be stored",
+                        )),
+                    }
+                }
+            })
+            .map_err(|error| {
+                napi::Error::from_reason(format!(
+                    "cannot start the thread that stores blobs, so nothing was stored: {error}"
+                ))
+            })?;
+        Ok(Self { jobs, thread })
+    }
+
+    fn finish(self) {
+        drop(self.jobs);
+        let _ = self.thread.join();
+    }
+}
+
+/// Options for `storeBlobAsync`.
+#[napi(object)]
+pub struct JsStoreBlobOptions {
+    /// Store content of more than one chunk as its chunks: see
+    /// `storeBlobAsync`.
+    pub chunked: Option<bool>,
 }
 
 /// The branch a view is bound to. Bound by id: ids are never reused, so a
@@ -428,12 +504,17 @@ fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateS
 impl JsStore {
     /// Get the inner store, returning an error if closed.
     fn get_store(&self) -> Result<Arc<Store>> {
+        self.with_open(|open| Arc::clone(&open.store))
+    }
+
+    fn with_open<T>(&self, f: impl FnOnce(&OpenStore) -> T) -> Result<T> {
         if self.detached {
             return Err(napi::Error::from_reason("View has been closed"));
         }
         self.shared
             .read()
-            .clone()
+            .as_ref()
+            .map(f)
             .ok_or_else(|| napi::Error::from_reason("Store has been closed"))
     }
 
@@ -460,7 +541,10 @@ impl JsStore {
     /// Wrap a freshly opened store in a root handle.
     fn root(store: Store) -> JsStore {
         JsStore {
-            shared: Arc::new(RwLock::new(Some(Arc::new(store)))),
+            shared: Arc::new(RwLock::new(Some(OpenStore {
+                store: Arc::new(store),
+                blob_writer: Mutex::new(None),
+            }))),
             pinned: None,
             detached: false,
             subscription_handles: Mutex::new(HashMap::new()),
@@ -506,12 +590,14 @@ impl JsStore {
     /// Close the store, releasing the lock and any resources.
     /// After closing, all operations on this store will fail.
     ///
-    /// On the root handle this closes the store itself: it is synced, every
-    /// view made from this handle stops working ("Store has been closed"),
-    /// and the lock file is released before `close()` returns — live views
-    /// do not keep the store or its lock alive. If the record log's fsync
-    /// has failed, this throws that error after closing the store, so it
-    /// can be reopened.
+    /// On the root handle this closes the store itself. It first waits for
+    /// every `storeBlobAsync` already called on it or on any view made from
+    /// it to finish, holding the calling thread while it does. Then the store
+    /// is synced, every view made from this handle stops working ("Store has
+    /// been closed"), and the lock file is released before `close()` returns
+    /// — live views do not keep the store or its lock alive. If the record
+    /// log's fsync has failed, this throws that error after closing the
+    /// store, so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed". The store stays open,
@@ -522,9 +608,9 @@ impl JsStore {
         if self.pinned.is_some() {
             if !self.detached {
                 let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
-                if let Some(store) = self.shared.read().as_ref() {
+                if let Some(open) = self.shared.read().as_ref() {
                     for id in handles {
-                        store.unsubscribe(SubscriptionId(id));
+                        open.store.unsubscribe(SubscriptionId(id));
                     }
                 }
                 self.detached = true;
@@ -532,12 +618,16 @@ impl JsStore {
             return Ok(());
         }
 
-        let store = self.shared.write().take();
-        if let Some(store) = store {
+        let open = self.shared.write().take();
+        if let Some(OpenStore { store, blob_writer }) = open {
+            if let Some(writer) = blob_writer.into_inner() {
+                writer.finish();
+            }
             // Sync before closing
             store.sync().map_err(to_napi_error)?;
-            // Drop the Arc. The slot was the only long-lived reference (views
-            // hold the slot, not the store), so the store is dropped here.
+            // Drop the Arc. The slot and the writer thread, joined above, were
+            // the only long-lived references (views hold the slot, not the
+            // store), so the store is dropped here.
             drop(store);
         }
         Ok(())
@@ -714,15 +804,17 @@ impl JsStore {
 
     /// Store a blob and return its hash. Bytes already stored are left as they
     /// are, unless their file is cut short, damaged or holds other bytes, which
-    /// is replaced; bytes read or stored since the store opened may be taken as
-    /// stored from memory. A symbolic link at the blob's name is read through,
-    /// and one that leads nowhere is replaced. Throws when something other than
-    /// a regular file, such as a directory, is at the blob's name or a link's
-    /// target, when its file can't be read or is in a blob format version newer
-    /// than this chronicle reads, when writing or syncing the blob fails, and
-    /// for a content type longer than 65,535 bytes. A sync that fails after the
-    /// blob is in place still throws, and storing the blob again before the
-    /// store closes tries the sync again.
+    /// is replaced, as is a chunked blob's file (see `storeBlobAsync`) whose
+    /// chunks are missing, damaged or other bytes; bytes read or stored since
+    /// the store opened may be taken as stored from memory. A symbolic link at
+    /// the blob's name is read through, and one that leads nowhere is
+    /// replaced. Throws when something other than a regular file, such as a
+    /// directory, is at the blob's name or a link's target, when its file can't
+    /// be read or is in a blob format version newer than this chronicle reads,
+    /// when writing or syncing the blob fails, and for a content type longer
+    /// than 65,535 bytes. A sync that fails after the blob is in place still
+    /// throws, and storing the blob again before the store closes tries the
+    /// sync again.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -732,14 +824,86 @@ impl JsStore {
         Ok(hash.to_string())
     }
 
-    /// Get a blob by hash. A blob read or stored since the store opened may be
-    /// answered from memory. Otherwise it throws when the blob's file is cut
+    /// Store a blob without holding the calling thread, resolving with its
+    /// hash once it's stored, or rejecting with the error that stopped it.
+    /// Without `chunked`, it's stored as `storeBlob` stores it, and the error
+    /// is the one `storeBlob` would throw. The bytes are copied before this
+    /// returns, so the buffer can be reused at once. These stores run one at a
+    /// time on a thread of the open store's own, which its root handle and
+    /// views share, in the order they're called on any of them; a `storeBlob`
+    /// meanwhile isn't ordered with them. Each holds its copy of the bytes
+    /// until it settles, so awaiting them is what bounds that memory.
+    /// The root's `close()` waits for every one already called, and one
+    /// called on a view still finishes after that view's `close()`. A store
+    /// whose root and views are all dropped without `close()` finishes the
+    /// ones already called, and then releases its lock. On a closed store or
+    /// view this throws, as every method does.
+    ///
+    /// With `chunked: true`, content longer than one chunk is cut where its
+    /// own bytes say, into chunks of at most 64 KiB, each at least 2 KiB but
+    /// the last, so content sharing long
+    /// runs of bytes with earlier chunked content shares those runs' chunks
+    /// too. Each chunk
+    /// is stored as a blob, and a file under the whole content's hash names
+    /// them in order, written only once every chunk is stored and synced.
+    /// Content of one chunk or less is stored whole. `getBlob` returns the
+    /// content either way, and a blob already stored in the other form is
+    /// left as it is when it reads back as the content. Chunking pays where
+    /// content repeats earlier chunked content: each chunk is a file of its
+    /// own, about 10 KiB on average, and a `getBlob` of a chunked blob reads
+    /// each one the blob cache doesn't hold, so content sharing nothing with
+    /// what's stored takes more files to store and to read than it would
+    /// whole, and more disk, since each file takes whole blocks. A chronicle
+    /// release from before `storeBlobAsync` can't read a chunked blob: its
+    /// `getBlob` of that hash throws, naming an unsupported blob version, and
+    /// it reads blobs stored whole as before. Chronicle's repository has
+    /// `tools/unchunk-blobs.py`, which rewrites a closed store's chunked
+    /// blobs whole.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn store_blob_async(
+        &self,
+        env: Env,
+        content: Buffer,
+        content_type: String,
+        options: Option<JsStoreBlobOptions>,
+    ) -> Result<JsObject> {
+        let chunked = options.and_then(|options| options.chunked).unwrap_or(false);
+        self.with_open(|open| {
+            let mut writer = open.blob_writer.lock();
+            if writer.is_none() {
+                *writer = Some(BlobWriter::start(Arc::clone(&open.store))?);
+            }
+            let content = content.to_vec();
+            let (done, promise) = env.create_deferred::<String, ResolveHash>()?;
+            let job = BlobJob {
+                content,
+                content_type,
+                chunked,
+                done,
+            };
+            if let Err(crossbeam_channel::SendError(job)) =
+                writer.as_ref().expect("started above").jobs.send(job)
+            {
+                job.done.reject(napi::Error::from_reason(
+                    "the thread that stores blobs has stopped, so nothing was stored",
+                ));
+            }
+            Ok(promise)
+        })?
+    }
+
+    /// Get a blob by hash. A blob read since the store opened may be answered
+    /// from memory. Otherwise it throws when the blob's file is cut
     /// short or damaged, which storing the same bytes again replaces, or when
     /// something other than a regular file is at its name or a link's target.
     /// It also throws when the file can't be opened or read, such as for its
     /// permissions, when a link at its name loops, and when the file is in a
     /// blob format version newer than this chronicle reads, which storing
     /// doesn't replace. A symbolic link that leads nowhere reads as no blob.
+    /// A chunked blob (see `storeBlobAsync`) is read through its chunks, and
+    /// a chunk read since the store opened may be answered from memory. It
+    /// throws when a chunk read from its file is missing, cut short, damaged
+    /// or other bytes, which storing the same bytes again repairs.
     #[napi]
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;

@@ -389,13 +389,13 @@ fn a_store_leaves_a_blob_file_in_a_newer_format_and_says_so() {
     drop(store);
     let file = the_one_blob_file(&path);
     let mut newer = fs::read(&file).unwrap();
-    newer[4] = 2;
+    newer[4] = 3;
     fs::write(&file, &newer).unwrap();
 
     let store = reopen(&path);
     match store.store_blob(CONTENT, CONTENT_TYPE) {
         Err(StoreError::InvalidFormat(message)) => {
-            assert!(message.contains("Unsupported blob version 2"), "{message}");
+            assert!(message.contains("Unsupported blob version 3"), "{message}");
             assert!(message.contains(&*file.to_string_lossy()), "{message}");
         }
         other => panic!("expected the store to refuse, got {other:?}"),
