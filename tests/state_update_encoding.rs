@@ -233,14 +233,23 @@ fn fast_path_matches_materialization_bytes() {
     register_log(&store, "log");
 
     for i in 0..25 {
-        store
+        let written = format!(
+            r#"{{"n":{i},"zeta":"later-key","alpha":{{"z":[{{"y":1,"x":2}}],"a":[1,2,3]}}}}"#
+        );
+        let record = store
             .append_to_state_json_with_identity(
                 "log",
-                json!({"n": i, "zeta": "later-key", "alpha": [1, 2, 3]}),
+                serde_json::from_str(&written).unwrap(),
                 "id",
                 "seq",
             )
             .unwrap();
+        let want = format!(
+            r#"{},"id":"{}","seq":{}}}"#,
+            &written[..written.len() - 1],
+            record.id.0,
+            record.sequence.0
+        );
 
         // Caches were just invalidated by the append: this lookup takes the
         // head-record fast path.
@@ -250,6 +259,12 @@ fn fast_path_matches_materialization_bytes() {
             String::from_utf8_lossy(&fast),
             String::from_utf8_lossy(&slow),
             "fast path diverged from materialization at item {}",
+            i
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&fast),
+            want,
+            "item {} lost the order its keys were written in",
             i
         );
     }
