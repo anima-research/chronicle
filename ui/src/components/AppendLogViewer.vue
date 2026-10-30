@@ -146,6 +146,18 @@ async function doSearch() {
 
 let unregisterHandler: (() => void) | null = null;
 
+// An appended item as a state_delta carries it
+function decodeAppended(appendData: unknown): LogItem {
+  if (Array.isArray(appendData)) {
+    // Byte array - decode to string then parse JSON
+    const bytes = new Uint8Array(appendData as number[]);
+    const jsonStr = new TextDecoder().decode(bytes);
+    return JSON.parse(jsonStr);
+  }
+  // Already parsed object
+  return appendData as LogItem;
+}
+
 // Handle incoming WebSocket events
 function handleWsEvent(event: { eventType: string; data: unknown }) {
   // Handle state delta events (for append_log changes)
@@ -153,29 +165,26 @@ function handleWsEvent(event: { eventType: string; data: unknown }) {
     const data = event.data as {
       type?: string;
       state_id?: string;
-      operation?: { Append?: unknown };
+      operation?: { Append?: unknown; AppendMany?: unknown };
       sequence?: number;
     };
 
-    if (data.state_id === props.stateId && data.operation?.Append) {
-      // Append operation contains raw bytes - decode UTF-8 and parse JSON
-      let appendedItem: LogItem;
-      const appendData = data.operation.Append;
-
-      if (Array.isArray(appendData)) {
-        // Byte array - decode to string then parse JSON
-        const bytes = new Uint8Array(appendData as number[]);
-        const jsonStr = new TextDecoder().decode(bytes);
-        appendedItem = JSON.parse(jsonStr);
-      } else {
-        // Already parsed object
-        appendedItem = appendData as LogItem;
+    if (data.state_id === props.stateId) {
+      // An Append carries one item, an AppendMany a batch of them (one byte
+      // array each), appended in order as if each were an Append
+      let appended: LogItem[] = [];
+      if (data.operation?.Append) {
+        appended = [decodeAppended(data.operation.Append)];
+      } else if (Array.isArray(data.operation?.AppendMany)) {
+        appended = data.operation.AppendMany.map(decodeAppended);
       }
 
-      // Prepend to show latest first (new items at top)
-      items.value = [appendedItem, ...items.value];
-      totalCount.value++;
-      loadedCount.value++;
+      if (appended.length > 0) {
+        // Prepend to show latest first (new items at top, the batch's last first)
+        items.value = [...appended.reverse(), ...items.value];
+        totalCount.value += appended.length;
+        loadedCount.value += appended.length;
+      }
     }
   }
 

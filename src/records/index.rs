@@ -153,6 +153,13 @@ impl RecordIndex {
         self.id_to_offset.read().get(&id).copied()
     }
 
+    /// The offsets of several record IDs, in the order given, `None` for an
+    /// ID with no record. One lookup of the ID map for them all.
+    pub fn get_offsets_by_id(&self, ids: &[RecordId]) -> Vec<Option<u64>> {
+        let id_to_offset = self.id_to_offset.read();
+        ids.iter().map(|id| id_to_offset.get(id).copied()).collect()
+    }
+
     /// Get all record IDs of a given type, in ascending ID order (see
     /// `type_index`).
     pub fn get_by_type(&self, record_type: &str) -> Vec<RecordId> {

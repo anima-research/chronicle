@@ -14,6 +14,13 @@ const LOG_MAGIC: &[u8; 4] = b"REC\0";
 /// Current log format version.
 const LOG_VERSION: u8 = 1;
 
+#[cfg(test)]
+thread_local! {
+    /// How many records this thread has begun to decode, so unit tests can
+    /// count the reads a pass over the log makes.
+    pub(crate) static RECORD_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// What an open-time scan of the log found and (if a torn tail was recovered)
 /// what it dropped. Surfaced via [`RecordLog::recovery`] so callers can log or
 /// react to silent data truncation instead of only seeing a stderr warning.
@@ -344,6 +351,20 @@ impl RecordLog {
         Self::read_record(&mut *file)
     }
 
+    /// Read the records at several offsets, in the order given, taking the
+    /// file lock once for them all rather than once per record. Each offset
+    /// must be a record boundary, as for `read_at`.
+    pub fn read_many_at(&self, offsets: &[u64]) -> Result<Vec<Record>> {
+        let mut file = self.file.write();
+        offsets
+            .iter()
+            .map(|&offset| {
+                file.seek(SeekFrom::Start(offset))?;
+                Self::read_record(&mut *file)
+            })
+            .collect()
+    }
+
     /// Iterate all records from the beginning.
     pub fn iter(&self) -> RecordIterator<'_> {
         self.iter_from(0)
@@ -446,6 +467,9 @@ impl RecordLog {
     /// field larger than `remaining` is rejected as `InvalidFormat` before
     /// allocation.
     fn read_record_inner(file: &mut File, bound: Option<u64>) -> Result<Record> {
+        #[cfg(test)]
+        RECORD_DECODES.with(|decodes| decodes.set(decodes.get() + 1));
+
         // Magic
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
@@ -741,32 +765,30 @@ pub struct RecordIterator<'a> {
 impl<'a> Iterator for RecordIterator<'a> {
     type Item = Result<(u64, Record)>;
 
+    /// Read the record at the iterator's offset, once: it ends where that
+    /// read stopped, which is where the next one starts. The file lock is
+    /// held from the seek to that position, since any other read moves the
+    /// shared file offset. An error ends the iteration after it is returned.
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset >= self.end {
             return None;
         }
 
         let current_offset = self.offset;
-        match self.log.read_at(current_offset) {
-            Ok(record) => {
-                // Calculate next offset by re-reading position
-                // This is a bit inefficient; we could track size during read
-                let mut file = self.log.file.write();
-                if let Ok(_) = file.seek(SeekFrom::Start(current_offset)) {
-                    // Skip to end of record
-                    if let Ok(rec) = RecordLog::read_record(&mut *file) {
-                        drop(rec);
-                        self.offset = file.stream_position().unwrap_or(self.end);
-                    } else {
-                        self.offset = self.end;
-                    }
-                } else {
-                    self.offset = self.end;
-                }
+        let read = {
+            let mut file = self.log.file.write();
+            file.seek(SeekFrom::Start(current_offset))
+                .map_err(StoreError::from)
+                .and_then(|_| RecordLog::read_record(&mut *file))
+                .and_then(|record| Ok((record, file.stream_position()?)))
+        };
+        match read {
+            Ok((record, next_offset)) => {
+                self.offset = next_offset;
                 Some(Ok((current_offset, record)))
             }
             Err(e) => {
-                self.offset = self.end; // Stop iteration on error
+                self.offset = self.end;
                 Some(Err(e))
             }
         }
@@ -885,6 +907,101 @@ mod tests {
         // Iterate and verify
         let records: Vec<_> = log.iter_from(0).collect();
         assert_eq!(records.len(), 10);
+    }
+
+    // The iterator reads each record once and finds the next one where that
+    // read stopped. It used to read each record a second time to find its
+    // end, which doubled the reads of the index rebuild at every open.
+    #[test]
+    fn iteration_reads_each_record_once_and_finds_every_boundary() {
+        let dir = TempDir::new().unwrap();
+        let log = RecordLog::open(dir.path().join("log.bin")).unwrap();
+        let mut written = Vec::new();
+        for i in 1..=12u64 {
+            // Records of different lengths, with and without links, so a
+            // boundary found from a wrong length would land mid-record.
+            let mut input = RecordInput::raw(
+                if i % 2 == 0 { "even" } else { "odd-type" },
+                vec![i as u8; (i * 37 % 200) as usize],
+            );
+            if i > 1 {
+                input.caused_by = vec![RecordId(i - 1)];
+            }
+            if i % 3 == 0 {
+                input.linked_to = vec![RecordId(1), RecordId(2)];
+            }
+            written.push(log.append(input, BranchId(1), Sequence(i)).unwrap());
+        }
+
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        let read: Vec<(u64, Record)> = log.iter().map(|r| r.unwrap()).collect();
+        assert_eq!(RECORD_DECODES.with(|decodes| decodes.get()), 12);
+        assert_eq!(read.len(), written.len());
+        for ((offset, record), (expected, expected_offset)) in read.iter().zip(&written) {
+            assert_eq!(offset, expected_offset);
+            assert_eq!(record.id, expected.id);
+            assert_eq!(record.payload, expected.payload);
+            assert_eq!(record.caused_by, expected.caused_by);
+            assert_eq!(record.linked_to, expected.linked_to);
+        }
+
+        // From a record in the middle, the same records from there on.
+        let (_, middle) = written[5];
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        let ids: Vec<u64> = log.iter_from(middle).map(|r| r.unwrap().1.id.0).collect();
+        assert_eq!(RECORD_DECODES.with(|decodes| decodes.get()), 7);
+        assert_eq!(ids, (6..=12).collect::<Vec<_>>());
+    }
+
+    // Each record's read holds the file from its seek to the position where
+    // the read stopped, so reads between steps, which move the shared file
+    // offset, don't move the iterator.
+    #[test]
+    fn reads_between_iteration_steps_do_not_move_the_iterator() {
+        let dir = TempDir::new().unwrap();
+        let log = RecordLog::open(dir.path().join("log.bin")).unwrap();
+        let mut offsets = Vec::new();
+        for i in 1..=6u64 {
+            let input = RecordInput::raw("test", vec![i as u8; 10 * i as usize]);
+            offsets.push(log.append(input, BranchId(1), Sequence(i)).unwrap().1);
+        }
+        let mut ids = Vec::new();
+        for result in log.iter() {
+            ids.push(result.unwrap().1.id.0);
+            log.read_at(offsets[0]).unwrap();
+            log.read_many_at(&[offsets[5], offsets[2]]).unwrap();
+        }
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    // A record that no longer reads ends the iteration: the error is
+    // returned once, and nothing after it.
+    #[test]
+    fn a_record_that_fails_to_read_ends_the_iteration() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        let log = RecordLog::open(&path).unwrap();
+        let mut offsets = Vec::new();
+        for i in 1..=4u64 {
+            let input = RecordInput::raw("test", format!("record {i}").into_bytes());
+            offsets.push(log.append(input, BranchId(1), Sequence(i)).unwrap().1);
+        }
+        // Damage the third record's payload under the open log.
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(offsets[2] + payload_offset(4)))
+            .unwrap();
+        file.write_all(b"XX").unwrap();
+        drop(file);
+
+        let results: Vec<_> = log.iter().collect();
+        assert_eq!(results.len(), 3, "{results:?}");
+        assert_eq!(results[0].as_ref().unwrap().1.id.0, 1);
+        assert_eq!(results[1].as_ref().unwrap().1.id.0, 2);
+        assert!(
+            matches!(results[2], Err(StoreError::ChecksumMismatch { .. })),
+            "{:?}",
+            results[2]
+        );
     }
 
     /// Byte offset of the payload within a record, given its type-string length.

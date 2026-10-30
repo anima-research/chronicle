@@ -50,6 +50,16 @@ fn replaced_item_count(data: &[u8]) -> Option<usize> {
     }
 }
 
+/// What `StateManager::lookup_state_items` found for a state.
+enum ItemsLookup {
+    /// The state has no value on the branch.
+    NoValue,
+    /// The state's value isn't a JSON array; the deserialization error.
+    NotArray(String),
+    /// The state's items.
+    Items(Arc<StateItems>),
+}
+
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotNeeded {
@@ -604,6 +614,14 @@ impl StateManager {
                 head.ops_since_delta_snapshot += 1;
                 head.item_count += 1;
             }
+            StateOperation::AppendMany(items) => {
+                // One operation for the cadence, however many items, as a
+                // TreeBatch counts. Append-only, so a delta snapshot may
+                // still consolidate it (`compute_delta_items` takes its
+                // items).
+                head.ops_since_delta_snapshot += 1;
+                head.item_count += items.len();
+            }
             StateOperation::Redact { start, end } => {
                 head.ops_since_delta_snapshot += 1;
                 // Redact removes the items of [start, end) that exist: both
@@ -728,6 +746,25 @@ impl StateManager {
                             .write()
                             .on_append(state_id, branch_id, offset, &value),
                         Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
+                    }
+                }
+                StateOperation::AppendMany(items) => {
+                    // Each item at its own ordinal, in order, as its own
+                    // Append would be. Every item is parsed before any is
+                    // indexed: one that doesn't parse poisons the indexes,
+                    // as it would on its own.
+                    let values: std::result::Result<Vec<serde_json::Value>, _> = items
+                        .iter()
+                        .map(|item| serde_json::from_slice::<serde_json::Value>(item))
+                        .collect();
+                    let mut field_indexes = self.field_indexes.write();
+                    match values {
+                        Ok(values) => {
+                            for value in &values {
+                                field_indexes.on_append(state_id, branch_id, offset, value);
+                            }
+                        }
+                        Err(_) => field_indexes.poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::DeltaSnapshot(_) => {
@@ -921,6 +958,18 @@ impl StateManager {
                 Arc::make_mut(&mut items).push(item);
                 Some(items)
             }
+            StateOperation::AppendMany(batch) => {
+                let batch: Vec<Arc<[u8]>> = batch
+                    .iter()
+                    .map(|item| reserialize(item))
+                    .collect::<Option<_>>()?;
+                let mut items = items.into_canonical()?;
+                let target = Arc::make_mut(&mut items);
+                for item in batch {
+                    target.push(item);
+                }
+                Some(items)
+            }
             StateOperation::Edit { index, new_value } => {
                 if *index >= items.len() {
                     return None;
@@ -947,24 +996,49 @@ impl StateManager {
     /// O(returned data) instead of O(state size). Validity is governed by
     /// the same head_offset discipline as `get_state`. A write to the state
     /// on this branch moves the head; the cached items follow it when the
-    /// new value can be derived from them (Append, Edit, Redact, and the
-    /// store's own snapshots), and are otherwise dropped so the next read
-    /// re-materializes. A branch whose head is at an offset another branch
-    /// has cached shares that branch's items. No caller-side invalidation
-    /// exists.
+    /// new value can be derived from them (Append, AppendMany, Edit, Redact,
+    /// and the store's own snapshots), and are otherwise dropped so the next
+    /// read re-materializes. A branch whose head is at an offset another
+    /// branch has cached shares that branch's items. No caller-side
+    /// invalidation exists.
     ///
     /// Returns an error if the state is not a JSON array (e.g. a Snapshot
     /// strategy state holding an object) — matching the behavior of the
-    /// previous slice implementation.
+    /// previous slice implementation. The point lookups (`get_state_item`,
+    /// `get_state_items_by_ordinal`) answer `None` for such a state instead.
     pub fn get_state_items(
         &self,
         branch_id: BranchId,
         state_id: &str,
     ) -> Result<Option<Arc<StateItems>>> {
+        match self.lookup_state_items(branch_id, state_id)? {
+            ItemsLookup::Items(items) => Ok(Some(items)),
+            ItemsLookup::NoValue => Ok(None),
+            ItemsLookup::NotArray(e) => Err(StoreError::Deserialization(e)),
+        }
+    }
+
+    /// `get_state_items` for a point lookup: a state whose value isn't an
+    /// array has no item at any ordinal, so it answers `None`, as a state
+    /// with no value does, where `get_state_items` returns an error.
+    fn state_items_for_lookup(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<StateItems>>> {
+        match self.lookup_state_items(branch_id, state_id)? {
+            ItemsLookup::Items(items) => Ok(Some(items)),
+            ItemsLookup::NoValue | ItemsLookup::NotArray(_) => Ok(None),
+        }
+    }
+
+    /// The body of `get_state_items`, which keeps apart a state with no
+    /// value and one whose value isn't an array.
+    fn lookup_state_items(&self, branch_id: BranchId, state_id: &str) -> Result<ItemsLookup> {
         let index = self.index.read();
         let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
-            None => return Ok(None),
+            None => return Ok(ItemsLookup::NoValue),
         };
         drop(index);
 
@@ -972,21 +1046,29 @@ impl StateManager {
 
         // Check items cache
         if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
-            return Ok(Some(cached));
+            return Ok(ItemsLookup::Items(cached));
         }
 
         // Materialize the full state once (served from the byte cache when
         // warm), then split into item spans without building a Value tree.
         let state = match self.get_state_shared(branch_id, state_id)? {
             Some(s) => s,
-            None => return Ok(None),
+            None => return Ok(ItemsLookup::NoValue),
         };
 
         let items = if state.data.is_empty() {
             StateItems::from_items(std::iter::empty(), state.canonical)
         } else {
-            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&state.data)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+            let raw: Vec<&serde_json::value::RawValue> = match serde_json::from_slice(&state.data) {
+                Ok(raw) => raw,
+                // serde_json reports a value of another type (an object, a
+                // string, ...) where it wanted a sequence as a data error;
+                // malformed bytes are a syntax or end-of-input error.
+                Err(e) if e.classify() == serde_json::error::Category::Data => {
+                    return Ok(ItemsLookup::NotArray(e.to_string()))
+                }
+                Err(e) => return Err(StoreError::Deserialization(e.to_string())),
+            };
             StateItems::from_items(raw.iter().map(|r| r.get().as_bytes()), state.canonical)
         };
         let items = Arc::new(items);
@@ -995,7 +1077,7 @@ impl StateManager {
             .write()
             .put(cache_key, head.head_offset, Arc::clone(&items));
 
-        Ok(Some(items))
+        Ok(ItemsLookup::Items(items))
     }
 
     /// Point lookup of a single AppendLog item.
@@ -1007,24 +1089,28 @@ impl StateManager {
     /// lookup fell into `get_state_items` and re-materialized the entire
     /// state on every single append (2026-08-01 Mythos: each materialization
     /// re-parsed a 114 MB snapshot chain — 10-30s CPU stalls at every turn
-    /// boundary). When the head record is an `Append` and the caller asks
-    /// for the final index, the item is served from the head record alone:
-    /// O(one record read) regardless of state size, no cache churn.
+    /// boundary). When the head record is an `Append` (or an `AppendMany`,
+    /// whose last item is the state's last) and the caller asks for the
+    /// final index, the item is served from the head record alone: O(one
+    /// record read) regardless of state size, no cache churn.
     ///
-    /// Byte fidelity: an item appended as a `serde_json::Value` is stored as
-    /// that Value's serialization, and materialization re-emits exactly
-    /// those bytes: it parses them and serializes the result, and a parsed
-    /// Value object keeps its keys in the order they were parsed in
-    /// (serde_json's `preserve_order`). Asserted by the fast/slow
-    /// equivalence test. On the head-record path, an item appended as raw
-    /// bytes is served as given, which may spell it differently (whitespace,
-    /// number form, escapes) from the materialization path and a warm items
-    /// cache.
+    /// Byte fidelity: an item appended as a `serde_json::Value`, as
+    /// `append_to_state_json_with_identity` and its batched form append
+    /// theirs, is stored as that Value's serialization, and materialization
+    /// re-emits exactly those bytes: it parses them and serializes the
+    /// result, and a parsed Value object keeps its keys in the order they
+    /// were parsed in (serde_json's `preserve_order`). Asserted by the
+    /// fast/slow equivalence test. On the head-record path, an item appended
+    /// as raw bytes is served as given, which may spell it differently
+    /// (whitespace, number form, escapes) from the materialization path and
+    /// a warm items cache.
     ///
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),
-    /// and any non-Append head or non-final index takes the full
-    /// materialization path.
+    /// and any other head or non-final index takes the full materialization
+    /// path. A state whose value isn't an array (a Snapshot state holding an
+    /// object, a Tree state) has no item at any index: `None`, not the
+    /// error `get_state_items` returns for it.
     pub fn get_state_item(
         &self,
         branch_id: BranchId,
@@ -1047,24 +1133,99 @@ impl StateManager {
 
         // Head-record fast path: last item + Append head.
         if head.item_count > 0 && index == head.item_count - 1 {
-            let log = self
-                .log
-                .as_ref()
-                .ok_or_else(|| StoreError::NotInitialized)?;
-            let record = log.read_at(head.head_offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-            if let StateOperation::Append(item) = update.operation {
+            if let Some(item) = self.last_item_from_head(&head)? {
                 return Ok(Some(item));
             }
-            // Non-Append head (Edit / Redact / snapshot / Set): the last
-            // item isn't recoverable from the head record alone.
         }
 
         // Slow path: full materialization (result cached for later reads).
-        match self.get_state_items(branch_id, state_id)? {
+        match self.state_items_for_lookup(branch_id, state_id)? {
             Some(items) => Ok(items.get(index).map(|item| item.to_vec())),
             None => Ok(None),
         }
+    }
+
+    /// Point lookups of several AppendLog items in one call: for each
+    /// ordinal in `ordinals`, in the order given, what `get_state_item`
+    /// returns for it, `None` where it is out of range, the state has no
+    /// value on this branch, or its value isn't an array. Ordinals may
+    /// repeat and come in any order.
+    ///
+    /// Every answer comes from one version of the state, and the version is
+    /// read once: from the warm item cache when it is current; from the head
+    /// record alone when every ordinal asked for is the last one, as
+    /// `get_state_item`'s fast path serves it; and otherwise from one
+    /// materialization, cached for later reads. So a batch of ordinals costs
+    /// at most what one cold `get_state_item` costs, not one each. An empty
+    /// request reads nothing. An ordinal past the end costs what it costs
+    /// `get_state_item`: on a cold cache, the materialization that finds the
+    /// end, as the head's item count isn't exact for every store. The bytes
+    /// are the same as `get_state_item`'s for items written in serde_json's
+    /// own spelling; an item written in another comes back as written from
+    /// the head record and re-serialized from the rest, as there.
+    pub fn get_state_items_by_ordinal(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // Nothing asked, nothing read.
+        if ordinals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head = {
+            let idx = self.index.read();
+            match idx.heads.get(branch_id, state_id) {
+                Some(h) => h.clone(),
+                None => return Ok(vec![None; ordinals.len()]),
+            }
+        };
+        let pick = |items: &StateItems| -> Vec<Option<Vec<u8>>> {
+            ordinals
+                .iter()
+                .map(|&i| items.get(i).map(|item| item.to_vec()))
+                .collect()
+        };
+
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(pick(&cached));
+        }
+
+        // Only the last item asked for: the head record may hold it, as for
+        // `get_state_item`.
+        if let Some(last) = head.item_count.checked_sub(1) {
+            if ordinals.iter().all(|&i| i == last) {
+                if let Some(item) = self.last_item_from_head(&head)? {
+                    return Ok(vec![Some(item); ordinals.len()]);
+                }
+            }
+        }
+
+        match self.state_items_for_lookup(branch_id, state_id)? {
+            Some(items) => Ok(pick(&items)),
+            None => Ok(vec![None; ordinals.len()]),
+        }
+    }
+
+    /// The state's last item, read from its head record alone, when that
+    /// record is an `Append` or an `AppendMany`; `None` for any other head
+    /// (Edit / Redact / snapshot / Set), whose last item the record alone
+    /// doesn't give.
+    fn last_item_from_head(&self, head: &StateChainHead) -> Result<Option<Vec<u8>>> {
+        let log = self
+            .log
+            .as_ref()
+            .ok_or_else(|| StoreError::NotInitialized)?;
+        let record = log.read_at(head.head_offset)?;
+        let update = StateUpdateRecord::decode(&record)?;
+        Ok(match update.operation {
+            StateOperation::Append(item) => Some(item),
+            // A batch at the head ends with the last item, as the last of its
+            // items appended one at a time would.
+            StateOperation::AppendMany(mut items) => items.pop(),
+            _ => None,
+        })
     }
 
     /// Get the current value of a Tree state as its decoded path→entry map.
@@ -1824,6 +1985,41 @@ mod tests {
         // Get state
         let state = manager.get_state(TEST_BRANCH, "counter").unwrap().unwrap();
         assert_eq!(state, b"42");
+    }
+
+    /// A batch moves the chain head by one operation and all of its items,
+    /// stays append-only for the snapshot schedule, and materializes as its
+    /// items in order after what came before.
+    #[test]
+    fn test_append_many_head_accounting() {
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 2,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        let first = StateOperation::Append(b"1".to_vec());
+        let offset1 = append_state_update(&log, "items", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", offset1, &first).unwrap();
+
+        let batch = StateOperation::AppendMany(vec![b"2".to_vec(), b"3".to_vec(), b"4".to_vec()]);
+        let offset2 = append_state_update(&log, "items", Some(offset1), batch.clone(), 2);
+        manager.record_update(TEST_BRANCH, "items", offset2, &batch).unwrap();
+
+        let head = manager.get_head(TEST_BRANCH, "items").unwrap();
+        assert_eq!(head.head_offset, offset2);
+        assert_eq!(head.item_count, 4);
+        assert_eq!(head.ops_since_delta_snapshot, 2);
+        assert!(!head.has_non_append_since_snapshot);
+        assert_eq!(manager.snapshot_needed(TEST_BRANCH, "items"), Some(SnapshotNeeded::Delta));
+        assert_eq!(manager.get_state(TEST_BRANCH, "items").unwrap().unwrap(), b"[1,2,3,4]");
+        assert_eq!(manager.get_state_item(TEST_BRANCH, "items", 3).unwrap().unwrap(), b"4");
     }
 
     #[test]

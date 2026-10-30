@@ -17,7 +17,9 @@
 //! These tests use only the cursor API so they compile against the unfixed
 //! code; they fail there on the `create_branch_at` child.
 
-use chronicle::{Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig};
+use chronicle::{
+    CompactionStats, Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -95,6 +97,14 @@ fn append_past_delta_threshold(store: &Store) -> Vec<Value> {
 /// children still read `expected_inherited ++ appended` — in-process and
 /// again after a close/reopen (cold reconstruction from the log).
 fn run_case(mutate: impl Fn(&Store), expected_inherited: Vec<Value>) {
+    run_case_then(mutate, expected_inherited, |_, _, _| {});
+}
+
+fn run_case_then(
+    mutate: impl Fn(&Store),
+    expected_inherited: Vec<Value>,
+    after_threshold: impl Fn(&str, &CompactionStats, &CompactionStats),
+) {
     let dir = TempDir::new().unwrap();
     let mut expected_by_branch: Vec<(&str, Vec<Value>)> = Vec::new();
     {
@@ -111,7 +121,9 @@ fn run_case(mutate: impl Fn(&Store), expected_inherited: Vec<Value>) {
             store.switch_branch(branch).unwrap();
             assert_eq!(read(&store), expected_inherited, "{branch}: inherited value at fork");
 
+            let before = store.get_compaction_stats("messages").unwrap();
             let appended = append_past_delta_threshold(&store);
+            after_threshold(branch, &before, &store.get_compaction_stats("messages").unwrap());
             let mut expected = expected_inherited.clone();
             expected.extend(appended);
 
@@ -205,4 +217,73 @@ fn branch_at_keeps_inherited_set_across_child_delta_snapshot() {
         },
         vec![json!("x"), json!("y")],
     );
+}
+
+fn append_many(store: &Store, values: &[&str]) {
+    store
+        .update_state(
+            "messages",
+            StateOperation::AppendMany(values.iter().map(|v| serde_json::to_vec(&json!(v)).unwrap()).collect()),
+        )
+        .unwrap();
+}
+
+/// A batch on the inherited chain is append-only, so it doesn't stop the
+/// child's delta snapshots, and they keep every one of its items.
+#[test]
+fn branch_at_keeps_an_inherited_batch_across_child_delta_snapshot() {
+    run_case_then(
+        |store| {
+            append_many(store, &["d", "e", "f"]);
+            append(store, json!("g"));
+        },
+        vec![json!("a"), json!("b"), json!("c"), json!("d"), json!("e"), json!("f"), json!("g")],
+        |branch, before, after| {
+            assert!(
+                after.delta_snapshots_since_full > before.delta_snapshots_since_full,
+                "{branch}: setup: the child took a delta snapshot past the threshold ({before:?} -> {after:?})"
+            );
+            assert_eq!(after.last_full_snapshot_offset, before.last_full_snapshot_offset, "{branch}: and no full");
+        },
+    );
+}
+
+/// The chain head `create_branch_at` rebuilds counts a batch before the cut
+/// as one operation and all of its items, exactly as the parent's head
+/// counted it, whether the cut falls on the batch or after it.
+#[test]
+fn branch_at_counts_a_batch_before_the_cut_as_the_parent_did() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    seed_with_full_snapshot(&store);
+    append_many(&store, &["d", "e", "f"]);
+    let on_batch = store.current_branch().head;
+    let at_batch = (
+        store.get_compaction_stats("messages").unwrap(),
+        store.get_state_len("messages").unwrap(),
+    );
+    append(&store, json!("g"));
+    append_many(&store, &["h", "i"]);
+    let at_head = store.current_branch().head;
+
+    store.create_branch("control", None).unwrap();
+    store.create_branch_at("historical", "main", at_head).unwrap();
+    store.create_branch_at("on-batch", "main", on_batch).unwrap();
+
+    let control = {
+        store.switch_branch("control").unwrap();
+        (store.get_compaction_stats("messages").unwrap(), store.get_state_len("messages").unwrap())
+    };
+    assert_eq!(control.0.ops_since_last_full_snapshot, 3, "two batches and an append");
+    assert_eq!(control.1, Some(9));
+    store.switch_branch("historical").unwrap();
+    let historical = (store.get_compaction_stats("messages").unwrap(), store.get_state_len("messages").unwrap());
+    assert_eq!(format!("{historical:?}"), format!("{control:?}"));
+
+    store.switch_branch("on-batch").unwrap();
+    let cut = (store.get_compaction_stats("messages").unwrap(), store.get_state_len("messages").unwrap());
+    assert_eq!(format!("{cut:?}"), format!("{at_batch:?}"));
+    assert_eq!(cut.0.ops_since_last_full_snapshot, 1);
+    assert_eq!(cut.1, Some(6));
+    assert_eq!(read(&store), ["a", "b", "c", "d", "e", "f"].map(|v| json!(v)).to_vec());
 }
