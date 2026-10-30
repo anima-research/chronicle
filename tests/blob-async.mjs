@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, constants, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -80,7 +80,7 @@ try {
   const hashes = await Promise.all(contents.map((content, i) =>
     handles[i % 2].storeBlobAsync(content, 'application/json', { chunked: i % 3 === 0 })));
 
-  const versionAt = (hash) => readFileSync(join(path, 'blobs', hash.slice(0, 2), hash))[4];
+  const versionAt = (hash, at = path) => readFileSync(join(at, 'blobs', hash.slice(0, 2), hash))[4];
   for (const [i, firstChunked] of [true, false].entries()) {
     const content = varied(100_000, 51 + 2 * i);
     const [first, second] = await Promise.all([
@@ -114,6 +114,36 @@ try {
   for (const [i, hash] of lateHashes.entries()) assert.deepEqual(reopened.getBlob(hash), lateContents[i]);
   for (const [i, hash] of hashes.entries()) assert.deepEqual(reopened.getBlob(hash), contents[i]);
   reopened.close();
+
+  const python = process.platform === 'win32' ? 'python' : 'python3';
+  const unchunkAt = (store, ...args) => execFileSync(python, [join(import.meta.dirname, '..', 'tools', 'unchunk-blobs.py'), store, ...args], { encoding: 'utf8', stdio: 'pipe' });
+  const unchunked = join(dir, 'unchunk');
+  const unchunk = (...args) => unchunkAt(unchunked, ...args);
+  const before = JsStore.openOrCreate({ path: unchunked });
+  const blobs = [varied(100_000, 61), varied(100_000, 63)];
+  const blobHashes = [
+    await before.storeBlobAsync(blobs[0], 'application/json', { chunked: true }),
+    await before.storeBlobAsync(blobs[1], 'application/json'),
+  ];
+  before.close();
+  assert.match(unchunk(), new RegExp(`^${blobHashes[0]}: 100000 bytes in \\d+ chunks\n1 chunked blob`));
+  assert.equal(versionAt(blobHashes[0], unchunked), 2);
+  unchunk('--apply');
+  for (const hash of blobHashes) assert.equal(versionAt(hash, unchunked), 1);
+  assert.match(unchunk(), /^0 chunked blob/);
+  const after = JsStore.open({ path: unchunked });
+  for (const [i, hash] of blobHashes.entries()) assert.deepEqual(after.getBlob(hash), blobs[i]);
+  after.close();
+
+  const damagedAt = join(dir, 'unchunk-damaged');
+  const damaged = JsStore.openOrCreate({ path: damagedAt });
+  const listHash = await damaged.storeBlobAsync(varied(100_000, 65), 'application/json', { chunked: true });
+  damaged.close();
+  const list = readFileSync(join(damagedAt, 'blobs', listHash.slice(0, 2), listHash));
+  const firstChunk = list.subarray(7 + list.readUInt16LE(5) + 12, 7 + list.readUInt16LE(5) + 44).toString('hex');
+  writeFileSync(join(damagedAt, 'blobs', firstChunk.slice(0, 2), firstChunk), 'not a blob');
+  assert.throws(() => unchunkAt(damagedAt, '--apply'), (error) => error.status !== 0 && /nothing after it was listed or rewritten/.test(error.stderr));
+  assert.equal(versionAt(listHash, damagedAt), 2);
   console.log('storeBlobAsync: all checks passed');
 } finally {
   rmSync(dir, { recursive: true, force: true });

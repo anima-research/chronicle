@@ -856,7 +856,9 @@ impl JsStore {
     /// whole, and more disk, since each file takes whole blocks. A chronicle
     /// release from before `storeBlobAsync` can't read a chunked blob: its
     /// `getBlob` of that hash throws, naming an unsupported blob version, and
-    /// it reads blobs stored whole as before.
+    /// it reads blobs stored whole as before. Chronicle's repository has
+    /// `tools/unchunk-blobs.py`, which rewrites a closed store's chunked
+    /// blobs whole.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn store_blob_async(
         &self,
