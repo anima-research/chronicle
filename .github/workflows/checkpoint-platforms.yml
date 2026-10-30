@@ -58,6 +58,9 @@ jobs:
       - name: Blob store tests
         run: cargo test --test blob_storage -- --nocapture
 
+      - name: Blob storage unit tests
+        run: cargo test --lib blobs:: -- --nocapture
+
       # LOCK's handling depends on each platform's locks (mandatory on
       # Windows) and file types, so its tests run here too.
       - name: Store lock tests
