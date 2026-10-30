@@ -12,6 +12,29 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.5.1 — 2026-10-30
+
+### Fixed
+
+- JSON objects you write now come back with their keys in the order you wrote
+  them (in a JavaScript object, its own property order), at every level and
+  from every method that returns them, and `JsStore`'s docs say so. The tree
+  methods still keep a tree state's entries by path, not in the order they
+  were set. Before, the JSON-writing methods (`appendJson`, `setStateJson`,
+  `appendToStateJson` and the rest) stored objects with their keys sorted,
+  and every method that parses stored JSON (`getStateJson`,
+  `getStateItemJson`, `getStateTail` and the rest) handed them back sorted.
+  - Nothing is migrated. Objects stored before through the JSON-writing
+    methods keep their sorted keys.
+  - Objects stored before as raw bytes (`appendToState`, `setState`,
+    `editStateItem`) came back sorted from the methods that parse them, and
+    now come back in the order of their bytes (in a JavaScript object, its
+    own property order), so a request built from them can change once after
+    the upgrade.
+  - A store this release writes still opens on 0.5.0, which hands back sorted
+    every object it parses, and can re-sort the items it writes into a
+    snapshot of an append log.
+
 ## 0.5.0 — 2026-10-29
 
 ### Breaking
