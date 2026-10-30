@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, mkdtempSync, openSync, rmSync } from 'node:fs';
+import { closeSync, constants, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -77,10 +77,19 @@ try {
   const view = store.view('main');
   const handles = [store, view];
   const contents = Array.from({ length: 12 }, (_, i) => varied(i % 2 ? 50 : 100_000, 10 + i));
-  const settled = [];
   const hashes = await Promise.all(contents.map((content, i) =>
-    handles[i % 2].storeBlobAsync(content, 'application/json', { chunked: i % 3 === 0 }).then((hash) => { settled.push(i); return hash; })));
-  assert.deepEqual(settled, contents.map((_, i) => i));
+    handles[i % 2].storeBlobAsync(content, 'application/json', { chunked: i % 3 === 0 })));
+
+  const versionAt = (hash) => readFileSync(join(path, 'blobs', hash.slice(0, 2), hash))[4];
+  for (const [i, firstChunked] of [true, false].entries()) {
+    const content = varied(100_000, 51 + 2 * i);
+    const [first, second] = await Promise.all([
+      handles[i].storeBlobAsync(content, 'application/json', { chunked: firstChunked }),
+      handles[1 - i].storeBlobAsync(content, 'application/json', { chunked: !firstChunked }),
+    ]);
+    assert.equal(first, second);
+    assert.equal(versionAt(first), firstChunked ? 2 : 1);
+  }
 
   const detached = store.view('main');
   const viewContent = varied(100_000, 40);

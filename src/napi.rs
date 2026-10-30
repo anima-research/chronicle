@@ -830,8 +830,9 @@ impl JsStore {
     /// is the one `storeBlob` would throw. The bytes are copied before this
     /// returns, so the buffer can be reused at once. These stores run one at a
     /// time on a thread of the open store's own, which its root handle and
-    /// views share, in the order they're called on any of them, and each
-    /// settles in that order; a `storeBlob` meanwhile isn't ordered with them.
+    /// views share, in the order they're called on any of them; a `storeBlob`
+    /// meanwhile isn't ordered with them. Each holds its copy of the bytes
+    /// until it settles, so awaiting them is what bounds that memory.
     /// The root's `close()` waits for every one already called, and one
     /// called on a view still finishes after that view's `close()`. A store
     /// whose root and views are all dropped without `close()` finishes the
@@ -847,10 +848,15 @@ impl JsStore {
     /// them in order, written only once every chunk is stored and synced.
     /// Content of one chunk or less is stored whole. `getBlob` returns the
     /// content either way, and a blob already stored in the other form is
-    /// left as it is when it reads back as the content. A chronicle release
-    /// without chunked blobs, 0.5.0 and earlier, can't read one: its `getBlob`
-    /// of that hash throws, naming an unsupported blob version, and it reads
-    /// blobs stored whole as before.
+    /// left as it is when it reads back as the content. Chunking pays where
+    /// content repeats earlier chunked content: each chunk is a file of its
+    /// own, about 10 KiB on average, and a `getBlob` of a chunked blob reads
+    /// each one the blob cache doesn't hold, so content sharing nothing with
+    /// what's stored takes more files to store and to read than it would
+    /// whole, and more disk, since each file takes whole blocks. A chronicle
+    /// release from before `storeBlobAsync` can't read a chunked blob: its
+    /// `getBlob` of that hash throws, naming an unsupported blob version, and
+    /// it reads blobs stored whole as before.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn store_blob_async(
         &self,

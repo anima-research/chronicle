@@ -78,7 +78,7 @@ A registration is kept in the store, so on a store opened again, `registerState`
 
 ### Blobs
 
-`storeBlob` keeps bytes under their SHA-256 hash, so the same content is stored once, and `getBlob` reads them back. `storeBlobAsync` stores them without holding the calling thread: the open store's own thread, which its root handle and views share, takes them one at a time, in the order they're called, and the root's `close()` waits for those already called. With `chunked: true`, it stores content as chunks cut where its own bytes say, so content sharing long runs of bytes with earlier chunked content shares those chunks on disk. A chronicle release without chunked blobs, 0.5.0 and earlier, can't read one.
+`storeBlob` keeps bytes under their SHA-256 hash, so the same content is stored once, and `getBlob` reads them back. `storeBlobAsync` stores them without holding the calling thread: the open store's own thread, which its root handle and views share, takes them one at a time, in the order they're called, and the root's `close()` waits for those already called. With `chunked: true`, it stores content as chunks cut where its own bytes say, so content sharing long runs of bytes with earlier chunked content shares those chunks on disk. Each chunk is a file of its own, about 10 KiB on average, and `getBlob` reads each one the blob cache doesn't hold, so content sharing nothing with what's stored takes more files to store and to read than it would whole, and more disk, since each file takes whole blocks. A chronicle release from before `storeBlobAsync` can't read a chunked blob.
 
 ### Subscriptions
 

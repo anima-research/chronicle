@@ -5,11 +5,10 @@
   would throw. The bytes are copied before it returns, so the buffer can be
   reused at once. The open store's own thread, which its root handle and
   views share, takes these stores one at a time, in the order they're called
-  on any of them, and each settles in that order; a `storeBlob` meanwhile
-  isn't ordered with them. The root's `close()` waits for every one already
-  called, holding the calling thread while it does, and a store whose root
-  and views are all dropped without `close()` finishes them before it
-  releases its lock.
+  on any of them; a `storeBlob` meanwhile isn't ordered with them. The
+  root's `close()` waits for every one already called, holding the calling
+  thread while it does, and a store whose root and views are all dropped
+  without `close()` finishes them before it releases its lock.
 - `storeBlobAsync` with `chunked: true` stores content longer than one chunk
   as chunks cut where its own bytes say, at most 64 KiB each and at least
   2 KiB but the last, every chunk a blob of its own, under a file at the
