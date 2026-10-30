@@ -126,14 +126,14 @@ impl BlobStorage {
     /// all, or a blob file in a format version newer than this chronicle
     /// reads, such as one a newer chronicle wrote, is an error and is left as
     /// it is, and so is a file naming chunks one of which is any of these. A
-    /// file holding a blob's or a chunk's bytes whole, which this
-    /// `BlobStorage` has written or read and checked, is taken as stored
+    /// file holding a blob's or a chunk's bytes whole, which a store of this
+    /// `BlobStorage` has written, or read and checked, is taken as stored
     /// without reading it again while a regular file of the same length, or a
     /// link to one, is at its name, until a read of it fails, in a
-    /// [`get`](Self::get) or in a store's check of the chunks a file names. A
-    /// file naming chunks isn't: storing the same content again reads it, and
-    /// this store reads its chunks too. A content type longer than 65,535
-    /// bytes is refused.
+    /// [`get`](Self::get) or in a store's check of the chunks a file names.
+    /// A `get` takes nothing as stored. A file naming chunks isn't: storing
+    /// the same content again reads it, and this store reads its chunks too.
+    /// A content type longer than 65,535 bytes is refused.
     pub fn store(&self, content: &[u8], content_type: &str) -> Result<Hash> {
         let content_type_len = content_type_len(content_type)?;
         let hash = Hash::from_bytes(content);
@@ -249,7 +249,12 @@ impl BlobStorage {
         for (chunk, _) in &pieces {
             list.extend_from_slice(&chunk.0);
         }
-        let checksum = crc32fast::hash(&list).to_le_bytes();
+        let content_type_len = content_type_len.to_le_bytes();
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&content_type_len);
+        hasher.update(content_type.as_bytes());
+        hasher.update(&list);
+        let checksum = hasher.finalize().to_le_bytes();
         self.cache.lock().pop(&hash);
         self.write(
             &hash,
@@ -257,7 +262,7 @@ impl BlobStorage {
             &[
                 BLOB_MAGIC,
                 &[CHUNKED_VERSION],
-                &content_type_len.to_le_bytes(),
+                &content_type_len,
                 content_type.as_bytes(),
                 &list,
                 &checksum,
@@ -460,7 +465,6 @@ impl BlobStorage {
             Some(StoredFile::Content(stored)) => {
                 check_hash(hash, &stored.content)?;
                 self.cache.lock().put(*hash, stored.clone());
-                self.remember(*hash, &stored);
                 stored
             }
             Some(StoredFile::Chunks(list)) => {
@@ -486,6 +490,12 @@ impl BlobStorage {
             let piece = self
                 .chunk_content(chunk, cached)
                 .map_err(|error| chunk_error(list_path, chunk, error))?;
+            if (content.len() + piece.len()) as u64 > list.len {
+                return Err(damaged(
+                    list_path,
+                    &format!("it names {} bytes of content, and its chunks hold more", list.len),
+                ));
+            }
             content.extend_from_slice(&piece);
         }
         if content.len() as u64 != list.len {
@@ -532,8 +542,9 @@ impl BlobStorage {
         };
         if cached {
             self.cache.lock().put(*chunk, stored.clone());
+        } else {
+            self.remember(*chunk, &stored);
         }
-        self.remember(*chunk, &stored);
         Ok(stored.content)
     }
 
@@ -608,11 +619,11 @@ impl BlobStorage {
             file.read_exact(&mut count_bytes)
                 .map_err(read_error(path))?;
             let count = u32::from_le_bytes(count_bytes);
-            let room = size.saturating_sub(4 + 1 + 2 + content_type_len as u64 + 8 + 4 + 4);
-            if u64::from(count) * 32 > room {
+            let names = 4 + 1 + 2 + content_type_len as u64 + 8 + 4 + u64::from(count) * 32 + 4;
+            if size != names {
                 return Err(damaged(
                     path,
-                    &format!("its header names {count} chunks, more than the file holds"),
+                    &format!("its header names {count} chunks, which takes a file of {names} bytes, and it holds {size}"),
                 ));
             }
             let mut hashes = vec![0u8; count as usize * 32];
@@ -622,6 +633,8 @@ impl BlobStorage {
                 .map_err(read_error(path))?;
             let stored_checksum = u32::from_le_bytes(checksum_bytes);
             let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&content_type_len_bytes);
+            hasher.update(&content_type_bytes);
             hasher.update(&content_len_bytes);
             hasher.update(&count_bytes);
             hasher.update(&hashes);
@@ -631,6 +644,15 @@ impl BlobStorage {
                     expected: stored_checksum,
                     got: computed_checksum,
                 });
+            }
+            if content_len > u64::from(count) * chunks::MAX_CHUNK as u64 {
+                return Err(damaged(
+                    path,
+                    &format!(
+                        "it names {content_len} bytes of content, more than its {count} chunk(s) of at most {} bytes can hold",
+                        chunks::MAX_CHUNK
+                    ),
+                ));
             }
             let chunks = hashes
                 .chunks_exact(32)
@@ -930,12 +952,14 @@ mod tests {
             list.extend_from_slice(&chunk.0);
         }
         let mut file = Vec::new();
+        let mut checked = Vec::new();
+        checked.extend_from_slice(&(b"application/json".len() as u16).to_le_bytes());
+        checked.extend_from_slice(b"application/json");
+        checked.extend_from_slice(&list);
         file.extend_from_slice(BLOB_MAGIC);
         file.push(CHUNKED_VERSION);
-        file.extend_from_slice(&(b"application/json".len() as u16).to_le_bytes());
-        file.extend_from_slice(b"application/json");
-        file.extend_from_slice(&list);
-        file.extend_from_slice(&crc32fast::hash(&list).to_le_bytes());
+        file.extend_from_slice(&checked);
+        file.extend_from_slice(&crc32fast::hash(&checked).to_le_bytes());
         let path = storage.blob_path(at);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, file).unwrap();
@@ -1135,10 +1159,9 @@ mod tests {
             fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
             let after_reading = store(&reader);
             fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-            assert_eq!(
-                after_reading.unwrap(),
-                hash,
-                "read and checked, chunked: {chunked}"
+            assert!(
+                after_reading.is_err(),
+                "a get takes nothing as stored, chunked: {chunked}"
             );
         }
     }
@@ -1204,6 +1227,67 @@ mod tests {
                 "expected a hash mismatch, got {:?}",
                 other.map(|b| b.map(|b| b.hash))
             ),
+        }
+    }
+
+    #[test]
+    fn a_chunk_list_with_its_content_type_damaged_or_bytes_past_its_checksum_is_refused_and_a_chunked_store_replaces_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blobs");
+        let storage = BlobStorage::new(&path, 100).unwrap();
+        let content = varied(100_000, 21);
+        let hash = storage.store_chunked(&content, "application/json").unwrap();
+        let file = storage.blob_path(&hash);
+        let good = fs::read(&file).unwrap();
+        let mut other_type = good.clone();
+        other_type[7] ^= 1;
+        let mut longer = good.clone();
+        longer.push(0);
+
+        for damaged in [other_type, longer] {
+            fs::write(&file, &damaged).unwrap();
+            let fresh = BlobStorage::new(&path, 100).unwrap();
+            match fresh.get(&hash) {
+                Err(StoreError::ChecksumMismatch { .. }) | Err(StoreError::InvalidFormat(_)) => {}
+                other => panic!(
+                    "expected the list refused as damaged, got {:?}",
+                    other.map(|b| b.map(|b| b.content_type))
+                ),
+            }
+            fresh.store_chunked(&content, "application/json").unwrap();
+            let reader = BlobStorage::new(&path, 100).unwrap();
+            assert_eq!(reader.get(&hash).unwrap().unwrap().content, content);
+        }
+    }
+
+    #[test]
+    fn a_chunk_list_naming_more_than_its_chunks_can_hold_is_refused_before_any_chunk_is_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blobs");
+        let storage = BlobStorage::new(&path, 100).unwrap();
+        let at = Hash::from_bytes(b"a list");
+        write_list(&storage, &at, chunks::MAX_CHUNK as u64 + 1, &[Hash::from_bytes(b"never stored")]);
+
+        match storage.get(&at) {
+            Err(StoreError::InvalidFormat(what)) => assert!(what.contains("is damaged"), "{what}"),
+            other => panic!("expected a damaged list, got {:?}", other.map(|b| b.map(|b| b.hash))),
+        }
+    }
+
+    #[test]
+    fn a_chunk_list_whose_chunks_hold_more_than_it_names_is_refused_at_the_first_chunk_past_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blobs");
+        let storage = BlobStorage::new(&path, 100).unwrap();
+        let chunk = storage.store(&varied(64 * 1024, 23), "application/octet-stream").unwrap();
+        let at = Hash::from_bytes(b"a list");
+        write_list(&storage, &at, 1, &[chunk, chunk]);
+
+        match storage.get(&at) {
+            Err(StoreError::InvalidFormat(what)) => {
+                assert!(what.contains("its chunks hold more"), "{what}")
+            }
+            other => panic!("expected a damaged list, got {:?}", other.map(|b| b.map(|b| b.hash))),
         }
     }
 
