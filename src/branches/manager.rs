@@ -1084,7 +1084,10 @@ mod tests {
 
         // Create hierarchy: main -> feature -> sub-feature
         manager.create_branch("feature", None).unwrap();
-        manager.create_branch("sub-feature", Some("feature")).unwrap();
+        let sub = manager.create_branch("sub-feature", Some("feature")).unwrap();
+        manager
+            .update_head(sub.id, Sequence(sub.branch_point.unwrap().0 + 1))
+            .unwrap();
 
         // GC feature with reparenting to main
         let result = manager.gc(BranchGcOptions {
@@ -1094,18 +1097,10 @@ mod tests {
             ..Default::default()
         }).unwrap();
 
-        // Both should be deleted since both are empty, but feature first
-        // sub-feature gets reparented to main, then deleted too
-        assert!(result.deleted.len() >= 1);
-
-        // sub-feature should now have main as parent (or be deleted)
-        let remaining = manager.list_branches();
-        for branch in &remaining {
-            if branch.name != MAIN_BRANCH {
-                // Any remaining non-main branch should have main as parent
-                assert_eq!(branch.parent, Some(BranchId(1)));
-            }
-        }
+        assert_eq!(result.deleted, vec!["feature".to_string()]);
+        assert_eq!(result.reparented, 1);
+        let main_id = manager.get_branch(MAIN_BRANCH).unwrap().id;
+        assert_eq!(manager.get_branch("sub-feature").unwrap().parent, Some(main_id));
     }
 
     #[test]

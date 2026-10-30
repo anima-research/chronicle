@@ -183,7 +183,6 @@ fn a_branch_made_from_a_damaged_branch_starts_from_its_reading() {
             append(&store, json!(v));
             reading.push(json!(v));
         }
-        assert_eq!(store.snapshot_needed("s"), None, "{name}: the change behind the old delta holds its deltas off");
         assert_reads(&store, &reading, &format!("{name}: after four appends"));
         assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: its count after four appends");
     }

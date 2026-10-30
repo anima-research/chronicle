@@ -19,7 +19,7 @@
   "scripts": {
     "build": "napi build --platform --release --features napi-bindings",
     "build:debug": "napi build --platform --features napi-bindings",
-    "test": "node test.mjs && node test-views.mjs && node tests/blob-async.mjs && node --test scripts/release-changelog.test.mjs scripts/release-holds.test.mjs",
+    "test": "node test.mjs && node test-views.mjs && node tests/blob-async.mjs && node test-key-order.mjs && node --test scripts/release-changelog.test.mjs scripts/release-holds.test.mjs",
     "preversion": "node scripts/release-holds.mjs",
     "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
     "prepublishOnly": "node scripts/release-holds.mjs"

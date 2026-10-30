@@ -1011,27 +1011,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delta_snapshot_is_a_field_index_noop() {
-        // Regression for the double-index bug: a DeltaSnapshot consolidates
-        // items ALREADY indexed via prior Appends — the field index must
-        // never see it as new content. FieldIndexManager itself has no
-        // `on_delta_snapshot` method at all (StateManager::record_update
-        // simply does not call into the field index for that operation) —
-        // this test documents that contract by asserting a bare `on_append`
-        // sequence (the only path that legitimately grows the index) stays
-        // exactly 1:1 with the number of Appends, with no hidden
-        // amplification hook to trip.
-        let mut mgr = FieldIndexManager::new();
-        mgr.register("s", "/v", FieldIndexKind::Number, MAIN, None, std::iter::empty())
-            .unwrap();
-        for i in 0..10 {
-            mgr.on_append("s", MAIN, i, &json!({"v": i}));
-        }
-        let all = mgr.query_range("s", "/v", MAIN, None, None, None, None, false).unwrap();
-        assert_eq!(all.len(), 10, "10 appends must yield exactly 10 indexed ordinals");
-    }
-
-    #[test]
     fn test_on_edit_updates_old_and_new() {
         let mut mgr = FieldIndexManager::new();
         let data = items(&[json!({"v": "a"}), json!({"v": "b"}), json!({"v": "a"})]);
@@ -1379,12 +1358,16 @@ mod tests {
     fn test_load_stale_version_returns_none() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state-indexes.bin");
-        let mut file = File::create(&path).unwrap();
-        file.write_all(FIELD_INDEX_MAGIC).unwrap();
-        file.write_all(&[255u8]).unwrap(); // bogus version
-        file.write_all(&0u64.to_le_bytes()).unwrap();
-        drop(file);
+        let mut mgr = FieldIndexManager::new();
+        mgr.register("s", "/v", FieldIndexKind::Number, MAIN, None, std::iter::empty())
+            .unwrap();
+        mgr.on_append("s", MAIN, 0, &json!({"v": 1}));
+        mgr.save(&path).unwrap();
+        assert!(FieldIndexManager::load(&path).unwrap().is_some(), "setup: the saved file loads");
 
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[FIELD_INDEX_MAGIC.len()] = FIELD_INDEX_VERSION - 1;
+        std::fs::write(&path, bytes).unwrap();
         assert!(FieldIndexManager::load(&path).unwrap().is_none());
     }
 

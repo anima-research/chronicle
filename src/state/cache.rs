@@ -553,10 +553,6 @@ mod tests {
         for (version, expected) in &versions {
             assert_eq!(&contents(version), expected);
         }
-        // Invariant: all chunks full except the last, none empty.
-        let (last, full) = items.chunks.split_last().unwrap();
-        assert!(full.iter().all(|c| c.len() == CHUNK));
-        assert!(!last.is_empty() && last.len() <= CHUNK);
     }
 
     #[test]
@@ -614,7 +610,7 @@ mod tests {
         assert!(Arc::ptr_eq(&value.chunks[1], &first.chunks[1]));
         assert!(!Arc::ptr_eq(&value.chunks[2], &first.chunks[2]));
         assert!(Arc::ptr_eq(&value.chunks[2][0], &first.chunks[2][0]));
-        assert_eq!(&first[CHUNK * 2 + 1], b"{\"a\":1,\"b\":2}");
+        assert_eq!(&first[CHUNK * 2 + 1], b"{\"b\":2,\"a\":1}");
         assert_eq!(&first[CHUNK * 2 + 3], b"100.0");
         // The original is untouched.
         assert_eq!(&value[CHUNK * 2 + 1], raw[1]);

@@ -37,6 +37,13 @@ use std::thread::JoinHandle;
 /// for every view at once (they throw "Store has been closed" from then on)
 /// and releases the lock file before it returns, however many views are
 /// still referenced. `close()` on a view only detaches that view.
+///
+/// JSON objects you write come back with their keys in the order you wrote
+/// them (in a JavaScript object, its own property order), at every level
+/// and from every method that returns them. The tree methods keep a tree
+/// state's entries by path, not in the order they were set. An object stored
+/// by an earlier version keeps the order it was stored in, which for the
+/// JSON-writing methods was sorted.
 #[napi]
 pub struct JsStore {
     /// The open store, shared by the root handle and every view made from
