@@ -188,9 +188,11 @@ Two things about the test setup are easy to trip over:
 CI installs it with `npm ci`, which unlike `npm install` fails loudly on a
 lock that is broken or out of sync.
 
-Push-time CI (`ci.yml`) runs the Rust suite, the debug napi build and the node
-smoke test on every push and PR, under Node 22.12.0, 24 and the latest Node
-(ubuntu only — the cross-target matrix runs at release time).
+Push-time CI (`ci.yml`) runs the debug napi build on every PR and every push
+to `main`, under Node 22.12.0, 24 and the latest Node. Both suites, Rust and
+Node, run once, under 22.12.0; the other two legs check only that the built
+module loads and opens a store (ubuntu only — the cross-target matrix runs at
+release time).
 
 Binaries ship inside the single published tarball. The platform packages that
 `napi prepublish` would name were never published, and a manifest declaring

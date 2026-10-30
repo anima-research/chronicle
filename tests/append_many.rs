@@ -58,9 +58,9 @@ fn text(bytes: Option<Vec<u8>>) -> Option<String> {
 }
 
 /// Item payloads for the differential workload. Several are not in
-/// serde_json's own spelling (unsorted keys, whitespace, exponents,
-/// escapes), so a read that returned stored bytes where a rebuild returns
-/// re-serialized ones would show.
+/// serde_json's own spelling (whitespace, exponents, escapes), so a read
+/// that returned stored bytes where a rebuild returns re-serialized ones
+/// would show.
 const RAW_ITEMS: [&[u8]; 8] = [
     b"{\"n\":1,\"tag\":\"a\"}",
     b"{ \"tag\" : \"b\", \"n\" : 2.50 }",

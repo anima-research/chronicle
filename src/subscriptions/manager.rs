@@ -371,8 +371,7 @@ mod tests {
         manager.broadcast_record(&record);
 
         // Should NOT receive (no more events after CaughtUp)
-        let result = handle.recv_timeout(Duration::from_millis(50));
-        assert!(result.is_err());
+        assert!(matches!(handle.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     }
 
     #[test]
@@ -414,7 +413,6 @@ mod tests {
         manager.broadcast_record(&record);
 
         // Should NOT receive (not caught up yet)
-        let result = handle.recv_timeout(Duration::from_millis(50));
-        assert!(result.is_err());
+        assert!(matches!(handle.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     }
 }

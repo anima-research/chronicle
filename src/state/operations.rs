@@ -100,8 +100,8 @@ pub fn materialize_operations(ops: Vec<StateOperation>) -> Result<Vec<u8>> {
 /// this crate's own serialization of the decoded value (`true`) or a payload
 /// passed through verbatim from a `Set`/`Snapshot`/`Delta` operation, or
 /// nothing at all (`false`). Verbatim bytes may spell the same JSON
-/// differently from how a later re-materialization would (key order,
-/// whitespace, number form).
+/// differently from how a later re-materialization would (whitespace,
+/// number form, escapes, and for a tree state, key order).
 pub(crate) fn materialize_operations_tagged(ops: Vec<StateOperation>) -> Result<(Vec<u8>, bool)> {
     let mut acc = Materialized::Raw(Vec::new());
 
@@ -538,6 +538,25 @@ mod tests {
     }
 
     #[test]
+    fn a_field_update_keeps_the_other_keys_in_place_and_puts_a_new_field_last() {
+        let state = br#"{"z":1,"b":2,"a":3}"#.to_vec();
+
+        let op = StateOperation::Field {
+            name: "b".to_string(),
+            operation: Box::new(StateOperation::Set(b"9".to_vec())),
+        };
+        let state = apply_operation(state, op).unwrap();
+        assert_eq!(String::from_utf8(state.clone()).unwrap(), r#"{"z":1,"b":9,"a":3}"#);
+
+        let op = StateOperation::Field {
+            name: "c".to_string(),
+            operation: Box::new(StateOperation::Set(b"4".to_vec())),
+        };
+        let state = apply_operation(state, op).unwrap();
+        assert_eq!(String::from_utf8(state).unwrap(), r#"{"z":1,"b":9,"a":3,"c":4}"#);
+    }
+
+    #[test]
     fn test_nested_field_append() {
         let state = serde_json::to_vec(&json!({"items": [1, 2], "meta": {}})).unwrap();
 
@@ -742,7 +761,7 @@ mod tests {
         let state = serde_json::to_vec(&json!([1])).unwrap();
         let op = StateOperation::AppendMany(vec![b"2".to_vec(), b"{\"b\":1, \"a\":[3]}".to_vec()]);
         let state = apply_operation(state, op).unwrap();
-        assert_eq!(state, br#"[1,2,{"a":[3],"b":1}]"#);
+        assert_eq!(state, br#"[1,2,{"b":1,"a":[3]}]"#);
 
         // Onto nothing: the same as its items appended one by one.
         let op = StateOperation::AppendMany(vec![b"\"x\"".to_vec()]);

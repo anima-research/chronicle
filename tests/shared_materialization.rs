@@ -324,7 +324,7 @@ fn cached_reads_equal_cold_reads_under_a_random_workload() {
         };
 
         // Appended payloads, several of them NOT in serde_json's own form
-        // (unsorted keys, whitespace, exponent numbers, escapes).
+        // (whitespace, exponent numbers, escapes).
         let raw_items: [&[u8]; 8] = [
             b"1",
             b"{\"z\":1,\"a\":[1, 2]}",

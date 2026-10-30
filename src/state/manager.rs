@@ -1094,13 +1094,16 @@ impl StateManager {
     /// final index, the item is served from the head record alone: O(one
     /// record read) regardless of state size, no cache churn.
     ///
-    /// Byte fidelity: an Append record stores exactly the bytes that
-    /// materialization re-emits for that item — both sides serialize the
-    /// same `serde_json::Value`, and Value objects are BTreeMap-backed so
-    /// key order is canonical. Asserted by the fast/slow equivalence test.
-    /// That holds for a writer that serializes its items with serde_json,
-    /// as `append_to_state_json_with_identity` and its batched form do;
-    /// bytes written in another spelling come back as written.
+    /// Byte fidelity: an item appended as a `serde_json::Value`, as
+    /// `append_to_state_json_with_identity` and its batched form append
+    /// theirs, is stored as that Value's serialization, and materialization
+    /// re-emits exactly those bytes: it parses them and serializes the
+    /// result, and a parsed Value object keeps its keys in the order they
+    /// were parsed in (serde_json's `preserve_order`). Asserted by the
+    /// fast/slow equivalence test. On the head-record path, an item appended
+    /// as raw bytes is served as given, which may spell it differently
+    /// (whitespace, number form, escapes) from the materialization path and
+    /// a warm items cache.
     ///
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),
@@ -2165,15 +2168,15 @@ mod tests {
             .record_update(TEST_BRANCH, "data", offset, &StateOperation::Set(b"\"cached\"".to_vec()))
             .unwrap();
 
-        // First call - cache miss
-        assert_eq!(manager.cache_len(), 0);
+        let before = manager.reconstruction_count();
         let _ = manager.get_state(TEST_BRANCH, "data").unwrap();
-        assert_eq!(manager.cache_len(), 1);
+        let rebuilds = manager.reconstruction_count();
+        assert!(rebuilds > before, "setup: the first read rebuilt the state");
 
         // Second call - cache hit (no additional disk reads)
         let state = manager.get_state(TEST_BRANCH, "data").unwrap().unwrap();
         assert_eq!(state, b"\"cached\"");
-        assert_eq!(manager.cache_len(), 1);
+        assert_eq!(manager.reconstruction_count(), rebuilds, "the repeat read rebuilt the state");
     }
 
     #[test]
@@ -2201,7 +2204,6 @@ mod tests {
 
         // Populate cache
         let _ = manager.get_state(TEST_BRANCH, "data").unwrap();
-        assert_eq!(manager.cache_len(), 1);
 
         // Update invalidates cache
         let offset2 = append_state_update(
@@ -2214,7 +2216,6 @@ mod tests {
         manager
             .record_update(TEST_BRANCH, "data", offset2, &StateOperation::Set(b"\"v2\"".to_vec()))
             .unwrap();
-        assert_eq!(manager.cache_len(), 0);
 
         // Next read gets new value
         let state = manager.get_state(TEST_BRANCH, "data").unwrap().unwrap();

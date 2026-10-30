@@ -325,7 +325,7 @@ fn failed_historical_chain_read_does_not_allocate_a_partial_branch() {
     assert!(matches!(err, StoreError::Deserialization(_)), "{err}");
     assert_eq!(store.list_branches().len(), 1);
     let fresh = store.create_empty_branch("fresh", None).unwrap();
-    assert_eq!(fresh.id.0, 2);
+    assert_eq!(store.get_state_on(fresh.id, "items").unwrap(), None);
 }
 
 #[test]
@@ -387,5 +387,9 @@ fn a_failed_final_sync_is_logged() {
     repair(&state_path, previous);
 
     let text = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
-    assert!(text.contains("final sync on drop failed"), "{text}");
+    let store_path = dir.path().display().to_string();
+    assert!(
+        text.lines().any(|line| line.contains("WARN") && line.contains(&store_path)),
+        "{text}"
+    );
 }

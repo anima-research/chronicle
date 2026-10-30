@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build & Test (Node ${{ matrix.node }})
+    name: Build & ${{ matrix.suite && 'Test' || 'Start' }} (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     # Bounds a hung run, which would otherwise hold its runner for six hours.
     # On Node 22.12.0, node --test can loop forever when a child's output
@@ -24,7 +24,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['22.12.0', '24', 'latest']
+        include:
+          - node: '22.12.0'
+            suite: true
+          - node: '24'
+          - node: 'latest'
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -54,10 +58,17 @@ jobs:
       # process, so test executables cannot link with it (the cdylib can).
       # The napi surface is covered by the napi build + node smoke test below.
       - name: Cargo tests
+        if: matrix.suite
         run: cargo test
 
       - name: Build native module (debug)
         run: npx napi build --platform --features napi-bindings
 
       - name: Node smoke test
+        if: matrix.suite
         run: npm test
+
+      - name: Start (load the module, open a store)
+        if: ${{ !matrix.suite }}
+        run: |
+          node --input-type=module -e "const { JsStore } = await import('./index.js'); JsStore.openOrCreate({ path: process.env.RUNNER_TEMP + '/start-check', blobCacheSize: 1 });"

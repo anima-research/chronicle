@@ -1,9 +1,10 @@
 //! Integration tests for the record store.
 
 use chronicle::{
-    FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy,
-    Store, StoreConfig,
+    DropReason, FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration,
+    StateStrategy, Store, StoreConfig, StoreEvent, SubscriptionConfig, SubscriptionFilter,
 };
+use std::time::Duration;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -1938,15 +1939,6 @@ fn test_field_index_survives_reopen_after_delta_snapshot_only() {
 
 #[test]
 fn test_register_field_index_idempotent_reregistration_skips_materialization() {
-    // Proves the freshness check runs BEFORE `get_state`/JSON-parsing the
-    // slot, not after: times a batch of no-op re-registrations against a
-    // large slot and asserts they stay cheap. If the freshness check ran
-    // after materialization (the pre-fix ordering), each of these would
-    // pay for a full chain reconstruction + JSON parse of the whole slot —
-    // the reviewer measured ~110ms for a single such call on a 20k-item/
-    // ~21MB slot. The threshold below is deliberately generous (a small
-    // constant total for 50 calls) so it fails hard on a regression to that
-    // behavior while staying robust to normal CI timing noise.
     let dir = TempDir::new().unwrap();
     let store = test_store(&dir);
 
@@ -1961,7 +1953,7 @@ fn test_register_field_index_idempotent_reregistration_skips_materialization() {
         })
         .unwrap();
 
-    let n = 20_000usize;
+    let n = 20usize;
     for i in 0..n {
         store
             .update_state(
@@ -1971,28 +1963,133 @@ fn test_register_field_index_idempotent_reregistration_skips_materialization() {
             .unwrap();
     }
 
-    // First registration: cold, legitimately pays full materialization cost.
     store
         .register_state_field_index("messages", "/v", FieldIndexKind::Number)
         .unwrap();
     assert_eq!(store.get_state_len("messages").unwrap().unwrap(), n);
 
-    // 50 idempotent re-registrations, all against the SAME head_offset —
-    // every one of them should be a no-op that never touches the slot.
-    let start = std::time::Instant::now();
-    for _ in 0..50 {
-        store
-            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
-            .unwrap();
-    }
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed < std::time::Duration::from_millis(200),
-        "50 idempotent re-registrations against a {}-item slot took {:?} — the freshness \
-         check must short-circuit before materializing/parsing the slot; this looks like \
-         the pre-fix behavior of paying full materialization cost on every no-op call",
-        n,
-        elapsed
+    store.clear_state_caches();
+    let rebuilds = store.state_reconstruction_count();
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    assert_eq!(
+        store.state_reconstruction_count(),
+        rebuilds,
+        "re-registering a current index rebuilt the slot"
     );
+}
+
+#[test]
+fn test_interleaved_states_read_back_their_own_items_across_snapshots_and_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let states = ["a", "b", "c", "d"];
+    let per_state = 30;
+    {
+        let store = test_store(&dir);
+        for id in states {
+            store
+                .register_state(StateRegistration {
+                    id: id.to_string(),
+                    strategy: StateStrategy::AppendLog { delta_snapshot_every: 5, full_snapshot_every: 2 },
+                    initial_value: None,
+                })
+                .unwrap();
+        }
+        for n in 0..per_state {
+            for id in states {
+                store
+                    .update_state(
+                        id,
+                        StateOperation::Append(serde_json::to_vec(&json!({"state": id, "n": n})).unwrap()),
+                    )
+                    .unwrap();
+            }
+        }
+        for id in states {
+            let stats = store.get_compaction_stats(id).unwrap();
+            assert!(stats.last_full_snapshot_offset.is_some(), "{id}: setup: a full snapshot taken");
+            let expected: Vec<serde_json::Value> = (0..per_state).map(|n| json!({"state": id, "n": n})).collect();
+            let items: Vec<serde_json::Value> =
+                serde_json::from_slice(&store.get_state(id).unwrap().unwrap()).unwrap();
+            assert_eq!(items, expected, "{id}: before the reopen");
+        }
+        store.sync().unwrap();
+    }
+
+    let store = Store::open(StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: false,
+    })
+    .unwrap();
+    for id in states {
+        let expected: Vec<serde_json::Value> = (0..per_state).map(|n| json!({"state": id, "n": n})).collect();
+        let items: Vec<serde_json::Value> =
+            serde_json::from_slice(&store.get_state(id).unwrap().unwrap()).unwrap();
+        assert_eq!(items, expected, "{id}: after the reopen");
+    }
+}
+
+#[test]
+fn test_subscription_catches_up_by_type_then_gets_live_records_and_unsubscribes() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+    let mut first = None;
+    let mut important = Vec::new();
+    for i in 0..30 {
+        let record_type = if i % 3 == 0 { "important" } else { "normal" };
+        let record = store.append(RecordInput::json(record_type, &json!({"i": i})).unwrap()).unwrap();
+        first.get_or_insert(record.sequence);
+        if i % 3 == 0 {
+            important.push(record.id.0);
+        }
+    }
+
+    let filtered = store.subscribe(SubscriptionConfig {
+        filter: SubscriptionFilter::record_types(vec!["important".to_string()]),
+        from_sequence: first,
+        ..Default::default()
+    });
+    store.catch_up_subscription(filtered.id).unwrap();
+    let mut caught_up = Vec::new();
+    loop {
+        match filtered.recv_timeout(Duration::from_secs(5)).unwrap() {
+            StoreEvent::Record { record } => caught_up.push(record.id),
+            StoreEvent::CaughtUp => break,
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert_eq!(caught_up, important, "each important record once, in order");
+
+    let live = store.subscribe(SubscriptionConfig {
+        filter: SubscriptionFilter::records(),
+        from_sequence: None,
+        ..Default::default()
+    });
+    store.catch_up_subscription(live.id).unwrap();
+    assert!(matches!(live.recv_timeout(Duration::from_secs(5)).unwrap(), StoreEvent::CaughtUp));
+    let appended: Vec<u64> = (0..5)
+        .map(|i| store.append(RecordInput::json("live", &json!({"live": i})).unwrap()).unwrap().id.0)
+        .collect();
+    for id in appended {
+        match live.recv_timeout(Duration::from_secs(5)).unwrap() {
+            StoreEvent::Record { record } => assert_eq!(record.id, id, "live records once, in order"),
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert!(matches!(live.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+    assert!(matches!(filtered.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+
+    store.unsubscribe(filtered.id);
+    store.unsubscribe(live.id);
+    assert_eq!(store.subscription_count(), 0);
+    store.append(RecordInput::json("important", &json!({"after": true})).unwrap()).unwrap();
+    for handle in [&filtered, &live] {
+        assert!(matches!(
+            handle.try_recv(),
+            Ok(StoreEvent::Dropped { reason: DropReason::Unsubscribed })
+        ));
+        assert!(handle.try_recv().is_err(), "nothing after the unsubscribe");
+    }
 }
