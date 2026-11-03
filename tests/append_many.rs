@@ -1002,8 +1002,10 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
 
 /// An identity batch with an item that isn't a JSON object is refused
 /// whole, as an empty one is, and nothing is recorded: no record, no
-/// sequence, no items, and no MANIFEST mark, since the refusal comes before
-/// the mark. So an older build refuses a store only once it holds a batch.
+/// sequence, no items, and no MANIFEST mark. The refusal comes before the
+/// mark, so a refused batch leaves the store as every release opens it. (A
+/// batch that passes and then fails to be written still leaves the mark;
+/// see `update_state`.)
 #[test]
 fn an_identity_batch_that_is_refused_writes_nothing() {
     let dir = TempDir::new().unwrap();
