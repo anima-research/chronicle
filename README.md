@@ -58,7 +58,7 @@ Every method is synchronous: it runs on the calling thread, and `pollSubscriptio
 
 Each record has an ID, a sequence number, a type, a payload, a timestamp, and two lists of links to other records: `causedBy` for what caused it, and `linkedTo` for any other relation. `append` takes the payload as bytes and `appendJson` as JSON, and the `WithLinks` forms of each add the links. `getEffects(id)` lists the records whose `causedBy` names that record, and `getLinksTo(id)` those whose `linkedTo` does.
 
-`getRecord` reads any record by ID, and `getRecordIdsByType` lists a type's record IDs across all branches. `query` reads the records the current branch has appended, by sequence range and type, at most `limit` of them (10,000 if you give none).
+`getRecord` reads any record by ID, and `getRecordIdsByType` lists a type's record IDs across all branches, in ascending ID order, so the last is the newest; the IDs are decimal strings, so compare them as numbers. The records a torn tail drops at open are gone, and their IDs are issued again to new records, possibly of another type. So a last ID taken before a crash can name a different record afterwards, and a count taken then can skip new ones. `query` reads the records the current branch has appended, by sequence range and type, at most `limit` of them (10,000 if you give none).
 
 ### States
 
@@ -86,9 +86,9 @@ A registration is kept in the store, so on a store opened again, `registerState`
 
 ## On disk
 
-A store is a directory. The log is `records.log`, and the state chains' heads are in `state.bin`, field indexes in `state-indexes.bin`, branches in `branches.bin`, and blobs under `blobs/`. `MANIFEST` names the format version, and `LOCK` is held while the store is open.
+A store is a directory. The log is `records.log`, and the state chains' heads are in `state.bin`, field indexes in `state-indexes.bin`, branches in `branches.bin`, and blobs under `blobs/`. `MANIFEST` names the format version, and `LOCK` is held while the store is open. `LOCK` must be a regular file, or absent: open and create refuse a symlink or anything else there. Don't delete or replace `LOCK` while the store is open: the next open would lock a new file and open the store too.
 
-- **One process at a time.** While a store is open, another `open` of it fails with "Store is locked by another process".
+- **One process at a time.** While a store is open, another `open` of it fails with "Store is locked by another process". With `LOCK` a regular file, a lock that fails for any other reason fails with that I/O error instead.
 - **Durability.** The log is flushed to disk every 100 records, so a machine crash can lose up to the last 100. `sync()` and `close()` flush it and save `state.bin` and `branches.bin`, each written to a new file that then replaces the old one, so a crash during `sync()` leaves each file as it was before that save or after it. Registering a state, changing its strategy, and creating, deleting or switching a branch save them before returning. When a process is killed or exits early without `close()` (a crash, a signal such as Ctrl-C, or `process.exit()`), the next open truncates a partly written last record, brings each branch's head up to the log, and replays the state changes the log holds since the last save, except those on a branch that save doesn't hold. `recovery()` reports what it found. Once an fsync of the log fails, `sync()` throws an error beginning `Durability lost:` every time until the store is reopened, and so do the calls above that save before returning. Call `close()` before exiting, and `sync()` after changes you can't lose.
 - **Looking inside.** Stores are binary. `tools/` has Python scripts that read `records.log` directly, and none of them takes the `LOCK`, so close the store before running one that writes.
   - `trim-records-log.py <store>/records.log` reports a torn tail, and trims it with `--apply` after the path.

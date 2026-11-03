@@ -133,13 +133,28 @@ fn sync_only_republishes_metadata_that_changed() {
         "unchanged sync must not republish metadata"
     );
 
+    let others = || {
+        let mut files: Vec<(String, Handle, Vec<u8>)> = fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .filter(|name| name != "records.log" && name != "branches.bin" && name != "LOCK")
+            .map(|name| {
+                let file = path.join(&name);
+                (name, Handle::from_path(&file).unwrap(), fs::read(&file).unwrap())
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    };
+    let before_raw = others();
     store
         .append(chronicle::RecordInput::raw("message", b"raw".to_vec()))
         .unwrap();
     store.sync().unwrap();
     let raw = identities();
-    assert_eq!(raw[0], first[0], "raw append leaves state metadata alone");
-    assert_eq!(raw[1], first[1], "raw append leaves field indexes alone");
+    assert_eq!(others(), before_raw, "raw append leaves every file but the log and the branch heads alone");
     assert_ne!(raw[2], first[2], "the new branch head must persist");
 
     append(&store, 20);
