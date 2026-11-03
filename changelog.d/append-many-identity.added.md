@@ -12,11 +12,12 @@
   take each at its own ordinal. An empty `items`, an item that isn't an
   object, or an `idField` equal to `sequenceField` throws and writes
   nothing, and leaves the `MANIFEST` alone. (The single form takes equal
-  names, and leaves the sequence at that key, over the id.) Once
-  the batch is recorded the call returns it: a failure of the snapshot the
-  write takes after its record is logged and tried again by the next write,
-  not thrown (see Fixed, #39). Like any batch, the first one a store records
-  moves its `MANIFEST` to version 2 (see Breaking); a store that only ever
-  takes single identity appends keeps version 1. In Rust:
+  names, and leaves the sequence at that key, over the id.) Once the batch
+  is recorded the call returns it: a failure of the snapshot the write
+  takes after its record goes into the store's snapshot-failure report and
+  is tried again by the next write, not thrown (see Fixed, #39). Like any
+  batch, the first one a store records moves its `MANIFEST` to version 2
+  (see Breaking); a store that only ever takes single identity appends
+  keeps version 1. In Rust:
   `Store::append_many_to_state_json_with_identity(_on)`, which returns an
   `AppendedBatch`.
