@@ -601,10 +601,22 @@ fn a_state_whose_value_is_not_an_array_has_no_items() {
             for &i in &ordinals {
                 assert_eq!(store.get_state_item(id, i).unwrap(), None, "{id}[{i}]");
             }
+            // The single reads warmed the state, so the cold batched read
+            // starts from nothing again and materializes it once; the warm
+            // one reads it from the cache.
+            if cold {
+                store.clear_state_caches();
+            }
+            let before = store.state_reconstruction_count();
             assert_eq!(
                 store.get_state_items_by_ordinal(id, &ordinals).unwrap(),
                 vec![None; ordinals.len()],
                 "{id}, cold: {cold}"
+            );
+            assert_eq!(
+                store.state_reconstruction_count(),
+                before + u64::from(cold),
+                "{id}, cold: {cold}: materializations"
             );
             assert!(store
                 .get_state_items_by_ordinal(id, &[])
