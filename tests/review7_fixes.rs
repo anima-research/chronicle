@@ -345,3 +345,31 @@ fn an_identity_batch_with_one_key_for_id_and_sequence_is_refused_and_writes_noth
         .unwrap();
     assert_eq!(batch.first_ordinal, 0);
 }
+
+/// Open syncs the directory of a store whose MANIFEST names format features.
+/// Where the directory can't be opened to sync it, as one this process may
+/// write and search but not list, the store still opens, as a save there
+/// goes without the sync.
+#[cfg(unix)]
+#[test]
+fn a_marked_store_in_a_directory_that_cant_be_listed_still_opens() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = Store::create(config(&path)).unwrap();
+        register_log(&store, "s");
+        store.append_many_to_state_json("s", &[json!(1)]).unwrap();
+        store.sync().unwrap();
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+    let listable = fs::read_dir(&path).is_ok();
+    let opened = Store::open(config(&path)).map(|store| value(&store, "s"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    if listable {
+        // Running as root, where the mode doesn't stop a listing.
+        return;
+    }
+    assert_eq!(opened.unwrap(), json!([1]));
+}

@@ -303,6 +303,25 @@ impl Store {
         let lock_file = Self::acquire_lock(&config.path)?;
         let mut features = Self::verify_manifest(&config.path)?;
 
+        // A MANIFEST naming format features was renamed into place by a
+        // batch's mark, and a failed directory sync after that rename left
+        // the rename in the system's cache only: this open reads version 2
+        // from there, and a power loss could still bring back version 1
+        // under a log that holds a batch. Syncing the directory before
+        // anything is written makes the rename durable, or fails the open.
+        #[cfg(unix)]
+        if features != 0 {
+            crate::atomic_file::sync_directory_at(&config.path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "open: syncing {}, whose MANIFEST names format features, failed: {error}",
+                        config.path.display()
+                    ),
+                )
+            })?;
+        }
+
         // With the lock held, no save of this store is in progress, so its
         // own staging files here were left by interrupted saves. The sweep's
         // doc says what else it can reach.
@@ -826,7 +845,10 @@ impl Store {
     /// store never asked to record one keeps version 1, which every release
     /// opens. If that rewrite fails, the error is returned and the batch isn't
     /// recorded; when only the directory sync after its rename failed, the
-    /// MANIFEST is already at version 2. If the record then fails to be
+    /// MANIFEST is already at version 2, and the next batch makes the rewrite
+    /// again. On Unix, an open that finds a version 2 MANIFEST syncs the
+    /// store's directory before it writes anything, and fails if that sync
+    /// fails. If the record then fails to be
     /// written, the error is returned and the store stays at version 2 with
     /// no batch.
     ///
