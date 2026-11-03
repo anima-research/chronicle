@@ -3404,11 +3404,8 @@ impl Store {
             STORE_VERSION => Ok(0),
             STORE_VERSION_FEATURES => {
                 let mut bits = [0u8; 8];
-                file.read_exact(&mut bits).map_err(|e| {
-                    StoreError::InvalidFormat(format!(
-                        "Store manifest version 2 is too short to hold its format features: {e}"
-                    ))
-                })?;
+                file.read_exact(&mut bits)
+                    .map_err(|e| Self::feature_bits_error(&manifest_path, e))?;
                 let features = u64::from_le_bytes(bits);
                 let unknown = features & !KNOWN_FEATURES;
                 if unknown != 0 {
@@ -3422,6 +3419,22 @@ impl Store {
             other => Err(StoreError::InvalidFormat(format!(
                 "Unsupported store version: {other}"
             ))),
+        }
+    }
+
+    /// The error for a failed read of a version 2 MANIFEST's feature bits.
+    /// A file that ends before them is too short, which is its format; any
+    /// other failure is the read's own I/O error, naming the file.
+    fn feature_bits_error(manifest: &Path, error: std::io::Error) -> StoreError {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            StoreError::InvalidFormat(format!(
+                "Store manifest version 2 is too short to hold its format features: {error}"
+            ))
+        } else {
+            StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("reading the format features of {}: {error}", manifest.display()),
+            ))
         }
     }
 
@@ -4065,6 +4078,30 @@ mod tests {
             Store::open_if_another_created(damaged_config, refused),
             Err(StoreError::InvalidOperation(message)) if message.contains("records.log")
         ));
+    }
+
+    /// A version 2 MANIFEST that ends before its feature bits is too short;
+    /// any other failure to read them is the read's I/O error.
+    #[test]
+    fn only_a_short_manifest_is_reported_as_too_short() {
+        let manifest = Path::new("/stores/s/MANIFEST");
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer");
+        match Store::feature_bits_error(manifest, eof) {
+            StoreError::InvalidFormat(message) => assert!(message.contains("too short"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        let failed = std::io::Error::new(std::io::ErrorKind::Other, "Input/output error");
+        match Store::feature_bits_error(manifest, failed) {
+            StoreError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                let text = error.to_string();
+                assert!(
+                    text.contains("/stores/s/MANIFEST") && text.contains("Input/output error") && !text.contains("too short"),
+                    "{text}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
