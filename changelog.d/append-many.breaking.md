@@ -34,7 +34,12 @@
     the Node API's `appendManyToStateJson` or
     `appendManyToStateJsonWithIdentity`. context-manager's presentation
     index is meant to be its first writer. A host rolled back must not call
-    `create` on a store it means to open.
+    `create` on a store it means to open. Where the store directory isn't
+    synced (this process may not open it, the system doesn't sync
+    directories, or the host runs Windows, where chronicle syncs none), a
+    power loss can undo the `MANIFEST`'s move to version 2 and keep the
+    batch's record, as it can undo a checkpoint save; an earlier release
+    then meets the batch in a store without the mark, as described above.
   - **State-delta subscribers:** a batch reaches a subscription as one
     `state_delta` event, whose `operation` is an `AppendMany` holding all of
     its items (see Added). A subscriber that keeps its own copy of an

@@ -522,8 +522,11 @@ fn a_manifest_with_an_unknown_feature_is_refused() {
     assert!(matches!(Store::open(config(dir.path())), Err(StoreError::InvalidFormat(_))));
 }
 
-/// The flag reaches the disk before the record does: when the manifest
-/// can't be replaced, the batch fails and nothing is recorded.
+/// The flag is in place before the record is written, and on disk before it
+/// too where the store directory can be synced (not where this process may
+/// not open it, nor where the system doesn't sync directories, nor on
+/// Windows): when the manifest can't be replaced, the batch fails and
+/// nothing is recorded.
 #[cfg(unix)]
 #[test]
 fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
