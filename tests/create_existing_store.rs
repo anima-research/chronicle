@@ -4,9 +4,10 @@
 //! so a create where an open was meant kept the records and lost every
 //! registration and branch, with no error. Now create takes the lock first and
 //! refuses a directory that holds a store or a store's data files;
-//! open_or_create decides by MANIFEST, so it creates into an empty directory
-//! or a fresh volume's root; and opening a directory with no MANIFEST says
-//! whether it's a damaged store or no store at all.
+//! open_or_create opens a store, refuses a damaged one as open does, and
+//! creates only where a new store can sit beside what's there; and opening a
+//! directory with no MANIFEST says whether it's a damaged store or no store at
+//! all.
 
 use chronicle::{StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, StoreError};
 use std::fs;
@@ -49,6 +50,14 @@ fn invalid_operation(result: chronicle::Result<Store>) -> String {
     }
 }
 
+fn invalid_format(result: chronicle::Result<Store>) -> String {
+    match result {
+        Err(StoreError::InvalidFormat(msg)) => msg,
+        Err(e) => panic!("expected InvalidFormat, got {e}"),
+        Ok(_) => panic!("succeeded where it should refuse"),
+    }
+}
+
 #[test]
 fn create_over_an_existing_store_refuses_and_keeps_it() {
     let dir = TempDir::new().unwrap();
@@ -68,7 +77,7 @@ fn create_over_an_existing_store_refuses_and_keeps_it() {
 
 #[test]
 fn create_refuses_each_data_file_of_a_store_without_its_manifest() {
-    for file in ["records.log", "state.bin", "branches.bin"] {
+    for file in ["records.log", "state.bin", "state-indexes.bin", "branches.bin"] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("damaged");
         fs::create_dir(&path).unwrap();
@@ -76,20 +85,114 @@ fn create_refuses_each_data_file_of_a_store_without_its_manifest() {
 
         let msg = invalid_operation(Store::create(config(&path)));
         assert!(
-            msg.contains(file) && msg.contains("damaged") && msg.contains(&*path.to_string_lossy()),
+            msg.contains(file) && msg.contains("a damaged Chronicle store") && msg.contains(&*path.to_string_lossy()),
             "{file}: {msg}"
         );
-        // open_or_create sends it to create (no MANIFEST), which refuses it too.
-        invalid_operation(Store::open_or_create(config(&path)));
+        // open_or_create says what open says, whichever its flag.
+        for create_if_missing in [true, false] {
+            let msg = invalid_format(Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }));
+            assert!(msg.contains(file) && msg.contains("a damaged Chronicle store"), "{file}: {msg}");
+        }
         assert_eq!(fs::read(path.join(file)).unwrap(), b"x", "{file} is untouched");
         assert!(!path.join("MANIFEST").exists(), "{file}: no MANIFEST was written");
     }
 }
 
-/// A create aimed at a store another process has open writes nothing there.
-/// A read-only MANIFEST makes a write fail loudly for an ordinary user, and a
-/// manifest backdated a day catches a rewrite of identical bytes where the
-/// mode doesn't stop it (as root). Unix only: it sets file modes.
+#[test]
+fn a_store_that_lost_only_its_manifest_is_damaged_from_every_entry_point() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+    fs::remove_file(path.join("MANIFEST")).unwrap();
+    let records = fs::read(path.join("records.log")).unwrap();
+
+    for create_if_missing in [true, false] {
+        let msg = invalid_format(Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }));
+        assert!(msg.contains("damaged") && msg.contains(&*path.to_string_lossy()), "{msg}");
+    }
+    assert!(invalid_format(Store::open(config(&path))).contains("damaged"));
+    assert!(invalid_operation(Store::create(config(&path))).contains("damaged"));
+    assert!(!path.join("MANIFEST").exists(), "no MANIFEST was written");
+    assert_eq!(fs::read(path.join("records.log")).unwrap(), records);
+}
+
+#[test]
+fn a_damaged_store_beside_other_files_is_still_called_damaged() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("damaged");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("records.log"), b"x").unwrap();
+    fs::write(path.join("notes.txt"), b"someone else's").unwrap();
+
+    for create_if_missing in [true, false] {
+        let msg = invalid_format(Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }));
+        assert!(msg.contains("records.log") && msg.contains("a damaged Chronicle store"), "{msg}");
+    }
+}
+
+#[test]
+fn blobs_with_data_in_them_and_no_manifest_are_a_damaged_store() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("damaged");
+    fs::create_dir_all(path.join("blobs/ab")).unwrap();
+    fs::write(path.join("blobs/ab/cdef"), b"data").unwrap();
+
+    assert!(invalid_operation(Store::create(config(&path))).contains("blobs"));
+    for create_if_missing in [true, false] {
+        let msg = invalid_format(Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) }));
+        assert!(msg.contains("blobs") && msg.contains("a damaged Chronicle store"), "{msg}");
+    }
+    assert_eq!(fs::read(path.join("blobs/ab/cdef")).unwrap(), b"data");
+    assert!(!path.join("MANIFEST").exists(), "no MANIFEST was written");
+}
+
+#[test]
+fn create_refuses_a_directory_holding_only_a_manifest() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+    let manifest = fs::read(path.join("MANIFEST")).unwrap();
+    let only = dir.path().join("only");
+    fs::create_dir(&only).unwrap();
+    fs::write(only.join("MANIFEST"), &manifest).unwrap();
+
+    assert!(invalid_operation(Store::create(config(&only))).contains("already holds"));
+    assert!(!only.join("records.log").exists(), "nothing was built beside it");
+}
+
+/// The refusal mustn't send anyone to entry points that fail on the same file.
+#[test]
+fn create_over_a_manifest_that_does_not_verify_says_so() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    drop(Store::create(config(&path)).unwrap());
+    fs::write(path.join("MANIFEST"), b"CH").unwrap();
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("MANIFEST") && msg.contains("doesn't verify"), "{msg}");
+    assert!(!msg.contains("open it"), "{msg}");
+    assert_eq!(fs::read(path.join("MANIFEST")).unwrap(), b"CH", "left as it was");
+}
+
+/// Runs on every platform, Windows's mandatory locks among them.
+#[test]
+fn create_aimed_at_an_open_store_is_locked_and_leaves_its_manifest() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let held = Store::create(config(&path)).unwrap();
+    let before = fs::read(path.join("MANIFEST")).unwrap();
+
+    let result = Store::create(config(&path));
+    assert!(matches!(result, Err(StoreError::Locked)), "got {:?}", result.err().map(|e| e.to_string()));
+    assert_eq!(fs::read(path.join("MANIFEST")).unwrap(), before);
+    drop(held);
+}
+
+/// A create aimed at a store that's open writes nothing there; a second handle
+/// in this process meets the lock as another process's would. A read-only
+/// MANIFEST makes a write fail loudly for an ordinary user, and a manifest
+/// backdated a day catches a rewrite of identical bytes where the mode doesn't
+/// stop it (as root). Unix only: it sets file modes.
 #[cfg(unix)]
 #[test]
 fn create_aimed_at_an_open_store_writes_nothing_there() {
@@ -104,13 +207,15 @@ fn create_aimed_at_an_open_store_writes_nothing_there() {
     let before = fs::read(&manifest).unwrap();
     let a_day_ago = SystemTime::now() - Duration::from_secs(86_400);
     fs::File::options().write(true).open(&manifest).unwrap().set_modified(a_day_ago).unwrap();
+    // Read back: a filesystem may round what it was asked to store.
+    let stored = fs::metadata(&manifest).unwrap().modified().unwrap();
     fs::set_permissions(&manifest, fs::Permissions::from_mode(0o444)).unwrap();
     let result = Store::create(config(&path));
     fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(matches!(result, Err(StoreError::Locked)), "got {:?}", result.err().map(|e| e.to_string()));
     assert_eq!(fs::read(&manifest).unwrap(), before);
-    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), a_day_ago, "MANIFEST was rewritten");
+    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), stored, "MANIFEST was rewritten");
     drop(held);
 }
 
@@ -167,6 +272,227 @@ fn open_or_create_refuses_a_directory_holding_other_files_and_writes_nothing() {
 }
 
 #[test]
+fn open_or_create_without_create_if_missing_refuses_other_files_as_not_a_store() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("project");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("Cargo.toml"), b"[package]").unwrap();
+
+    let msg = invalid_format(Store::open_or_create(StoreConfig { create_if_missing: false, ..config(&path) }));
+    assert!(msg.contains("Cargo.toml"), "{msg}");
+}
+
+#[test]
+fn open_or_create_still_creates_a_directory_that_is_missing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a/new/store");
+
+    drop(Store::open_or_create(config(&path)).unwrap());
+    Store::open(config(&path)).unwrap();
+}
+
+/// Allowed names count only as the kind of entry a new store can sit beside.
+#[test]
+fn open_or_create_refuses_an_allowed_name_of_the_wrong_kind() {
+    let dir = TempDir::new().unwrap();
+    let file_store = dir.path().join("file-entry");
+    fs::create_dir(&file_store).unwrap();
+    fs::write(file_store.join("blobs"), b"a file").unwrap();
+    let file_found = dir.path().join("file-found");
+    fs::create_dir(&file_found).unwrap();
+    fs::write(file_found.join("lost+found"), b"a file").unwrap();
+    let dir_ds_store = dir.path().join("dir-ds-store");
+    fs::create_dir_all(dir_ds_store.join(".DS_Store")).unwrap();
+
+    let dir_staging = dir.path().join("dir-staging");
+    fs::create_dir_all(dir_staging.join(".chronicle-checkpoint-AbC123")).unwrap();
+    fs::write(dir_staging.join("LOCK"), b"").unwrap();
+
+    for (path, name) in [(&file_store, "blobs"), (&file_found, "lost+found"), (&dir_ds_store, ".DS_Store")] {
+        let msg = invalid_format(Store::open_or_create(config(path)));
+        assert!(msg.contains(name), "{msg}");
+        assert!(!path.join("MANIFEST").exists() && !path.join("LOCK").exists(), "{name}: nothing was written");
+    }
+    // A directory named like a staging file, beside the LOCK a stopped create
+    // would leave: the sweep wouldn't take it, so it isn't one.
+    let msg = invalid_format(Store::open_or_create(config(&dir_staging)));
+    assert!(msg.contains(".chronicle-checkpoint-AbC123"), "{msg}");
+    assert!(!dir_staging.join("MANIFEST").exists(), "nothing was written");
+}
+
+/// A file named like a staging file is one only where a create could have left
+/// it: a create takes LOCK before it stages anything.
+#[test]
+fn open_or_create_leaves_a_staging_lookalike_with_no_lock_beside_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("notes");
+    fs::create_dir(&path).unwrap();
+    let notes = path.join(".chronicle-checkpoint-notes");
+    fs::write(&notes, b"mine").unwrap();
+
+    let msg = invalid_format(Store::open_or_create(config(&path)));
+    assert!(msg.contains(".chronicle-checkpoint-notes"), "{msg}");
+    assert_eq!(fs::read(&notes).unwrap(), b"mine");
+    assert!(!path.join("MANIFEST").exists() && !path.join("LOCK").exists(), "nothing was written");
+}
+
+/// A directory it can't list isn't an empty one: it may hold anything. Unix
+/// only: it sets directory modes. As root the listing succeeds and finds the
+/// file, so the check is what both ways share: a refusal, and nothing written.
+#[cfg(unix)]
+#[test]
+fn open_or_create_refuses_a_directory_it_cannot_list_and_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("write-only");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("Cargo.toml"), b"[package]").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o333)).unwrap();
+    let result = Store::open_or_create(config(&path));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    match result {
+        Err(e) => assert!(e.to_string().contains(&*path.to_string_lossy()), "{e}"),
+        Ok(_) => panic!("created a store in a directory it can't list"),
+    }
+    assert!(!path.join("MANIFEST").exists() && !path.join("LOCK").exists(), "nothing was written");
+}
+
+/// A MANIFEST link with nothing behind it isn't an absent MANIFEST: a create
+/// would write through it, into wherever it leads. Unix only: it makes a link.
+#[cfg(unix)]
+#[test]
+fn open_or_create_refuses_a_dangling_manifest_link_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, path.join("MANIFEST")).unwrap();
+
+    let msg = invalid_format(Store::open_or_create(config(&path)));
+    assert!(msg.contains("nothing behind it"), "{msg}");
+    assert!(!elsewhere.exists() && !path.join("LOCK").exists(), "nothing was written");
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("MANIFEST") && msg.contains("nothing behind it"), "{msg}");
+    assert!(!elsewhere.exists(), "create didn't write through it either");
+}
+
+/// The same for a data file's link, and create names it.
+#[cfg(unix)]
+#[test]
+fn create_refuses_a_dangling_data_file_link_and_writes_nothing_through_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, path.join("state.bin")).unwrap();
+
+    assert!(invalid_operation(Store::create(config(&path))).contains("state.bin"));
+    assert!(!elsewhere.exists());
+}
+
+/// A `blobs/` that can't be listed may hold anything, as a directory that can't
+/// be listed may. Unix only: it sets modes. As root the listing succeeds and
+/// finds the data, so the check is what both share: a refusal.
+#[cfg(unix)]
+#[test]
+fn a_blobs_directory_that_cannot_be_listed_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir_all(path.join("blobs/ab")).unwrap();
+    fs::write(path.join("blobs/ab/cdef"), b"data").unwrap();
+    fs::set_permissions(path.join("blobs"), fs::Permissions::from_mode(0o333)).unwrap();
+    let opened = Store::open_or_create(config(&path)).err().map(|e| e.to_string());
+    let created = Store::create(config(&path)).err().map(|e| e.to_string());
+    fs::set_permissions(path.join("blobs"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let opened = opened.expect("open_or_create refused");
+    let created = created.expect("create refused");
+    assert!(opened.contains("blobs") && created.contains("blobs"), "{opened} / {created}");
+    assert!(!path.join("MANIFEST").exists(), "no MANIFEST was written");
+}
+
+/// What the volume or Finder leaves in an otherwise empty `blobs/` isn't data.
+#[test]
+fn a_stopped_create_whose_blobs_holds_only_a_volumes_or_finders_entry_is_finished() {
+    let dir = TempDir::new().unwrap();
+    let finder = dir.path().join("finder");
+    fs::create_dir_all(finder.join("blobs")).unwrap();
+    fs::write(finder.join("blobs/.DS_Store"), b"").unwrap();
+    let volume = dir.path().join("volume");
+    fs::create_dir_all(volume.join("blobs/lost+found")).unwrap();
+
+    for path in [&finder, &volume] {
+        drop(Store::open_or_create(config(path)).unwrap());
+        Store::open(config(path)).unwrap();
+    }
+    drop(Store::create(config(&dir.path().join("fresh"))).unwrap());
+}
+
+/// A `blobs` link says nothing about this store: it may lead to a shared
+/// directory. `create` takes it, as it always has. Unix only: it makes a link.
+#[cfg(unix)]
+#[test]
+fn create_takes_a_blobs_link_to_a_directory_with_data_in_it() {
+    let dir = TempDir::new().unwrap();
+    let share = dir.path().join("share");
+    fs::create_dir_all(share.join("ab")).unwrap();
+    fs::write(share.join("ab/cdef"), b"data").unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    std::os::unix::fs::symlink(&share, path.join("blobs")).unwrap();
+
+    drop(Store::create(config(&path)).unwrap());
+    assert_eq!(fs::read(share.join("ab/cdef")).unwrap(), b"data");
+}
+
+/// A store it can't look inside isn't an uninitialized one. Unix only: it sets
+/// modes. As root the look succeeds and the store opens.
+#[cfg(unix)]
+#[test]
+fn open_or_create_without_create_if_missing_does_not_call_an_unsearchable_store_uninitialized() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    let result = Store::open_or_create(StoreConfig { create_if_missing: false, ..config(&path) });
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!matches!(result, Err(StoreError::NotInitialized)));
+}
+
+/// A file named like a staging file is one only where a create could have left
+/// it, for create as for open_or_create.
+#[test]
+fn create_leaves_a_staging_lookalike_with_no_lock_beside_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("notes");
+    fs::create_dir(&path).unwrap();
+    let notes = path.join(".chronicle-checkpoint-notes");
+    fs::write(&notes, b"mine").unwrap();
+
+    drop(Store::create(config(&path)).unwrap());
+    assert_eq!(fs::read(&notes).unwrap(), b"mine");
+}
+
+/// `LOCK` is the lock's to judge, and it says what to do about one that isn't a
+/// regular file.
+#[test]
+fn open_or_create_leaves_a_lock_of_the_wrong_kind_to_the_lock() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir_all(path.join("LOCK")).unwrap();
+
+    let msg = invalid_format(Store::open_or_create(config(&path)));
+    assert!(msg.contains("takes its lock only on a regular LOCK file"), "{msg}");
+}
+
+#[test]
 fn open_or_create_creates_beside_a_finder_ds_store() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("volume");
@@ -189,8 +515,9 @@ fn open_or_create_finishes_a_create_that_stopped_inside_its_manifest_save() {
     fs::write(&staged, b"CHR").unwrap();
 
     drop(Store::open_or_create(config(&path)).unwrap());
-    Store::open(config(&path)).unwrap();
+    // Before any open, which sweeps too.
     assert!(!staged.exists(), "the interrupted save's staging file is swept");
+    Store::open(config(&path)).unwrap();
 }
 
 #[test]
