@@ -225,6 +225,12 @@ fn an_empty_batch_is_refused_and_writes_nothing() {
 /// the count is read under the same lock as the write, so no other batch or
 /// single append can land between them.
 ///
+/// The test is probabilistic. The writers wait on a barrier and then each
+/// writes many times, so on most runs their writes interleave, and a count
+/// read outside the write lock would then give two batches one ordinal. A
+/// scheduler that still ran them one after another would let such an
+/// implementation pass that run.
+///
 /// The cadence is set past the workload so that no automatic snapshot is
 /// written. An automatic snapshot reads the state after the write lock is
 /// released, and with several threads writing one state a write can land
@@ -233,16 +239,23 @@ fn an_empty_batch_is_refused_and_writes_nothing() {
 /// batches, and it is outside what this test checks.
 #[test]
 fn racing_batches_report_the_ordinals_their_items_took() {
+    const BATCHERS: u64 = 4;
+    const BATCHES: u64 = 100;
+    const SINGLES: u64 = 150;
     let dir = TempDir::new().unwrap();
     let store = Arc::new(Store::create(config(dir.path())).unwrap());
+    // BATCHERS * BATCHES + SINGLES operations, short of the cadence.
     register(&store, "log", 1000, 1000);
+    let start = Arc::new(std::sync::Barrier::new(BATCHERS as usize + 1));
 
-    let batchers: Vec<_> = (0..4u64)
+    let batchers: Vec<_> = (0..BATCHERS)
         .map(|t| {
             let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
+                start.wait();
                 let mut written = Vec::new();
-                for i in 0..20u64 {
+                for i in 0..BATCHES {
                     let items: Vec<Value> = (0..=(i % 4))
                         .map(|k| json!({ "t": t, "i": i, "k": k }))
                         .collect();
@@ -255,8 +268,10 @@ fn racing_batches_report_the_ordinals_their_items_took() {
         .collect();
     let single = {
         let store = Arc::clone(&store);
+        let start = Arc::clone(&start);
         std::thread::spawn(move || {
-            for i in 0..30u64 {
+            start.wait();
+            for i in 0..SINGLES {
                 append(&store, "log", &json!({ "single": i }));
             }
         })
@@ -277,7 +292,7 @@ fn racing_batches_report_the_ordinals_their_items_took() {
     }
     assert_eq!(
         taken.iter().filter(|t| !**t).count(),
-        30,
+        SINGLES as usize,
         "only the single appends are left"
     );
 }
