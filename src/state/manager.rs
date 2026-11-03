@@ -1160,7 +1160,9 @@ impl StateManager {
     /// Returns an error if the state is not a JSON array (e.g. a Snapshot
     /// strategy state holding an object) — matching the behavior of the
     /// previous slice implementation. The point lookups (`get_state_item`,
-    /// `get_state_items_by_ordinal`) answer `None` for such a state instead.
+    /// `get_state_items_by_ordinal`) answer `None` for such a state instead,
+    /// where its bytes hold one JSON value; bytes that don't (`{`, `123abc`)
+    /// are a `Deserialization` error from every lookup.
     pub fn get_state_items(
         &self,
         branch_id: BranchId,
@@ -1217,10 +1219,18 @@ impl StateManager {
             let raw: Vec<&serde_json::value::RawValue> = match serde_json::from_slice(&state.data) {
                 Ok(raw) => raw,
                 // serde_json reports a value of another type (an object, a
-                // string, ...) where it wanted a sequence as a data error;
-                // malformed bytes are a syntax or end-of-input error.
+                // string, ...) where it wanted a sequence as a data error, as
+                // soon as it sees the value's first byte, so malformed bytes
+                // that start like one (`{`, `123abc`) are a data error too.
+                // Only bytes that hold one JSON value are a value that isn't
+                // an array; the rest are malformed, which is an error.
                 Err(e) if e.classify() == serde_json::error::Category::Data => {
-                    return Ok(ItemsLookup::NotArray(e.to_string()))
+                    if let Err(malformed) =
+                        serde_json::from_slice::<&serde_json::value::RawValue>(&state.data)
+                    {
+                        return Err(StoreError::Deserialization(malformed.to_string()));
+                    }
+                    return Ok(ItemsLookup::NotArray(e.to_string()));
                 }
                 Err(e) => return Err(StoreError::Deserialization(e.to_string())),
             };
@@ -1266,7 +1276,8 @@ impl StateManager {
     /// and any other head or non-final index takes the full materialization
     /// path. A state whose value isn't an array (a Snapshot state holding an
     /// object, a Tree state) has no item at any index: `None`, not the
-    /// error `get_state_items` returns for it.
+    /// error `get_state_items` returns for it. Bytes that aren't one JSON
+    /// value are the `Deserialization` error, as from `get_state_items`.
     pub fn get_state_item(
         &self,
         branch_id: BranchId,

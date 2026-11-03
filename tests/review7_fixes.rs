@@ -5,6 +5,9 @@
 //!   be off, as one a release before 0.5.0 stored after a Redact past the
 //!   end, or one a caller's `DeltaSnapshot` left. The head-record fast paths
 //!   of the batched calls serve only a count the session has checked.
+//! - The point lookups report malformed state bytes as the error they are,
+//!   and answer `None` only for a value that is one JSON value but not an
+//!   array.
 
 use chronicle::{
     BranchId, StateIndex, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
@@ -264,4 +267,54 @@ fn the_batched_head_record_fast_paths_serve_only_a_checked_count() {
         [Some("\"d\"".to_string())]
     );
     assert_eq!(store.state_reconstruction_count(), before, "served from the head record");
+}
+
+#[test]
+fn a_point_lookup_reports_malformed_state_bytes() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    for (n, bytes) in [&b"{"[..], b"{\"a\": ", b"123abc", b"[1, 2", b"tru"].into_iter().enumerate() {
+        let id = format!("bad{n}");
+        store
+            .register_state(StateRegistration {
+                id: id.clone(),
+                strategy: StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+        store.update_state(&id, StateOperation::Set(bytes.to_vec())).unwrap();
+        let shown = String::from_utf8_lossy(bytes);
+        store.clear_state_caches();
+        assert!(
+            matches!(store.get_state_item(&id, 0), Err(StoreError::Deserialization(_))),
+            "{shown}: {:?}",
+            store.get_state_item(&id, 0)
+        );
+        store.clear_state_caches();
+        assert!(
+            matches!(
+                store.get_state_items_by_ordinal(&id, &[0, 1]),
+                Err(StoreError::Deserialization(_))
+            ),
+            "{shown}"
+        );
+    }
+
+    // One JSON value that isn't an array still has no item at any index.
+    for (n, value) in [json!({"a": 1}), json!("text"), json!(7), json!(null)].into_iter().enumerate() {
+        let id = format!("other{n}");
+        store
+            .register_state(StateRegistration {
+                id: id.clone(),
+                strategy: StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+        store
+            .update_state(&id, StateOperation::Set(serde_json::to_vec(&value).unwrap()))
+            .unwrap();
+        store.clear_state_caches();
+        assert_eq!(store.get_state_item(&id, 0).unwrap(), None, "{value}");
+        assert_eq!(store.get_state_items_by_ordinal(&id, &[0]).unwrap(), [None], "{value}");
+    }
 }

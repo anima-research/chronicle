@@ -1354,7 +1354,8 @@ impl JsStore {
     /// which materializes and converts the entire state on every call. Use
     /// this for point lookups in large states. Returns `null` if the state
     /// doesn't exist, the index is negative or out of range, or the state's
-    /// value isn't an array.
+    /// value isn't an array. Throws the deserialization error if the state's
+    /// bytes aren't one JSON value.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1382,8 +1383,9 @@ impl JsStore {
     /// call. The result has one entry per index in `ordinals`, in the order
     /// given: what `getStateItemJson` returns for that index, so `null` if
     /// it is negative or out of range, the state doesn't exist, or the
-    /// state's value isn't an array. Indices may repeat and come in any
-    /// order.
+    /// state's value isn't an array. Throws, as `getStateItemJson` does, if
+    /// the state's bytes aren't one JSON value. Indices may repeat and come
+    /// in any order.
     ///
     /// Every entry comes from the same version of the state, and a cold
     /// state is materialized at most once for the whole call, not once per

@@ -1640,6 +1640,8 @@ impl Store {
     /// O(item size) once the per-item cache is warm (see `get_state_slice`).
     /// Returns `None` if the state doesn't exist, the index is out of range,
     /// or the state's value isn't an array (where `get_state_slice` errors).
+    /// Returns `StoreError::Deserialization` if the state's bytes aren't one
+    /// JSON value, as `get_state_slice` does.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -1661,7 +1663,9 @@ impl Store {
     /// Several items of an AppendLog state by ordinal, as raw JSON bytes, in
     /// one call: for each ordinal, in the order given, the item
     /// `get_state_item` returns for it, `None` where the ordinal is out of
-    /// range, the state has no value, or its value isn't an array. Ordinals
+    /// range, the state has no value, or its value isn't an array; the
+    /// `Deserialization` error where the state's bytes aren't one JSON value,
+    /// as for `get_state_item`. Ordinals
     /// may repeat and come in any order. All of them are answered from one
     /// version of the state, read at most once, and an empty request reads
     /// nothing (see `StateManager::get_state_items_by_ordinal`).
