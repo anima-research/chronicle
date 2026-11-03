@@ -5,8 +5,18 @@
 //!
 //! Each batched call must answer what the single calls it stands for would:
 //! the batch's items sit at the ordinals it reports, a batched item read
-//! returns the bytes `get_state_item` returns for each ordinal, and a
+//! returns the item `get_state_item` returns for each ordinal, and a
 //! batched record read returns what `get_record` returns for each ID.
+//!
+//! An item read returns the same bytes as `get_state_item` for an item
+//! written in serde_json's own spelling. One written in another spelling
+//! comes back as the path serving the read gives it, as written from the
+//! head record or re-serialized from a materialization or the warm cache,
+//! so its spelling depends on what is cached, as `get_state_item`'s does.
+//! A batched read takes the head record only when every ordinal it asks
+//! for is the last one, so on a cold cache the last item asked for with
+//! another comes back re-serialized where `get_state_item` alone returns
+//! it as written. The tests here write items in serde_json's spelling.
 
 use chronicle::{
     BranchId, RecordId, RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy,
