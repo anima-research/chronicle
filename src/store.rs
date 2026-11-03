@@ -48,11 +48,22 @@ impl Default for StoreConfig {
 pub struct AppendedBatch {
     /// The one record that holds the whole batch, at one sequence.
     pub record: Record,
-    /// The ordinal the batch's first item took: the state's length on the
-    /// branch, as `get_state_len` counts it, just before the batch, read
-    /// under the same lock as the write. Item `i` of the batch is at
-    /// `first_ordinal + i`, so a caller has every item's ordinal without a
-    /// read.
+    /// The ordinal the batch's first item took: the number of items the
+    /// state held on the branch just before the batch, read under the same
+    /// lock as the write. Item `i` of the batch is at `first_ordinal + i`, so
+    /// a caller has every item's ordinal without a read.
+    ///
+    /// Where this session hasn't kept the state's count on the branch itself
+    /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
+    /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
+    /// array), the batch first counts
+    /// the state's items, reading its whole value once, and the head keeps
+    /// that count, which `get_state_len` then reports: a count a release
+    /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
+    /// A value that doesn't materialize as a JSON array has no items to
+    /// count, and this is then the count `get_state_len` reports. An error
+    /// reading the log for the count is returned, and the batch isn't
+    /// recorded.
     pub first_ordinal: usize,
 }
 
@@ -1060,12 +1071,12 @@ impl Store {
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
             // The builder runs under `write_lock`, so no other write to this
-            // state can land between this count and the batch.
-            first_ordinal = self
-                .state
-                .get_head(branch_id, state_id)
-                .map(|h| h.item_count)
-                .unwrap_or(0);
+            // state can land between this count and the batch. A head this
+            // session hasn't checked has its items counted first, unless the
+            // batch is empty, which is refused before it's written.
+            if !items.is_empty() {
+                first_ordinal = self.state.checked_item_count(branch_id, state_id)?;
+            }
             Ok(StateOperation::AppendMany(items))
         })?;
         Ok(AppendedBatch {

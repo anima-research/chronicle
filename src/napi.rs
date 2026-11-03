@@ -97,9 +97,16 @@ impl From<Record> for JsRecord {
 pub struct JsAppendedBatch {
     /// The one record that holds the whole batch, at one sequence.
     pub record: JsRecord,
-    /// The index the batch's first item took: the state's length on the
-    /// handle's branch, as `getStateLen` counts it, just before the batch.
-    /// Item `i` of the batch is at `firstOrdinal + i`.
+    /// The index the batch's first item took: the number of items the state
+    /// held on the handle's branch just before the batch. Item `i` of the
+    /// batch is at `firstOrdinal + i`.
+    ///
+    /// The first batch to a state on a branch the store opened with, or on
+    /// one `createBranchAt` started, counts the state's items, reading its
+    /// whole value once, and `getStateLen` reports that count from then on:
+    /// a count a release before 0.5.0 stored can be off. A value that isn't
+    /// a JSON array, or holds an item that isn't JSON, has no items to count,
+    /// and this is then the length `getStateLen` reports.
     pub first_ordinal: i64,
 }
 
@@ -1163,7 +1170,8 @@ impl JsStore {
 
     /// Append several JSON items to an AppendLog state as one record, at one
     /// sequence, and return that record with the index the first item took
-    /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`.
+    /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`. `JsAppendedBatch`
+    /// says when the batch counts the state's items to find that index.
     ///
     /// Reads see the items exactly as if each had been appended with
     /// `appendToStateJson`, in order, except that a historical read or a
@@ -1199,9 +1207,10 @@ impl JsStore {
     /// Append several JSON objects to an AppendLog state as one record, at
     /// one sequence, writing that record's id and sequence into each of them
     /// first, and return the record with the index the first item took
-    /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`. It is the batched
-    /// form of `appendToStateJsonWithIdentity`, as `appendManyToStateJson`
-    /// is of `appendToStateJson`.
+    /// (`firstOrdinal`, found as `JsAppendedBatch` says); item `i` is at
+    /// `firstOrdinal + i`. It is the batched form of
+    /// `appendToStateJsonWithIdentity`, as `appendManyToStateJson` is of
+    /// `appendToStateJson`.
     ///
     /// Each item is stamped as `appendToStateJsonWithIdentity` stamps its
     /// one item: `idField` receives the record id (as a string, matching

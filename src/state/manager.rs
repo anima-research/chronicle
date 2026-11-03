@@ -60,6 +60,21 @@ enum ItemsLookup {
     Items(Arc<StateItems>),
 }
 
+/// What a session knows of one chain head's `item_count`. See
+/// `StateManager::counts`.
+#[derive(Clone, Copy, Debug)]
+struct CountCheck {
+    /// The head offset this holds for. A head that has moved past it is
+    /// unchecked again.
+    at: u64,
+    /// Whether the count is the number of items the state's value holds.
+    /// False where the session read the value to count it and the value
+    /// didn't materialize as a JSON array (an item that isn't JSON, a value
+    /// of another type, an Edit past the end): there is nothing to count,
+    /// and the value isn't read for a count again while this holds.
+    exact: bool,
+}
+
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotNeeded {
@@ -143,7 +158,10 @@ pub struct StateChainHead {
     /// except a count an older build stored before Redacts were clamped or before
     /// Deltas and empty replaces were counted: loading keeps a stored count as it
     /// is, so that one can stay wrong until a full Snapshot or an array Set or
-    /// Delta counts the items again. For Tree states it is an estimate between
+    /// Delta counts the items again, or a batched append counts them (see
+    /// `StateManager::checked_item_count`). A `DeltaSnapshot` leaves the count
+    /// as it is: the store's own restate items already counted, and one a
+    /// caller writes may hold others. For Tree states it is an estimate between
     /// full snapshots (an overwrite counts as an insert, and a remove as a
     /// removal whether or not the path existed) and is corrected from the
     /// snapshot bytes at each full. Snapshot spacing does NOT read this field —
@@ -356,6 +374,24 @@ pub struct StateManager {
     /// `retire_branch`.
     retired_branches: parking_lot::Mutex<Vec<BranchId>>,
 
+    /// What this session knows of each head's `item_count`, per branch and
+    /// state. A head created or counted in this session has an entry, which
+    /// follows the head while every write keeps the count exact (an Append,
+    /// an AppendMany, an Edit, a Redact, a Set, Delta or full Snapshot of an
+    /// array, the store's own snapshots). A head loaded from `state.bin`, a
+    /// head another write left uncounted (a `DeltaSnapshot` the caller
+    /// wrote, a value that isn't an array) and a head installed or copied
+    /// from elsewhere have none, as their count may be off: a release before
+    /// 0.5.0 stored some counts wrong, and loading keeps a stored count as it
+    /// is. A batched append counts such a head's items before it takes its
+    /// ordinals (`checked_item_count`), and the batched calls' head-record
+    /// fast paths serve only an exact entry.
+    ///
+    /// In memory only. A head saved with one more field would make releases
+    /// that predate it refuse `state.bin`: their decoder rejects a head
+    /// longer than the fields they know.
+    counts: RwLock<HashMap<BranchId, HashMap<String, CountCheck>>>,
+
     /// Number of times a state value was rebuilt from the log
     /// (`reconstruct_from_disk`). Everything served from a cache — this
     /// branch's own entry or one shared with another branch — leaves it
@@ -395,6 +431,7 @@ impl StateManager {
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
             retired_branches: parking_lot::Mutex::new(Vec::new()),
+            counts: RwLock::new(HashMap::new()),
             reconstructions: AtomicU64::new(0),
         })
     }
@@ -426,6 +463,7 @@ impl StateManager {
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
             retired_branches: parking_lot::Mutex::new(Vec::new()),
+            counts: RwLock::new(HashMap::new()),
             reconstructions: AtomicU64::new(0),
         };
 
@@ -587,6 +625,9 @@ impl StateManager {
             head.has_non_append_since_snapshot = true;
         }
 
+        // Whether the operation set the count from the value it holds: an
+        // array, or no bytes at all for a Set or Delta.
+        let mut counted_from_value = false;
         match operation {
             StateOperation::Snapshot(data) => {
                 // Full snapshot resets everything
@@ -598,7 +639,10 @@ impl StateManager {
                 // Update item count from snapshot: array-shaped (AppendLog) states
                 // count elements, map-shaped (Tree) states count entries.
                 head.item_count = match serde_json::from_slice::<serde_json::Value>(data) {
-                    Ok(serde_json::Value::Array(arr)) => arr.len(),
+                    Ok(serde_json::Value::Array(arr)) => {
+                        counted_from_value = true;
+                        arr.len()
+                    }
                     Ok(serde_json::Value::Object(map)) => map.len(),
                     _ => 0,
                 };
@@ -643,6 +687,7 @@ impl StateManager {
                 // would walk past the replacement and resurrect older appends.
                 if let Some(count) = replaced_item_count(data) {
                     head.item_count = count;
+                    counted_from_value = true;
                 }
             }
             StateOperation::TreeSet { .. } => {
@@ -678,12 +723,38 @@ impl StateManager {
                 head.ops_since_delta_snapshot += 1;
                 if let Some(count) = replaced_item_count(new_value) {
                     head.item_count = count;
+                    counted_from_value = true;
                 }
             }
             StateOperation::Field { .. } => {
                 head.ops_since_delta_snapshot += 1;
             }
         }
+
+        // Carry what this session knows of the count to the new head: one
+        // the operation set from the value it holds is exact, an operation
+        // that adds, edits or removes items keeps the check as it was, and
+        // any other leaves the new head unchecked.
+        let carried = match prev_offset {
+            // The record creates the head, so its count starts from nothing.
+            None => Some(true),
+            Some(prev) => self.count_check(branch_id, state_id, prev).map(|check| check.exact),
+        };
+        let checked = match operation {
+            _ if counted_from_value => Some(true),
+            StateOperation::Append(_)
+            | StateOperation::AppendMany(_)
+            | StateOperation::Edit { .. }
+            | StateOperation::Redact { .. } => carried,
+            // The store's own delta snapshot restates the value it read.
+            StateOperation::DeltaSnapshot(_) if content_preserving => carried,
+            _ => None,
+        };
+        self.set_count_check(
+            branch_id,
+            state_id,
+            checked.map(|exact| CountCheck { at: offset, exact }),
+        );
 
         // Bring this branch's cached values for the state in line with the
         // new head. Entries are per branch: nothing another branch holds is
@@ -843,6 +914,90 @@ impl StateManager {
         }
 
         Ok(())
+    }
+
+    /// This session's check of the count of the head of `state_id` on
+    /// `branch_id`, if there is one for the head at `head_offset`.
+    fn count_check(&self, branch_id: BranchId, state_id: &str, head_offset: u64) -> Option<CountCheck> {
+        self.counts
+            .read()
+            .get(&branch_id)
+            .and_then(|states| states.get(state_id))
+            .copied()
+            .filter(|check| check.at == head_offset)
+    }
+
+    /// Whether this session knows the count of the head at `head_offset` to
+    /// be the number of items the state's value holds.
+    fn count_is_exact(&self, branch_id: BranchId, state_id: &str, head_offset: u64) -> bool {
+        self.count_check(branch_id, state_id, head_offset)
+            .is_some_and(|check| check.exact)
+    }
+
+    fn set_count_check(&self, branch_id: BranchId, state_id: &str, check: Option<CountCheck>) {
+        let mut counts = self.counts.write();
+        match check {
+            Some(check) => {
+                let states = counts.entry(branch_id).or_default();
+                match states.get_mut(state_id) {
+                    Some(slot) => *slot = check,
+                    None => {
+                        states.insert(state_id.to_string(), check);
+                    }
+                }
+            }
+            None => {
+                if let Some(states) = counts.get_mut(&branch_id) {
+                    states.remove(state_id);
+                }
+            }
+        }
+    }
+
+    /// The state's item count on the branch, for a batched append to take
+    /// its first ordinal from: the head's `item_count` once this session has
+    /// checked it, and otherwise the number of items the state's value
+    /// holds, which the head then keeps as its count. 0 for a state with no
+    /// head on the branch.
+    ///
+    /// Counting reads the whole value once (`get_state_items`, so its items
+    /// stay cached for the batch and the reads after it), at most once per
+    /// head this session loaded or left unchecked. A value that doesn't
+    /// materialize as a JSON array has no items to count: the head keeps its
+    /// stored count, which is returned, and the value isn't read for a count
+    /// again until a write replaces it or leaves the head unchecked. An
+    /// error reading the log is returned, and nothing changes.
+    ///
+    /// Call only while holding `Store::write_lock`, so the head can't move
+    /// between the count and the write that uses it. A head that moved
+    /// anyway keeps its own count, which is returned.
+    pub(crate) fn checked_item_count(&self, branch_id: BranchId, state_id: &str) -> Result<usize> {
+        let Some(head) = self.get_head(branch_id, state_id) else {
+            return Ok(0);
+        };
+        if self.count_check(branch_id, state_id, head.head_offset).is_some() {
+            return Ok(head.item_count);
+        }
+        let (count, exact) = match self.get_state_items(branch_id, state_id) {
+            Ok(Some(items)) => (items.len(), true),
+            Ok(None) => (0, true),
+            Err(StoreError::Io(error)) => return Err(StoreError::Io(error)),
+            Err(_) => (head.item_count, false),
+        };
+        let mut index = self.index.write();
+        match index.heads.get_mut(branch_id, state_id) {
+            Some(current) if current.head_offset == head.head_offset => {
+                current.item_count = count;
+                self.set_count_check(
+                    branch_id,
+                    state_id,
+                    Some(CountCheck { at: head.head_offset, exact }),
+                );
+                Ok(count)
+            }
+            Some(current) => Ok(current.item_count),
+            None => Ok(0),
+        }
     }
 
     /// Get the current value of a state.
@@ -1090,9 +1245,10 @@ impl StateManager {
     /// state on every single append (2026-08-01 Mythos: each materialization
     /// re-parsed a 114 MB snapshot chain — 10-30s CPU stalls at every turn
     /// boundary). When the head record is an `Append` (or an `AppendMany`,
-    /// whose last item is the state's last) and the caller asks for the
-    /// final index, the item is served from the head record alone: O(one
-    /// record read) regardless of state size, no cache churn.
+    /// whose last item is the state's last, where this session has checked
+    /// the head's count: see `checked_item_count`) and the caller asks for
+    /// the final index, the item is served from the head record alone:
+    /// O(one record read) regardless of state size, no cache churn.
     ///
     /// Byte fidelity: an item appended as a `serde_json::Value`, as
     /// `append_to_state_json_with_identity` and its batched form append
@@ -1133,7 +1289,7 @@ impl StateManager {
 
         // Head-record fast path: last item + Append head.
         if head.item_count > 0 && index == head.item_count - 1 {
-            if let Some(item) = self.last_item_from_head(&head)? {
+            if let Some(item) = self.last_item_from_head(branch_id, state_id, &head)? {
                 return Ok(Some(item));
             }
         }
@@ -1154,7 +1310,8 @@ impl StateManager {
     /// Every answer comes from one version of the state, and the version is
     /// read once: from the warm item cache when it is current; from the head
     /// record alone when every ordinal asked for is the last one, as
-    /// `get_state_item`'s fast path serves it; and otherwise from one
+    /// `get_state_item`'s fast path serves it, and this session has checked
+    /// the head's count (see `checked_item_count`); and otherwise from one
     /// materialization, cached for later reads. So a batch of ordinals costs
     /// at most what one cold `get_state_item` costs, not one each. An empty
     /// request reads nothing. An ordinal past the end costs what it costs
@@ -1193,10 +1350,15 @@ impl StateManager {
         }
 
         // Only the last item asked for: the head record may hold it, as for
-        // `get_state_item`.
-        if let Some(last) = head.item_count.checked_sub(1) {
+        // `get_state_item`, where this session has checked the head's count,
+        // so that the last item is the one the count makes last.
+        if let Some(last) = head
+            .item_count
+            .checked_sub(1)
+            .filter(|_| self.count_is_exact(branch_id, state_id, head.head_offset))
+        {
             if ordinals.iter().all(|&i| i == last) {
-                if let Some(item) = self.last_item_from_head(&head)? {
+                if let Some(item) = self.last_item_from_head(branch_id, state_id, &head)? {
                     return Ok(vec![Some(item); ordinals.len()]);
                 }
             }
@@ -1209,10 +1371,17 @@ impl StateManager {
     }
 
     /// The state's last item, read from its head record alone, when that
-    /// record is an `Append` or an `AppendMany`; `None` for any other head
-    /// (Edit / Redact / snapshot / Set), whose last item the record alone
-    /// doesn't give.
-    fn last_item_from_head(&self, head: &StateChainHead) -> Result<Option<Vec<u8>>> {
+    /// record is an `Append`, or an `AppendMany` whose head count this
+    /// session has checked; `None` for any other head (Edit / Redact /
+    /// snapshot / Set, an AppendMany with an unchecked count), whose last
+    /// item the record alone doesn't give or may not be the one the count
+    /// makes last.
+    fn last_item_from_head(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        head: &StateChainHead,
+    ) -> Result<Option<Vec<u8>>> {
         let log = self
             .log
             .as_ref()
@@ -1223,7 +1392,11 @@ impl StateManager {
             StateOperation::Append(item) => Some(item),
             // A batch at the head ends with the last item, as the last of its
             // items appended one at a time would.
-            StateOperation::AppendMany(mut items) => items.pop(),
+            StateOperation::AppendMany(mut items)
+                if self.count_is_exact(branch_id, state_id, head.head_offset) =>
+            {
+                items.pop()
+            }
             _ => None,
         })
     }
@@ -1430,6 +1603,27 @@ impl StateManager {
             for (state_id, head) in &copied {
                 self.share_cached(to_branch, state_id, head.head_offset);
             }
+            // A copied head has its parent's count, so it has the parent's
+            // check of it too.
+            let mut counts = self.counts.write();
+            let inherited: Vec<(String, CountCheck)> = counts
+                .get(&from_branch)
+                .map(|parent| {
+                    copied
+                        .iter()
+                        .filter_map(|(state_id, head)| {
+                            parent
+                                .get(state_id)
+                                .filter(|check| check.at == head.head_offset)
+                                .map(|check| (state_id.clone(), *check))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !inherited.is_empty() {
+                counts.entry(to_branch).or_default().extend(inherited);
+            }
+            drop(counts);
             index
                 .heads
                 .by_branch
@@ -1699,6 +1893,7 @@ impl StateManager {
         self.items_cache.write().pop_prefix(&prefix);
         self.tree_cache.write().pop_prefix(&prefix);
         self.field_indexes.write().drop_branch(branch_id);
+        self.counts.write().remove(&branch_id);
         self.retired_branches.lock().push(branch_id);
     }
 
