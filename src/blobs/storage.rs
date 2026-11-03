@@ -827,26 +827,53 @@ mod tests {
 
     // Stores of one content racing from several storages each stage their
     // own file and rename it into place, and reads meanwhile find the blob
-    // whole or absent, never partly written.
+    // whole or absent, never partly written. The writers and readers start
+    // together on a barrier, and the readers read until every writer is
+    // done, so reads overlap the writes on most runs; the test is
+    // probabilistic, as a scheduler may still keep them apart.
     #[test]
     fn racing_stores_and_reads_of_one_blob_find_it_whole_or_absent() {
+        const WRITERS: usize = 4;
+        const READERS: usize = 4;
         let dir = TempDir::new().unwrap();
         let content: Vec<u8> = (0..200_000u32).map(|i| (i % 241) as u8).collect();
         let hash = Hash::from_bytes(&content);
+        let start = std::sync::Barrier::new(WRITERS + READERS);
+        let writers_done = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            for _ in 0..4 {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        assert_eq!(reopened(&dir).store(&content, "image/png").unwrap(), hash);
+                    })
+                })
+                .collect();
+            for _ in 0..READERS {
                 scope.spawn(|| {
-                    assert_eq!(reopened(&dir).store(&content, "image/png").unwrap(), hash);
-                });
-            }
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    for _ in 0..50 {
-                        if let Some(blob) = reopened(&dir).get(&hash).unwrap() {
-                            assert_eq!(blob.content, content);
+                    start.wait();
+                    loop {
+                        // Read once more after the writers are done, so each
+                        // reader also finds the finished blob.
+                        let done = writers_done.load(Ordering::Acquire);
+                        match reopened(&dir).get(&hash).unwrap() {
+                            Some(blob) => assert_eq!(blob.content, content),
+                            None => assert!(!done, "absent after every store returned"),
+                        }
+                        if done {
+                            break;
                         }
                     }
                 });
+            }
+            // The readers stop on this flag, so it is set even when a writer
+            // panicked, and that panic is raised after it.
+            let joined: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
+            writers_done.store(true, Ordering::Release);
+            for result in joined {
+                if let Err(panic) = result {
+                    std::panic::resume_unwind(panic);
+                }
             }
         });
         assert_eq!(staged(&dir.path().join("blobs")), 0);
