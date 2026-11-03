@@ -201,6 +201,23 @@ pub struct JsUnregisteredState {
     pub updates: i64,
 }
 
+/// A state whose snapshot after a recorded write failed at its most recent
+/// attempt on a branch, as `snapshotFailures()` lists it.
+#[napi(object)]
+pub struct JsSnapshotFailure {
+    pub state_id: String,
+    /// The name of the branch the writes and their snapshots were on.
+    pub branch: String,
+    /// How many writes in a row found the state's snapshot due on the branch
+    /// and failed to take it, counted since the store opened or the last
+    /// snapshot of the state there.
+    pub failures: i64,
+    /// The sequence of the most recent of those writes.
+    pub sequence: i64,
+    /// The error the most recent attempt failed with.
+    pub error: String,
+}
+
 /// Configuration for creating a store.
 #[napi(object)]
 pub struct JsStoreConfig {
@@ -658,6 +675,36 @@ impl JsStore {
             undecodable_state_updates: r.undecodable_state_updates as i64,
             updates_on_missing_branches: r.updates_on_missing_branches as i64,
         }))
+    }
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, one entry per branch and state, ordered by branch and
+    /// then state id; an empty array when none has. The same on every handle
+    /// of the store.
+    ///
+    /// A write that reaches a state's snapshot cadence takes the snapshot
+    /// after its record, and when that snapshot fails, the write still
+    /// returns its record (issue #39). The store logs a `tracing` warning,
+    /// which a Node process doesn't show, and counts the failure here, with
+    /// the sequence of the write and the error. An entry goes once a
+    /// snapshot of the state on that branch is recorded (by a later write
+    /// or `compactState`), or a write finds none due. Kept in memory only: a
+    /// reopened store lists none until a write's snapshot fails again. A
+    /// deleted branch's entries aren't listed.
+    #[napi]
+    pub fn snapshot_failures(&self) -> Result<Vec<JsSnapshotFailure>> {
+        let store = self.get_store()?;
+        Ok(store
+            .snapshot_failures()
+            .into_iter()
+            .map(|failure| JsSnapshotFailure {
+                state_id: failure.state_id,
+                branch: failure.branch,
+                failures: failure.failures as i64,
+                sequence: failure.sequence.0 as i64,
+                error: failure.error,
+            })
+            .collect())
     }
 
     // --- Records ---
@@ -1151,8 +1198,8 @@ impl JsStore {
     /// Once the item is recorded the call returns its record. A write that
     /// reaches the state's snapshot cadence takes the snapshot after its
     /// record, and if that snapshot fails the call still returns: the store
-    /// logs a `tracing` warning, and the next write to the state tries the
-    /// snapshot again (issue #39).
+    /// logs a `tracing` warning and lists the state in `snapshotFailures()`,
+    /// and the next write to the state tries the snapshot again (issue #39).
     #[napi]
     pub fn append_to_state_json_with_identity(
         &self,
@@ -1182,8 +1229,9 @@ impl JsStore {
     /// nothing, for an empty `items`. Once the batch is recorded the call
     /// returns it. A write that reaches the snapshot cadence takes the
     /// snapshot after its record, and if that snapshot fails the call still
-    /// returns: the store logs a `tracing` warning, and the next write to
-    /// the state tries the snapshot again (issue #39).
+    /// returns: the store logs a `tracing` warning and lists the state in
+    /// `snapshotFailures()`, and the next write to the state tries the
+    /// snapshot again (issue #39).
     ///
     /// The first batch a store records changes its format: the store's
     /// `MANIFEST` goes to version 2, and releases from before batched
@@ -1230,8 +1278,9 @@ impl JsStore {
     /// the batch is recorded the call
     /// returns it. A write that reaches the snapshot cadence takes the
     /// snapshot after its record, and if that snapshot fails the call still
-    /// returns: the store logs a `tracing` warning, and the next write to
-    /// the state tries the snapshot again (issue #39).
+    /// returns: the store logs a `tracing` warning and lists the state in
+    /// `snapshotFailures()`, and the next write to the state tries the
+    /// snapshot again (issue #39).
     ///
     /// Just before a store's first batch is written, by this call or
     /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it

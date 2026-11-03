@@ -7,10 +7,11 @@ use crate::records::{RecordIndex, RecordLog, RecoveryReport};
 use crate::state::{StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
-    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence,
+    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence, SnapshotFailure,
     StateOperation, StateRegistration, StateUpdateRecord, StoreStats, Timestamp,
     TreeChange, TreeEntry, TreeOp, TreeState,
 };
+use std::collections::BTreeMap;
 use fs2::FileExt;
 use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
@@ -172,6 +173,10 @@ pub struct Store {
 
     /// What `open` had to recover, for [`Store::recovery`].
     recovery: Option<RecoveryReport>,
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, per branch, for [`Store::snapshot_failures`].
+    snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotFailure>>>,
 }
 
 impl Store {
@@ -360,6 +365,7 @@ impl Store {
             write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery: None,
+            snapshot_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -593,6 +599,7 @@ impl Store {
             }),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery,
+            snapshot_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -611,6 +618,71 @@ impl Store {
     /// `tracing` warnings out of logs.
     pub fn recovery(&self) -> Option<RecoveryReport> {
         self.recovery.clone()
+    }
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, one entry per branch and state, ordered by branch id
+    /// and then state id; empty when none has.
+    ///
+    /// A write that reaches a state's snapshot thresholds takes the snapshot
+    /// after its record, and that snapshot's failure doesn't fail the write
+    /// (see [`Store::update_state`]). Each such failure is logged as a
+    /// `tracing` warning and counted here, with the sequence of the write
+    /// and the error, so a process that shows no `tracing` output, such as a
+    /// Node one, can see it. An entry goes once a snapshot of the state on
+    /// that branch is recorded (by a later write, `compact_state`,
+    /// `create_snapshot_if_needed`, or a snapshot the caller writes), or a
+    /// write finds none due. A snapshot asked for directly, which returns
+    /// its own error, isn't counted. Entries are kept in memory only: a
+    /// reopened store lists none until a write's snapshot fails again. A
+    /// deleted branch's entries aren't listed.
+    pub fn snapshot_failures(&self) -> Vec<SnapshotFailure> {
+        self.snapshot_failures
+            .lock()
+            .iter()
+            .filter(|(branch_id, _)| self.branches.get_branch_by_id(**branch_id).is_some())
+            .flat_map(|(_, states)| states.values().cloned())
+            .collect()
+    }
+
+    /// Count a failed snapshot after the write at `sequence` to `state_id`
+    /// on `branch`, for `snapshot_failures`.
+    fn note_snapshot_failure(&self, branch: &Branch, state_id: &str, sequence: Sequence, error: &StoreError) {
+        let mut failures = self.snapshot_failures.lock();
+        let states = failures.entry(branch.id).or_default();
+        match states.get_mut(state_id) {
+            Some(failure) => {
+                failure.failures += 1;
+                failure.branch = branch.name.clone();
+                failure.sequence = sequence;
+                failure.error = error.to_string();
+            }
+            None => {
+                states.insert(
+                    state_id.to_string(),
+                    SnapshotFailure {
+                        state_id: state_id.to_string(),
+                        branch_id: branch.id,
+                        branch: branch.name.clone(),
+                        failures: 1,
+                        sequence,
+                        error: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Drop the failure `snapshot_failures` holds for `state_id` on
+    /// `branch_id`, if any: a snapshot of it was recorded, or none is due.
+    fn clear_snapshot_failure(&self, branch_id: BranchId, state_id: &str) {
+        let mut failures = self.snapshot_failures.lock();
+        if let Some(states) = failures.get_mut(&branch_id) {
+            states.remove(state_id);
+            if states.is_empty() {
+                failures.remove(&branch_id);
+            }
+        }
     }
 
     /// Toggle the auto-snapshot pass inside `update_state`.
@@ -926,12 +998,13 @@ impl Store {
     /// (unless `set_auto_snapshot(false)`). A recorded write never returns
     /// an error from that snapshot (issue #39). If the snapshot fails, on a
     /// full disk, say, or because it materializes an item that doesn't
-    /// parse, the failure is logged as a `tracing` warning and the write
-    /// returns its record. The snapshot stays due, so the next write to the
-    /// state on that branch tries it again. A state whose snapshot keeps
-    /// failing, such as one holding an Append that isn't JSON, logs a
-    /// warning at each write that finds a snapshot due, and takes none
-    /// until a `Set` replaces its value.
+    /// parse, the failure is logged as a `tracing` warning and counted in
+    /// [`Store::snapshot_failures`], and the write returns its record. The
+    /// snapshot stays due, so the next write to the state on that branch
+    /// tries it again. A state whose snapshot keeps failing, such as one
+    /// holding an Append that isn't JSON, logs a warning at each write that
+    /// finds a snapshot due, each counted there too, and takes none until a
+    /// `Set` replaces its value.
     pub fn update_state(
         &self,
         state_id: &str,
@@ -987,8 +1060,8 @@ impl Store {
     /// An `item` that isn't a JSON object is refused with `InvalidOperation`
     /// and writes nothing. Once the item is recorded, the call returns its
     /// record: if the snapshot the write takes after it fails, that is
-    /// logged and the next write tries it again, as for `update_state`
-    /// (issue #39).
+    /// logged and counted in `snapshot_failures`, and the next write tries
+    /// it again, as for `update_state` (issue #39).
     pub fn append_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -1033,8 +1106,9 @@ impl Store {
     /// `update_state`). Each item must be one JSON value, as for an
     /// `Append`. An empty batch is refused with `InvalidOperation` and
     /// writes nothing. Once the batch is recorded, the call returns it: if
-    /// the snapshot the write takes after it fails, that is logged and the
-    /// next write tries it again, as for `update_state` (issue #39).
+    /// the snapshot the write takes after it fails, that is logged and
+    /// counted in `snapshot_failures`, and the next write tries it again, as
+    /// for `update_state` (issue #39).
     pub fn append_many_to_state(
         &self,
         state_id: &str,
@@ -1106,8 +1180,8 @@ impl Store {
     /// `sequence_field` are the same key, where an item couldn't hold both
     /// the record id and the sequence. Once the batch is recorded,
     /// the call returns it: if the snapshot the write takes after it fails,
-    /// that is logged and the next write tries it again, as for
-    /// `update_state` (issue #39).
+    /// that is logged and counted in `snapshot_failures`, and the next write
+    /// tries it again, as for `update_state` (issue #39).
     pub fn append_many_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -1333,6 +1407,17 @@ impl Store {
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
 
+        // A snapshot record, whoever wrote it, ends any snapshot failure on
+        // record for the state on this branch.
+        if matches!(
+            operation,
+            StateOperation::Snapshot(_)
+                | StateOperation::DeltaSnapshot(_)
+                | StateOperation::TreeDeltaSnapshot(_)
+        ) {
+            self.clear_snapshot_failure(branch.id, state_id);
+        }
+
         // Broadcast state delta to subscribers
         self.subscriptions.broadcast_state_delta(state_id, operation, next_seq);
         self.subscriptions.broadcast_branch_head(&branch.name, next_seq);
@@ -1351,16 +1436,22 @@ impl Store {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(write);
             // Same branch as the write above — never the cursor, which may
-            // point elsewhere (or have moved) by now.
-            if let Err(error) = self.auto_snapshot_if_needed(branch.id, state_id) {
-                tracing::warn!(
-                    %error,
-                    state_id,
-                    branch = %branch.name,
-                    sequence = next_seq.0,
-                    "the snapshot after a recorded state write failed: the write stands and \
-                     returns its record, and the next write to the state tries the snapshot again"
-                );
+            // point elsewhere (or have moved) by now. Besides the warning, the
+            // failure is counted for `snapshot_failures`, as a Node process
+            // shows no `tracing` output.
+            match self.auto_snapshot_if_needed(branch.id, state_id) {
+                Ok(()) => self.clear_snapshot_failure(branch.id, state_id),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        state_id,
+                        branch = %branch.name,
+                        sequence = next_seq.0,
+                        "the snapshot after a recorded state write failed: the write stands and \
+                         returns its record, and the next write to the state tries the snapshot again"
+                    );
+                    self.note_snapshot_failure(&branch, state_id, next_seq, &error);
+                }
             }
         }
 

@@ -12,10 +12,15 @@
 //! An item that isn't JSON stands in for the failure, as it does in the
 //! reviewers' probe: the store records it as given, and the snapshot that
 //! reads it back fails, as one on a full disk would fail its write.
+//!
+//! Besides the `tracing` warning, which a process without a subscriber (a
+//! Node process, say) never shows, `Store::snapshot_failures` lists each
+//! state whose snapshot failed at its last attempt, until a snapshot of it
+//! is taken.
 
 use chronicle::{
-    Record, Sequence, StateOperation, StateRegistration, StateStrategy, StateUpdateRecord, Store,
-    StoreConfig, StoreError,
+    Record, Sequence, SnapshotFailure, StateOperation, StateRegistration, StateStrategy,
+    StateUpdateRecord, Store, StoreConfig, StoreError,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -129,6 +134,22 @@ fn write(store: &Store, form: Form, state_id: &str, items: &[Value]) -> chronicl
     }
 }
 
+/// The one entry `snapshot_failures` holds, checked against the state, the
+/// branch, the number of failed attempts and the write that made the last.
+fn only_failure(store: &Store, failures: u64, sequence: Sequence) -> SnapshotFailure {
+    let listed = store.snapshot_failures();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let failure = listed.into_iter().next().unwrap();
+    assert_eq!(
+        (failure.state_id.as_str(), failure.branch.as_str(), failure.failures, failure.sequence),
+        ("s", "main", failures, sequence),
+        "{failure:?}"
+    );
+    assert_eq!(failure.branch_id, store.current_branch().id);
+    assert!(failure.error.contains("Deserialization"), "{failure:?}");
+    failure
+}
+
 fn written(form: Form, items: &[Value]) -> usize {
     match form {
         Form::Append | Form::Identity => 1,
@@ -162,6 +183,7 @@ fn each_write_form_returns_its_record_when_its_own_snapshot_fails() {
                 record.sequence,
                 "{form:?}: no snapshot record followed it"
             );
+            only_failure(&store, 1, record.sequence);
             assert_eq!(len(&store, "s"), 1 + written(form, &items), "{form:?}");
             assert!(log.contains(WARNING), "{form:?}: {log}");
             assert!(log.contains("state_id=\"s\""), "{form:?}: {log}");
@@ -205,8 +227,10 @@ fn each_write_form_returns_its_record_when_its_own_snapshot_fails() {
                 log.contains(WARNING),
                 "{form:?}: the next write tried again: {log}"
             );
+            only_failure(&store, 2, next.sequence);
 
-            // Asked for directly, the snapshot's error is the caller's.
+            // Asked for directly, the snapshot's error is the caller's, and
+            // isn't counted as a write's.
             assert!(
                 matches!(
                     store.create_snapshot_if_needed("s"),
@@ -215,6 +239,7 @@ fn each_write_form_returns_its_record_when_its_own_snapshot_fails() {
                 "{form:?}"
             );
             assert_eq!(head(&store), next.sequence, "{form:?}");
+            only_failure(&store, 2, next.sequence);
             (record, (next.sequence, len(&store, "s")))
         };
 
@@ -226,9 +251,12 @@ fn each_write_form_returns_its_record_when_its_own_snapshot_fails() {
             store.get_record(record.id).unwrap().unwrap().sequence,
             record.sequence
         );
+        assert_eq!(store.snapshot_failures(), [], "{form:?}: kept in memory only");
         let (again, log) = logged(|| write(&store, form, "s", &[json!({"id": "d"})]));
-        assert_eq!(again.unwrap().sequence, after.0.next(), "{form:?}");
+        let again = again.unwrap();
+        assert_eq!(again.sequence, after.0.next(), "{form:?}");
         assert!(log.contains(WARNING), "{form:?}: {log}");
+        only_failure(&store, 1, again.sequence);
     }
 }
 
@@ -254,6 +282,7 @@ fn the_snapshot_a_failure_left_due_is_taken_by_the_next_write_that_can() {
         batch.record.sequence,
         "no snapshot was written"
     );
+    only_failure(&store, 1, batch.record.sequence);
     let stats = store.get_chain_stats("s").unwrap().unwrap();
     assert!(!stats.has_full_snapshot);
 
@@ -269,6 +298,7 @@ fn the_snapshot_a_failure_left_due_is_taken_by_the_next_write_that_can() {
     });
     let set = set.unwrap();
     assert!(!log.contains(WARNING), "{log}");
+    assert_eq!(store.snapshot_failures(), [], "the snapshot was taken");
     assert_eq!(
         head(&store),
         set.sequence.next(),
@@ -307,4 +337,46 @@ fn the_snapshot_a_failure_left_due_is_taken_by_the_next_write_that_can() {
             {"id": "c", "by": next.record.id.0.to_string(), "at": next.record.sequence.0},
         ])
     );
+}
+
+#[test]
+fn a_failure_is_listed_for_its_branch_until_a_snapshot_or_the_branch_goes() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    register(&store, "s", 2, 10);
+    register(&store, "t", 2, 10);
+    let fork = store.create_branch("fork", None).unwrap();
+    for state in ["s", "t"] {
+        store
+            .update_state_on(fork.id, state, StateOperation::Append(POISON.to_vec()))
+            .unwrap();
+        store
+            .update_state_on(fork.id, state, StateOperation::Append(b"1".to_vec()))
+            .unwrap();
+    }
+    let listed = store.snapshot_failures();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|f| (f.state_id.as_str(), f.branch.as_str(), f.branch_id, f.failures))
+            .collect::<Vec<_>>(),
+        [("s", "fork", fork.id, 1), ("t", "fork", fork.id, 1)]
+    );
+    assert!(store.get_state("s").unwrap().is_none(), "main never had a write");
+
+    // A snapshot the caller writes, with automatic ones off, ends the
+    // failure on record for its state alone.
+    store.set_auto_snapshot(false);
+    store
+        .update_state_on(fork.id, "t", StateOperation::Snapshot(b"[1]".to_vec()))
+        .unwrap();
+    let listed = store.snapshot_failures();
+    assert_eq!(
+        listed.iter().map(|f| f.state_id.as_str()).collect::<Vec<_>>(),
+        ["s"],
+        "{listed:?}"
+    );
+
+    store.delete_branch("fork").unwrap();
+    assert_eq!(store.snapshot_failures(), [], "a deleted branch's states aren't listed");
 }

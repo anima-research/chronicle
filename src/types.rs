@@ -510,6 +510,26 @@ pub enum TreeChange {
 /// The tree state itself: a sorted map of path → TreeEntry.
 pub type TreeState = BTreeMap<String, TreeEntry>;
 
+/// A state whose snapshot after a recorded write failed at its most recent
+/// attempt on a branch, as `Store::snapshot_failures` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotFailure {
+    /// The state.
+    pub state_id: String,
+    /// The branch the writes and their snapshots were on.
+    pub branch_id: BranchId,
+    /// That branch's name.
+    pub branch: String,
+    /// How many writes in a row found the state's snapshot due on the branch
+    /// and failed to take it, counted since the store opened or the last
+    /// snapshot of the state there.
+    pub failures: u64,
+    /// The sequence of the most recent of those writes.
+    pub sequence: Sequence,
+    /// The error the most recent attempt failed with.
+    pub error: String,
+}
+
 /// Store statistics.
 #[derive(Clone, Debug, Default)]
 pub struct StoreStats {
