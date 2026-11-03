@@ -188,12 +188,15 @@ impl Store {
     /// leaves when it stops before its manifest, and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
-    /// isn't taken for a place to put a store.
+    /// isn't taken for a place to put a store. A directory whose entries
+    /// can't be listed, as one this process may write and search but not
+    /// read, fails with the listing's I/O error, naming it, whatever
+    /// `create_if_missing` says.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
         if Self::present_store_file(&config.path)?.is_some() {
             return Self::open(config);
         }
-        if let Some(other) = Self::foreign_entry(&config.path) {
+        if let Some(other) = Self::foreign_entry(&config.path)? {
             return Err(StoreError::InvalidFormat(format!(
                 "{} has no MANIFEST and holds {other}, so it isn't a Chronicle store or an empty place for one",
                 config.path.display()
@@ -206,14 +209,36 @@ impl Store {
         }
     }
 
-    fn foreign_entry(path: &Path) -> Option<String> {
+    /// The first entry of `path` a new store can't sit beside, if any; none
+    /// for a missing directory. An error listing the directory is returned,
+    /// naming it: a directory whose entries can't be read can't be told
+    /// empty.
+    fn foreign_entry(path: &Path) -> std::io::Result<Option<String>> {
         let allowed = |name: &str| {
             ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
-        fs::read_dir(path).ok()?.flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .find(|name| !allowed(name))
+        let listing_error = |error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot list {} to tell whether a new store can go there: {error}",
+                    path.display()
+                ),
+            )
+        };
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(listing_error(error)),
+        };
+        for entry in entries {
+            let name = entry.map_err(listing_error)?.file_name().to_string_lossy().into_owned();
+            if !allowed(&name) {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
     }
 
     /// Create a new store.

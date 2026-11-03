@@ -329,3 +329,41 @@ fn open_or_create_on_a_path_that_is_a_file_names_it() {
     }
     assert_eq!(fs::read(&path).unwrap(), b"someone's file");
 }
+
+/// A directory this process may write and search but not list: the store
+/// files' names can be looked up, and come back absent, but whether it holds
+/// anything else can't be told, so open_or_create neither creates a store
+/// there nor says there is none. Unix only: it sets a directory's mode.
+#[cfg(unix)]
+#[test]
+fn open_or_create_on_a_directory_it_cant_list_returns_the_listing_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for create_if_missing in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("project");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("notes.txt"), b"someone's notes").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+        let listable = fs::read_dir(&path).is_ok();
+        let result = Store::open_or_create(StoreConfig { create_if_missing, ..config(&path) })
+            .map(drop);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        if listable {
+            // Running as root, where the mode doesn't stop a listing.
+            return;
+        }
+
+        match result {
+            Err(StoreError::Io(error)) => assert!(
+                error.kind() == std::io::ErrorKind::PermissionDenied
+                    && error.to_string().contains(&*path.to_string_lossy()),
+                "{create_if_missing}: {error}"
+            ),
+            Err(e) => panic!("{create_if_missing}: expected the listing's I/O error, got {e}"),
+            Ok(()) => panic!("{create_if_missing}: created a store in a directory it can't list"),
+        }
+        let left: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["notes.txt"], "{create_if_missing}: nothing was written there");
+    }
+}
