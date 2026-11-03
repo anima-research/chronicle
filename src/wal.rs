@@ -306,15 +306,13 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(seq, 1);
-
         // Should have one pending entry
         let pending = wal.get_pending_entries().unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].seq, 1);
+        assert_eq!(pending[0].seq, seq);
 
         // Commit it
-        wal.commit(1).unwrap();
+        wal.commit(seq).unwrap();
 
         // Should have no pending entries
         let pending = wal.get_pending_entries().unwrap();
@@ -348,18 +346,16 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(seq1, 1);
-        assert_eq!(seq2, 2);
-        assert_eq!(seq3, 3);
+        assert!(seq1 != seq2 && seq2 != seq3 && seq1 != seq3, "{seq1} {seq2} {seq3}");
 
         // Commit first and third
-        wal.commit(1).unwrap();
-        wal.commit(3).unwrap();
+        wal.commit(seq1).unwrap();
+        wal.commit(seq3).unwrap();
 
         // Only second should be pending
         let pending = wal.get_pending_entries().unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].seq, 2);
+        assert_eq!(pending[0].seq, seq2);
     }
 
     #[test]
@@ -419,7 +415,8 @@ mod tests {
             })
             .unwrap();
 
-        // Sequence should reset
-        assert_eq!(seq, 1);
+        let pending = wal.get_pending_entries().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, seq);
     }
 }

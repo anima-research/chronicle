@@ -38,7 +38,7 @@ test('ErrorCode lists every code, each named as its value', () => {
   assert.deepEqual(Object.keys(ErrorCode).sort(), [
     'BlobNotFound', 'BranchExists', 'BranchNotFound', 'ChecksumMismatch', 'Corruption',
     'Deserialization', 'DurabilityLost', 'HashMismatch', 'InvalidFieldIndexKind',
-    'InvalidFormat', 'InvalidHash', 'InvalidLimit', 'InvalidOperation', 'InvalidRecordId',
+    'InvalidFormat', 'InvalidHash', 'InvalidOperation', 'InvalidRecordId',
     'InvalidSequence', 'InvalidStrategy', 'InvalidSubscriptionId', 'InvalidTreeOp', 'Io',
     'Locked', 'NotInitialized', 'RecordNotFound', 'Serialization', 'StateExists',
     'StateNotRegistered', 'StoreClosed', 'StrategyMismatch', 'SubscriptionDisconnected',
@@ -94,21 +94,6 @@ test("the binding's own refusals carry theirs", () => {
   throwsCoded(() => store.getStateUpdateJson('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
   throwsCoded(() => store.getEffects('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
   throwsCoded(() => store.getLinksTo('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
-  throwsCoded(
-    () => store.getRecordIdsByType('note', { after: 'x' }),
-    ErrorCode.InvalidRecordId,
-    'Invalid record ID for after: "x"',
-  );
-  throwsCoded(
-    () => store.getRecordIdsByType('note', { limit: -1 }),
-    ErrorCode.InvalidLimit,
-    'Invalid limit: -1 (a non-negative integer)',
-  );
-  throwsCoded(
-    () => store.getRecordIdsByType('note', { limit: 1.5 }),
-    ErrorCode.InvalidLimit,
-    'Invalid limit: 1.5 (a non-negative integer)',
-  );
   store.registerState({ id: 'log', strategy: 'append_log' });
   throwsCoded(
     () => store.registerStateFieldIndex('log', 'when', 'date'),

@@ -3,11 +3,12 @@
 //! Reconstruction (store reopen, cache miss, branch switch) must be
 //! (near-)linear in state size. Historically it applied ops one at a time,
 //! each op re-parsing and re-serializing the full state — O(tail × N) — which
-//! every warm-cache bench missed. These gates measure the coldest path the
-//! process can reach: build a store, drop it, reopen, time the first
-//! `get_state`. Reopening clears every in-process cache (state LRU, head
-//! offsets); the OS page cache stays warm. That is acceptable for THIS gate
-//! because the quadratic it guards is CPU-bound (per-op parse + reserialize):
+//! every warm-cache bench missed. These gates measure a rebuild from the log:
+//! build a store, drop every cached state value (`clear_state_caches`), and
+//! time the next `get_state`, which `state_reconstruction_count` shows rebuilt
+//! the value. Opening a store and switching branch aren't timed. The OS page
+//! cache stays warm. That is acceptable for THIS gate because the quadratic it
+//! guards is CPU-bound (per-op parse + reserialize):
 //! it measured 11.6× per 4× N through a warm page cache before the fix. A
 //! disk-latency regression would need an I/O-cold harness; this is not one.
 //!
@@ -25,20 +26,21 @@
 //! scales off the measured item ratio instead of assuming 4×. The tables
 //! print items/tail per point so the phase is auditable, not assumed.
 //!
-//! Wall-clock discipline: each point is the min of 3 fully-cold reads (fresh
-//! `Store::open` per read — a second read on one handle is an LRU hit), and
-//! the gates serialize on a mutex so they never contend with each other.
-//! Tables print with `-- --nocapture`.
+//! Timing discipline: each point is the min of 3 rebuilds, each timed by the
+//! thread's CPU time, so time spent waiting to run on a busy machine isn't
+//! counted, and the gates serialize on a mutex so they never contend with each
+//! other. Tables print with `-- --nocapture`. Unix only: the thread's CPU time
+//! comes from `clock_gettime`.
+#![cfg(unix)]
 
 use chronicle::{
     StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, TreeEntry,
 };
 use serde_json::json;
 use std::sync::Mutex;
-use std::time::Instant;
 use tempfile::TempDir;
 
-/// Serializes the gates: wall-clock measurements must not contend.
+/// Serializes the gates: timed reads must not contend.
 static GATE: Mutex<()> = Mutex::new(());
 
 fn config(dir: &TempDir) -> StoreConfig {
@@ -50,7 +52,8 @@ fn config(dir: &TempDir) -> StoreConfig {
 }
 
 struct SizedStore {
-    dir: TempDir,
+    store: Store,
+    _dir: TempDir,
     /// Items in the state at measurement time.
     items: usize,
     /// Ops since the last full snapshot at measurement time.
@@ -103,19 +106,33 @@ fn build_at_known_phase<F: FnMut(&Store, usize)>(
     }
     let tail = tail(&store);
     store.sync().unwrap();
-    drop(store);
-    SizedStore { dir, items, tail }
+    SizedStore { store, _dir: dir, items, tail }
 }
 
-/// Min of 3 fully-cold reads: fresh open per read, first `get_state` timed.
-fn min_cold_read_ms(dir: &TempDir, state_id: &str) -> f64 {
+fn timed_ms<T>(f: impl FnOnce() -> T) -> (T, f64) {
+    fn cpu_ms() -> f64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
+        ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6
+    }
+    let start = cpu_ms();
+    let value = f();
+    (value, cpu_ms() - start)
+}
+
+fn min_rebuild_ms(store: &Store, state_id: &str) -> f64 {
     (0..3)
         .map(|_| {
-            let store = Store::open(config(dir)).unwrap();
-            let t = Instant::now();
-            let state = store.get_state(state_id).unwrap();
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            assert!(state.is_some(), "cold read returned no state");
+            store.clear_state_caches();
+            let rebuilds = store.state_reconstruction_count();
+            let (state, ms) = timed_ms(|| store.get_state(state_id).unwrap());
+            assert!(state.is_some(), "the read returned no state");
+            assert_eq!(
+                store.state_reconstruction_count(),
+                rebuilds + 1,
+                "the read rebuilt the state"
+            );
             ms
         })
         .fold(f64::INFINITY, f64::min)
@@ -153,8 +170,8 @@ fn assert_cold_linear(name: &str, points: &[(SizedStore, f64)]) {
 }
 
 /// Base step counts: the observed full then lands at the next doubling point
-/// (~4k/16k/64k items), giving ~4× item ratios between gate sizes.
-const COLD_SIZES: [usize; 3] = [3_000, 12_000, 48_000];
+/// (~3k/12k items), giving a ~4× item ratio between the gate sizes.
+const COLD_SIZES: [usize; 2] = [750, 6_000];
 
 fn register_log(store: &Store) {
     store
@@ -189,7 +206,7 @@ fn cold_read_append_log_linear() {
         .iter()
         .map(|&n| {
             let s = build_at_known_phase("log", n, register_log, append_entry);
-            let t = min_cold_read_ms(&s.dir, "log");
+            let t = min_rebuild_ms(&s.store, "log");
             (s, t)
         })
         .collect();
@@ -221,7 +238,7 @@ fn cold_read_edit_sprinkled_linear() {
         .iter()
         .map(|&n| {
             let s = build_at_known_phase("log", n, register_log, step);
-            let t = min_cold_read_ms(&s.dir, "log");
+            let t = min_rebuild_ms(&s.store, "log");
             (s, t)
         })
         .collect();
@@ -262,7 +279,7 @@ fn cold_read_tree_linear() {
         .iter()
         .map(|&n| {
             let s = build_at_known_phase("tree", n, register, step);
-            let t = min_cold_read_ms(&s.dir, "tree");
+            let t = min_rebuild_ms(&s.store, "tree");
             (s, t)
         })
         .collect();

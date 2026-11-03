@@ -144,8 +144,6 @@ pub enum ErrorCode {
     SubscriptionDisconnected,
     /// A tree operation other than set or remove, or a set without an entry.
     InvalidTreeOp,
-    /// A limit that isn't a non-negative integer.
-    InvalidLimit,
     /// A field index kind other than number or string.
     InvalidFieldIndexKind,
 }
@@ -183,7 +181,6 @@ impl ErrorCode {
             ErrorCode::SubscriptionNotFound => "SubscriptionNotFound",
             ErrorCode::SubscriptionDisconnected => "SubscriptionDisconnected",
             ErrorCode::InvalidTreeOp => "InvalidTreeOp",
-            ErrorCode::InvalidLimit => "InvalidLimit",
             ErrorCode::InvalidFieldIndexKind => "InvalidFieldIndexKind",
         }
     }
@@ -307,7 +304,6 @@ mod tests {
                 "SubscriptionDisconnected",
             ),
             (ErrorCode::InvalidTreeOp, "InvalidTreeOp"),
-            (ErrorCode::InvalidLimit, "InvalidLimit"),
             (ErrorCode::InvalidFieldIndexKind, "InvalidFieldIndexKind"),
         ];
         for (code, name) in cases {
