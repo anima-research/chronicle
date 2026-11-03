@@ -45,3 +45,8 @@
   `MANIFEST` and opens on every earlier release, as before, and existing
   stores open on this one unchanged. The record framing and the encodings of
   `state.bin`, `branches.bin` and `state-indexes.bin` are unchanged.
+- **Rust embedders:** `StateOperation` has a new variant, `AppendMany`, for
+  several items appended to an append-log state as one record (see Added).
+  An exhaustive `match` on `StateOperation`, including one on the
+  `operation` of a `StoreEvent::StateDelta`, needs an arm for it, even in a
+  host that never writes a batch.
