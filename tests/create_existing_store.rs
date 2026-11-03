@@ -373,6 +373,64 @@ fn open_or_create_on_a_directory_it_cant_list_returns_the_listing_error() {
 }
 
 #[test]
+fn create_on_a_manifest_that_isnt_a_stores_says_what_is_wrong_and_keeps_it() {
+    for (name, bytes) in [
+        ("empty", &b""[..]),
+        ("foreign", &b"hello world"[..]),
+        ("cut short", &b"RST"[..]),
+        ("unknown version", &b"RST\0\x09"[..]),
+        ("features cut short", &b"RST\0\x02\x01"[..]),
+        ("unknown features", &b"RST\0\x02\0\0\0\0\0\0\0\x80"[..]),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        fs::create_dir(&path).unwrap();
+        let manifest = path.join("MANIFEST");
+        fs::write(&manifest, bytes).unwrap();
+
+        let msg = invalid_operation(Store::create(config(&path)));
+        assert!(
+            msg.contains(&*manifest.to_string_lossy()) && msg.contains("won't write over it"),
+            "{name}: {msg}"
+        );
+        assert!(
+            !msg.contains("already holds") && !msg.contains("open_or_create") && !msg.contains("openOrCreate"),
+            "{name}: it doesn't send the caller to calls that fail on this MANIFEST: {msg}"
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), bytes, "{name}: MANIFEST is untouched");
+    }
+}
+
+/// A MANIFEST that isn't a regular file is refused without being opened:
+/// opening a FIFO for reading waits for a writer.
+#[cfg(unix)]
+#[test]
+fn create_on_a_manifest_that_isnt_a_regular_file_refuses_without_hanging() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    let manifest = path.join("MANIFEST");
+    let c_path = std::ffi::CString::new(manifest.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+    let (done, result) = std::sync::mpsc::channel();
+    let store_config = config(&path);
+    std::thread::spawn(move || {
+        let _ = done.send(Store::create(store_config).map(drop));
+    });
+    match result.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Err(StoreError::InvalidOperation(msg))) => assert!(
+            msg.contains(&*manifest.to_string_lossy())
+                && msg.contains("isn't a regular file")
+                && msg.contains("won't write over it"),
+            "{msg}"
+        ),
+        Ok(other) => panic!("{other:?}"),
+        Err(_) => panic!("create on a FIFO MANIFEST didn't return within 10 s"),
+    }
+}
+
+#[test]
 fn create_names_open_or_create_in_both_apis() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");

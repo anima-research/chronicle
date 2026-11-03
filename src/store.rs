@@ -246,7 +246,11 @@ impl Store {
     /// Refuses a directory that already holds a store: creating over one
     /// used to keep its records but publish empty state and branch indexes
     /// over its own at the first sync (#34). Use [`Store::open`] or
-    /// [`Store::open_or_create`] for a store that may exist.
+    /// [`Store::open_or_create`] for a store that may exist. A `MANIFEST`
+    /// that open can't read (empty, cut short, another file's bytes, a
+    /// version or format features this build doesn't know) is refused too,
+    /// with what is wrong with it, and isn't written over; so is one that
+    /// isn't a regular file, which create doesn't open.
     ///
     /// It never writes a MANIFEST over a store's own, so it can't drop the
     /// format features a version 2 MANIFEST names. A create that did, even
@@ -270,10 +274,27 @@ impl Store {
                     Self::link_to_nothing(&manifest)
                 )
             } else if found == "MANIFEST" {
-                format!(
-                    "create: {} already holds a Chronicle store; open it with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
-                    config.path.display()
-                )
+                // Only a regular file is read: opening a FIFO waits for a
+                // writer.
+                let checked = match fs::metadata(&manifest) {
+                    Ok(metadata) if !metadata.is_file() => Err("it isn't a regular file".to_string()),
+                    _ => Self::verify_manifest(&config.path).map(drop).map_err(|error| match error {
+                        StoreError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            "it ends before a MANIFEST's header does".to_string()
+                        }
+                        other => other.to_string(),
+                    }),
+                };
+                match checked {
+                    Ok(()) => format!(
+                        "create: {} already holds a Chronicle store; open it with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
+                        config.path.display()
+                    ),
+                    Err(problem) => format!(
+                        "create: {} can't be read as a Chronicle store's MANIFEST: {problem}; create won't write over it",
+                        manifest.display(),
+                    ),
+                }
             } else {
                 format!(
                     "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over",
