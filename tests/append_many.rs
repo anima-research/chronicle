@@ -481,15 +481,29 @@ fn the_first_batch_marks_the_manifest_so_older_builds_refuse_the_store() {
             "an older build refuses the store at open"
         );
 
-        // Later batches find the flag already set.
-        let modified = std::fs::metadata(dir.path().join("MANIFEST")).unwrap().modified().unwrap();
+        // Later batches find the flag already set. The MANIFEST's time is
+        // set far in the past first, so a rewrite shows whatever the
+        // filesystem's timestamp resolution, and a replacement through a
+        // new file shows on Unix as a new inode.
+        let manifest_path = dir.path().join("MANIFEST");
+        let long_ago = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let before = std::fs::metadata(&manifest_path).unwrap();
+        assert_eq!(before.modified().unwrap(), long_ago);
         store.update_state("log", batch(&[json!(3)])).unwrap();
         assert_eq!(manifest(dir.path()), marked);
-        assert_eq!(
-            std::fs::metadata(dir.path().join("MANIFEST")).unwrap().modified().unwrap(),
-            modified,
-            "the manifest is written once"
-        );
+        let after = std::fs::metadata(&manifest_path).unwrap();
+        assert_eq!(after.modified().unwrap(), long_ago, "the manifest is written once");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(after.ino(), before.ino(), "the manifest is not replaced");
+        }
     }
 
     // This build opens it and keeps writing to it.
@@ -522,8 +536,11 @@ fn a_manifest_with_an_unknown_feature_is_refused() {
     assert!(matches!(Store::open(config(dir.path())), Err(StoreError::InvalidFormat(_))));
 }
 
-/// The flag reaches the disk before the record does: when the manifest
-/// can't be replaced, the batch fails and nothing is recorded.
+/// The flag is in place before the record is written, and on disk before it
+/// too where the store directory can be synced (not where this process may
+/// not open it, nor where the system doesn't sync directories, nor on
+/// Windows): when the manifest can't be replaced, the batch fails and
+/// nothing is recorded.
 #[cfg(unix)]
 #[test]
 fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
@@ -999,8 +1016,10 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
 
 /// An identity batch with an item that isn't a JSON object is refused
 /// whole, as an empty one is, and nothing is recorded: no record, no
-/// sequence, no items, and no MANIFEST mark, since the refusal comes before
-/// the mark. So an older build refuses a store only once it holds a batch.
+/// sequence, no items, and no MANIFEST mark. The refusal comes before the
+/// mark, so a refused batch leaves the store as every release opens it. (A
+/// batch that passes and then fails to be written still leaves the mark;
+/// see `update_state`.)
 #[test]
 fn an_identity_batch_that_is_refused_writes_nothing() {
     let dir = TempDir::new().unwrap();

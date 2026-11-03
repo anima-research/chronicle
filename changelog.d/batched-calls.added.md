@@ -4,13 +4,22 @@
     append-log state as one record, at one sequence (an `AppendMany`), and
     returns `{ record, firstOrdinal }`: the record, and the index the first
     item took, so item `i` is at `firstOrdinal + i` without a read. That
-    index is the state's length just before the batch, read under the write
-    lock. Reads see the items as if each were appended with
-    `appendToStateJson`, except that a historical read or a branch cut by
-    sequence keeps or drops the batch whole, as it has one sequence. An
-    empty `items` throws and writes nothing. The
-    first batch a store records moves its `MANIFEST` to version 2 (see
-    Breaking).
+    index is the state's length just before the batch as `getStateLen`
+    counts it, read under the write lock. Reads see the items as if each
+    were appended with `appendToStateJson`, except that a historical read or
+    a branch cut by sequence keeps or drops the batch whole, as it has one
+    sequence. An empty `items` throws and writes nothing. The first batch a
+    store records moves its `MANIFEST` to version 2 (see Breaking).
+    **Migration:** a store last written by chronicle 0.1.0 to 0.4.x can hold
+    an append-log state whose stored count is wrong (see 0.5.0's Fixed): one
+    whose chain holds, from those builds, a `Redact` running past the end, a
+    `Delta` that replaced the value, or an empty `Set` or `Delta`. Such a
+    count stays as it is until a full snapshot, or an array or empty
+    `setState`, sets it again. For each state the store already held when
+    it was opened, this release recounts the items at the state's first
+    batch on each branch, so that batch's `firstOrdinal` is the length of
+    the state's array. `compactState` before the batch takes a full
+    snapshot, which recounts them too.
   - `getStateItemsJson(stateId, ordinals)` returns, for each index in the
     order given, what `getStateItemJson` returns for it: `null` for an
     index that is negative or out of range, for a state with no value, and

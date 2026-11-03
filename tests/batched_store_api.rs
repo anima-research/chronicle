@@ -5,8 +5,18 @@
 //!
 //! Each batched call must answer what the single calls it stands for would:
 //! the batch's items sit at the ordinals it reports, a batched item read
-//! returns the bytes `get_state_item` returns for each ordinal, and a
+//! returns the item `get_state_item` returns for each ordinal, and a
 //! batched record read returns what `get_record` returns for each ID.
+//!
+//! An item read returns the same bytes as `get_state_item` for an item
+//! written in serde_json's own spelling. One written in another spelling
+//! comes back as the path serving the read gives it, as written from the
+//! head record or re-serialized from a materialization or the warm cache,
+//! so its spelling depends on what is cached, as `get_state_item`'s does.
+//! A batched read takes the head record only when every ordinal it asks
+//! for is the last one, so on a cold cache the last item asked for with
+//! another comes back re-serialized where `get_state_item` alone returns
+//! it as written. The tests here write items in serde_json's spelling.
 
 use chronicle::{
     BranchId, RecordId, RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy,
@@ -215,6 +225,12 @@ fn an_empty_batch_is_refused_and_writes_nothing() {
 /// the count is read under the same lock as the write, so no other batch or
 /// single append can land between them.
 ///
+/// The test is probabilistic. The writers wait on a barrier and then each
+/// writes many times, so on most runs their writes interleave, and a count
+/// read outside the write lock would then give two batches one ordinal. A
+/// scheduler that still ran them one after another would let such an
+/// implementation pass that run.
+///
 /// The cadence is set past the workload so that no automatic snapshot is
 /// written. An automatic snapshot reads the state after the write lock is
 /// released, and with several threads writing one state a write can land
@@ -223,16 +239,23 @@ fn an_empty_batch_is_refused_and_writes_nothing() {
 /// batches, and it is outside what this test checks.
 #[test]
 fn racing_batches_report_the_ordinals_their_items_took() {
+    const BATCHERS: u64 = 4;
+    const BATCHES: u64 = 100;
+    const SINGLES: u64 = 150;
     let dir = TempDir::new().unwrap();
     let store = Arc::new(Store::create(config(dir.path())).unwrap());
+    // BATCHERS * BATCHES + SINGLES operations, short of the cadence.
     register(&store, "log", 1000, 1000);
+    let start = Arc::new(std::sync::Barrier::new(BATCHERS as usize + 1));
 
-    let batchers: Vec<_> = (0..4u64)
+    let batchers: Vec<_> = (0..BATCHERS)
         .map(|t| {
             let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
+                start.wait();
                 let mut written = Vec::new();
-                for i in 0..20u64 {
+                for i in 0..BATCHES {
                     let items: Vec<Value> = (0..=(i % 4))
                         .map(|k| json!({ "t": t, "i": i, "k": k }))
                         .collect();
@@ -245,8 +268,10 @@ fn racing_batches_report_the_ordinals_their_items_took() {
         .collect();
     let single = {
         let store = Arc::clone(&store);
+        let start = Arc::clone(&start);
         std::thread::spawn(move || {
-            for i in 0..30u64 {
+            start.wait();
+            for i in 0..SINGLES {
                 append(&store, "log", &json!({ "single": i }));
             }
         })
@@ -267,7 +292,7 @@ fn racing_batches_report_the_ordinals_their_items_took() {
     }
     assert_eq!(
         taken.iter().filter(|t| !**t).count(),
-        30,
+        SINGLES as usize,
         "only the single appends are left"
     );
 }
@@ -576,10 +601,22 @@ fn a_state_whose_value_is_not_an_array_has_no_items() {
             for &i in &ordinals {
                 assert_eq!(store.get_state_item(id, i).unwrap(), None, "{id}[{i}]");
             }
+            // The single reads warmed the state, so the cold batched read
+            // starts from nothing again and materializes it once; the warm
+            // one reads it from the cache.
+            if cold {
+                store.clear_state_caches();
+            }
+            let before = store.state_reconstruction_count();
             assert_eq!(
                 store.get_state_items_by_ordinal(id, &ordinals).unwrap(),
                 vec![None; ordinals.len()],
                 "{id}, cold: {cold}"
+            );
+            assert_eq!(
+                store.state_reconstruction_count(),
+                before + u64::from(cold),
+                "{id}, cold: {cold}: materializations"
             );
             assert!(store
                 .get_state_items_by_ordinal(id, &[])

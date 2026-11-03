@@ -3,4 +3,6 @@
   array, such as a Snapshot state holding an object, as they do for an
   index out of range. They threw the deserialization error (`invalid type:
   map, expected a sequence`). `getStateSlice` and `Store::get_state_slice(_on)`
-  still throw for such a state.
+  still throw for such a state. A state whose bytes aren't JSON at all,
+  such as `{`, still throws its deserialization error from these lookups,
+  and from `getStateItemsJson` too.

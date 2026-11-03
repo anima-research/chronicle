@@ -28,11 +28,28 @@
   version 2 store rewrote its `MANIFEST` to version 1, even when it then
   failed because the store was open, and an earlier release's `create`
   still does.
-  **Who needs to act:** anyone who may roll a host back to an earlier
-  chronicle after the host has written a batch, from Rust or with the Node
-  API's `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`.
-  context-manager's presentation index is meant to be its first writer. A
-  host rolled back must not call `create` on a store it means to open.
+  **Who needs to act:**
+  - **Hosts that may be rolled back:** anyone who may roll a host back to an
+    earlier chronicle after the host has written a batch, from Rust or with
+    the Node API's `appendManyToStateJson` or
+    `appendManyToStateJsonWithIdentity`. context-manager's presentation
+    index is meant to be its first writer. A host rolled back must not call
+    `create` on a store it means to open. Where the store directory isn't
+    synced (this process may not open it, the system doesn't sync
+    directories, or the host runs Windows, where chronicle syncs none), a
+    power loss can undo the `MANIFEST`'s move to version 2 and keep the
+    batch's record, as it can undo a checkpoint save; an earlier release
+    then meets the batch in a store without the mark, as described above.
+  - **State-delta subscribers:** a batch reaches a subscription as one
+    `state_delta` event, whose `operation` is an `AppendMany` holding all of
+    its items (see Added). A subscriber that keeps its own copy of an
+    append-log state from `Append` events must take each item of an
+    `AppendMany` too, in order, as if each were an `Append`, or it misses
+    every item a batch writes. That holds for a subscriber that never calls
+    the batch APIs itself, once any writer to the store does. chronicle's
+    dev UI was one: its append-log viewer took only `Append`, and in this
+    release it takes the items of an `AppendMany` as well.
+
   **Migration:** none going forward. Going back, there is none for a store
   that holds a batch: keep a copy of the store from before the upgrade if a
   rollback must stay possible. A first batch whose rewritten `MANIFEST` is in
@@ -45,3 +62,8 @@
   `MANIFEST` and opens on every earlier release, as before, and existing
   stores open on this one unchanged. The record framing and the encodings of
   `state.bin`, `branches.bin` and `state-indexes.bin` are unchanged.
+- **Rust embedders:** `StateOperation` has a new variant, `AppendMany`, for
+  several items appended to an append-log state as one record (see Added).
+  An exhaustive `match` on `StateOperation`, including one on the
+  `operation` of a `StoreEvent::StateDelta`, needs an arm for it, even in a
+  host that never writes a batch.
