@@ -273,7 +273,11 @@ fn a_store_file_left_as_a_link_to_nothing_is_refused_and_nothing_is_written_thro
         let msg = invalid_operation(Store::create(config(&path)));
         assert!(msg.contains(&*path.to_string_lossy()), "{file}: {msg}");
         assert!(
-            file != "MANIFEST" || (msg.contains("leads to nothing") && !msg.contains("already holds")),
+            file != "MANIFEST"
+                || (msg.contains("leads to nothing")
+                    && !msg.contains("already holds")
+                    && msg.contains("Store::open_or_create")
+                    && msg.contains("openOrCreate")),
             "{file}: {msg}"
         );
         assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: nothing was written through the link");
@@ -366,4 +370,17 @@ fn open_or_create_on_a_directory_it_cant_list_returns_the_listing_error() {
         let left: Vec<_> = fs::read_dir(&path).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["notes.txt"], "{create_if_missing}: nothing was written there");
     }
+}
+
+#[test]
+fn create_names_open_or_create_in_both_apis() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(
+        msg.contains("Store::open_or_create") && msg.contains("openOrCreate"),
+        "{msg}"
+    );
 }

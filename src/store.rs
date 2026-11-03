@@ -266,12 +266,12 @@ impl Store {
                 && matches!(fs::metadata(&manifest), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             {
                 format!(
-                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with open or open_or_create",
+                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
                     Self::link_to_nothing(&manifest)
                 )
             } else if found == "MANIFEST" {
                 format!(
-                    "create: {} already holds a Chronicle store; open it with open or open_or_create",
+                    "create: {} already holds a Chronicle store; open it with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
                     config.path.display()
                 )
             } else {
