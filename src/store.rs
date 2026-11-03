@@ -7,10 +7,11 @@ use crate::records::{RecordIndex, RecordLog, RecoveryReport};
 use crate::state::{StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
-    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence,
+    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence, SnapshotFailure,
     StateOperation, StateRegistration, StateUpdateRecord, StoreStats, Timestamp,
     TreeChange, TreeEntry, TreeOp, TreeState,
 };
+use std::collections::BTreeMap;
 use fs2::FileExt;
 use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
@@ -48,11 +49,22 @@ impl Default for StoreConfig {
 pub struct AppendedBatch {
     /// The one record that holds the whole batch, at one sequence.
     pub record: Record,
-    /// The ordinal the batch's first item took: the state's length on the
-    /// branch, as `get_state_len` counts it, just before the batch, read
-    /// under the same lock as the write. Item `i` of the batch is at
-    /// `first_ordinal + i`, so a caller has every item's ordinal without a
-    /// read.
+    /// The ordinal the batch's first item took: the number of items the
+    /// state held on the branch just before the batch, read under the same
+    /// lock as the write. Item `i` of the batch is at `first_ordinal + i`, so
+    /// a caller has every item's ordinal without a read.
+    ///
+    /// Where this session hasn't kept the state's count on the branch itself
+    /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
+    /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
+    /// array), the batch first counts
+    /// the state's items, reading its whole value once, and the head keeps
+    /// that count, which `get_state_len` then reports: a count a release
+    /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
+    /// A value that doesn't materialize as a JSON array has no items to
+    /// count, and this is then the count `get_state_len` reports. An error
+    /// reading the log for the count is returned, and the batch isn't
+    /// recorded.
     pub first_ordinal: usize,
 }
 
@@ -161,6 +173,10 @@ pub struct Store {
 
     /// What `open` had to recover, for [`Store::recovery`].
     recovery: Option<RecoveryReport>,
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, per branch, for [`Store::snapshot_failures`].
+    snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotFailure>>>,
 }
 
 impl Store {
@@ -177,32 +193,80 @@ impl Store {
     /// leaves when it stops before its manifest, and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
-    /// isn't taken for a place to put a store.
+    /// isn't taken for a place to put a store. A directory whose entries
+    /// can't be listed, as one this process may write and search but not
+    /// read, fails with the listing's I/O error, naming it, whatever
+    /// `create_if_missing` says.
+    ///
+    /// The directory is looked at before create takes the store's lock, so
+    /// another create can finish in between. Create then finds the
+    /// `MANIFEST` that create wrote and refuses the directory, and this
+    /// opens the store there instead, as if it had been there to begin with.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
         if Self::present_store_file(&config.path)?.is_some() {
             return Self::open(config);
         }
-        if let Some(other) = Self::foreign_entry(&config.path) {
+        if let Some(other) = Self::foreign_entry(&config.path)? {
             return Err(StoreError::InvalidFormat(format!(
                 "{} has no MANIFEST and holds {other}, so it isn't a Chronicle store or an empty place for one",
                 config.path.display()
             )));
         }
         if config.create_if_missing {
-            Self::create(config)
+            let created = Self::create(config.clone());
+            Self::open_if_another_created(config, created)
         } else {
             Err(StoreError::NotInitialized)
         }
     }
 
-    fn foreign_entry(path: &Path) -> Option<String> {
+    /// What `open_or_create` returns once its `create` has run. A create
+    /// refused with `InvalidOperation` where the directory now holds a
+    /// `MANIFEST` lost to another create that finished after
+    /// `open_or_create` looked, and the store that one made is opened (with
+    /// open's account of a `MANIFEST` it can't read). Any other result is
+    /// returned as it is.
+    fn open_if_another_created(config: StoreConfig, created: Result<Self>) -> Result<Self> {
+        match created {
+            Err(StoreError::InvalidOperation(_))
+                if matches!(Self::present_store_file(&config.path), Ok(Some("MANIFEST"))) =>
+            {
+                Self::open(config)
+            }
+            other => other,
+        }
+    }
+
+    /// The first entry of `path` a new store can't sit beside, if any; none
+    /// for a missing directory. An error listing the directory is returned,
+    /// naming it: a directory whose entries can't be read can't be told
+    /// empty.
+    fn foreign_entry(path: &Path) -> std::io::Result<Option<String>> {
         let allowed = |name: &str| {
             ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
-        fs::read_dir(path).ok()?.flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .find(|name| !allowed(name))
+        let listing_error = |error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot list {} to tell whether a new store can go there: {error}",
+                    path.display()
+                ),
+            )
+        };
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(listing_error(error)),
+        };
+        for entry in entries {
+            let name = entry.map_err(listing_error)?.file_name().to_string_lossy().into_owned();
+            if !allowed(&name) {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
     }
 
     /// Create a new store.
@@ -210,7 +274,11 @@ impl Store {
     /// Refuses a directory that already holds a store: creating over one
     /// used to keep its records but publish empty state and branch indexes
     /// over its own at the first sync (#34). Use [`Store::open`] or
-    /// [`Store::open_or_create`] for a store that may exist.
+    /// [`Store::open_or_create`] for a store that may exist. A `MANIFEST`
+    /// that open can't read (empty, cut short, another file's bytes, a
+    /// version or format features this build doesn't know) is refused too,
+    /// with what is wrong with it, and isn't written over; so is one that
+    /// isn't a regular file, which create doesn't open.
     ///
     /// It never writes a MANIFEST over a store's own, so it can't drop the
     /// format features a version 2 MANIFEST names. A create that did, even
@@ -230,14 +298,31 @@ impl Store {
                 && matches!(fs::metadata(&manifest), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             {
                 format!(
-                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with open or open_or_create",
+                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
                     Self::link_to_nothing(&manifest)
                 )
             } else if found == "MANIFEST" {
-                format!(
-                    "create: {} already holds a Chronicle store; open it with open or open_or_create",
-                    config.path.display()
-                )
+                // Only a regular file is read: opening a FIFO waits for a
+                // writer.
+                let checked = match fs::metadata(&manifest) {
+                    Ok(metadata) if !metadata.is_file() => Err("it isn't a regular file".to_string()),
+                    _ => Self::verify_manifest(&config.path).map(drop).map_err(|error| match error {
+                        StoreError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            "it ends before a MANIFEST's header does".to_string()
+                        }
+                        other => other.to_string(),
+                    }),
+                };
+                match checked {
+                    Ok(()) => format!(
+                        "create: {} already holds a Chronicle store; open it with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
+                        config.path.display()
+                    ),
+                    Err(problem) => format!(
+                        "create: {} can't be read as a Chronicle store's MANIFEST: {problem}; create won't write over it",
+                        manifest.display(),
+                    ),
+                }
             } else {
                 format!(
                     "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over",
@@ -280,6 +365,7 @@ impl Store {
             write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery: None,
+            snapshot_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -291,6 +377,25 @@ impl Store {
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
         let mut features = Self::verify_manifest(&config.path)?;
+
+        // A MANIFEST naming format features was renamed into place by a
+        // batch's mark, and a failed directory sync after that rename left
+        // the rename in the system's cache only: this open reads version 2
+        // from there, and a power loss could still bring back version 1
+        // under a log that holds a batch. Syncing the directory before
+        // anything is written makes the rename durable, or fails the open.
+        #[cfg(unix)]
+        if features != 0 {
+            crate::atomic_file::sync_directory_at(&config.path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "open: syncing {}, whose MANIFEST names format features, failed: {error}",
+                        config.path.display()
+                    ),
+                )
+            })?;
+        }
 
         // With the lock held, no save of this store is in progress, so its
         // own staging files here were left by interrupted saves. The sweep's
@@ -494,6 +599,7 @@ impl Store {
             }),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery,
+            snapshot_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -512,6 +618,71 @@ impl Store {
     /// `tracing` warnings out of logs.
     pub fn recovery(&self) -> Option<RecoveryReport> {
         self.recovery.clone()
+    }
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, one entry per branch and state, ordered by branch id
+    /// and then state id; empty when none has.
+    ///
+    /// A write that reaches a state's snapshot thresholds takes the snapshot
+    /// after its record, and that snapshot's failure doesn't fail the write
+    /// (see [`Store::update_state`]). Each such failure is logged as a
+    /// `tracing` warning and counted here, with the sequence of the write
+    /// and the error, so a process that shows no `tracing` output, such as a
+    /// Node one, can see it. An entry goes once a snapshot of the state on
+    /// that branch is recorded (by a later write, `compact_state`,
+    /// `create_snapshot_if_needed`, or a snapshot the caller writes), or a
+    /// write finds none due. A snapshot asked for directly, which returns
+    /// its own error, isn't counted. Entries are kept in memory only: a
+    /// reopened store lists none until a write's snapshot fails again. A
+    /// deleted branch's entries aren't listed.
+    pub fn snapshot_failures(&self) -> Vec<SnapshotFailure> {
+        self.snapshot_failures
+            .lock()
+            .iter()
+            .filter(|(branch_id, _)| self.branches.get_branch_by_id(**branch_id).is_some())
+            .flat_map(|(_, states)| states.values().cloned())
+            .collect()
+    }
+
+    /// Count a failed snapshot after the write at `sequence` to `state_id`
+    /// on `branch`, for `snapshot_failures`.
+    fn note_snapshot_failure(&self, branch: &Branch, state_id: &str, sequence: Sequence, error: &StoreError) {
+        let mut failures = self.snapshot_failures.lock();
+        let states = failures.entry(branch.id).or_default();
+        match states.get_mut(state_id) {
+            Some(failure) => {
+                failure.failures += 1;
+                failure.branch = branch.name.clone();
+                failure.sequence = sequence;
+                failure.error = error.to_string();
+            }
+            None => {
+                states.insert(
+                    state_id.to_string(),
+                    SnapshotFailure {
+                        state_id: state_id.to_string(),
+                        branch_id: branch.id,
+                        branch: branch.name.clone(),
+                        failures: 1,
+                        sequence,
+                        error: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Drop the failure `snapshot_failures` holds for `state_id` on
+    /// `branch_id`, if any: a snapshot of it was recorded, or none is due.
+    fn clear_snapshot_failure(&self, branch_id: BranchId, state_id: &str) {
+        let mut failures = self.snapshot_failures.lock();
+        if let Some(states) = failures.get_mut(&branch_id) {
+            states.remove(state_id);
+            if states.is_empty() {
+                failures.remove(&branch_id);
+            }
+        }
     }
 
     /// Toggle the auto-snapshot pass inside `update_state`.
@@ -815,7 +986,10 @@ impl Store {
     /// store never asked to record one keeps version 1, which every release
     /// opens. If that rewrite fails, the error is returned and the batch isn't
     /// recorded; when only the directory sync after its rename failed, the
-    /// MANIFEST is already at version 2. If the record then fails to be
+    /// MANIFEST is already at version 2, and the next batch makes the rewrite
+    /// again. On Unix, an open that finds a version 2 MANIFEST syncs the
+    /// store's directory before it writes anything, and fails if that sync
+    /// fails. If the record then fails to be
     /// written, the error is returned and the store stays at version 2 with
     /// no batch.
     ///
@@ -824,12 +998,13 @@ impl Store {
     /// (unless `set_auto_snapshot(false)`). A recorded write never returns
     /// an error from that snapshot (issue #39). If the snapshot fails, on a
     /// full disk, say, or because it materializes an item that doesn't
-    /// parse, the failure is logged as a `tracing` warning and the write
-    /// returns its record. The snapshot stays due, so the next write to the
-    /// state on that branch tries it again. A state whose snapshot keeps
-    /// failing, such as one holding an Append that isn't JSON, logs a
-    /// warning at each write that finds a snapshot due, and takes none
-    /// until a `Set` replaces its value.
+    /// parse, the failure is logged as a `tracing` warning and counted in
+    /// [`Store::snapshot_failures`], and the write returns its record. The
+    /// snapshot stays due, so the next write to the state on that branch
+    /// tries it again. A state whose snapshot keeps failing, such as one
+    /// holding an Append that isn't JSON, logs a warning at each write that
+    /// finds a snapshot due, each counted there too, and takes none until a
+    /// `Set` replaces its value.
     pub fn update_state(
         &self,
         state_id: &str,
@@ -885,8 +1060,8 @@ impl Store {
     /// An `item` that isn't a JSON object is refused with `InvalidOperation`
     /// and writes nothing. Once the item is recorded, the call returns its
     /// record: if the snapshot the write takes after it fails, that is
-    /// logged and the next write tries it again, as for `update_state`
-    /// (issue #39).
+    /// logged and counted in `snapshot_failures`, and the next write tries
+    /// it again, as for `update_state` (issue #39).
     pub fn append_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -931,8 +1106,9 @@ impl Store {
     /// `update_state`). Each item must be one JSON value, as for an
     /// `Append`. An empty batch is refused with `InvalidOperation` and
     /// writes nothing. Once the batch is recorded, the call returns it: if
-    /// the snapshot the write takes after it fails, that is logged and the
-    /// next write tries it again, as for `update_state` (issue #39).
+    /// the snapshot the write takes after it fails, that is logged and
+    /// counted in `snapshot_failures`, and the next write tries it again, as
+    /// for `update_state` (issue #39).
     pub fn append_many_to_state(
         &self,
         state_id: &str,
@@ -1000,10 +1176,12 @@ impl Store {
     /// release opens.
     ///
     /// Refused with `InvalidOperation`, writing nothing, when `items` is
-    /// empty or any item isn't a JSON object. Once the batch is recorded,
+    /// empty, any item isn't a JSON object, or `id_field` and
+    /// `sequence_field` are the same key, where an item couldn't hold both
+    /// the record id and the sequence. Once the batch is recorded,
     /// the call returns it: if the snapshot the write takes after it fails,
-    /// that is logged and the next write tries it again, as for
-    /// `update_state` (issue #39).
+    /// that is logged and counted in `snapshot_failures`, and the next write
+    /// tries it again, as for `update_state` (issue #39).
     pub fn append_many_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -1029,6 +1207,12 @@ impl Store {
         id_field: &str,
         sequence_field: &str,
     ) -> Result<AppendedBatch> {
+        if id_field == sequence_field {
+            return Err(StoreError::InvalidOperation(format!(
+                "the id field and the sequence field are both \"{id_field}\": an item holds one \
+                 value at a key, so it can't carry both the record id and the sequence there"
+            )));
+        }
         self.append_batch_with_builder(branch_id, state_id, |id, seq| {
             if let Some(at) = items.iter().position(|item| !item.is_object()) {
                 return Err(StoreError::InvalidOperation(format!(
@@ -1060,12 +1244,12 @@ impl Store {
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
             // The builder runs under `write_lock`, so no other write to this
-            // state can land between this count and the batch.
-            first_ordinal = self
-                .state
-                .get_head(branch_id, state_id)
-                .map(|h| h.item_count)
-                .unwrap_or(0);
+            // state can land between this count and the batch. A head this
+            // session hasn't checked has its items counted first, unless the
+            // batch is empty, which is refused before it's written.
+            if !items.is_empty() {
+                first_ordinal = self.state.checked_item_count(branch_id, state_id)?;
+            }
             Ok(StateOperation::AppendMany(items))
         })?;
         Ok(AppendedBatch {
@@ -1223,6 +1407,17 @@ impl Store {
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
 
+        // A snapshot record, whoever wrote it, ends any snapshot failure on
+        // record for the state on this branch.
+        if matches!(
+            operation,
+            StateOperation::Snapshot(_)
+                | StateOperation::DeltaSnapshot(_)
+                | StateOperation::TreeDeltaSnapshot(_)
+        ) {
+            self.clear_snapshot_failure(branch.id, state_id);
+        }
+
         // Broadcast state delta to subscribers
         self.subscriptions.broadcast_state_delta(state_id, operation, next_seq);
         self.subscriptions.broadcast_branch_head(&branch.name, next_seq);
@@ -1241,16 +1436,22 @@ impl Store {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(write);
             // Same branch as the write above — never the cursor, which may
-            // point elsewhere (or have moved) by now.
-            if let Err(error) = self.auto_snapshot_if_needed(branch.id, state_id) {
-                tracing::warn!(
-                    %error,
-                    state_id,
-                    branch = %branch.name,
-                    sequence = next_seq.0,
-                    "the snapshot after a recorded state write failed: the write stands and \
-                     returns its record, and the next write to the state tries the snapshot again"
-                );
+            // point elsewhere (or have moved) by now. Besides the warning, the
+            // failure is counted for `snapshot_failures`, as a Node process
+            // shows no `tracing` output.
+            match self.auto_snapshot_if_needed(branch.id, state_id) {
+                Ok(()) => self.clear_snapshot_failure(branch.id, state_id),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        state_id,
+                        branch = %branch.name,
+                        sequence = next_seq.0,
+                        "the snapshot after a recorded state write failed: the write stands and \
+                         returns its record, and the next write to the state tries the snapshot again"
+                    );
+                    self.note_snapshot_failure(&branch, state_id, next_seq, &error);
+                }
             }
         }
 
@@ -1629,6 +1830,8 @@ impl Store {
     /// O(item size) once the per-item cache is warm (see `get_state_slice`).
     /// Returns `None` if the state doesn't exist, the index is out of range,
     /// or the state's value isn't an array (where `get_state_slice` errors).
+    /// Returns `StoreError::Deserialization` if the state's bytes aren't one
+    /// JSON value, as `get_state_slice` does.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -1650,7 +1853,9 @@ impl Store {
     /// Several items of an AppendLog state by ordinal, as raw JSON bytes, in
     /// one call: for each ordinal, in the order given, the item
     /// `get_state_item` returns for it, `None` where the ordinal is out of
-    /// range, the state has no value, or its value isn't an array. Ordinals
+    /// range, the state has no value, or its value isn't an array; the
+    /// `Deserialization` error where the state's bytes aren't one JSON value,
+    /// as for `get_state_item`. Ordinals
     /// may repeat and come in any order. All of them are answered from one
     /// version of the state, read at most once, and an empty request reads
     /// nothing (see `StateManager::get_state_items_by_ordinal`).
@@ -3290,11 +3495,8 @@ impl Store {
             STORE_VERSION => Ok(0),
             STORE_VERSION_FEATURES => {
                 let mut bits = [0u8; 8];
-                file.read_exact(&mut bits).map_err(|e| {
-                    StoreError::InvalidFormat(format!(
-                        "Store manifest version 2 is too short to hold its format features: {e}"
-                    ))
-                })?;
+                file.read_exact(&mut bits)
+                    .map_err(|e| Self::feature_bits_error(&manifest_path, e))?;
                 let features = u64::from_le_bytes(bits);
                 let unknown = features & !KNOWN_FEATURES;
                 if unknown != 0 {
@@ -3308,6 +3510,22 @@ impl Store {
             other => Err(StoreError::InvalidFormat(format!(
                 "Unsupported store version: {other}"
             ))),
+        }
+    }
+
+    /// The error for a failed read of a version 2 MANIFEST's feature bits.
+    /// A file that ends before them is too short, which is its format; any
+    /// other failure is the read's own I/O error, naming the file.
+    fn feature_bits_error(manifest: &Path, error: std::io::Error) -> StoreError {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            StoreError::InvalidFormat(format!(
+                "Store manifest version 2 is too short to hold its format features: {error}"
+            ))
+        } else {
+            StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("reading the format features of {}: {error}", manifest.display()),
+            ))
         }
     }
 
@@ -3903,6 +4121,77 @@ mod tests {
                 StoreError::Io(e) => assert_eq!(e.raw_os_error(), Some(code)),
                 other => panic!("{code}: {other:?}"),
             }
+        }
+    }
+
+    /// open_or_create looks at the directory before create takes the lock,
+    /// so another create can finish in between. Create then finds that
+    /// store's MANIFEST and refuses; open_or_create opens the store instead.
+    #[test]
+    fn open_or_create_opens_the_store_a_create_it_lost_to_made() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let winner = Store::create(config.clone()).unwrap();
+            winner
+                .register_state(StateRegistration {
+                    id: "s".into(),
+                    strategy: crate::types::StateStrategy::Snapshot,
+                    initial_value: None,
+                })
+                .unwrap();
+            winner.update_state("s", StateOperation::Set(b"1".to_vec())).unwrap();
+            winner.sync().unwrap();
+        }
+        let lost = Store::create(config.clone());
+        assert!(matches!(lost, Err(StoreError::InvalidOperation(_))));
+        let opened = Store::open_if_another_created(config.clone(), lost).unwrap();
+        assert_eq!(opened.get_state("s").unwrap().unwrap(), b"1");
+        drop(opened);
+
+        // A store another process holds open stays its own: Locked comes
+        // back as it is.
+        let held = Store::open(config.clone()).unwrap();
+        assert!(matches!(
+            Store::open_if_another_created(config.clone(), Store::create(config.clone())),
+            Err(StoreError::Locked)
+        ));
+        drop(held);
+
+        // A damaged store (a data file, no MANIFEST) isn't one to open: the
+        // refusal comes back as it is.
+        let damaged = TempDir::new().unwrap();
+        let damaged_config = test_config(&damaged);
+        fs::create_dir_all(&damaged_config.path).unwrap();
+        fs::write(damaged_config.path.join("records.log"), b"x").unwrap();
+        let refused = Store::create(damaged_config.clone());
+        assert!(matches!(
+            Store::open_if_another_created(damaged_config, refused),
+            Err(StoreError::InvalidOperation(message)) if message.contains("records.log")
+        ));
+    }
+
+    /// A version 2 MANIFEST that ends before its feature bits is too short;
+    /// any other failure to read them is the read's I/O error.
+    #[test]
+    fn only_a_short_manifest_is_reported_as_too_short() {
+        let manifest = Path::new("/stores/s/MANIFEST");
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer");
+        match Store::feature_bits_error(manifest, eof) {
+            StoreError::InvalidFormat(message) => assert!(message.contains("too short"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        let failed = std::io::Error::new(std::io::ErrorKind::Other, "Input/output error");
+        match Store::feature_bits_error(manifest, failed) {
+            StoreError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                let text = error.to_string();
+                assert!(
+                    text.contains("/stores/s/MANIFEST") && text.contains("Input/output error") && !text.contains("too short"),
+                    "{text}"
+                );
+            }
+            other => panic!("{other:?}"),
         }
     }
 
