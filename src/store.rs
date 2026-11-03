@@ -192,6 +192,11 @@ impl Store {
     /// can't be listed, as one this process may write and search but not
     /// read, fails with the listing's I/O error, naming it, whatever
     /// `create_if_missing` says.
+    ///
+    /// The directory is looked at before create takes the store's lock, so
+    /// another create can finish in between. Create then finds the
+    /// `MANIFEST` that create wrote and refuses the directory, and this
+    /// opens the store there instead, as if it had been there to begin with.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
         if Self::present_store_file(&config.path)?.is_some() {
             return Self::open(config);
@@ -203,9 +208,27 @@ impl Store {
             )));
         }
         if config.create_if_missing {
-            Self::create(config)
+            let created = Self::create(config.clone());
+            Self::open_if_another_created(config, created)
         } else {
             Err(StoreError::NotInitialized)
+        }
+    }
+
+    /// What `open_or_create` returns once its `create` has run. A create
+    /// refused with `InvalidOperation` where the directory now holds a
+    /// `MANIFEST` lost to another create that finished after
+    /// `open_or_create` looked, and the store that one made is opened (with
+    /// open's account of a `MANIFEST` it can't read). Any other result is
+    /// returned as it is.
+    fn open_if_another_created(config: StoreConfig, created: Result<Self>) -> Result<Self> {
+        match created {
+            Err(StoreError::InvalidOperation(_))
+                if matches!(Self::present_store_file(&config.path), Ok(Some("MANIFEST"))) =>
+            {
+                Self::open(config)
+            }
+            other => other,
         }
     }
 
@@ -3995,6 +4018,53 @@ mod tests {
                 other => panic!("{code}: {other:?}"),
             }
         }
+    }
+
+    /// open_or_create looks at the directory before create takes the lock,
+    /// so another create can finish in between. Create then finds that
+    /// store's MANIFEST and refuses; open_or_create opens the store instead.
+    #[test]
+    fn open_or_create_opens_the_store_a_create_it_lost_to_made() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let winner = Store::create(config.clone()).unwrap();
+            winner
+                .register_state(StateRegistration {
+                    id: "s".into(),
+                    strategy: crate::types::StateStrategy::Snapshot,
+                    initial_value: None,
+                })
+                .unwrap();
+            winner.update_state("s", StateOperation::Set(b"1".to_vec())).unwrap();
+            winner.sync().unwrap();
+        }
+        let lost = Store::create(config.clone());
+        assert!(matches!(lost, Err(StoreError::InvalidOperation(_))));
+        let opened = Store::open_if_another_created(config.clone(), lost).unwrap();
+        assert_eq!(opened.get_state("s").unwrap().unwrap(), b"1");
+        drop(opened);
+
+        // A store another process holds open stays its own: Locked comes
+        // back as it is.
+        let held = Store::open(config.clone()).unwrap();
+        assert!(matches!(
+            Store::open_if_another_created(config.clone(), Store::create(config.clone())),
+            Err(StoreError::Locked)
+        ));
+        drop(held);
+
+        // A damaged store (a data file, no MANIFEST) isn't one to open: the
+        // refusal comes back as it is.
+        let damaged = TempDir::new().unwrap();
+        let damaged_config = test_config(&damaged);
+        fs::create_dir_all(&damaged_config.path).unwrap();
+        fs::write(damaged_config.path.join("records.log"), b"x").unwrap();
+        let refused = Store::create(damaged_config.clone());
+        assert!(matches!(
+            Store::open_if_another_created(damaged_config, refused),
+            Err(StoreError::InvalidOperation(message)) if message.contains("records.log")
+        ));
     }
 
     #[test]
