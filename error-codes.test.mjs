@@ -85,6 +85,27 @@ test("the store's errors carry their kind", () => {
   store.close();
 });
 
+test("a view's refusals carry theirs", () => {
+  const { store } = freshStore();
+  store.createBranch('pinned');
+  const view = store.view('pinned');
+  throwsCoded(() => view.switchBranch('main'), ErrorCode.InvalidOperation, /^switchBranch is not available on a view/);
+  throwsCoded(
+    () => view.deleteBranch('pinned'),
+    ErrorCode.BranchNotFound,
+    "Branch not found: Cannot delete the branch this view is pinned to ('pinned')",
+  );
+  store.deleteBranch('pinned');
+  throwsCoded(
+    () => view.getStateJson('anything'),
+    ErrorCode.BranchNotFound,
+    "Branch not found: 'pinned' (the branch this view is pinned to has been deleted)",
+  );
+  const closed = store.view('main');
+  closed.close();
+  throwsCoded(() => closed.getStateJson('anything'), ErrorCode.StoreClosed, 'View has been closed');
+});
+
 test("the binding's own refusals carry theirs", () => {
   const { store } = freshStore();
   throwsCoded(() => store.getRecord('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');

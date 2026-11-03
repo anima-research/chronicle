@@ -128,7 +128,7 @@ pub enum ErrorCode {
     InvalidOperation,
     SubscriptionDropped,
     // The binding's own, for calls it refuses or can't complete itself.
-    /// The store was closed with `close()`.
+    /// The store, or this view of it, was closed with `close()`.
     StoreClosed,
     /// A state registration named a strategy other than snapshot, append_log or tree.
     InvalidStrategy,
