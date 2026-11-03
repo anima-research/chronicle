@@ -7,8 +7,10 @@ on:
       - 'Cargo.toml'
       - 'build.rs'
       - 'src/**'
+      - 'tests/append_many.rs'
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
+      - 'tests/create_existing_store.rs'
       - 'tests/lock_file.rs'
   pull_request:
     paths:
@@ -16,8 +18,10 @@ on:
       - 'Cargo.toml'
       - 'build.rs'
       - 'src/**'
+      - 'tests/append_many.rs'
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
+      - 'tests/create_existing_store.rs'
       - 'tests/lock_file.rs'
   workflow_dispatch:
 
@@ -65,3 +69,13 @@ jobs:
 
       - name: Lock error mapping test
         run: cargo test --lib store::tests::only_another_holders_lock_is_reported_as_locked -- --nocapture
+
+      # A store's first batch marks its MANIFEST through the same checkpoint
+      # replacement, and create's refusal of an existing store reads each
+      # platform's directory entries and file types, so their tests run here
+      # too.
+      - name: Batched append tests
+        run: cargo test --test append_many -- --nocapture
+
+      - name: Create over an existing store tests
+        run: cargo test --test create_existing_store -- --nocapture
