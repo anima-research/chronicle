@@ -1011,7 +1011,9 @@ impl Store {
     /// release opens.
     ///
     /// Refused with `InvalidOperation`, writing nothing, when `items` is
-    /// empty or any item isn't a JSON object. Once the batch is recorded,
+    /// empty, any item isn't a JSON object, or `id_field` and
+    /// `sequence_field` are the same key, where an item couldn't hold both
+    /// the record id and the sequence. Once the batch is recorded,
     /// the call returns it: if the snapshot the write takes after it fails,
     /// that is logged and the next write tries it again, as for
     /// `update_state` (issue #39).
@@ -1040,6 +1042,12 @@ impl Store {
         id_field: &str,
         sequence_field: &str,
     ) -> Result<AppendedBatch> {
+        if id_field == sequence_field {
+            return Err(StoreError::InvalidOperation(format!(
+                "the id field and the sequence field are both \"{id_field}\": an item holds one \
+                 value at a key, so it can't carry both the record id and the sequence there"
+            )));
+        }
         self.append_batch_with_builder(branch_id, state_id, |id, seq| {
             if let Some(at) = items.iter().position(|item| !item.is_object()) {
                 return Err(StoreError::InvalidOperation(format!(

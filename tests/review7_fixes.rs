@@ -8,6 +8,8 @@
 //! - The point lookups report malformed state bytes as the error they are,
 //!   and answer `None` only for a value that is one JSON value but not an
 //!   array.
+//! - The batched identity append refuses one key for both the id and the
+//!   sequence.
 
 use chronicle::{
     BranchId, StateIndex, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
@@ -317,4 +319,29 @@ fn a_point_lookup_reports_malformed_state_bytes() {
         assert_eq!(store.get_state_item(&id, 0).unwrap(), None, "{value}");
         assert_eq!(store.get_state_items_by_ordinal(&id, &[0]).unwrap(), [None], "{value}");
     }
+}
+
+#[test]
+fn an_identity_batch_with_one_key_for_id_and_sequence_is_refused_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    register_log(&store, "log");
+    let manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
+    let head = store.current_branch().head;
+
+    match store.append_many_to_state_json_with_identity("log", &[json!({"x": 1})], "identity", "identity") {
+        Err(StoreError::InvalidOperation(message)) => {
+            assert!(message.contains("identity"), "{message}")
+        }
+        other => panic!("expected InvalidOperation, got {:?}", other.map(|b| b.record.id)),
+    }
+    assert_eq!(store.current_branch().head, head, "no record");
+    assert_eq!(store.get_state_len("log").unwrap(), None);
+    assert_eq!(fs::read(dir.path().join("MANIFEST")).unwrap(), manifest, "no format mark");
+
+    // Distinct keys still go through.
+    let batch = store
+        .append_many_to_state_json_with_identity("log", &[json!({"x": 1})], "id", "seq")
+        .unwrap();
+    assert_eq!(batch.first_ordinal, 0);
 }

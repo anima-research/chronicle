@@ -1224,8 +1224,10 @@ impl JsStore {
     /// Otherwise it is `appendManyToStateJson`: reads see the stamped items
     /// as if each had been appended alone, the batch counts as one operation
     /// toward the snapshot cadence, and subscribers get one "state_delta"
-    /// event for it. Throws, writing nothing, for an empty `items` or an
-    /// item that isn't a JSON object. Once the batch is recorded the call
+    /// event for it. Throws, writing nothing, for an empty `items`, an item
+    /// that isn't a JSON object, or an `idField` equal to `sequenceField`,
+    /// where an item couldn't hold both the record id and the sequence. Once
+    /// the batch is recorded the call
     /// returns it. A write that reaches the snapshot cadence takes the
     /// snapshot after its record, and if that snapshot fails the call still
     /// returns: the store logs a `tracing` warning, and the next write to
