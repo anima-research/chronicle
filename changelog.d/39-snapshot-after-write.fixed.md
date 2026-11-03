@@ -16,5 +16,6 @@
   A call whose own work is the snapshot, `compactState`
   (`Store::compact_state`) or `Store::create_snapshot_if_needed`, still
   returns its error. Refusals before the record (an empty batch, an item
-  that isn't an object, a `MANIFEST` that can't be marked) still throw and
-  write nothing.
+  that isn't an object, an identity batch whose `idField` equals its
+  `sequenceField`, a `MANIFEST` that can't be marked) still throw and write
+  nothing.

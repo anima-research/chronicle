@@ -5,12 +5,14 @@
   `AppendMany`), and returns `{ record, firstOrdinal }`. Before the record is
   written, each item gets that record's id (a string, as `JsRecord.id`) at
   `idField` and its sequence (a number) at `sequenceField`, overwriting what
-  was there, exactly as the single form stamps its one item. The batch is
-  one record, so every item of it carries the same id and sequence, and a
+  was there, as the single form stamps its one item. The batch is one
+  record, so every item of it carries the same id and sequence, and a
   branch cut by an item's sequence keeps or drops the whole batch. Reads see
   the stamped items as if each had been appended alone, and field indexes
-  take each at its own ordinal. An empty `items`, or an item that isn't an
-  object, throws and writes nothing, and leaves the `MANIFEST` alone. Once
+  take each at its own ordinal. An empty `items`, an item that isn't an
+  object, or an `idField` equal to `sequenceField` throws and writes
+  nothing, and leaves the `MANIFEST` alone. (The single form takes equal
+  names, and leaves the sequence at that key, over the id.) Once
   the batch is recorded the call returns it: a failure of the snapshot the
   write takes after its record is logged and tried again by the next write,
   not thrown (see Fixed, #39). Like any batch, the first one a store records
