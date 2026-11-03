@@ -9,8 +9,9 @@
   an item that isn't JSON, the call threw although the write was recorded,
   so a caller took it for a write that didn't happen, and one that retried
   a write that isn't idempotent made it twice. The call now returns its
-  record, and the failure goes into the store's snapshot-failure report,
-  which Rust and Node callers can read: it counts the failures and keeps
+  record, and the failure goes into the store's snapshot-failure report
+  (`snapshotFailures()`; `Store::snapshot_failures`), which Rust and Node
+  callers can read: it counts the failures and keeps
   the last one's error, state, branch and sequence. The store also
   logs a `tracing` warning ("the snapshot after a recorded state write
   failed") with the same fields, which reaches only a host that installs a

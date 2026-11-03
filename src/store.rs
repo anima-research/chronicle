@@ -3447,10 +3447,13 @@ impl Store {
 
     /// Rewrite the MANIFEST as format version 2 naming `features`. It goes
     /// through a new file beside it, synced and renamed over it, so a crash
-    /// leaves the old MANIFEST or the new one, never a torn one; on Unix the
-    /// directory is synced too, so the new one is on disk before this
-    /// returns. A version 1 store is never written back: features are only
-    /// ever added.
+    /// leaves the old MANIFEST or the new one, never a torn one. Where the
+    /// system and the directory's permissions allow, the directory is synced
+    /// too, so the new one is on disk before this returns; where they don't
+    /// (a directory this process may not open, a system that doesn't sync
+    /// directories, or Windows, where nothing here syncs one), a power loss
+    /// can undo the rename, as it can undo a checkpoint save. A version 1
+    /// store is never written back: features are only ever added.
     fn write_manifest_features(path: &Path, features: u64) -> Result<()> {
         crate::atomic_file::Checkpoint::default().save(
             &path.join("MANIFEST"),

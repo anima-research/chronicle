@@ -14,8 +14,8 @@
   nothing, and leaves the `MANIFEST` alone. (The single form takes equal
   names, and leaves the sequence at that key, over the id.) Once the batch
   is recorded the call returns it: a failure of the snapshot the write
-  takes after its record goes into the store's snapshot-failure report and
-  is tried again by the next write, not thrown (see Fixed, #39). Like any
+  takes after its record goes into the store's snapshot-failure report
+  (`snapshotFailures()`) and is tried again by the next write, not thrown (see Fixed, #39). Like any
   batch, the first one a store records moves its `MANIFEST` to version 2
   (see Breaking); a store that only ever takes single identity appends
   keeps version 1. In Rust:
