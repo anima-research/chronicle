@@ -48,15 +48,17 @@ def write_whole(blobs, path, content_type, content):
     except BaseException:
         if os.path.exists(staging): os.unlink(staging)
         raise
-    if os.name == 'posix':
-        try: fd = os.open(os.path.dirname(path), os.O_RDONLY)
-        except OSError as e:
-            if e.errno in (errno.EACCES, errno.EPERM): return
-            raise
-        try: sync(fd)
-        except OSError as e:
-            if e.errno not in (errno.EBADF, errno.EINVAL): raise
-        finally: os.close(fd)
+
+def sync_directory(path):
+    if os.name != 'posix': return
+    try: fd = os.open(path, os.O_RDONLY)
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM): return
+        raise
+    try: sync(fd)
+    except OSError as e:
+        if e.errno not in (errno.EBADF, errno.EINVAL): raise
+    finally: os.close(fd)
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1].startswith('-'): sys.exit('usage: unchunk-blobs.py <store> [--apply]')
@@ -90,6 +92,7 @@ def main():
             found += 1
             if apply: write_whole(blobs, path, content_type, content)
             print(f'{name}: {content_len} bytes in {len(chunks)} chunks{", rewritten whole" if apply else ""}')
+        if apply: sync_directory(shard_dir)
     print(f'{found} chunked blob(s){" rewritten whole" if apply else "; --apply rewrites them whole"}')
 
 main()
