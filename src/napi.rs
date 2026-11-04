@@ -845,7 +845,8 @@ impl JsStore {
     /// runs of bytes with earlier chunked content shares those runs' chunks
     /// too. Each chunk
     /// is stored as a blob, and a file under the whole content's hash names
-    /// them in order, written only once every chunk is stored and synced.
+    /// them in order, written only once every chunk is stored and each one
+    /// this store wrote is synced.
     /// Content of one chunk or less is stored whole. `getBlob` returns the
     /// content either way, and a blob already stored in the other form is
     /// left as it is when it reads back as the content. Chunking pays where
