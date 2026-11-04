@@ -138,7 +138,9 @@ impl Store {
     ///    one. A new store can sit beside `lost+found` (a fresh volume's root),
     ///    Finder's `.DS_Store`, and what a create leaves when it stops before
     ///    its manifest: `LOCK`, an empty `blobs/`, and beside that `LOCK` the
-    ///    staging file of its manifest save. A directory that can't be listed
+    ///    staging file of its manifest save. A `blobs` link is refused here,
+    ///    since where it leads may hold anything; [`Store::create`], asked for
+    ///    by name, takes one. A directory that can't be listed
     ///    is refused too, since it may hold anything.
     /// 4. Without `create_if_missing`, what's left is `NotInitialized`.
     /// 5. Otherwise the store is created, the directory first if it's missing.
@@ -197,8 +199,11 @@ impl Store {
             }
         }
         let blobs = path.join("blobs");
-        if !fs::symlink_metadata(&blobs).is_ok_and(|meta| meta.is_dir()) {
-            return Ok(None);
+        match fs::symlink_metadata(&blobs) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(failed(e, &blobs)),
         }
         let entries = match fs::read_dir(&blobs) {
             Ok(entries) => entries,
@@ -263,7 +268,7 @@ impl Store {
     /// over its own at the first sync (#34). Refuses a damaged one too: a
     /// store's data files, or a `blobs/` with data in it, without a `MANIFEST`.
     /// Use [`Store::open`] or [`Store::open_or_create`] for a store that may
-    /// exist.
+    /// exist; they refuse a damaged one too.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
@@ -2934,25 +2939,36 @@ impl Store {
         crate::atomic_file::Checkpoint::default().save(&path.join("MANIFEST"), &[STORE_MAGIC, &[STORE_VERSION]])
     }
 
+    /// What opening a directory whose `MANIFEST` can't be found fails with: the
+    /// path's own absence as that, a look that failed as that, and otherwise what
+    /// the directory is.
+    fn no_manifest_error(path: &Path) -> StoreError {
+        if let Err(e) = fs::metadata(path) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return StoreError::Io(std::io::Error::new(e.kind(), format!("{} doesn't exist", path.display())));
+            }
+        }
+        StoreError::InvalidFormat(match Self::store_entry(path) {
+            Err(look) => return look,
+            Ok(Some("MANIFEST")) => format!(
+                "{} has a MANIFEST link with nothing behind it: a damaged Chronicle store, which neither open nor create will take as it is",
+                path.display()
+            ),
+            Ok(Some(found)) => format!(
+                "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
+                path.display()
+            ),
+            Ok(None) => format!("{} has no MANIFEST, so it isn't a Chronicle store", path.display()),
+        })
+    }
+
     fn verify_manifest(path: &Path) -> Result<()> {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
         let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => StoreError::InvalidFormat(
-                match Self::store_entry(path).ok().flatten() {
-                    Some("MANIFEST") => format!(
-                        "{} has a MANIFEST link with nothing behind it: a damaged Chronicle store, which neither open nor create will take as it is",
-                        path.display()
-                    ),
-                    Some(found) => format!(
-                        "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
-                        path.display()
-                    ),
-                    None => format!("{} has no MANIFEST, so it isn't a Chronicle store", path.display()),
-                },
-            ),
-            _ => e.into(),
+            std::io::ErrorKind::NotFound => Self::no_manifest_error(path),
+            kind => StoreError::Io(std::io::Error::new(kind, format!("reading {}: {e}", manifest_path.display()))),
         })?;
 
         let mut magic = [0u8; 4];
@@ -3476,10 +3492,22 @@ mod tests {
     fn a_create_that_lost_the_race_opens_the_store_it_lost_to() {
         let dir = TempDir::new().unwrap();
         drop(Store::create(test_config(&dir)).unwrap());
-        Store::create_unless_raced(test_config(&dir)).unwrap();
+        // As try_reopen waits: a concurrent test's child can hold the closed
+        // store's lock for a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match Store::create_unless_raced(test_config(&dir)) {
+                Err(StoreError::Locked) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                result => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
     }
 
-    /// Only a MANIFEST means that: a damaged store is still refused.
     #[test]
     fn foreign_entry_lets_a_racing_creates_files_past_for_create_to_judge() {
         let dir = TempDir::new().unwrap();
@@ -3489,6 +3517,7 @@ mod tests {
         assert_eq!(Store::foreign_entry(dir.path()).unwrap(), None);
     }
 
+    /// Only a MANIFEST means that: a damaged store is still refused.
     #[test]
     fn a_create_refused_over_a_damaged_store_stays_refused() {
         let dir = TempDir::new().unwrap();

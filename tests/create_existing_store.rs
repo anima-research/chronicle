@@ -174,25 +174,34 @@ fn create_over_a_manifest_that_does_not_verify_says_so() {
     assert_eq!(fs::read(path.join("MANIFEST")).unwrap(), b"CH", "left as it was");
 }
 
-/// Runs on every platform, Windows's mandatory locks among them.
+/// Runs on every platform, Windows's mandatory locks among them. A rewrite of
+/// MANIFEST would put back the same bytes, so its modification time is what
+/// catches one: backdated, and read back since a filesystem may round it.
 #[test]
 fn create_aimed_at_an_open_store_is_locked_and_leaves_its_manifest() {
+    use std::time::{Duration, SystemTime};
+
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     let held = Store::create(config(&path)).unwrap();
-    let before = fs::read(path.join("MANIFEST")).unwrap();
+    let manifest = path.join("MANIFEST");
+    let before = fs::read(&manifest).unwrap();
+    let a_day_ago = SystemTime::now() - Duration::from_secs(86_400);
+    fs::File::options().write(true).open(&manifest).unwrap().set_modified(a_day_ago).unwrap();
+    let stored = fs::metadata(&manifest).unwrap().modified().unwrap();
 
     let result = Store::create(config(&path));
     assert!(matches!(result, Err(StoreError::Locked)), "got {:?}", result.err().map(|e| e.to_string()));
-    assert_eq!(fs::read(path.join("MANIFEST")).unwrap(), before);
+    assert_eq!(fs::read(&manifest).unwrap(), before);
+    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), stored, "MANIFEST was rewritten");
     drop(held);
 }
 
-/// A create aimed at a store that's open writes nothing there; a second handle
-/// in this process meets the lock as another process's would. A read-only
-/// MANIFEST makes a write fail loudly for an ordinary user, and a manifest
-/// backdated a day catches a rewrite of identical bytes where the mode doesn't
-/// stop it (as root). Unix only: it sets file modes.
+/// The same with MANIFEST read-only, which a create that writes before it takes
+/// the lock would meet at once on some writers. A second handle in this process
+/// meets the lock as another process's would. The modification time is what
+/// catches a rewrite here too, since today's writer renames over MANIFEST, which
+/// its mode doesn't stop. Unix only: it sets file modes.
 #[cfg(unix)]
 #[test]
 fn create_aimed_at_an_open_store_writes_nothing_there() {
@@ -467,7 +476,8 @@ fn open_or_create_without_create_if_missing_does_not_call_an_unsearchable_store_
 }
 
 /// A file named like a staging file is one only where a create could have left
-/// it, for create as for open_or_create.
+/// it, for create as for open_or_create. This holds for that call: once the
+/// store exists it has a LOCK, and each open sweeps by the store's own prefix.
 #[test]
 fn create_leaves_a_staging_lookalike_with_no_lock_beside_it() {
     let dir = TempDir::new().unwrap();
@@ -478,6 +488,85 @@ fn create_leaves_a_staging_lookalike_with_no_lock_beside_it() {
 
     drop(Store::create(config(&path)).unwrap());
     assert_eq!(fs::read(&notes).unwrap(), b"mine");
+}
+
+/// `open` on a path that isn't there says so, as an IO error, rather than calling
+/// it a directory that isn't a store.
+#[test]
+fn open_on_a_missing_path_says_it_does_not_exist() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("typo/store");
+
+    match Store::open(config(&path)) {
+        Err(StoreError::Io(e)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            assert!(e.to_string().contains(&*path.to_string_lossy()), "{e}");
+        }
+        Err(e) => panic!("expected an IO NotFound, got {e}"),
+        Ok(_) => panic!("opened a path that isn't there"),
+    }
+}
+
+/// `open` says what `open_or_create` says of a `blobs/` it can't list. Unix only:
+/// it sets modes. As root the listing succeeds, so the refusal is damaged instead.
+#[cfg(unix)]
+#[test]
+fn open_reports_a_look_that_failed_rather_than_no_store() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir_all(path.join("blobs/ab")).unwrap();
+    fs::set_permissions(path.join("blobs"), fs::Permissions::from_mode(0o333)).unwrap();
+    let listable = fs::read_dir(path.join("blobs")).is_ok();
+    let opened = Store::open(config(&path)).err().map(|e| e.to_string());
+    fs::set_permissions(path.join("blobs"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let opened = opened.expect("open refused");
+    assert!(opened.contains("blobs") && !opened.contains("isn't a Chronicle store"), "{opened}");
+    assert!(listable || opened.contains("looking in"), "the failed look, not a verdict: {opened}");
+}
+
+/// open_or_create doesn't take a `blobs` link, wherever it leads: a store would
+/// write into what it can't vouch for. `create`, asked for by name, does (above).
+/// Unix only: it makes links.
+#[cfg(unix)]
+#[test]
+fn open_or_create_refuses_a_blobs_link_and_writes_nothing_through_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let share = dir.path().join("share");
+    fs::create_dir_all(&share).unwrap();
+    fs::write(share.join("notes.txt"), b"mine").unwrap();
+    let file = dir.path().join("a-file");
+    fs::write(&file, b"x").unwrap();
+
+    for (name, target) in [("to-a-directory", share.clone()), ("to-a-file", file), ("dangling", dir.path().join("gone"))] {
+        let path = dir.path().join(name);
+        fs::create_dir(&path).unwrap();
+        symlink(&target, path.join("blobs")).unwrap();
+        let msg = invalid_format(Store::open_or_create(config(&path)));
+        assert!(msg.contains("holds blobs"), "{name}: {msg}");
+        assert!(!path.join("MANIFEST").exists() && !path.join("LOCK").exists(), "{name}: nothing was written");
+    }
+    assert_eq!(fs::read_dir(&share).unwrap().count(), 1, "the link's target is as it was");
+}
+
+/// A failure reading MANIFEST names where. Unix only: the path is a file, whose
+/// `MANIFEST` fails as not a directory.
+#[cfg(unix)]
+#[test]
+fn open_names_the_path_when_reading_its_manifest_fails() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a-file");
+    fs::write(&path, b"x").unwrap();
+
+    match Store::open(config(&path)) {
+        Err(StoreError::Io(e)) => assert!(e.to_string().contains(&*path.to_string_lossy()), "{e}"),
+        Err(e) => panic!("expected an IO error, got {e}"),
+        Ok(_) => panic!("opened a file"),
+    }
 }
 
 /// `LOCK` is the lock's to judge, and it says what to do about one that isn't a

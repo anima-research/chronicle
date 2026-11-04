@@ -469,7 +469,8 @@ impl JsStore {
 
     /// Create a new store at the given path. Refuses a path that already holds
     /// a store (its MANIFEST or a data file) or a `blobs/` with data in it; use
-    /// `openOrCreate` or `open` for a store that may exist.
+    /// `openOrCreate` or `open` for a store that may exist. They refuse a damaged
+    /// store too.
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -493,7 +494,10 @@ impl JsStore {
         Ok(Self::root(store))
     }
 
-    /// Open or create a store.
+    /// Open a store, or create one where a new store can sit: a missing path, an
+    /// empty directory, or one holding only what a new store can sit beside.
+    /// A damaged store or a directory holding anything else is refused, and
+    /// nothing is written there. See `Store::open_or_create` for the order.
     #[napi(factory)]
     pub fn open_or_create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
