@@ -97,9 +97,10 @@ impl From<rmp_serde::decode::Error> for StoreError {
 /// as its `code`, beside its message, so a caller can tell kinds apart
 /// without matching message text. (An error napi raises while it converts a
 /// call's arguments, before chronicle runs, keeps napi's own code or none.)
-/// A code's name is its variant's identifier: napi's string enum
-/// takes each value from it, and `as_str` spells the same name for
-/// `error.code`. Renaming a variant would change a published code.
+/// Each member's value is its name, kept across releases.
+// A code's name is its variant's identifier: napi's string enum takes each
+// value from it, and `as_str` spells the same name for `error.code`, so
+// renaming a variant would change a published code.
 #[cfg_attr(feature = "napi-bindings", napi_derive::napi(string_enum))]
 #[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
 #[derive(Debug, PartialEq, Eq)]
@@ -134,7 +135,8 @@ pub enum ErrorCode {
     /// A store file holds what no write leaves, such as a damaged log entry
     /// with valid ones after it, which open refuses.
     Corruption,
-    /// Not raised by this release.
+    /// Not raised by this release: a state's strategy conflicts are
+    /// `InvalidOperation`.
     StrategyMismatch,
     /// The store is open already, in another process or through another
     /// open of it.
@@ -143,7 +145,7 @@ pub enum ErrorCode {
     /// fails with `Io`.
     NotInitialized,
     /// A store or blob file isn't in a format this release reads, or is
-    /// damaged.
+    /// damaged, or the store's `LOCK` isn't a regular file.
     InvalidFormat,
     /// A record or blob read from its file doesn't match its checksum.
     ChecksumMismatch,
@@ -151,9 +153,10 @@ pub enum ErrorCode {
     HashMismatch,
     /// Not raised by this release.
     Transaction,
-    /// A call refused as things stand, such as `switchBranch` on a view, or
+    /// A call refused as things stand, such as `switchBranch` on a view;
     /// deleting the main branch, the current one or the one a view is
-    /// pinned to.
+    /// pinned to; changing a state's strategy to another kind; or a tree
+    /// operation on a state that isn't a tree.
     InvalidOperation,
     /// The store dropped the subscription, because its buffer overran.
     SubscriptionDropped,
