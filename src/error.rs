@@ -140,8 +140,8 @@ pub enum ErrorCode {
     InvalidSubscriptionId,
     /// No subscription with that ID can be reached: it was never made, was
     /// unsubscribed through any handle, or was a view's when the view was
-    /// closed. A poll reaches only the subscriptions made through its own
-    /// handle.
+    /// closed or garbage-collected. A poll reaches only the subscriptions
+    /// made through its own handle.
     SubscriptionNotFound,
     /// A tree operation other than set or remove, or a set without an entry.
     InvalidTreeOp,

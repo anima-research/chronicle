@@ -68,6 +68,12 @@ pub struct JsStore {
     live_subscriptions: Arc<Mutex<HashSet<u64>>>,
 }
 
+impl Drop for JsStore {
+    fn drop(&mut self) {
+        self.release_subscriptions();
+    }
+}
+
 /// The branch a view is bound to. Bound by id: ids are never reused, so a
 /// view cannot be silently re-pointed at a different branch that later takes
 /// the same name. The name is kept for `pinnedBranch()` and error messages
@@ -469,6 +475,20 @@ impl JsStore {
         Ok((store, branch))
     }
 
+    fn release_subscriptions(&self) {
+        let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
+        let mut live = self.live_subscriptions.lock();
+        for id in &handles {
+            live.remove(id);
+        }
+        drop(live);
+        if let Some(store) = self.shared.read().as_ref() {
+            for id in handles {
+                store.unsubscribe(SubscriptionId(id));
+            }
+        }
+    }
+
     /// Wrap a freshly opened store in a root handle.
     fn root(store: Store) -> JsStore {
         JsStore {
@@ -529,22 +549,13 @@ impl JsStore {
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed". The store stays open,
     /// nothing is synced, and the root and other views are unaffected. A
-    /// view never needs to be closed; dropping it is enough.
+    /// view never needs to be closed; dropping it is enough, and its
+    /// subscriptions are removed when it's garbage-collected.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         if self.pinned.is_some() {
             if !self.detached {
-                let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
-                let mut live = self.live_subscriptions.lock();
-                for id in &handles {
-                    live.remove(id);
-                }
-                drop(live);
-                if let Some(store) = self.shared.read().as_ref() {
-                    for id in handles {
-                        store.unsubscribe(SubscriptionId(id));
-                    }
-                }
+                self.release_subscriptions();
                 self.detached = true;
             }
             return Ok(());
@@ -1633,7 +1644,7 @@ impl JsStore {
     /// subscription's `from_sequence` setting. Any handle of the store can
     /// catch up a subscription made through another. An ID that was never
     /// made, was unsubscribed through any handle, or was a view's when the
-    /// view was closed throws `SubscriptionNotFound`. One the store has
+    /// view was closed or garbage-collected throws `SubscriptionNotFound`. One the store has
     /// dropped because its buffer overran, during a catch-up or live, throws
     /// `SubscriptionDropped`.
     #[napi]

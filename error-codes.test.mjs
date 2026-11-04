@@ -8,7 +8,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { ErrorCode, JsStore } from './index.js';
+
+setFlagsFromString('--expose-gc');
+const gc = runInNewContext('gc');
 
 const dirs = [];
 after(() => {
@@ -187,6 +192,34 @@ test('a poll of a subscription unsubscribed through another handle returns what 
   assert.equal(store.pollSubscription(id)?.eventType, 'dropped');
   throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  store.close();
+});
+
+test("a poll through a view that was closed of the view's own subscription says it is not found", () => {
+  const { store } = freshStore();
+  const view = store.view('main');
+  const id = view.subscribe();
+  view.close();
+  throwsCoded(() => view.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  throwsCoded(() => view.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  assert.equal(store.subscriptionCount(), 0);
+  store.close();
+});
+
+test('a view dropped without close() takes its subscriptions with it', async () => {
+  const { store } = freshStore();
+  const ids = [];
+  (() => {
+    for (let i = 0; i < 20; i++) ids.push(store.view('main').subscribe());
+  })();
+  assert.equal(store.subscriptionCount(), 20);
+  for (let i = 0; i < 200 && store.subscriptionCount() > 0; i++) {
+    gc();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(store.subscriptionCount(), 0);
+  for (const id of ids) throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   store.close();
 });
 
