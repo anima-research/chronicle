@@ -173,6 +173,29 @@ test('a catch-up that overruns the subscription\'s buffer drops it', () => {
   store.close();
 });
 
+test('a subscription is caught up, or not found once unsubscribed, through any handle of its store', () => {
+  const { store } = freshStore();
+  const view = store.view('main');
+  const onRoot = store.subscribe();
+  const onView = view.subscribe();
+  view.catchUpSubscription(onRoot);
+  store.catchUpSubscription(onView);
+  assert.equal(store.pollSubscription(onRoot)?.eventType, 'caught_up');
+  assert.equal(view.pollSubscription(onView)?.eventType, 'caught_up');
+  view.unsubscribe(onRoot);
+  store.unsubscribe(onView);
+  for (const handle of [store, view]) {
+    for (const id of [onRoot, onView]) {
+      throwsCoded(() => handle.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+    }
+  }
+  const closing = store.view('main');
+  const onClosing = closing.subscribe();
+  closing.close();
+  throwsCoded(() => store.catchUpSubscription(onClosing), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  store.close();
+});
+
 test('opening a store that is not there is an Io error', () => {
   const parent = mkdtempSync(join(tmpdir(), 'chronicle-codes-'));
   dirs.push(parent);

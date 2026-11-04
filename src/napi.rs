@@ -14,7 +14,7 @@ use crate::{
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Results from this binding's methods. An error one returns carries its
@@ -65,6 +65,7 @@ pub struct JsStore {
     detached: bool,
     /// Active subscription handles, stored by ID.
     subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
+    live_subscriptions: Arc<Mutex<HashSet<u64>>>,
 }
 
 /// The branch a view is bound to. Bound by id: ids are never reused, so a
@@ -475,6 +476,7 @@ impl JsStore {
             pinned: None,
             detached: false,
             subscription_handles: Mutex::new(HashMap::new()),
+            live_subscriptions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -533,6 +535,11 @@ impl JsStore {
         if self.pinned.is_some() {
             if !self.detached {
                 let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
+                let mut live = self.live_subscriptions.lock();
+                for id in &handles {
+                    live.remove(id);
+                }
+                drop(live);
                 if let Some(store) = self.shared.read().as_ref() {
                     for id in handles {
                         store.unsubscribe(SubscriptionId(id));
@@ -601,6 +608,7 @@ impl JsStore {
             }),
             detached: false,
             subscription_handles: Mutex::new(HashMap::new()),
+            live_subscriptions: Arc::clone(&self.live_subscriptions),
         })
     }
 
@@ -1596,6 +1604,7 @@ impl JsStore {
 
         // Store the handle for later polling
         self.subscription_handles.lock().insert(id, handle);
+        self.live_subscriptions.lock().insert(id);
 
         Ok(id.to_string())
     }
@@ -1610,6 +1619,7 @@ impl JsStore {
 
         // Remove handle from our map
         self.subscription_handles.lock().remove(&id);
+        self.live_subscriptions.lock().remove(&id);
 
         // Unsubscribe from store
         store.unsubscribe(SubscriptionId(id));
@@ -1619,17 +1629,19 @@ impl JsStore {
     /// Perform catch-up for a subscription (replay historical data).
     ///
     /// This replays state snapshots and historical records based on the
-    /// subscription's `from_sequence` setting.
+    /// subscription's `from_sequence` setting. Any handle of the store can
+    /// catch up a subscription made through another. An ID that no handle
+    /// holds, because it was never made, was unsubscribed through any handle,
+    /// or was a view's when the view was closed, throws
+    /// `SubscriptionNotFound`. One the store has dropped because its buffer
+    /// overran, during a catch-up or live, throws `SubscriptionDropped`.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
         let (store, branch) = self.target()?;
         let id: u64 = subscription_id
             .parse()
             .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
-        // An ID this binding never made, or has unsubscribed, is not found,
-        // as polling says; SubscriptionDropped is left for one the store
-        // dropped while the binding still holds it.
-        if !self.subscription_handles.lock().contains_key(&id) {
+        if !self.live_subscriptions.lock().contains(&id) {
             return Err(coded(ErrorCode::SubscriptionNotFound, "Subscription not found"));
         }
 
