@@ -1673,7 +1673,9 @@ impl JsStore {
     /// unsubscribed through another handle, and `SubscriptionDropped` once
     /// the store dropped it because its buffer overran. Its handle holds an
     /// ended subscription, buffer and all, until it's unsubscribed through
-    /// that handle.
+    /// that handle, the handle is a view that's closed, or the handle is
+    /// garbage-collected. After the root's `close()`, `unsubscribe` throws
+    /// `StoreClosed`, so only the last two free it.
     #[napi]
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
