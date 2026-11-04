@@ -975,18 +975,19 @@ impl JsStore {
     ///
     ///
     /// The main branch and the current branch cannot be deleted; nor can a
-    /// view delete the branch it is itself pinned to. A branch that OTHER
-    /// views are pinned to can be deleted — those views then throw
-    /// "Branch not found" from every branch-dependent method.
+    /// view delete the branch it is itself pinned to. Each of these throws
+    /// `InvalidOperation`. A branch that OTHER views are pinned to can be
+    /// deleted — those views then throw "Branch not found" from every
+    /// branch-dependent method.
     #[napi]
     pub fn delete_branch(&self, name: String) -> Result<()> {
         let store = self.get_store()?;
         if let Some(pinned) = &self.pinned {
             if pinned.name == name && store.branch_exists(pinned.id) {
-                return Err(coded(ErrorCode::BranchNotFound, format!(
-                    "Branch not found: Cannot delete the branch this view is pinned to ('{}')",
+                return Err(to_napi_error(StoreError::InvalidOperation(format!(
+                    "Cannot delete the branch this view is pinned to ('{}')",
                     name
-                )));
+                ))));
             }
         }
         store.delete_branch(&name).map_err(to_napi_error)

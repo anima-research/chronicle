@@ -94,10 +94,10 @@ impl From<rmp_serde::decode::Error> for StoreError {
 
 /// What kind of failure an error from the Node binding is. Each error the
 /// binding raises for a store failure, or for a call it refuses, carries one
-/// as its `code`, beside its unchanged message, so a caller can tell kinds
-/// apart without matching message text. (An error napi raises while it
-/// converts a call's arguments, before chronicle runs, keeps napi's own code
-/// or none.) A code's name is its variant's identifier: napi's string enum
+/// as its `code`, beside its message, so a caller can tell kinds apart
+/// without matching message text. (An error napi raises while it converts a
+/// call's arguments, before chronicle runs, keeps napi's own code or none.)
+/// A code's name is its variant's identifier: napi's string enum
 /// takes each value from it, and `as_str` spells the same name for
 /// `error.code`. Renaming a variant would change a published code, so the
 /// tests below pin every name, against both.

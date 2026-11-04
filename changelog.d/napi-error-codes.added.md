@@ -2,10 +2,9 @@
   a call it refuses, now carries `code`, one of the values of the new
   `ErrorCode` enum, such as `BranchNotFound`, `Locked` or `StoreClosed`. A
   failed fsync of the record log gives `DurabilityLost`, which `sync()` and
-  the calls that checkpoint then throw until the store is reopened. Its
-  message is unchanged, except `catchUpSubscription`'s for an ID the binding
-  doesn't hold (see Changed). Branch on `error.code` rather than on message
-  text: compare it with `ErrorCode`'s members, whose names are kept across
-  releases. An error napi raises while converting a call's arguments, before
-  the call reaches chronicle, keeps napi's own code (`StringExpected`,
-  `InvalidArg`) or has none.
+  the calls that checkpoint then throw until the store is reopened. Messages
+  are unchanged, except the ones Changed names. Branch on `error.code` rather
+  than on message text: compare it with `ErrorCode`'s members, whose names
+  are kept across releases. An error napi raises while converting a call's
+  arguments, before the call reaches chronicle, keeps napi's own code
+  (`StringExpected`, `InvalidArg`) or has none.

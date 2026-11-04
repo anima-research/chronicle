@@ -1,9 +1,8 @@
 // Each error the binding raises for a store failure, or for a call it
-// refuses, carries an `ErrorCode` as `error.code`, beside its message, which
-// is unchanged. An error napi raises while converting a call's arguments,
-// before chronicle runs, keeps napi's own code or none. These run the built
-// binding (index.js and index.d.ts), so they need the napi build first, as
-// test.mjs does.
+// refuses, carries an `ErrorCode` as `error.code`, beside its message. An
+// error napi raises while converting a call's arguments, before chronicle
+// runs, keeps napi's own code or none. These run the built binding (index.js
+// and index.d.ts), so they need the napi build first, as test.mjs does.
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -82,6 +81,10 @@ test("the store's errors carry their kind", () => {
   // State bytes that aren't JSON, read as JSON.
   store.setState('notes', Buffer.from('not json'));
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  throwsCoded(() => store.deleteBranch('main'), ErrorCode.InvalidOperation, 'Invalid operation: Cannot delete main branch');
+  store.createBranch('side');
+  store.switchBranch('side');
+  throwsCoded(() => store.deleteBranch('side'), ErrorCode.InvalidOperation, 'Invalid operation: Cannot delete current branch');
   store.close();
 });
 
@@ -92,8 +95,8 @@ test("a view's refusals carry theirs", () => {
   throwsCoded(() => view.switchBranch('main'), ErrorCode.InvalidOperation, /^switchBranch is not available on a view/);
   throwsCoded(
     () => view.deleteBranch('pinned'),
-    ErrorCode.BranchNotFound,
-    "Branch not found: Cannot delete the branch this view is pinned to ('pinned')",
+    ErrorCode.InvalidOperation,
+    "Invalid operation: Cannot delete the branch this view is pinned to ('pinned')",
   );
   store.deleteBranch('pinned');
   throwsCoded(
