@@ -344,8 +344,9 @@ impl BlobStorage {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot sync the directories holding {}: {error}; nothing was stored, and storing the blob again tries the sync again",
-                    self.path.display()
+                    "cannot sync the directories holding {}: {error}; {} wasn't written, and storing the blob again tries the sync again",
+                    self.path.display(),
+                    blob_path.display()
                 ),
             )
         })?;

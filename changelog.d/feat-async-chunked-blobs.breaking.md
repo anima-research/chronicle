@@ -12,8 +12,9 @@
   earlier release on such a store, close it and run
   `tools/unchunk-blobs.py <store> --apply` from chronicle's repository,
   which rewrites each chunked blob whole under the same hash; without
-  `--apply` it lists them. A blob it stops at, such as one with a damaged
-  chunk, can't be read by this release either. With the store open in
+  `--apply` it lists them. A blob it stops at because its list or a chunk
+  can't be read, such as one with a damaged chunk, can't be read by this
+  release either. With the store open in
   this release, store its content again with `storeBlob`, which writes it
   whole. If that throws, as it does for a chunk in a newer format or one
   this account can't read, delete the blob's file, then store the content;

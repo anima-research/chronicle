@@ -126,7 +126,7 @@ try {
     await before.storeBlobAsync(blobs[1], 'application/json'),
   ];
   before.close();
-  assert.match(unchunk(), new RegExp(`^${blobHashes[0]}: 100000 bytes in \\d+ chunks\n1 chunked blob`));
+  assert.match(unchunk(), new RegExp(`^${blobHashes[0]}: 100000 bytes in \\d+ chunks\\r?\\n1 chunked blob`));
   assert.equal(versionAt(blobHashes[0], unchunked), 2);
   unchunk('--apply');
   for (const hash of blobHashes) assert.equal(versionAt(hash, unchunked), 1);

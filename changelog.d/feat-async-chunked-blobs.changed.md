@@ -5,8 +5,8 @@
   store has already stored whole, or read and checked whole while storing,
   still returns without reading their file again while a regular file
   of the same length is at their name, until a read of that file fails. A
-  `getBlob` records nothing of the kind, so storing bytes `getBlob` has read
-  reads their file once. A check of such a file that races a store
+  `getBlob` records nothing of the kind, so storing bytes only `getBlob` has
+  read reads their file once. A check of such a file that races a store
   replacing it on another thread can drop the entry that store has just
   made, until the store that checked reads the file and records it again;
   a store of the same bytes in between reads the file once. A chunked
