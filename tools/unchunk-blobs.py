@@ -2,13 +2,14 @@
 # List a store's chunked blobs (storeBlobAsync with chunked: true), and with --apply rewrite each one whole under the
 # same hash, so a chronicle release from before storeBlobAsync can read it. Its chunks stay, as blobs of their own.
 #   unchunk-blobs.py <store> [--apply]
-import errno, hashlib, os, secrets, struct, sys, zlib
+import errno, hashlib, os, secrets, stat, struct, sys, zlib
 try: from fcntl import fcntl, F_FULLFSYNC
 except ImportError: F_FULLFSYNC = None
 
 STAGING_PREFIX = '.chronicle-blob-'
 
 def read_blob(path):
+    if not stat.S_ISREG(os.stat(path).st_mode): raise ValueError('it is not a regular file')
     with open(path, 'rb') as f: data = f.read()
     try:
         if data[:4] != b'BLB\0': raise ValueError('it is not a blob file')

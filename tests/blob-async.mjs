@@ -139,11 +139,27 @@ try {
   const damaged = JsStore.openOrCreate({ path: damagedAt });
   const listHash = await damaged.storeBlobAsync(varied(100_000, 65), 'application/json', { chunked: true });
   damaged.close();
-  const list = readFileSync(join(damagedAt, 'blobs', listHash.slice(0, 2), listHash));
-  const firstChunk = list.subarray(7 + list.readUInt16LE(5) + 12, 7 + list.readUInt16LE(5) + 44).toString('hex');
-  writeFileSync(join(damagedAt, 'blobs', firstChunk.slice(0, 2), firstChunk), 'not a blob');
+  const firstChunkPath = (at, hash) => {
+    const list = readFileSync(join(at, 'blobs', hash.slice(0, 2), hash));
+    const chunk = list.subarray(7 + list.readUInt16LE(5) + 12, 7 + list.readUInt16LE(5) + 44).toString('hex');
+    return join(at, 'blobs', chunk.slice(0, 2), chunk);
+  };
+  writeFileSync(firstChunkPath(damagedAt, listHash), 'not a blob');
   assert.throws(() => unchunkAt(damagedAt, '--apply'), (error) => error.status !== 0 && /nothing after it was listed or rewritten/.test(error.stderr));
   assert.equal(versionAt(listHash, damagedAt), 2);
+
+  if (process.platform !== 'win32') {
+    const fifoAt = join(dir, 'unchunk-fifo');
+    const fifo = JsStore.openOrCreate({ path: fifoAt });
+    const fifoHash = await fifo.storeBlobAsync(varied(100_000, 67), 'application/json', { chunked: true });
+    fifo.close();
+    rmSync(firstChunkPath(fifoAt, fifoHash));
+    execFileSync('mkfifo', [firstChunkPath(fifoAt, fifoHash)]);
+    assert.throws(
+      () => execFileSync(python, [join(import.meta.dirname, '..', 'tools', 'unchunk-blobs.py'), fifoAt], { encoding: 'utf8', stdio: 'pipe', timeout: 30_000 }),
+      (error) => error.status !== 0 && /is not a regular file/.test(error.stderr),
+    );
+  }
   console.log('storeBlobAsync: all checks passed');
 } finally {
   rmSync(dir, { recursive: true, force: true });
