@@ -6,7 +6,9 @@
     through any handle, was a view's when the view was closed, or was a
     handle's when the handle was garbage-collected now throws
     `SubscriptionNotFound` with the message `Subscription not found`, as
-    polling does, instead of `Subscription was dropped`.
+    polling does, instead of `Subscription was dropped`. Any handle can
+    catch up a subscription made through another, replaying the branch of
+    the handle it's called on.
   - A poll of a subscription that has ended, once the events queued for it
     are read, throws why it ended instead of `Subscription disconnected`:
     `StoreClosed` (`Store has been closed`) after the root's `close()`,

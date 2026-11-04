@@ -255,6 +255,32 @@ test('a view dropped without close() takes its subscriptions with it', async () 
   store.close();
 });
 
+test('a catch-up replays the branch of the handle it is called on', () => {
+  const { store } = freshStore();
+  store.append('on-main', Buffer.from('m'));
+  store.createBranch('side');
+  const side = store.view('side');
+  side.append('on-side', Buffer.from('s'));
+  const config = { fromSequence: 0, filter: { includeRecords: true } };
+  const events = (id) => {
+    const out = [];
+    for (let event = side.pollSubscription(id); event; event = side.pollSubscription(id)) out.push(event);
+    return out;
+  };
+  const throughRoot = side.subscribe(config);
+  store.catchUpSubscription(throughRoot);
+  const fromRoot = events(throughRoot);
+  assert.equal(fromRoot.at(-1)?.eventType, 'caught_up');
+  assert.ok(fromRoot.some((e) => e.eventType === 'record' && e.data.includes('"on-main"')), JSON.stringify(fromRoot));
+  assert.ok(!fromRoot.some((e) => e.data.includes('"on-side"')), JSON.stringify(fromRoot));
+  const throughSide = side.subscribe(config);
+  side.catchUpSubscription(throughSide);
+  const fromSide = events(throughSide);
+  assert.equal(fromSide.at(-1)?.eventType, 'caught_up');
+  assert.ok(fromSide.some((e) => e.eventType === 'record' && e.data.includes('"on-side"')), JSON.stringify(fromSide));
+  store.close();
+});
+
 test('a catch-up that overruns the subscription\'s buffer drops it', () => {
   const { store } = freshStore();
   for (const n of [1, 2, 3]) store.append('note', Buffer.from(String(n)));

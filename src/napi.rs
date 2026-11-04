@@ -1646,8 +1646,10 @@ impl JsStore {
     /// Perform catch-up for a subscription (replay historical data).
     ///
     /// This replays state snapshots and historical records based on the
-    /// subscription's `from_sequence` setting. Any handle of the store can
-    /// catch up a subscription made through another. An ID that was never
+    /// subscription's `fromSequence` setting, from the branch of the handle
+    /// it's called on: the current branch on the root, its own branch on a
+    /// view. Any handle of the store can catch up a subscription made
+    /// through another, replaying its own branch. An ID that was never
     /// made, was unsubscribed through any handle, was a view's when the view
     /// was closed, or was a handle's when the handle was garbage-collected
     /// throws `SubscriptionNotFound`. One the store has dropped because its
