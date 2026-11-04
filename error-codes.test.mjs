@@ -219,7 +219,7 @@ test("a poll through a view that was closed of the view's own subscription says 
   store.close();
 });
 
-test('a root dropped without close() takes its own subscriptions with it, and a view it leaves finds them gone', async () => {
+test('a root dropped without close() takes its own subscriptions with it, and a view it leaves keeps its own', async () => {
   const { store, dir } = freshStore();
   store.close();
   let view;
@@ -229,29 +229,47 @@ test('a root dropped without close() takes its own subscriptions with it, and a 
     view = root.view('main');
     for (let i = 0; i < 20; i++) ids.push(root.subscribe());
   })();
-  assert.equal(view.subscriptionCount(), 20);
-  for (let i = 0; i < 200 && view.subscriptionCount() > 0; i++) {
+  const own = view.subscribe();
+  assert.equal(view.subscriptionCount(), 21);
+  for (let i = 0; i < 200 && view.subscriptionCount() > 1; i++) {
     gc();
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(view.subscriptionCount(), 0);
+  assert.equal(view.subscriptionCount(), 1);
   for (const id of ids) throwsCoded(() => view.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-  view.close();
+  view.catchUpSubscription(own);
+  assert.equal(view.pollSubscription(own)?.eventType, 'caught_up');
+  view = null;
+  let reopened = null;
+  for (let i = 0; i < 200 && reopened === null; i++) {
+    gc();
+    await new Promise((resolve) => setImmediate(resolve));
+    try {
+      reopened = JsStore.open({ path: dir });
+    } catch (error) {
+      if (error.code !== ErrorCode.Locked) throw error;
+    }
+  }
+  assert.notEqual(reopened, null);
+  reopened.close();
 });
 
-test('a view dropped without close() takes its subscriptions with it', async () => {
+test('a view dropped without close() takes its subscriptions with it, and the root keeps its own', async () => {
   const { store } = freshStore();
+  const own = store.subscribe();
   const ids = [];
   (() => {
     for (let i = 0; i < 20; i++) ids.push(store.view('main').subscribe());
   })();
-  assert.equal(store.subscriptionCount(), 20);
-  for (let i = 0; i < 200 && store.subscriptionCount() > 0; i++) {
+  assert.equal(store.subscriptionCount(), 21);
+  for (let i = 0; i < 200 && store.subscriptionCount() > 1; i++) {
     gc();
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(store.subscriptionCount(), 0);
+  assert.equal(store.subscriptionCount(), 1);
   for (const id of ids) throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  store.catchUpSubscription(own);
+  assert.equal(store.pollSubscription(own)?.eventType, 'caught_up');
   store.close();
 });
 
