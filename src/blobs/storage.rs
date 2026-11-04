@@ -711,6 +711,7 @@ impl BlobStorage {
     /// until the same content is stored again.
     pub fn delete(&self, hash: &Hash) -> Result<bool> {
         self.cache.lock().pop(hash);
+        self.known.lock().remove(hash);
 
         let blob_path = self.blob_path(hash);
         if blob_path.exists() {
@@ -1541,7 +1542,10 @@ mod tests {
         let hash = storage.store(&content, "a").unwrap();
         storage.delete(&hash).unwrap();
         let same_length_type = "a".repeat(1 + content.len() - 4 - 32 * chunk_count);
-        storage.store_chunked(&content, &same_length_type).unwrap();
+        BlobStorage::new(&path, 100)
+            .unwrap()
+            .store_chunked(&content, &same_length_type)
+            .unwrap();
         assert_eq!(
             fs::metadata(storage.blob_path(&hash)).unwrap().len(),
             whole_file_len(1, content.len())
