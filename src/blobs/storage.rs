@@ -798,6 +798,16 @@ fn chunk_error(path: &Path, chunk: &Hash, error: StoreError) -> StoreError {
         StoreError::InvalidFormat(what) if !what.starts_with(UNSUPPORTED_VERSION) => what,
         StoreError::ChecksumMismatch { .. } => "is damaged: its checksum doesn't match".into(),
         StoreError::HashMismatch { got, .. } => format!("holds other bytes, whose hash is {got}"),
+        StoreError::Io(error) => {
+            return io::Error::new(
+                error.kind(),
+                format!(
+                    "blob file {} names the chunk {chunk}, which can't be read: {error}",
+                    path.display()
+                ),
+            )
+            .into()
+        }
         other => return other,
     };
     StoreError::InvalidFormat(format!(
@@ -1279,6 +1289,35 @@ mod tests {
                 assert!(what.ends_with(REPLACED_BY_STORING), "{what}");
             }
             other => panic!("expected the list refused as damaged, got {:?}", other.map(|b| b.map(|b| b.hash))),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chunk_that_cant_be_opened_is_named_with_the_list_that_names_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blobs");
+        let storage = BlobStorage::new(&path, 100).unwrap();
+        let chunk = storage.store(&varied(4 * 1024, 26), "application/octet-stream").unwrap();
+        let at = Hash::from_bytes(b"a list");
+        write_list(&storage, &at, 4 * 1024, &[chunk]);
+        let chunk_file = storage.blob_path(&chunk);
+        fs::set_permissions(&chunk_file, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&chunk_file).is_ok() {
+            return;
+        }
+
+        let got = BlobStorage::new(&path, 100).unwrap().get(&at);
+        fs::set_permissions(&chunk_file, fs::Permissions::from_mode(0o644)).unwrap();
+        match got {
+            Err(StoreError::Io(error)) => {
+                let what = error.to_string();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert!(what.contains(&storage.blob_path(&at).display().to_string()), "{what}");
+                assert!(what.contains(&chunk.to_string()), "{what}");
+            }
+            other => panic!("expected the chunk's I/O error, got {:?}", other.map(|b| b.map(|b| b.hash))),
         }
     }
 
