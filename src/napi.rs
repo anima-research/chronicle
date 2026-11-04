@@ -537,7 +537,9 @@ impl JsStore {
     }
 
     /// Close the store, releasing the lock and any resources.
-    /// After closing, all operations on this store will fail.
+    /// After closing, the store's methods throw `StoreClosed`, but for
+    /// `isClosed()`, `pinnedBranch()` and `close()` itself, which answer as
+    /// before, and a poll, which first returns what was queued.
     ///
     /// On the root handle this closes the store itself: it is synced, every
     /// view made from this handle stops working ("Store has been closed"),
@@ -547,10 +549,12 @@ impl JsStore {
     /// can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
-    /// and its methods throw "View has been closed". The store stays open,
-    /// nothing is synced, and the root and other views are unaffected. A
-    /// view never needs to be closed; dropping it is enough. Any handle's
-    /// subscriptions are removed when it's garbage-collected.
+    /// and its methods throw "View has been closed", but for `isClosed()`,
+    /// `pinnedBranch()` and `close()`, and a poll, which finds no
+    /// subscription. The store stays open, nothing is synced, and the root
+    /// and other views are unaffected. A view never needs to be closed;
+    /// dropping it is enough. Any handle's subscriptions are removed when
+    /// it's garbage-collected.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         if self.pinned.is_some() {
@@ -1553,8 +1557,9 @@ impl JsStore {
     /// have reached the disk, and a later fsync can't show that they did.
     /// Its message begins `Durability lost:`, and its `code` is
     /// `DurabilityLost`. Registering a state, changing a strategy, and
-    /// creating, deleting or switching a branch throw it too, and so does any
-    /// write while one of them waits for its checkpoint.
+    /// creating, deleting or switching a branch throw it too, unless a check
+    /// of their own refuses them first, and so does any write while one of
+    /// them waits for its checkpoint.
     /// Reopening the store is the only way to resume durable writes.
     /// Reopening can't tell whether records the operating system still caches
     /// reached the disk: if they didn't while later records did, an open
@@ -1671,11 +1676,12 @@ impl JsStore {
     /// queued for it are read, a poll throws why it ended: `StoreClosed`
     /// after the root's `close()`, `SubscriptionNotFound` once it was
     /// unsubscribed through another handle, and `SubscriptionDropped` once
-    /// the store dropped it because its buffer overran. Its handle holds an
-    /// ended subscription, buffer and all, until it's unsubscribed through
-    /// that handle, the handle is a view that's closed, or the handle is
-    /// garbage-collected. After the root's `close()`, `unsubscribe` throws
-    /// `StoreClosed`, so only the last two free it.
+    /// the store dropped it because its buffer overran. After the root's
+    /// `close()` it's `StoreClosed`, whatever ended the subscription before.
+    /// Its handle holds an ended subscription, buffer and all, until it's
+    /// unsubscribed through that handle, the handle is a view that's closed,
+    /// or the handle is garbage-collected. After the root's `close()`,
+    /// `unsubscribe` throws `StoreClosed`, so only the last two free it.
     #[napi]
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
