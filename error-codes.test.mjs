@@ -166,6 +166,9 @@ test('a catch-up that overruns the subscription\'s buffer drops it', () => {
   const { store } = freshStore();
   for (const n of [1, 2, 3]) store.append('note', Buffer.from(String(n)));
   const id = store.subscribe({ bufferSize: 1, fromSequence: 0, filter: { includeRecords: true } });
+  assert.equal(store.subscriptionCount(), 1);
+  throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+  assert.equal(store.subscriptionCount(), 0);
   throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   store.close();
 });

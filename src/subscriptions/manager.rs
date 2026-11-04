@@ -259,14 +259,17 @@ impl SubscriptionManager {
     // --- Catch-up Helpers ---
 
     /// Send an event directly to a subscription (for catch-up).
-    /// Returns false if the subscription was dropped.
+    /// Returns false if the subscription was dropped: it was gone already, or
+    /// it couldn't take the event and is dropped now.
     pub fn send_to(&self, id: SubscriptionId, event: StoreEvent) -> bool {
-        let subs = self.subscriptions.read();
-        if let Some(sub) = subs.get(&id) {
-            sub.try_send(event)
-        } else {
-            false
+        let sent = match self.subscriptions.read().get(&id) {
+            Some(sub) => sub.try_send(event),
+            None => return false,
+        };
+        if !sent {
+            self.subscriptions.write().remove(&id);
         }
+        sent
     }
 
     /// Get the config for a subscription (for catch-up logic).
