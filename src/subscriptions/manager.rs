@@ -419,6 +419,7 @@ mod tests {
         let manager = SubscriptionManager::new();
         let handle = manager.subscribe(SubscriptionConfig::default());
         let id = handle.id;
+        assert_eq!(manager.subscription_count(), 1);
         drop(handle);
         assert!(!manager.send_to(id, StoreEvent::CaughtUp));
         assert_eq!(manager.subscription_count(), 0);
@@ -428,6 +429,7 @@ mod tests {
     fn marking_a_subscription_that_is_gone_caught_up_says_it_was_dropped() {
         let manager = SubscriptionManager::new();
         let handle = manager.subscribe(SubscriptionConfig::default());
+        assert!(manager.mark_caught_up(handle.id).is_ok());
         manager.unsubscribe(handle.id);
         assert!(matches!(
             manager.mark_caught_up(handle.id),

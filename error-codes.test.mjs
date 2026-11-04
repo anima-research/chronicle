@@ -210,12 +210,33 @@ test("a poll through a view that was closed of the view's own subscription says 
   const { store } = freshStore();
   const view = store.view('main');
   const id = view.subscribe();
+  assert.equal(store.subscriptionCount(), 1);
   view.close();
   throwsCoded(() => view.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   throwsCoded(() => view.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   assert.equal(store.subscriptionCount(), 0);
   store.close();
+});
+
+test('a root dropped without close() takes its own subscriptions with it, and a view it leaves finds them gone', async () => {
+  const { store, dir } = freshStore();
+  store.close();
+  let view;
+  const ids = [];
+  (() => {
+    const root = JsStore.open({ path: dir });
+    view = root.view('main');
+    for (let i = 0; i < 20; i++) ids.push(root.subscribe());
+  })();
+  assert.equal(view.subscriptionCount(), 20);
+  for (let i = 0; i < 200 && view.subscriptionCount() > 0; i++) {
+    gc();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(view.subscriptionCount(), 0);
+  for (const id of ids) throwsCoded(() => view.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  view.close();
 });
 
 test('a view dropped without close() takes its subscriptions with it', async () => {
