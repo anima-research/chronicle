@@ -40,8 +40,8 @@ test('ErrorCode lists every code, each named as its value', () => {
     'InvalidFormat', 'InvalidHash', 'InvalidOperation', 'InvalidRecordId',
     'InvalidSequence', 'InvalidStrategy', 'InvalidSubscriptionId', 'InvalidTreeOp', 'Io',
     'Locked', 'NotInitialized', 'RecordNotFound', 'Serialization', 'StateExists',
-    'StateNotRegistered', 'StoreClosed', 'StrategyMismatch', 'SubscriptionDisconnected',
-    'SubscriptionDropped', 'SubscriptionNotFound', 'Transaction',
+    'StateNotRegistered', 'StoreClosed', 'StrategyMismatch', 'SubscriptionDropped',
+    'SubscriptionNotFound', 'Transaction',
   ]);
   for (const [key, value] of Object.entries(ErrorCode)) assert.equal(value, key);
 });
@@ -157,12 +157,37 @@ test('a second open of a store in use is Locked', () => {
   store.close();
 });
 
-test('after close(), polling a subscription says it is disconnected, not that the store is closed', () => {
+test("after the root's close(), a poll returns what was queued, then says the store is closed", () => {
   const { store } = freshStore();
   const id = store.subscribe();
+  store.catchUpSubscription(id);
   store.close();
-  throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionDisconnected, 'Subscription disconnected');
-  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDisconnected, 'Subscription disconnected');
+  assert.equal(store.pollSubscription(id)?.eventType, 'caught_up');
+  throwsCoded(() => store.pollSubscription(id), ErrorCode.StoreClosed, 'Store has been closed');
+  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.StoreClosed, 'Store has been closed');
+});
+
+test('a poll of a subscription its buffer overflowed returns what was queued, then says it was dropped', () => {
+  const { store } = freshStore();
+  const id = store.subscribe({ bufferSize: 1, filter: { includeRecords: true } });
+  store.catchUpSubscription(id);
+  store.append('note', Buffer.from('a'));
+  assert.equal(store.subscriptionCount(), 0);
+  assert.equal(store.pollSubscription(id)?.eventType, 'caught_up');
+  throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+  store.close();
+});
+
+test('a poll of a subscription unsubscribed through another handle returns what was queued, then says it is not found', () => {
+  const { store } = freshStore();
+  const view = store.view('main');
+  const id = store.subscribe();
+  view.unsubscribe(id);
+  assert.equal(store.pollSubscription(id)?.eventType, 'dropped');
+  throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  store.close();
 });
 
 test('a catch-up that overruns the subscription\'s buffer drops it', () => {

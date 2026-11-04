@@ -138,10 +138,11 @@ pub enum ErrorCode {
     InvalidHash,
     /// A subscription ID that isn't a non-negative integer.
     InvalidSubscriptionId,
-    /// No subscription has that ID: it was never made, or was unsubscribed.
+    /// No subscription with that ID can be reached: it was never made, was
+    /// unsubscribed through any handle, or was a view's when the view was
+    /// closed. A poll reaches only the subscriptions made through its own
+    /// handle.
     SubscriptionNotFound,
-    /// The subscription's channel closed.
-    SubscriptionDisconnected,
     /// A tree operation other than set or remove, or a set without an entry.
     InvalidTreeOp,
     /// A field index kind other than number or string.
@@ -179,7 +180,6 @@ impl ErrorCode {
             ErrorCode::InvalidHash => "InvalidHash",
             ErrorCode::InvalidSubscriptionId => "InvalidSubscriptionId",
             ErrorCode::SubscriptionNotFound => "SubscriptionNotFound",
-            ErrorCode::SubscriptionDisconnected => "SubscriptionDisconnected",
             ErrorCode::InvalidTreeOp => "InvalidTreeOp",
             ErrorCode::InvalidFieldIndexKind => "InvalidFieldIndexKind",
         }
@@ -299,10 +299,6 @@ mod tests {
             (ErrorCode::InvalidHash, "InvalidHash"),
             (ErrorCode::InvalidSubscriptionId, "InvalidSubscriptionId"),
             (ErrorCode::SubscriptionNotFound, "SubscriptionNotFound"),
-            (
-                ErrorCode::SubscriptionDisconnected,
-                "SubscriptionDisconnected",
-            ),
             (ErrorCode::InvalidTreeOp, "InvalidTreeOp"),
             (ErrorCode::InvalidFieldIndexKind, "InvalidFieldIndexKind"),
         ];

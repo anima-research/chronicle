@@ -1631,11 +1631,11 @@ impl JsStore {
     ///
     /// This replays state snapshots and historical records based on the
     /// subscription's `from_sequence` setting. Any handle of the store can
-    /// catch up a subscription made through another. An ID that no handle
-    /// holds, because it was never made, was unsubscribed through any handle,
-    /// or was a view's when the view was closed, throws
-    /// `SubscriptionNotFound`. One the store has dropped because its buffer
-    /// overran, during a catch-up or live, throws `SubscriptionDropped`.
+    /// catch up a subscription made through another. An ID that was never
+    /// made, was unsubscribed through any handle, or was a view's when the
+    /// view was closed throws `SubscriptionNotFound`. One the store has
+    /// dropped because its buffer overran, during a catch-up or live, throws
+    /// `SubscriptionDropped`.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
         let (store, branch) = self.target()?;
@@ -1653,7 +1653,13 @@ impl JsStore {
 
     /// Poll for the next event from a subscription (non-blocking).
     ///
-    /// Returns null if no events are available.
+    /// Returns null if no events are available. A poll reaches only the
+    /// subscriptions made through its own handle; another ID throws
+    /// `SubscriptionNotFound`. Once a subscription has ended and the events
+    /// queued for it are read, a poll throws why it ended: `StoreClosed`
+    /// after the root's `close()`, `SubscriptionNotFound` once it was
+    /// unsubscribed through another handle, and `SubscriptionDropped` once
+    /// the store dropped it because its buffer overran.
     #[napi]
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
@@ -1668,16 +1674,14 @@ impl JsStore {
         match handle.try_recv() {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(coded(
-                ErrorCode::SubscriptionDisconnected,
-                "Subscription disconnected",
-            )),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(self.ended(id)),
         }
     }
 
     /// Poll for the next event with a timeout (milliseconds).
     ///
-    /// Returns null if no event received within the timeout.
+    /// Returns null if no event received within the timeout. Throws as
+    /// `pollSubscription` does.
     #[napi]
     pub fn poll_subscription_timeout(
         &self,
@@ -1697,10 +1701,17 @@ impl JsStore {
         match handle.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(coded(
-                ErrorCode::SubscriptionDisconnected,
-                "Subscription disconnected",
-            )),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.ended(id)),
+        }
+    }
+
+    fn ended(&self, id: u64) -> napi::Error<ErrorCode> {
+        if self.shared.read().is_none() {
+            coded(ErrorCode::StoreClosed, "Store has been closed")
+        } else if !self.live_subscriptions.lock().contains(&id) {
+            coded(ErrorCode::SubscriptionNotFound, "Subscription not found")
+        } else {
+            to_napi_error(StoreError::SubscriptionDropped)
         }
     }
 
