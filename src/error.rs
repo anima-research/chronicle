@@ -99,33 +99,63 @@ impl From<rmp_serde::decode::Error> for StoreError {
 /// call's arguments, before chronicle runs, keeps napi's own code or none.)
 /// A code's name is its variant's identifier: napi's string enum
 /// takes each value from it, and `as_str` spells the same name for
-/// `error.code`. Renaming a variant would change a published code, so the
-/// tests below pin every name, against both.
+/// `error.code`. Renaming a variant would change a published code.
 #[cfg_attr(feature = "napi-bindings", napi_derive::napi(string_enum))]
 #[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     // One per `StoreError` variant.
+    /// The operating system refused or failed a file operation, such as
+    /// opening a path that holds no store; the message carries its error.
     Io,
+    /// An fsync of the record log failed. `sync()` throws it until the store
+    /// is reopened, and so do the calls that checkpoint, unless a check of
+    /// their own refuses them first.
     DurabilityLost,
+    /// Not raised by this release.
     RecordNotFound,
+    /// No branch has that name, or the branch a view is pinned to was
+    /// deleted.
     BranchNotFound,
+    /// Not raised by this release.
     BlobNotFound,
+    /// No state is registered under that ID.
     StateNotRegistered,
+    /// A state is already registered under that ID.
     StateExists,
+    /// A branch was asked to start at a sequence past its parent's head.
     InvalidSequence,
+    /// A branch already has that name.
     BranchExists,
+    /// A value couldn't be encoded, as JSON or in the store's own format.
     Serialization,
+    /// Bytes couldn't be decoded, as JSON or from the store's own format.
     Deserialization,
+    /// A store file holds what no write leaves, such as a damaged log entry
+    /// with valid ones after it, which open refuses.
     Corruption,
+    /// Not raised by this release.
     StrategyMismatch,
+    /// The store is open already, in another process or through another
+    /// open of it.
     Locked,
+    /// Not raised through this binding: `open` of a path that holds no store
+    /// fails with `Io`.
     NotInitialized,
+    /// A store or blob file isn't in a format this release reads, or is
+    /// damaged.
     InvalidFormat,
+    /// A record or blob read from its file doesn't match its checksum.
     ChecksumMismatch,
+    /// A blob's bytes don't match the hash they're stored under.
     HashMismatch,
+    /// Not raised by this release.
     Transaction,
+    /// A call refused as things stand, such as `switchBranch` on a view, or
+    /// deleting the main branch, the current one or the one a view is
+    /// pinned to.
     InvalidOperation,
+    /// The store dropped the subscription, because its buffer overran.
     SubscriptionDropped,
     // The binding's own, for calls it refuses or can't complete itself.
     /// The store, or this view of it, was closed with `close()`.
