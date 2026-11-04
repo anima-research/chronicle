@@ -86,6 +86,10 @@ test("the store's errors carry their kind", () => {
   // State bytes that aren't JSON, read as JSON.
   store.setState('notes', Buffer.from('not json'));
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  store.registerState({ id: 'items', strategy: 'append_log' });
+  store.appendToState('items', Buffer.from('not json'));
+  throwsCoded(() => store.getStateItemJson('items', 0), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.deleteBranch('main'), ErrorCode.InvalidOperation, 'Invalid operation: Cannot delete main branch');
   store.createBranch('side');
   store.switchBranch('side');
@@ -162,38 +166,45 @@ test('a second open of a store in use is Locked', () => {
   store.close();
 });
 
-test("after the root's close(), a poll returns what was queued, then says the store is closed", () => {
-  const { store } = freshStore();
-  const id = store.subscribe();
-  store.catchUpSubscription(id);
-  store.close();
-  assert.equal(store.pollSubscription(id)?.eventType, 'caught_up');
-  throwsCoded(() => store.pollSubscription(id), ErrorCode.StoreClosed, 'Store has been closed');
-  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.StoreClosed, 'Store has been closed');
-});
+const owners = [['the root', (store) => store], ['a view', (store) => store.view('main')]];
 
-test('a poll of a subscription its buffer overflowed returns what was queued, then says it was dropped', () => {
-  const { store } = freshStore();
-  const id = store.subscribe({ bufferSize: 1, filter: { includeRecords: true } });
-  store.catchUpSubscription(id);
-  store.append('note', Buffer.from('a'));
-  assert.equal(store.subscriptionCount(), 0);
-  assert.equal(store.pollSubscription(id)?.eventType, 'caught_up');
-  throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
-  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
-  store.close();
-});
+for (const [made, ownerOf] of owners) {
+  test(`after the root's close(), a poll of a subscription made through ${made} returns what was queued, then says the store is closed`, () => {
+    const { store } = freshStore();
+    const owner = ownerOf(store);
+    const id = owner.subscribe();
+    owner.catchUpSubscription(id);
+    store.close();
+    assert.equal(owner.pollSubscription(id)?.eventType, 'caught_up');
+    throwsCoded(() => owner.pollSubscription(id), ErrorCode.StoreClosed, 'Store has been closed');
+    throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.StoreClosed, 'Store has been closed');
+  });
 
-test('a poll of a subscription unsubscribed through another handle returns what was queued, then says it is not found', () => {
-  const { store } = freshStore();
-  const view = store.view('main');
-  const id = store.subscribe();
-  view.unsubscribe(id);
-  assert.equal(store.pollSubscription(id)?.eventType, 'dropped');
-  throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-  store.close();
-});
+  test(`a poll of a subscription made through ${made} that its buffer overflowed returns what was queued, then says it was dropped`, () => {
+    const { store } = freshStore();
+    const owner = ownerOf(store);
+    const id = owner.subscribe({ bufferSize: 1, filter: { includeRecords: true } });
+    owner.catchUpSubscription(id);
+    store.append('note', Buffer.from('a'));
+    assert.equal(store.subscriptionCount(), 0);
+    assert.equal(owner.pollSubscription(id)?.eventType, 'caught_up');
+    throwsCoded(() => owner.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+    throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+    store.close();
+  });
+
+  test(`a poll of a subscription made through ${made} and unsubscribed through another handle returns what was queued, then says it is not found`, () => {
+    const { store } = freshStore();
+    const owner = ownerOf(store);
+    const other = owner === store ? store.view('main') : store;
+    const id = owner.subscribe();
+    other.unsubscribe(id);
+    assert.equal(owner.pollSubscription(id)?.eventType, 'dropped');
+    throwsCoded(() => owner.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+    throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+    store.close();
+  });
+}
 
 test("a poll through a view that was closed of the view's own subscription says it is not found", () => {
   const { store } = freshStore();
