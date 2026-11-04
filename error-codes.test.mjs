@@ -284,6 +284,7 @@ test('a subscription is caught up, or not found once unsubscribed, through any h
   }
   const closing = store.view('main');
   const onClosing = closing.subscribe();
+  assert.equal(store.subscriptionCount(), 1);
   closing.close();
   throwsCoded(() => store.catchUpSubscription(onClosing), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   store.close();
