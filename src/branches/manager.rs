@@ -624,12 +624,11 @@ impl BranchManager {
 
         // Get new parent ID if reparenting
         let new_parent_id = match reparent_to {
-            Some(parent_name) => Some(
-                *index
-                    .name_to_id
-                    .get(parent_name)
-                    .ok_or_else(|| StoreError::BranchNotFound(parent_name.to_string()))?,
-            ),
+            Some(parent_name) => Some(*index.name_to_id.get(parent_name).ok_or_else(|| {
+                StoreError::InvalidOperation(format!(
+                    "Cannot delete {name}: the branch to reparent its children onto, {parent_name}, doesn't exist"
+                ))
+            })?),
             None => None,
         };
 
@@ -902,6 +901,21 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_reparenting_delete_onto_a_missing_branch_is_refused_as_an_invalid_operation() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+        manager.create_branch("child", None).unwrap();
+
+        let result = manager.delete_branch_with_reparent("child", Some("missing"));
+        assert!(
+            matches!(&result, Err(StoreError::InvalidOperation(m))
+                if m == "Cannot delete child: the branch to reparent its children onto, missing, doesn't exist"),
+            "{result:?}"
+        );
+        assert!(manager.get_branch("child").is_some());
     }
 
     #[test]

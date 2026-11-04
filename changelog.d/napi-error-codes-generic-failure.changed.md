@@ -18,4 +18,6 @@
     branch it is pinned to, now throws `InvalidOperation` (in Rust,
     `StoreError::InvalidOperation`), whose message begins
     `Invalid operation:`, where it was `BranchNotFound` and began
-    `Branch not found:`.
+    `Branch not found:`. In Rust, so does
+    `BranchManager::delete_branch_with_reparent` naming a branch to reparent
+    onto that doesn't exist.
