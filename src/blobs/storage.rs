@@ -641,10 +641,7 @@ impl BlobStorage {
             hasher.update(&hashes);
             let computed_checksum = hasher.finalize();
             if stored_checksum != computed_checksum {
-                return Err(StoreError::ChecksumMismatch {
-                    expected: stored_checksum,
-                    got: computed_checksum,
-                });
+                return Err(damaged(path, "its checksum doesn't match"));
             }
             if content_len > u64::from(count) * chunks::MAX_CHUNK as u64 {
                 return Err(damaged(
@@ -1259,6 +1256,29 @@ mod tests {
             fresh.store_chunked(&content, "application/json").unwrap();
             let reader = BlobStorage::new(&path, 100).unwrap();
             assert_eq!(reader.get(&hash).unwrap().unwrap().content, content);
+        }
+    }
+
+    #[test]
+    fn a_chunk_list_whose_checksum_doesnt_match_names_its_file_and_the_repair() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blobs");
+        let storage = BlobStorage::new(&path, 100).unwrap();
+        let content = varied(100_000, 25);
+        let hash = storage.store_chunked(&content, "application/json").unwrap();
+        let file = storage.blob_path(&hash);
+        let mut damaged = fs::read(&file).unwrap();
+        let named = damaged.len() - 4 - 1;
+        damaged[named] ^= 1;
+        fs::write(&file, &damaged).unwrap();
+
+        match BlobStorage::new(&path, 100).unwrap().get(&hash) {
+            Err(StoreError::InvalidFormat(what)) => {
+                assert!(what.contains(&file.display().to_string()), "{what}");
+                assert!(what.contains("its checksum doesn't match"), "{what}");
+                assert!(what.ends_with(REPLACED_BY_STORING), "{what}");
+            }
+            other => panic!("expected the list refused as damaged, got {:?}", other.map(|b| b.map(|b| b.hash))),
         }
     }
 
