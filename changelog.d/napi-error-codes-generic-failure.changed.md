@@ -3,8 +3,8 @@
   error's `ErrorCode` instead, so a check for `GenericFailure` no longer
   matches them. Three kinds of error also change their message:
   - `catchUpSubscription` on an ID that was never made, was unsubscribed
-    through any handle, or was a view's when the view was closed or
-    garbage-collected now throws
+    through any handle, was a view's when the view was closed, or was a
+    handle's when the handle was garbage-collected now throws
     `SubscriptionNotFound` with the message `Subscription not found`, as
     polling does, instead of `Subscription was dropped`.
   - A poll of a subscription that has ended, once the events queued for it

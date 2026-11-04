@@ -549,7 +549,7 @@ impl JsStore {
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed". The store stays open,
     /// nothing is synced, and the root and other views are unaffected. A
-    /// view never needs to be closed; dropping it is enough, and its
+    /// view never needs to be closed; dropping it is enough. Any handle's
     /// subscriptions are removed when it's garbage-collected.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
@@ -1643,9 +1643,10 @@ impl JsStore {
     /// This replays state snapshots and historical records based on the
     /// subscription's `from_sequence` setting. Any handle of the store can
     /// catch up a subscription made through another. An ID that was never
-    /// made, was unsubscribed through any handle, or was a view's when the
-    /// view was closed or garbage-collected throws `SubscriptionNotFound`. One the store has
-    /// dropped because its buffer overran, during a catch-up or live, throws
+    /// made, was unsubscribed through any handle, was a view's when the view
+    /// was closed, or was a handle's when the handle was garbage-collected
+    /// throws `SubscriptionNotFound`. One the store has dropped because its
+    /// buffer overran, during a catch-up or live, throws
     /// `SubscriptionDropped`.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
@@ -1670,7 +1671,9 @@ impl JsStore {
     /// queued for it are read, a poll throws why it ended: `StoreClosed`
     /// after the root's `close()`, `SubscriptionNotFound` once it was
     /// unsubscribed through another handle, and `SubscriptionDropped` once
-    /// the store dropped it because its buffer overran.
+    /// the store dropped it because its buffer overran. Its handle holds an
+    /// ended subscription, buffer and all, until it's unsubscribed through
+    /// that handle.
     #[napi]
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id

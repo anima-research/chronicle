@@ -4,9 +4,10 @@
   the overrun fell on a replayed event, it used to fail with
   `Subscription was dropped` while the subscription stayed registered. In
   Rust, `SubscriptionManager::send_to` now removes a subscription that can't
-  take the event, and `mark_caught_up` fails with `SubscriptionDropped` for
-  one that's gone, where it returned `Ok`.
-- A view dropped without `close()` now gives up its subscriptions when it's
-  garbage-collected. A subscription it had made and not caught up used to
-  stay in the store, counted by `subscriptionCount()`, until the store
-  closed.
+  take the event, and `Store::mark_subscription_caught_up` and
+  `SubscriptionManager::mark_caught_up` fail with `SubscriptionDropped` for
+  one that's gone, where they returned `Ok`.
+- A handle, the root or a view, dropped without `close()` now gives up its
+  subscriptions when it's garbage-collected. A subscription it had made and
+  not caught up used to stay in the store, counted by `subscriptionCount()`,
+  until the store closed.
