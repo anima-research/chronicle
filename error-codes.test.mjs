@@ -116,6 +116,7 @@ test("a view's refusals carry theirs", () => {
   const closed = store.view('main');
   closed.close();
   throwsCoded(() => closed.getStateJson('anything'), ErrorCode.StoreClosed, 'View has been closed');
+  store.close();
 });
 
 test("the binding's own refusals carry theirs", () => {
