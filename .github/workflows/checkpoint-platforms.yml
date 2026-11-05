@@ -10,6 +10,7 @@ on:
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
       - 'tests/lock_file.rs'
+      - 'tests/create_existing_store.rs'
   pull_request:
     paths:
       - '.github/workflows/checkpoint-platforms.yml'
@@ -19,6 +20,7 @@ on:
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
       - 'tests/lock_file.rs'
+      - 'tests/create_existing_store.rs'
   workflow_dispatch:
 
 permissions:
@@ -62,6 +64,10 @@ jobs:
       # Windows) and file types, so its tests run here too.
       - name: Store lock tests
         run: cargo test --test lock_file -- --nocapture
+
+      # A create aimed at an open store meets the same locks.
+      - name: Store create tests
+        run: cargo test --test create_existing_store -- --nocapture
 
       - name: Lock error mapping test
         run: cargo test --lib store::tests::only_another_holders_lock_is_reported_as_locked -- --nocapture

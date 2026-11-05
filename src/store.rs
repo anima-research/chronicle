@@ -127,28 +127,179 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open an existing store or create a new one.
+    /// Open an existing store or create a new one, deciding in this order:
+    ///
+    /// 1. A directory holding a store's `MANIFEST` is opened.
+    /// 2. One holding a store's data files, or a `blobs/` with data in it, but
+    ///    no `MANIFEST` is refused as a damaged store, as [`Store::open`]
+    ///    refuses it.
+    /// 3. One holding anything but what a new store can sit beside, such as a
+    ///    mistaken path to a project, is refused as no store and no place for
+    ///    one. A new store can sit beside `lost+found` (a fresh volume's root),
+    ///    Finder's `.DS_Store`, and what a create leaves when it stops before
+    ///    its manifest: `LOCK`, an empty `blobs/`, and beside that `LOCK` the
+    ///    staging file of its manifest save. A `blobs` link is refused here,
+    ///    since where it leads may hold anything; [`Store::create`], asked for
+    ///    by name, takes one. A directory that can't be listed
+    ///    is refused too, since it may hold anything.
+    /// 4. Without `create_if_missing`, what's left is `NotInitialized`.
+    /// 5. Otherwise the store is created, the directory first if it's missing.
+    ///
+    /// This looks before it takes the lock. [`Store::create`] looks again under
+    /// the lock, and a store another create finished and closed in between is
+    /// opened; one still open is [`StoreError::Locked`].
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.exists() {
-            Self::open(config)
-        } else if config.create_if_missing {
-            Self::create(config)
-        } else {
-            Err(StoreError::NotInitialized)
+        if Self::store_entry(&config.path)?.is_some() {
+            return Self::open(config);
+        }
+        if let Some(other) = Self::foreign_entry(&config.path)? {
+            return Err(StoreError::InvalidFormat(format!(
+                "{} has no MANIFEST and holds {other}, so it isn't a Chronicle store or an empty place for one",
+                config.path.display()
+            )));
+        }
+        if !config.create_if_missing {
+            return Err(StoreError::NotInitialized);
+        }
+        Self::create_unless_raced(config)
+    }
+
+    /// [`Store::create`], for a caller that found no `MANIFEST` before taking
+    /// the lock. Another create may have published one and closed its store
+    /// since, and that store is the one this caller asked for.
+    fn create_unless_raced(config: StoreConfig) -> Result<Self> {
+        match Self::create(config.clone()) {
+            Err(StoreError::InvalidOperation(_)) if config.path.join("MANIFEST").exists() => {
+                Self::open(config)
+            }
+            outcome => outcome,
         }
     }
 
+    /// What in a directory says a store has lived there: its `MANIFEST` or a
+    /// data file, whatever kind of entry it is (a link with nothing behind it
+    /// isn't an absent file: a write would go through it), or a `blobs/` it may
+    /// have written to. A create writes no blob before its `MANIFEST`, so its
+    /// own leftover `blobs/` is empty, but for what a volume or Finder puts
+    /// there. A `blobs` link says nothing, since it may lead to a shared
+    /// directory. A look that fails is an error, naming where: this can't say
+    /// the directory holds nothing.
+    fn store_entry(path: &Path) -> Result<Option<&'static str>> {
+        let failed = |e: std::io::Error, at: &Path| {
+            StoreError::Io(std::io::Error::new(e.kind(), format!("looking in {}: {e}", at.display())))
+        };
+        let gone = |e: &std::io::Error| {
+            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+        };
+        for file in Self::STORE_FILES {
+            match fs::symlink_metadata(path.join(file)) {
+                Ok(_) => return Ok(Some(file)),
+                Err(e) if gone(&e) => {}
+                Err(e) => return Err(failed(e, path)),
+            }
+        }
+        let blobs = path.join("blobs");
+        match fs::symlink_metadata(&blobs) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(failed(e, &blobs)),
+        }
+        let entries = match fs::read_dir(&blobs) {
+            Ok(entries) => entries,
+            Err(e) if gone(&e) => return Ok(None),
+            Err(e) => return Err(failed(e, &blobs)),
+        };
+        for entry in entries {
+            let name = entry.map_err(|e| failed(e, &blobs))?.file_name();
+            if name != ".DS_Store" && name != "lost+found" {
+                return Ok(Some("blobs/ with data in it"));
+            }
+        }
+        Ok(None)
+    }
+
+    /// An entry a new store can't sit beside, in a directory that
+    /// [`Store::store_entry`] found nothing in. A store's own files are allowed
+    /// because another create may have written them since that look; `create`
+    /// looks again under the lock. `LOCK` is allowed whatever it is, since
+    /// taking the lock refuses one that isn't a regular file and says why.
+    /// A missing directory has nothing in it; one that can't be listed is an
+    /// error, not an empty directory.
+    fn foreign_entry(path: &Path) -> Result<Option<String>> {
+        let unlisted = |e: std::io::Error| {
+            StoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("listing {}: {e}", path.display()),
+            ))
+        };
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(unlisted(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(unlisted)?;
+            let kind = entry.file_type().map_err(unlisted)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let fits = match name.as_str() {
+                "LOCK" => true,
+                "blobs" | "lost+found" => kind.is_dir(),
+                ".DS_Store" => kind.is_file(),
+                name if Self::STORE_FILES.contains(&name) => true,
+                // A create takes LOCK before it stages anything.
+                name => {
+                    name.starts_with(crate::atomic_file::STAGING_PREFIX)
+                        && kind.is_file()
+                        && fs::symlink_metadata(path.join("LOCK")).is_ok()
+                }
+            };
+            if !fits {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a new store.
+    ///
+    /// Refuses a directory that already holds a store: creating over one
+    /// used to keep its records but publish empty state and branch indexes
+    /// over its own at the first sync (#34). Refuses a damaged one too: a
+    /// store's data files, or a `blobs/` with data in it, without a `MANIFEST`.
+    /// Use [`Store::open`] or [`Store::open_or_create`] for a store that may
+    /// exist; they refuse a damaged one too.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
-        fs::create_dir_all(config.path.join("blobs"))?;
+        // A LOCK already here says a save may have been interrupted here.
+        let lock_was_here = fs::symlink_metadata(config.path.join("LOCK")).is_ok();
 
-        // Write manifest
-        Self::write_manifest(&config.path)?;
-
-        // Acquire lock
+        // The lock comes first, so a create aimed at a store another process
+        // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
+        if let Some(found) = Self::store_entry(&config.path)? {
+            let path = config.path.display();
+            return Err(StoreError::InvalidOperation(if found != "MANIFEST" {
+                format!(
+                    "create: {path} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over"
+                )
+            } else if let Err(e) = Self::verify_manifest(&config.path) {
+                format!(
+                    "create: {path} holds a MANIFEST that doesn't verify ({e}), which create won't write over"
+                )
+            } else {
+                format!("create: {path} already holds a Chronicle store; open it instead")
+            }));
+        }
+
+        // With the lock held, staging files here were left by interrupted
+        // saves, a create's own manifest save among them (as open sweeps them).
+        if lock_was_here {
+            crate::atomic_file::remove_staging_files(&config.path);
+        }
+        fs::create_dir_all(config.path.join("blobs"))?;
+        Self::write_manifest(&config.path)?;
 
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
@@ -2778,33 +2929,65 @@ impl Store {
 
     // --- Private Helpers ---
 
+    /// The files whose presence means a directory already holds a store.
+    const STORE_FILES: [&'static str; 5] =
+        ["MANIFEST", "records.log", "state.bin", "state-indexes.bin", "branches.bin"];
+
+    // Published whole, through a staging file renamed over it, so a crash
+    // mid-write can't leave a MANIFEST that create refuses and open can't read.
     fn write_manifest(path: &Path) -> Result<()> {
-        use std::io::Write;
+        crate::atomic_file::Checkpoint::default().save(&path.join("MANIFEST"), &[STORE_MAGIC, &[STORE_VERSION]])
+    }
 
-        let manifest_path = path.join("MANIFEST");
-        let mut file = File::create(manifest_path)?;
-
-        file.write_all(STORE_MAGIC)?;
-        file.write_all(&[STORE_VERSION])?;
-        file.sync_all()?;
-
-        Ok(())
+    /// What opening a directory whose `MANIFEST` can't be found fails with: the
+    /// path's own absence as that, a look that failed as that, and otherwise what
+    /// the directory is.
+    fn no_manifest_error(path: &Path) -> StoreError {
+        if let Err(e) = fs::metadata(path) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return StoreError::Io(std::io::Error::new(e.kind(), format!("{} doesn't exist", path.display())));
+            }
+        }
+        StoreError::InvalidFormat(match Self::store_entry(path) {
+            Err(look) => return look,
+            Ok(Some("MANIFEST")) => format!(
+                "{} has a MANIFEST link with nothing behind it: a damaged Chronicle store, which neither open nor create will take as it is",
+                path.display()
+            ),
+            Ok(Some(found)) => format!(
+                "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
+                path.display()
+            ),
+            Ok(None) => format!("{} has no MANIFEST, so it isn't a Chronicle store", path.display()),
+        })
     }
 
     fn verify_manifest(path: &Path) -> Result<()> {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
-        let mut file = File::open(manifest_path)?;
+        // Only a regular file is opened: opening a FIFO waits for a writer, as
+        // acquire_lock says of LOCK, and create would wait holding the lock.
+        if fs::metadata(&manifest_path).is_ok_and(|meta| !meta.is_file()) {
+            return Err(StoreError::InvalidFormat(format!(
+                "{} isn't a regular file, so it isn't a Chronicle store's MANIFEST",
+                manifest_path.display()
+            )));
+        }
+        let reading = |e: std::io::Error| StoreError::Io(std::io::Error::new(e.kind(), format!("reading {}: {e}", manifest_path.display())));
+        let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Self::no_manifest_error(path),
+            _ => reading(e),
+        })?;
 
         let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
+        file.read_exact(&mut magic).map_err(reading)?;
         if &magic != STORE_MAGIC {
             return Err(StoreError::InvalidFormat("Invalid store magic".into()));
         }
 
         let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
+        file.read_exact(&mut version).map_err(reading)?;
         if version[0] != STORE_VERSION {
             return Err(StoreError::InvalidFormat(format!(
                 "Unsupported store version: {}",
@@ -3310,6 +3493,50 @@ mod tests {
             let state = store.get_state("test").unwrap().unwrap();
             assert_eq!(state, b"value");
         }
+    }
+
+    /// The path of an open_or_create that lost a race: it found no MANIFEST,
+    /// and by the time it held the lock another create had finished and closed.
+    #[test]
+    fn a_create_that_lost_the_race_opens_the_store_it_lost_to() {
+        let dir = TempDir::new().unwrap();
+        drop(Store::create(test_config(&dir)).unwrap());
+        // As try_reopen waits: a concurrent test's child can hold the closed
+        // store's lock for a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match Store::create_unless_raced(test_config(&dir)) {
+                Err(StoreError::Locked) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                result => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_entry_lets_a_racing_creates_files_past_for_create_to_judge() {
+        let dir = TempDir::new().unwrap();
+        for file in Store::STORE_FILES {
+            fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        assert_eq!(Store::foreign_entry(dir.path()).unwrap(), None);
+    }
+
+    /// Only a MANIFEST means that: a damaged store is still refused.
+    #[test]
+    fn a_create_refused_over_a_damaged_store_stays_refused() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        fs::create_dir(&config.path).unwrap();
+        fs::write(config.path.join("records.log"), b"x").unwrap();
+        assert!(matches!(
+            Store::create_unless_raced(config),
+            Err(StoreError::InvalidOperation(_))
+        ));
     }
 
     #[test]
