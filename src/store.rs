@@ -2966,19 +2966,28 @@ impl Store {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
+        // Only a regular file is opened: opening a FIFO waits for a writer, as
+        // acquire_lock says of LOCK, and create would wait holding the lock.
+        if fs::metadata(&manifest_path).is_ok_and(|meta| !meta.is_file()) {
+            return Err(StoreError::InvalidFormat(format!(
+                "{} isn't a regular file, so it isn't a Chronicle store's MANIFEST",
+                manifest_path.display()
+            )));
+        }
+        let reading = |e: std::io::Error| StoreError::Io(std::io::Error::new(e.kind(), format!("reading {}: {e}", manifest_path.display())));
         let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => Self::no_manifest_error(path),
-            kind => StoreError::Io(std::io::Error::new(kind, format!("reading {}: {e}", manifest_path.display()))),
+            _ => reading(e),
         })?;
 
         let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
+        file.read_exact(&mut magic).map_err(reading)?;
         if &magic != STORE_MAGIC {
             return Err(StoreError::InvalidFormat("Invalid store magic".into()));
         }
 
         let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
+        file.read_exact(&mut version).map_err(reading)?;
         if version[0] != STORE_VERSION {
             return Err(StoreError::InvalidFormat(format!(
                 "Unsupported store version: {}",

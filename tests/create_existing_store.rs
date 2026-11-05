@@ -569,6 +569,64 @@ fn open_names_the_path_when_reading_its_manifest_fails() {
     }
 }
 
+/// A `MANIFEST` cut short, as main's writer leaves one when a create crashes
+/// mid-write, is reported by where it is, from every entry point.
+#[test]
+fn a_manifest_cut_short_names_where() {
+    for bytes in [&b""[..], &b"CH"[..], &b"RST\0"[..]] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        fs::create_dir_all(&path).unwrap();
+        let manifest = path.join("MANIFEST");
+        fs::write(&manifest, bytes).unwrap();
+        let shown = manifest.to_string_lossy().into_owned();
+        for (name, msg) in [
+            ("open", Store::open(config(&path)).err().map(|e| e.to_string())),
+            ("open_or_create", Store::open_or_create(config(&path)).err().map(|e| e.to_string())),
+        ] {
+            let msg = msg.unwrap_or_else(|| panic!("{name} opened a cut-short MANIFEST"));
+            assert!(msg.contains(&shown), "{name}: {msg}");
+        }
+    }
+}
+
+/// A `MANIFEST` that isn't a regular file is refused by where it is, without
+/// opening it: a directory, and a FIFO, whose open would wait for a writer, and
+/// `create` would wait holding the lock. Unix only: it makes a FIFO. Each call runs
+/// on a thread so a hang fails the test rather than the run.
+#[cfg(unix)]
+#[test]
+fn a_manifest_that_is_not_a_file_is_refused_without_hanging() {
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let as_dir = dir.path().join("dir");
+    fs::create_dir_all(as_dir.join("MANIFEST")).unwrap();
+    let as_fifo = dir.path().join("fifo");
+    fs::create_dir_all(&as_fifo).unwrap();
+    assert!(Command::new("mkfifo").arg(as_fifo.join("MANIFEST")).status().unwrap().success());
+
+    for path in [as_dir, as_fifo] {
+        let shown = path.join("MANIFEST").to_string_lossy().into_owned();
+        type Entry = fn(StoreConfig) -> chronicle::error::Result<Store>;
+        for (name, entry) in [("open", Store::open as Entry), ("open_or_create", Store::open_or_create as Entry), ("create", Store::create as Entry)] {
+            let (tx, rx) = mpsc::channel();
+            let cfg = config(&path);
+            std::thread::spawn(move || {
+                let _ = tx.send(entry(cfg).err().map(|e| e.to_string()));
+            });
+            let msg = rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{name} hung on {shown}"))
+                .unwrap_or_else(|| panic!("{name} opened {shown}"));
+            assert!(msg.contains(&shown), "{name}: {msg}");
+        }
+        assert!(path.join("MANIFEST").symlink_metadata().is_ok());
+    }
+}
+
 /// `LOCK` is the lock's to judge, and it says what to do about one that isn't a
 /// regular file.
 #[test]
