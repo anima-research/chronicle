@@ -153,10 +153,15 @@ pub enum ErrorCode {
     HashMismatch,
     /// Not raised by this release.
     Transaction,
-    /// A call refused as things stand, such as `switchBranch` on a view;
-    /// deleting the main branch, the current one or the one a view is
-    /// pinned to; changing a state's strategy to another kind; or a tree
-    /// operation on a state that isn't a tree.
+    /// A call refused for one of these reasons. Not allowed as things stand:
+    /// `switchBranch` on a view; deleting the main branch, the current one
+    /// or the one a view is pinned to; changing a state's strategy to
+    /// another kind; or a tree operation on a state that isn't a tree. Or
+    /// for one of these arguments: an edit index past the end; an invalid
+    /// tree path or field-index path; an item for
+    /// `appendToStateJsonWithIdentity` that isn't a JSON object; the
+    /// reserved record type `state_update`; or a blob content type over
+    /// 65,535 bytes.
     InvalidOperation,
     /// The store dropped the subscription, because its buffer overran.
     SubscriptionDropped,
