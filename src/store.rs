@@ -1321,7 +1321,9 @@ impl Store {
     /// gives, which may name the `(record_id, sequence)` the batch is about
     /// to take, as one `AppendMany` through `update_state_with_builder`, and
     /// reads the first ordinal under the same lock. `empty` says the builder
-    /// gives no items, a batch that is refused before anything is counted.
+    /// gives no items: such a batch is refused here, before it takes the
+    /// lock, so it does nothing, not even the checkpoint an earlier failure
+    /// left pending, which every write first finishes.
     fn append_batch_with_builder<F>(
         &self,
         branch_id: BranchId,
@@ -1332,6 +1334,13 @@ impl Store {
     where
         F: FnOnce(RecordId, Sequence) -> Result<Vec<Vec<u8>>>,
     {
+        if empty {
+            return Err(StoreError::InvalidOperation(
+                "AppendMany needs at least one item: an empty batch would be a record that \
+                 appends nothing"
+                    .into(),
+            ));
+        }
         // A head this session hasn't checked has its items counted here,
         // before the write lock, as the count reads the state's whole value
         // and every other writer of the store would wait on the lock while
@@ -1339,11 +1348,9 @@ impl Store {
         // the value was read, so it is the count of that head's value, and
         // the builder below finds it checked, or, where a write in between
         // left the head unchecked, counts again under the lock.
-        if !empty {
-            self.state
-                .checked_item_count(branch_id, state_id)
-                .map_err(Self::count_error)?;
-        }
+        self.state
+            .checked_item_count(branch_id, state_id)
+            .map_err(Self::count_error)?;
         let mut first_ordinal = 0;
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
