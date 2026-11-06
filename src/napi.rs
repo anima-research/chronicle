@@ -1416,7 +1416,8 @@ impl JsStore {
     /// this for point lookups in large states. Returns `null` if the state
     /// doesn't exist, the index is negative or out of range, or the state's
     /// value isn't an array. Throws the deserialization error if the state's
-    /// bytes aren't one JSON value.
+    /// bytes aren't one JSON value, except the last item served from the
+    /// head record alone, which reads no earlier item.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1442,13 +1443,15 @@ impl JsStore {
 
     /// Get several items of an AppendLog state by index, as JSON, in one
     /// call. The result has one entry per index in `ordinals`, in the order
-    /// given: what `getStateItemJson` returns for that index, so `null` if
-    /// it is negative or out of range, the state doesn't exist, or the
-    /// state's value isn't an array, except at the last index of a head
-    /// whose count this session hasn't checked, where `getStateItemJson`
-    /// answers from the stored count and this from the value. Throws, as
-    /// `getStateItemJson` does, if the state's bytes aren't one JSON value.
-    /// Indices may repeat and come in any order.
+    /// given: what `getStateItemJson` returns for that index, so `null` if it
+    /// is negative or out of range, the state doesn't exist, or the state's
+    /// value isn't an array, except at the last index of a head whose count
+    /// this session hasn't found exact (unchecked, or checked on a value that
+    /// doesn't materialize), where `getStateItemJson` answers from the stored
+    /// count and this from the value. Throws, as `getStateItemJson` does, if
+    /// the state's bytes aren't one JSON value, except the last item served
+    /// from the head record alone, which reads no earlier item. Indices may
+    /// repeat and come in any order.
     ///
     /// Every entry comes from the same version of the state, and a cold
     /// state is materialized at most once for the whole call, not once per

@@ -4,8 +4,10 @@
 //! `get_records` (several records by ID in one call).
 //!
 //! Each batched call must answer what the single calls it stands for would:
-//! the batch's items sit at the ordinals it reports, a batched item read
-//! returns the item `get_state_item` returns for each ordinal, and a
+//! the batch's items sit at the ordinals it reports (on an array value; see
+//! `AppendedBatch::first_ordinal` for one that isn't), a batched item read
+//! returns the item `get_state_item` returns for each ordinal, except at the
+//! last index of a head whose count this session hasn't found exact, and a
 //! batched record read returns what `get_record` returns for each ID.
 //!
 //! An item read returns the same bytes as `get_state_item` for an item

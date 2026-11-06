@@ -985,9 +985,10 @@ impl StateManager {
     /// A write takes its ordinals from the count only while holding
     /// `Store::write_lock`, so the head can't move between the count and the
     /// write that uses it. Called without the lock, as a batch does first so
-    /// that the read of the value doesn't hold up other writers, it may
-    /// race a write: the count is then kept only if the head is still the
-    /// one whose value was read, as heads only move forward (each to the
+    /// that other writers wait only for each record it reads (each read takes
+    /// the log file's lock, which an append takes too), not the whole count,
+    /// it may race a write: the count is then kept only if the head is still
+    /// the one whose value was read, as heads only move forward (each to the
     /// offset of a newer record), so the value read was that head's. A head
     /// that moved keeps its own count, which is returned.
     pub(crate) fn checked_item_count(&self, branch_id: BranchId, state_id: &str) -> Result<usize> {
@@ -1359,13 +1360,14 @@ impl StateManager {
         }
     }
 
-    /// Point lookups of several AppendLog items in one call: for each
-    /// ordinal in `ordinals`, in the order given, what `get_state_item`
-    /// returns for it, `None` where it is out of range, the state has no
-    /// value on this branch, or its value isn't an array, except at the last
-    /// index of a head whose count this session hasn't checked, where
-    /// `get_state_item` answers from the stored count and this from the
-    /// value. Ordinals may repeat and come in any order.
+    /// Point lookups of several AppendLog items in one call: for each ordinal
+    /// in `ordinals`, in the order given, what `get_state_item` returns for
+    /// it, `None` where it is out of range, the state has no value on this
+    /// branch, or its value isn't an array, except at the last index of a
+    /// head whose count this session hasn't found exact (unchecked, or
+    /// checked on a value that doesn't materialize), where `get_state_item`
+    /// answers from the stored count and this from the value. Ordinals may
+    /// repeat and come in any order.
     ///
     /// Every answer comes from one version of the state, and the version is
     /// read once: from the warm item cache when it is current; from the head
@@ -1373,13 +1375,16 @@ impl StateManager {
     /// `get_state_item`'s fast path serves it, and this session has checked
     /// the head's count (see `checked_item_count`); and otherwise from one
     /// materialization, cached for later reads. So a batch of ordinals costs
-    /// at most what one cold `get_state_item` costs, not one each. An empty
-    /// request reads nothing. An ordinal past the end costs what it costs
-    /// `get_state_item`: on a cold cache, the materialization that finds the
-    /// end, as the head's item count isn't exact for every store. The bytes
-    /// are the same as `get_state_item`'s for items written in serde_json's
-    /// own spelling; an item written in another comes back as written from
-    /// the head record and re-serialized from the rest, as there.
+    /// at most one materialization, not one per ordinal; at the last index of
+    /// a head whose count this session hasn't found exact, that is a
+    /// materialization where `get_state_item` reads only the head record. An
+    /// empty request reads nothing. An ordinal past the end costs what it
+    /// costs `get_state_item`: on a cold cache, the materialization that
+    /// finds the end, as the head's item count isn't exact for every store.
+    /// The bytes are the same as `get_state_item`'s for items written in
+    /// serde_json's own spelling; an item written in another comes back as
+    /// written from the head record and re-serialized from the rest, as
+    /// there.
     pub fn get_state_items_by_ordinal(
         &self,
         branch_id: BranchId,

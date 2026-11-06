@@ -7,8 +7,9 @@
 //!   of the batched calls serve only a count the session has checked.
 //! - The point lookups report malformed state bytes as the error they are,
 //!   except the last item served from the head record alone, which reads no
-//!   earlier item, and answer `None` only for a value that is one JSON value
-//!   but not an array.
+//!   earlier item, and, of the values that aren't arrays, answer `None` only
+//!   for one that is one JSON value, as for an absent state or an index out
+//!   of range.
 //! - The batched identity append refuses one key for both the id and the
 //!   sequence.
 

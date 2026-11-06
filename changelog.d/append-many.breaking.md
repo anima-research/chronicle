@@ -7,12 +7,12 @@
   "Unsupported store version: 2". Without the mark, what an earlier release
   does depends on the release and on where the batch lies. Past the last
   checkpoint, 0.5.0 replays the log's state updates and skips the batch,
-  which it can't decode, logging a warning; then, at the update that follows
-  the batch in that state's chain (its next update on that branch), it
-  refuses to open the store as corrupt ("cannot replay state ... does not
-  match checkpoint/replayed head"). When the batch is that state's newest
-  update there is no next one, so 0.5.0 opens the store, and the state lacks
-  the batch's items with only that warning to say so. Releases before 0.5.0
+  which it can't decode, logging a warning; then, at the next update in
+  that state's chain on that branch that isn't itself a batch, it refuses
+  to open the store as corrupt ("cannot replay state ... does not match
+  checkpoint/replayed head"). When only batches follow (the batch, or a run
+  of them, is the newest), 0.5.0 opens the store, and the state lacks all
+  their items with only those warnings to say so. Releases before 0.5.0
   don't replay updates past the last checkpoint at all: they open the store
   without a word, and the state is what the checkpoint holds, without the
   batch or any other update to it past the checkpoint. Before the

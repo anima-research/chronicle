@@ -1062,14 +1062,16 @@ impl Store {
     /// written, to format version 2 with the batch feature named, so a build
     /// that predates the operation refuses the store when it opens it. A
     /// store never asked to record one keeps version 1, which every release
-    /// opens. If that rewrite fails, the error is returned and the batch isn't
-    /// recorded; when only the directory sync after its rename failed, the
-    /// MANIFEST is already at version 2, and the next batch makes the rewrite
-    /// again. On Unix, an open that finds a version 2 MANIFEST syncs the
-    /// store's directory before it writes anything, and fails if that sync
-    /// fails. If the record then fails to be
-    /// written, the error is returned and the store stays at version 2 with
-    /// no batch.
+    /// opens. If that rewrite fails, the error is returned and the batch
+    /// isn't recorded; when only the directory sync after its rename failed,
+    /// the MANIFEST is already at version 2, and the next batch makes the
+    /// rewrite again. On Unix, an open that finds a version 2 MANIFEST syncs
+    /// the directory the mark renamed into (the store's, or for a linked
+    /// MANIFEST the one holding its target) before it writes anything, and
+    /// fails if that sync fails, except where this process may not open it or
+    /// the system doesn't sync directories, as for every checkpoint save. If
+    /// the record then fails to be written, the error is returned and the
+    /// store stays at version 2 with no batch.
     ///
     /// Snapshots are created automatically when the state's thresholds are
     /// reached, by the write that reaches them, once its record is written
@@ -1949,7 +1951,8 @@ impl Store {
     /// Returns `None` if the state doesn't exist, the index is out of range,
     /// or the state's value isn't an array (where `get_state_slice` errors).
     /// Returns `StoreError::Deserialization` if the state's bytes aren't one
-    /// JSON value, as `get_state_slice` does.
+    /// JSON value, as `get_state_slice` does, except the last item served
+    /// from the head record alone, which reads no earlier item.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -1973,12 +1976,15 @@ impl Store {
     /// `get_state_item` returns for it, `None` where the ordinal is out of
     /// range, the state has no value, or its value isn't an array; the
     /// `Deserialization` error where the state's bytes aren't one JSON value,
-    /// as for `get_state_item`. The exception is the last index of a head
-    /// whose count this session hasn't checked, where `get_state_item`
-    /// answers from the stored count and this from the value. Ordinals
-    /// may repeat and come in any order. All of them are answered from one
-    /// version of the state, read at most once, and an empty request reads
-    /// nothing (see `StateManager::get_state_items_by_ordinal`).
+    /// as for `get_state_item`, except the last item served from the head
+    /// record alone, which reads no earlier item. It answers otherwise than
+    /// `get_state_item` only at the last index of a head whose count this
+    /// session hasn't found exact (unchecked, or checked on a value that
+    /// doesn't materialize), where `get_state_item` answers from the stored
+    /// count and this from the value. Ordinals may repeat and come in any
+    /// order. All of them are answered from one version of the state, read at
+    /// most once, and an empty request reads nothing (see
+    /// `StateManager::get_state_items_by_ordinal`).
     pub fn get_state_items_by_ordinal(
         &self,
         state_id: &str,
