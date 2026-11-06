@@ -452,3 +452,48 @@ fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
     assert_eq!(store.stats().unwrap().record_count, records);
     assert_eq!(store.get_state_len("s").unwrap(), Some(3), "the stored count, unchanged");
 }
+
+/// A batch whose count reads a record of the state's chain whose framing is
+/// bad, here a version byte no build writes, is refused with the reader's
+/// `InvalidFormat` and writes nothing. The magic and version come before
+/// anything the checksum covers (the payload), so the reader names them
+/// first. The damage is made after open, which checks every record.
+#[test]
+fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = Store::create(config(&path)).unwrap();
+        store.set_auto_snapshot(false);
+        register_log(&store, "s");
+        append(&store, "s", json!("first"));
+        append(&store, "s", json!("framing-damaged"));
+        append(&store, "s", json!("last"));
+        store.sync().unwrap();
+    }
+    let store = open(&path);
+    let head = store.current_branch().head;
+    let records = store.stats().unwrap().record_count;
+
+    // The record holding the marker starts at the last record magic before
+    // it; its version byte follows the magic.
+    let log = path.join("records.log");
+    let bytes = fs::read(&log).unwrap();
+    let marker = b"framing-damaged";
+    let at = bytes.windows(marker.len()).position(|w| w == marker).unwrap();
+    let start = bytes[..at].windows(4).rposition(|w| w == b"REC\0").unwrap();
+    assert_eq!(bytes[start + 4], 1, "log version 1");
+    let mut handle = fs::OpenOptions::new().write(true).open(&log).unwrap();
+    handle.seek(SeekFrom::Start(start as u64 + 4)).unwrap();
+    handle.write_all(&[0xEE]).unwrap();
+    drop(handle);
+
+    match store.append_many_to_state_json("s", &[json!(1)]) {
+        Err(StoreError::InvalidFormat(message)) => assert!(message.contains("log version"), "{message}"),
+        other => panic!("expected the reader's InvalidFormat, got {:?}", other.map(|batch| batch.first_ordinal)),
+    }
+    assert_eq!(store.current_branch().head, head, "no record");
+    assert_eq!(store.stats().unwrap().record_count, records);
+}

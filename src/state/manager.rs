@@ -2219,6 +2219,39 @@ mod tests {
         assert_eq!(state, b"42");
     }
 
+    /// A batch counts outside the store's write lock, so its count can be
+    /// kept for a branch after `retire_branch` dropped the branch's counts,
+    /// while the heads are still there. Purging the branch's heads drops it.
+    #[test]
+    fn purging_a_retired_branch_drops_a_count_checked_after_it_was_retired() {
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let append = StateOperation::Append(b"1".to_vec());
+        let offset = append_state_update(&log, "items", None, append.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", offset, &append).unwrap();
+        // Unchecked, as a head loaded from state.bin is.
+        manager.set_count_check(TEST_BRANCH, "items", None);
+
+        manager.retire_branch(TEST_BRANCH);
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 1);
+        assert!(
+            manager.counts.read().contains_key(&TEST_BRANCH),
+            "the count landed after the retire, beside the heads still held"
+        );
+
+        assert_eq!(manager.purge_retired_branches(), 1);
+        assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "it goes with the heads");
+    }
+
     /// A batch moves the chain head by one operation and all of its items,
     /// stays append-only for the snapshot schedule, and materializes as its
     /// items in order after what came before.
