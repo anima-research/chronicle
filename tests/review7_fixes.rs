@@ -330,6 +330,7 @@ fn an_identity_batch_with_one_key_for_id_and_sequence_is_refused_and_writes_noth
     register_log(&store, "log");
     let manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
     let head = store.current_branch().head;
+    let size = store.stats().unwrap().total_size_bytes;
 
     match store.append_many_to_state_json_with_identity("log", &[json!({"x": 1})], "identity", "identity") {
         Err(StoreError::InvalidOperation(message)) => {
@@ -338,6 +339,7 @@ fn an_identity_batch_with_one_key_for_id_and_sequence_is_refused_and_writes_noth
         other => panic!("expected InvalidOperation, got {:?}", other.map(|b| b.record.id)),
     }
     assert_eq!(store.current_branch().head, head, "no record");
+    assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
     assert_eq!(store.get_state_len("log").unwrap(), None);
     assert_eq!(fs::read(dir.path().join("MANIFEST")).unwrap(), manifest, "no format mark");
 
@@ -440,6 +442,7 @@ fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
     let store = open(&path);
     let head = store.current_branch().head;
     let records = store.stats().unwrap().record_count;
+    let size = store.stats().unwrap().total_size_bytes;
     damage(&path.join("records.log"), b"damaged-in-the-chain");
 
     match store.append_many_to_state_json("s", &[json!(1)]) {
@@ -451,6 +454,7 @@ fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
     }
     assert_eq!(store.current_branch().head, head, "no record");
     assert_eq!(store.stats().unwrap().record_count, records);
+    assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
     assert_eq!(store.get_state_len("s").unwrap(), Some(3), "the stored count, unchanged");
 }
 
@@ -478,6 +482,7 @@ fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
     let store = open(&path);
     let head = store.current_branch().head;
     let records = store.stats().unwrap().record_count;
+    let size = store.stats().unwrap().total_size_bytes;
 
     // The record holding the marker starts at the last record magic before
     // it; its version byte follows the magic.
@@ -501,6 +506,7 @@ fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
     }
     assert_eq!(store.current_branch().head, head, "no record");
     assert_eq!(store.stats().unwrap().record_count, records);
+    assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
 }
 
 /// An identity batch refused for an item that isn't an object leaves the

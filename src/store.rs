@@ -4460,6 +4460,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = reopened_with_items(&dir, 3);
         let head = store.current_branch().head;
+        let size = store.stats().unwrap().total_size_bytes;
         *store.log.read_failures.lock() = 1;
         match store.append_many_to_state_json("s", &[json!("a")]) {
             Err(StoreError::Io(error)) => {
@@ -4474,6 +4475,7 @@ mod tests {
             other => panic!("expected the read's I/O error, got {:?}", other.map(|b| b.first_ordinal)),
         }
         assert_eq!(store.current_branch().head, head, "no record");
+        assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
         assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
     }
 

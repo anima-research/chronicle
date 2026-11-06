@@ -187,7 +187,6 @@ fn probe_open_time_over_a_large_log() {
 #[ignore = "manual probe"]
 fn probe_first_batch_after_open_and_another_writer() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Barrier;
     use std::time::Duration;
 
     for items in [50_000usize, 200_000] {
@@ -209,18 +208,22 @@ fn probe_first_batch_after_open_and_another_writer() {
             create_if_missing: false,
         })
         .unwrap();
-        let start = Barrier::new(2);
+        let started = AtomicBool::new(false);
         let done = AtomicBool::new(false);
         let (batch_ms, worst_ms, writes) = std::thread::scope(|scope| {
             let batch = scope.spawn(|| {
-                start.wait();
                 let t = Instant::now();
+                started.store(true, Ordering::SeqCst);
                 store.append_many_to_state_json("log", &[json!({"kind": "entry"})]).unwrap();
                 let elapsed = t.elapsed();
                 done.store(true, Ordering::SeqCst);
                 elapsed
             });
-            start.wait();
+            // Every write counted starts after the batch's call has begun and
+            // before it has returned (as far as `done` shows).
+            while !started.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
             let mut worst = Duration::ZERO;
             let mut writes = 0u64;
             while !done.load(Ordering::SeqCst) {
@@ -232,9 +235,9 @@ fn probe_first_batch_after_open_and_another_writer() {
             let batch = batch.join().unwrap();
             (batch.as_secs_f64() * 1000.0, worst.as_secs_f64() * 1000.0, writes)
         });
-        // The slowest other write means something only where some ran while
-        // the batch did.
-        assert!(writes > 0, "no other write overlapped the batch");
+        // The slowest other write means something only where some started
+        // while the batch's call was running.
+        assert!(writes > 0, "no other write started while the batch was running");
         println!(
             "items={:<8} first batch {:>8.1} ms   slowest other write {:>8.1} ms   ({} other writes)",
             items, batch_ms, worst_ms, writes

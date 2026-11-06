@@ -347,6 +347,14 @@ fn differential_fuzz() {
                 _ => StateOperation::Snapshot(serde_json::to_vec(&json!([1, 2, 3])).unwrap()),
             });
         }
+        // A Set or Snapshot after a batch replaces the value and would hide
+        // a divergence the batch made, so every prefix that ends at a batch
+        // is checked too.
+        for end in 1..ops.len() {
+            if matches!(ops[end - 1], StateOperation::AppendMany(_)) {
+                check_batched(&format!("fuzz_case_{}_to_{}", case, end), ops[..end].to_vec());
+            }
+        }
         check_batched(&format!("fuzz_case_{}", case), ops);
     }
 }

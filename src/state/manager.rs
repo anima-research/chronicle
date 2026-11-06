@@ -2469,6 +2469,24 @@ mod tests {
         assert_eq!(manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap().len(), 2);
     }
 
+    /// A fork copies the parent's heads and, for each head the parent has
+    /// checked at the same offset, the check too, so the fork's first batch
+    /// takes the count without reading the value again.
+    #[test]
+    fn a_fork_takes_the_parents_check_of_a_head_it_copies() {
+        const SIDE: BranchId = BranchId(2);
+        let (_dir, _log, manager) = stale_head(&appends(3), 0);
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        let offset = manager.get_head(TEST_BRANCH, "items").unwrap().head_offset;
+
+        manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
+        let check = manager.count_check(SIDE, "items", offset).expect("the fork has the parent's check");
+        assert!(check.exact);
+        let before = manager.reconstruction_count();
+        assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 3);
+        assert_eq!(manager.reconstruction_count(), before, "the fork's count read nothing");
+    }
+
     /// A batch counts outside the store's write lock, so its count can be
     /// kept for a branch after `retire_branch` dropped the branch's counts,
     /// while the heads are still there. Purging the branch's heads drops it.
@@ -2488,10 +2506,12 @@ mod tests {
         let append = StateOperation::Append(b"1".to_vec());
         let offset = append_state_update(&log, "items", None, append.clone(), 1);
         manager.record_update(TEST_BRANCH, "items", offset, &append).unwrap();
-        // Unchecked, as a head loaded from state.bin is.
-        manager.set_count_check(TEST_BRANCH, "items", None);
+        assert!(manager.counts.read().contains_key(&TEST_BRANCH), "the write checked its count");
 
+        // Retiring drops the branch's counts at once, leaving its head
+        // unchecked, and the heads stay until the purge.
         manager.retire_branch(TEST_BRANCH);
+        assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "retire drops the counts");
         assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 1);
         assert!(
             manager.counts.read().contains_key(&TEST_BRANCH),
