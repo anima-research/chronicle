@@ -1439,9 +1439,11 @@ impl JsStore {
     /// call. The result has one entry per index in `ordinals`, in the order
     /// given: what `getStateItemJson` returns for that index, so `null` if
     /// it is negative or out of range, the state doesn't exist, or the
-    /// state's value isn't an array. Throws, as `getStateItemJson` does, if
-    /// the state's bytes aren't one JSON value. Indices may repeat and come
-    /// in any order.
+    /// state's value isn't an array, except at the last index of a head
+    /// whose count this session hasn't checked, where `getStateItemJson`
+    /// answers from the stored count and this from the value. Throws, as
+    /// `getStateItemJson` does, if the state's bytes aren't one JSON value.
+    /// Indices may repeat and come in any order.
     ///
     /// Every entry comes from the same version of the state, and a cold
     /// state is materialized at most once for the whole call, not once per

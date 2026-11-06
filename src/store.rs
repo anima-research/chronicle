@@ -1942,7 +1942,9 @@ impl Store {
     /// `get_state_item` returns for it, `None` where the ordinal is out of
     /// range, the state has no value, or its value isn't an array; the
     /// `Deserialization` error where the state's bytes aren't one JSON value,
-    /// as for `get_state_item`. Ordinals
+    /// as for `get_state_item`. The exception is the last index of a head
+    /// whose count this session hasn't checked, where `get_state_item`
+    /// answers from the stored count and this from the value. Ordinals
     /// may repeat and come in any order. All of them are answered from one
     /// version of the state, read at most once, and an empty request reads
     /// nothing (see `StateManager::get_state_items_by_ordinal`).
