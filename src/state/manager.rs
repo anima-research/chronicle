@@ -404,6 +404,11 @@ pub struct StateManager {
     /// on another thread can.
     #[cfg(test)]
     after_lookup_head: parking_lot::Mutex<Option<Box<dyn FnOnce(&StateManager) + Send>>>,
+
+    /// Run once by `checked_item_count` between its read of the value and
+    /// its write-back of the count, so a test can move the head in between.
+    #[cfg(test)]
+    after_count_read: parking_lot::Mutex<Option<Box<dyn FnOnce(&StateManager) + Send>>>,
 }
 
 /// Derive the field-index file path as a sibling of the state-index path.
@@ -441,6 +446,8 @@ impl StateManager {
             reconstructions: AtomicU64::new(0),
             #[cfg(test)]
             after_lookup_head: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            after_count_read: parking_lot::Mutex::new(None),
         })
     }
 
@@ -475,6 +482,8 @@ impl StateManager {
             reconstructions: AtomicU64::new(0),
             #[cfg(test)]
             after_lookup_head: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            after_count_read: parking_lot::Mutex::new(None),
         };
 
         if path.exists() {
@@ -1008,8 +1017,16 @@ impl StateManager {
             ) => return Err(error),
             Err(_) => (head.item_count, false),
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_count_read.lock().take() {
+            hook(self);
+        }
         let mut index = self.index.write();
         match index.heads.get_mut(branch_id, state_id) {
+            // A write that landed after the value was read has moved the
+            // head and set its count from the one before plus what it wrote;
+            // `count` is the older head's, and stored over it would drop
+            // that write's items until the next count.
             Some(current) if current.head_offset == head.head_offset => {
                 current.item_count = count;
                 self.set_count_check(
@@ -2301,6 +2318,40 @@ mod tests {
         assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 1, "the side branch holds one item");
         let side_items = manager.get_state_items(SIDE, "items").unwrap().unwrap();
         assert_eq!(side_items.len(), 1);
+    }
+
+    /// A count read without the store's write lock can race a write that
+    /// lands after the value is read: the write's head keeps the count the
+    /// write set (the one before plus its item), and the older value's
+    /// count isn't stored over it.
+    #[test]
+    fn a_count_read_before_a_write_isnt_stored_over_the_writes_count() {
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let first = StateOperation::Append(b"1".to_vec());
+        let before = append_state_update(&log, "items", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", before, &first).unwrap();
+        manager.set_count_check(TEST_BRANCH, "items", None);
+
+        let log_for_hook = Arc::clone(&log);
+        *manager.after_count_read.lock() = Some(Box::new(move |manager: &StateManager| {
+            let second = StateOperation::Append(b"2".to_vec());
+            let offset = append_state_update(&log_for_hook, "items", Some(before), second.clone(), 2);
+            manager.record_update(TEST_BRANCH, "items", offset, &second).unwrap();
+        }));
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 2, "the moved head's count");
+        assert!(manager.after_count_read.lock().is_none(), "the write ran after the read");
+        assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 2, "the write's count stands");
+        assert_eq!(manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap().len(), 2);
     }
 
     /// A batch counts outside the store's write lock, so its count can be

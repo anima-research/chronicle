@@ -100,6 +100,11 @@ pub struct RecordLog {
     #[cfg(test)]
     pub(crate) fsync_failures: Mutex<u64>,
 
+    /// How many of the next `read_at` calls fail with an I/O error before
+    /// reading, so unit tests can stand in for a failing device.
+    #[cfg(test)]
+    pub(crate) read_failures: Mutex<u64>,
+
     /// Highest sequence seen per branch during the open scan. Immutable after
     /// open; `Store::open` reconciles branch heads against this.
     branch_max_seq: HashMap<BranchId, Sequence>,
@@ -199,6 +204,8 @@ impl RecordLog {
             durability_failure: Mutex::new(None),
             #[cfg(test)]
             fsync_failures: Mutex::new(0),
+            #[cfg(test)]
+            read_failures: Mutex::new(0),
             branch_max_seq,
             recovery,
         })
@@ -346,6 +353,14 @@ impl RecordLog {
 
     /// Read a record at a given offset.
     pub fn read_at(&self, offset: u64) -> Result<Record> {
+        #[cfg(test)]
+        {
+            let mut failures = self.read_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("injected read failure").into());
+            }
+        }
         let mut file = self.file.write();
         file.seek(SeekFrom::Start(offset))?;
         Self::read_record(&mut *file)

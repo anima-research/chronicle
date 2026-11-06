@@ -4432,6 +4432,31 @@ mod tests {
         assert_eq!(store.get_state_len("s").unwrap(), Some(4));
     }
 
+    /// A count that can't read the state's records fails the batch with the
+    /// read's I/O error, which says the batch was not recorded, and writes
+    /// nothing.
+    #[test]
+    fn a_batch_whose_count_fails_to_read_says_it_was_not_recorded() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 3);
+        let head = store.current_branch().head;
+        *store.log.read_failures.lock() = 1;
+        match store.append_many_to_state_json("s", &[json!("a")]) {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                let text = error.to_string();
+                assert!(
+                    text.contains("the batch was not recorded, because reading the state's records")
+                        && text.contains("injected read failure"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected the read's I/O error, got {:?}", other.map(|b| b.first_ordinal)),
+        }
+        assert_eq!(store.current_branch().head, head, "no record");
+        assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
+    }
+
     /// The snapshot outcomes of writes are noted after the write lock is
     /// dropped, so they can arrive out of order. An older one never
     /// overwrites a newer one.
