@@ -455,9 +455,10 @@ fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
 
 /// A batch whose count reads a record of the state's chain whose framing is
 /// bad, here a version byte no build writes, is refused with the reader's
-/// `InvalidFormat` and writes nothing. The magic and version come before
-/// anything the checksum covers (the payload), so the reader names them
-/// first. The damage is made after open, which checks every record.
+/// `InvalidFormat`, which says the batch was not recorded, and writes
+/// nothing. The magic and version come before anything the checksum covers
+/// (the payload), so the reader names them first. The damage is made after
+/// open, which checks every record.
 #[test]
 fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
     use std::io::{Seek, SeekFrom, Write};
@@ -491,7 +492,10 @@ fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
     drop(handle);
 
     match store.append_many_to_state_json("s", &[json!(1)]) {
-        Err(StoreError::InvalidFormat(message)) => assert!(message.contains("log version"), "{message}"),
+        Err(StoreError::InvalidFormat(message)) => assert!(
+            message.contains("log version") && message.contains("the batch was not recorded"),
+            "{message}"
+        ),
         other => panic!("expected the reader's InvalidFormat, got {:?}", other.map(|batch| batch.first_ordinal)),
     }
     assert_eq!(store.current_branch().head, head, "no record");

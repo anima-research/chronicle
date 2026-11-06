@@ -882,8 +882,10 @@ impl Store {
     /// given, what `get_record` returns for it, `None` for an ID with no
     /// record. IDs may repeat. Store-wide, like `get_record`. The IDs are
     /// looked up together and the records read under one hold of the log
-    /// file, rather than one each. A record that fails to read returns its
-    /// error, which doesn't name the ID; `get_record` on each ID finds which.
+    /// file, rather than one each, so a long list holds other reads and
+    /// appends of the store until it is read; split it to let them in. A
+    /// record that fails to read returns its error, which doesn't name the
+    /// ID; `get_record` on each ID finds which.
     pub fn get_records(&self, ids: &[RecordId]) -> Result<Vec<Option<Record>>> {
         let offsets = self.index.get_offsets_by_id(ids);
         let found: Vec<u64> = offsets.iter().flatten().copied().collect();
@@ -1329,7 +1331,9 @@ impl Store {
         // the builder below finds it checked, or, where a write in between
         // left the head unchecked, counts again under the lock.
         if !empty {
-            self.state.checked_item_count(branch_id, state_id)?;
+            self.state
+                .checked_item_count(branch_id, state_id)
+                .map_err(Self::count_error)?;
         }
         let mut first_ordinal = 0;
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
@@ -1339,7 +1343,10 @@ impl Store {
             // unchecked has its items counted here, unless the batch is
             // empty, which is refused before it's written.
             if !items.is_empty() {
-                first_ordinal = self.state.checked_item_count(branch_id, state_id)?;
+                first_ordinal = self
+                    .state
+                    .checked_item_count(branch_id, state_id)
+                    .map_err(Self::count_error)?;
             }
             Ok(StateOperation::AppendMany(items))
         })?;
@@ -1347,6 +1354,26 @@ impl Store {
             record,
             first_ordinal,
         })
+    }
+
+    /// The error of a batch whose count failed to read the state's chain,
+    /// which says the batch wasn't recorded, as a failed mark does: an I/O
+    /// error keeps its kind, and a record whose framing is bad stays
+    /// `InvalidFormat`. A failed checksum carries no message to add it to,
+    /// and comes back as it is.
+    fn count_error(error: StoreError) -> StoreError {
+        match error {
+            StoreError::Io(error) => StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "the batch was not recorded, because reading the state's records to count its items failed: {error}"
+                ),
+            )),
+            StoreError::InvalidFormat(message) => StoreError::InvalidFormat(format!(
+                "the batch was not recorded, because a record the count read is damaged: {message}"
+            )),
+            other => other,
+        }
     }
 
     /// Core update path. Builds the operation via a closure that receives the

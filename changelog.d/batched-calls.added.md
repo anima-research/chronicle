@@ -28,7 +28,8 @@
     JSON array, or holds an item that isn't JSON, has no items to count:
     the batch takes the stored count. A record of the state's chain that
     fails to read (an I/O error, a failed checksum, a record whose framing
-    is bad) fails the batch with that error, writing nothing. In Rust, a
+    is bad) fails the batch with that error, writing nothing; but for a
+    failed checksum, the error says the batch was not recorded. In Rust, a
     `DeltaSnapshot` a caller writes through `update_state` leaves the count
     as it was, and the next batch counts the items again the same way.
     `compactState` before the batch takes a full snapshot, which recounts
@@ -49,7 +50,9 @@
   - `getRecords(ids)` returns, for each ID in the order given, what
     `getRecord` returns for it, or `null` for an ID with no record. The IDs
     are looked up together and the records read under one hold of the log
-    file. A malformed ID throws before anything is read.
+    file, so a long list holds other reads and appends of the store until
+    it is read; split it to let them in. A malformed ID throws before
+    anything is read.
   - A batch reaches subscribers as one `state_delta` event, whose
     `operation` is `{"AppendMany": [[...], ...]}` with each item an integer
     array, as an `Append`'s item is. The `JsStoreEvent.data` doc now says so.

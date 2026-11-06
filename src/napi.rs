@@ -749,10 +749,12 @@ impl JsStore {
 
     /// Get several records by ID in one call. The result has one entry per
     /// ID, in the order given: the record, as `getRecord` returns it, or
-    /// `null` for an ID with no record. IDs may repeat. Throws, reading
-    /// nothing, if an ID isn't a record ID. A record that fails to read
-    /// throws its error, which doesn't name the ID; `getRecord` on each ID
-    /// finds which.
+    /// `null` for an ID with no record. IDs may repeat. The records are read
+    /// under one hold of the log file, so a long list holds other reads and
+    /// appends of the store until it is read; split it to let them in.
+    /// Throws, reading nothing, if an ID isn't a record ID. A record that
+    /// fails to read throws its error, which doesn't name the ID;
+    /// `getRecord` on each ID finds which.
     #[napi]
     pub fn get_records(&self, ids: Vec<String>) -> Result<Vec<Option<JsRecord>>> {
         let store = self.get_store()?;
