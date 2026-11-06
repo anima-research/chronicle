@@ -11,6 +11,7 @@ on:
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
       - 'tests/create_existing_store.rs'
+      - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
   pull_request:
     paths:
@@ -22,6 +23,7 @@ on:
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
       - 'tests/create_existing_store.rs'
+      - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
   workflow_dispatch:
 
@@ -79,3 +81,9 @@ jobs:
 
       - name: Create over an existing store tests
         run: cargo test --test create_existing_store -- --nocapture
+
+      # The batch replay tests re-run the test binary as a child that writes
+      # and is killed or exits, then cut the log with set_len: nothing
+      # Unix-only. The filter picks the three batch tests.
+      - name: Batch replay after a crash tests
+        run: cargo test --test crash_state_recovery batch -- --nocapture

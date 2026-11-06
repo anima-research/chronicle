@@ -58,7 +58,10 @@ fn many(vs: &[serde_json::Value]) -> StateOperation {
 }
 
 /// `ops` with every `AppendMany` replaced by one `Append` per item, in
-/// order: what the batch must be indistinguishable from.
+/// order: what the batch must be indistinguishable from. A `Field` whose
+/// batch is empty, which `update_state` refuses and so no store holds, is
+/// kept as it is: expanded, it would be no operation, where the Field still
+/// reads the field's bytes.
 fn expand_batches(ops: &[StateOperation]) -> Vec<StateOperation> {
     ops.iter().flat_map(expand_batch).collect()
 }
@@ -66,10 +69,16 @@ fn expand_batches(ops: &[StateOperation]) -> Vec<StateOperation> {
 fn expand_batch(op: &StateOperation) -> Vec<StateOperation> {
     match op {
         StateOperation::AppendMany(items) => items.iter().cloned().map(StateOperation::Append).collect(),
-        StateOperation::Field { name, operation } => expand_batch(operation)
-            .into_iter()
-            .map(|inner| StateOperation::Field { name: name.clone(), operation: Box::new(inner) })
-            .collect(),
+        StateOperation::Field { name, operation } => {
+            let inner = expand_batch(operation);
+            if inner.is_empty() {
+                return vec![op.clone()];
+            }
+            inner
+                .into_iter()
+                .map(|inner| StateOperation::Field { name: name.clone(), operation: Box::new(inner) })
+                .collect()
+        }
         other => vec![other.clone()],
     }
 }
@@ -191,6 +200,16 @@ fn differential_batches() {
         ],
     );
     check_batched("empty_batch_onto_nothing", vec![many(&[])]);
+    // An empty batch inside a Field applies the Field to the field's bytes,
+    // which for an absent field don't parse; it isn't one `update_state`
+    // records, and the expansion keeps it as it is.
+    check_batched(
+        "empty_batch_in_an_absent_field",
+        vec![
+            set(json!({})),
+            StateOperation::Field { name: "items".into(), operation: Box::new(many(&[])) },
+        ],
+    );
     check_batched("empty_batch_onto_scalar", vec![set(json!("s")), many(&[])]);
     check_batched("batch_onto_scalar", vec![set(json!("s")), many(&[json!(1)])]);
     check_batched("batch_onto_tree", vec![tset("a", "aa"), many(&[json!(1)])]);
