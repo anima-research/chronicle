@@ -189,7 +189,23 @@ for (const [made, ownerOf] of owners) {
     const other = owner === store ? store.view('main') : store;
     const id = owner.subscribe();
     other.unsubscribe(id);
-    assert.equal(owner.pollSubscription(id)?.eventType, 'dropped');
+    const dropped = owner.pollSubscription(id);
+    assert.equal(dropped?.eventType, 'dropped');
+    assert.deepEqual(JSON.parse(dropped.data), { type: 'dropped', reason: 'unsubscribed' });
+    throwsCoded(() => owner.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+    throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+    store.close();
+  });
+
+  test(`a poll of a subscription made through ${made} and unsubscribed through another handle while its buffer is full returns what was queued, then says it was dropped`, () => {
+    const { store } = freshStore();
+    const owner = ownerOf(store);
+    const other = owner === store ? store.view('main') : store;
+    const id = owner.subscribe({ bufferSize: 1 });
+    owner.catchUpSubscription(id);
+    other.unsubscribe(id);
+    assert.equal(store.subscriptionCount(), 0);
+    assert.equal(owner.pollSubscription(id)?.eventType, 'caught_up');
     throwsCoded(() => owner.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
     throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
     store.close();
