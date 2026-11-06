@@ -968,9 +968,14 @@ impl StateManager {
     /// again until a write replaces it or leaves the head unchecked. An
     /// error reading the log is returned, and nothing changes.
     ///
-    /// Call only while holding `Store::write_lock`, so the head can't move
-    /// between the count and the write that uses it. A head that moved
-    /// anyway keeps its own count, which is returned.
+    /// A write takes its ordinals from the count only while holding
+    /// `Store::write_lock`, so the head can't move between the count and the
+    /// write that uses it. Called without the lock, as a batch does first so
+    /// that the read of the value doesn't hold up other writers, it may
+    /// race a write: the count is then kept only if the head is still the
+    /// one whose value was read, as heads only move forward (each to the
+    /// offset of a newer record), so the value read was that head's. A head
+    /// that moved keeps its own count, which is returned.
     pub(crate) fn checked_item_count(&self, branch_id: BranchId, state_id: &str) -> Result<usize> {
         let Some(head) = self.get_head(branch_id, state_id) else {
             return Ok(0);
@@ -1918,9 +1923,17 @@ impl StateManager {
             return 0;
         }
         let mut index = self.index.write();
+        // A batch counts outside the store's write lock (see
+        // `checked_item_count`), so a count it checked can be kept for the
+        // branch after `retire_branch` dropped the branch's counts. It goes
+        // with the heads, under the same lock as they do.
+        let mut counts = self.counts.write();
         retired
             .into_iter()
-            .filter_map(|branch_id| index.heads.remove_branch(branch_id))
+            .filter_map(|branch_id| {
+                counts.remove(&branch_id);
+                index.heads.remove_branch(branch_id)
+            })
             .map(|heads| heads.len())
             .sum()
     }

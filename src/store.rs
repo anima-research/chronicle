@@ -174,9 +174,24 @@ pub struct Store {
     /// What `open` had to recover, for [`Store::recovery`].
     recovery: Option<RecoveryReport>,
 
-    /// The states whose snapshot after a recorded write failed at its most
-    /// recent attempt, per branch, for [`Store::snapshot_failures`].
-    snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotFailure>>>,
+    /// The latest snapshot outcome taken in for each state a write reached,
+    /// per branch, for [`Store::snapshot_failures`]. A write takes its
+    /// snapshot after it drops the write lock, so outcomes can come in out
+    /// of order; each is taken in only if no later write's has been. A
+    /// state's entry outlives its failure, keeping the sequence for that
+    /// check, until its branch is deleted or the store closes.
+    snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotOutcome>>>,
+}
+
+/// The snapshot outcome a [`Store`] has taken in last for one state on one
+/// branch.
+struct SnapshotOutcome {
+    /// The sequence of the write it came from, or of the snapshot record
+    /// that ended a failure.
+    sequence: Sequence,
+    /// The failure, where the outcome was one, counting the writes in a row
+    /// whose snapshot failed.
+    failure: Option<SnapshotFailure>,
 }
 
 impl Store {
@@ -188,8 +203,12 @@ impl Store {
     /// is missing or unusable is refused, with open's account of what it
     /// found, whatever `create_if_missing` says. Otherwise it is created into
     /// (when `create_if_missing` is set) only if it is missing or holds
-    /// nothing but what a new store can sit beside: `lost+found` (a fresh
-    /// volume's root), Finder's `.DS_Store`, the `LOCK` and `blobs/` a create
+    /// nothing but what a new store can sit beside: what a fresh volume's
+    /// root holds (`lost+found` from mke2fs; `.fseventsd`,
+    /// `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`, which macOS adds
+    /// to a volume it mounts; `System Volume Information` and
+    /// `$RECYCLE.BIN`, which Windows adds), Finder's `.DS_Store`, the `LOCK`
+    /// and `blobs/` a create
     /// leaves when it stops before its manifest, and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
@@ -243,7 +262,19 @@ impl Store {
     /// empty.
     fn foreign_entry(path: &Path) -> std::io::Result<Option<String>> {
         let allowed = |name: &str| {
-            ["lost+found", ".DS_Store", "LOCK", "blobs"].contains(&name)
+            [
+                "lost+found",
+                ".fseventsd",
+                ".Spotlight-V100",
+                ".Trashes",
+                ".TemporaryItems",
+                "System Volume Information",
+                "$RECYCLE.BIN",
+                ".DS_Store",
+                "LOCK",
+                "blobs",
+            ]
+            .contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
         let listing_error = |error: std::io::Error| {
@@ -382,17 +413,18 @@ impl Store {
         // batch's mark, and a failed directory sync after that rename left
         // the rename in the system's cache only: this open reads version 2
         // from there, and a power loss could still bring back version 1
-        // under a log that holds a batch. Syncing the directory before
-        // anything is written makes the rename durable, or fails the open.
+        // under a log that holds a batch. Syncing the directory the rename
+        // was made in before anything is written makes it durable, or fails
+        // the open. That is the store's directory, or, for a MANIFEST that
+        // is a symbolic link, the one holding the file it leads to, which
+        // the mark renamed into.
         #[cfg(unix)]
         if features != 0 {
-            crate::atomic_file::sync_directory_at(&config.path).map_err(|error| {
+            let manifest = config.path.join("MANIFEST");
+            crate::atomic_file::sync_directory_of(&manifest).map_err(|error| {
                 std::io::Error::new(
                     error.kind(),
-                    format!(
-                        "open: syncing {}, whose MANIFEST names format features, failed: {error}",
-                        config.path.display()
-                    ),
+                    format!("open: {} names format features: {error}", manifest.display()),
                 )
             })?;
         }
@@ -635,52 +667,73 @@ impl Store {
     /// write finds none due. A snapshot asked for directly, which returns
     /// its own error, isn't counted. Entries are kept in memory only: a
     /// reopened store lists none until a write's snapshot fails again. A
-    /// deleted branch's entries aren't listed.
+    /// deleted branch's entries aren't listed. Each write's outcome comes in
+    /// after the write, so writes to a state that race can finish out of
+    /// order: the entry follows the latest of them by sequence, and an
+    /// earlier write's outcome that comes in after it changes nothing.
     pub fn snapshot_failures(&self) -> Vec<SnapshotFailure> {
         self.snapshot_failures
             .lock()
             .iter()
             .filter(|(branch_id, _)| self.branches.get_branch_by_id(**branch_id).is_some())
-            .flat_map(|(_, states)| states.values().cloned())
+            .flat_map(|(_, states)| states.values().filter_map(|outcome| outcome.failure.clone()))
             .collect()
     }
 
     /// Count a failed snapshot after the write at `sequence` to `state_id`
-    /// on `branch`, for `snapshot_failures`.
+    /// on `branch`, for `snapshot_failures`, unless the outcome of a later
+    /// write is already in.
     fn note_snapshot_failure(&self, branch: &Branch, state_id: &str, sequence: Sequence, error: &StoreError) {
-        let mut failures = self.snapshot_failures.lock();
-        let states = failures.entry(branch.id).or_default();
+        let mut outcomes = self.snapshot_failures.lock();
+        let states = outcomes.entry(branch.id).or_default();
+        let failure = |failures| SnapshotFailure {
+            state_id: state_id.to_string(),
+            branch_id: branch.id,
+            branch: branch.name.clone(),
+            failures,
+            sequence,
+            error: error.to_string(),
+        };
         match states.get_mut(state_id) {
-            Some(failure) => {
-                failure.failures += 1;
-                failure.branch = branch.name.clone();
-                failure.sequence = sequence;
-                failure.error = error.to_string();
+            Some(outcome) if outcome.sequence > sequence => {}
+            Some(outcome) => {
+                let before = outcome.failure.as_ref().map_or(0, |failure| failure.failures);
+                outcome.sequence = sequence;
+                outcome.failure = Some(failure(before + 1));
             }
             None => {
                 states.insert(
                     state_id.to_string(),
-                    SnapshotFailure {
-                        state_id: state_id.to_string(),
-                        branch_id: branch.id,
-                        branch: branch.name.clone(),
-                        failures: 1,
+                    SnapshotOutcome {
                         sequence,
-                        error: error.to_string(),
+                        failure: Some(failure(1)),
                     },
                 );
             }
         }
     }
 
-    /// Drop the failure `snapshot_failures` holds for `state_id` on
-    /// `branch_id`, if any: a snapshot of it was recorded, or none is due.
-    fn clear_snapshot_failure(&self, branch_id: BranchId, state_id: &str) {
-        let mut failures = self.snapshot_failures.lock();
-        if let Some(states) = failures.get_mut(&branch_id) {
-            states.remove(state_id);
-            if states.is_empty() {
-                failures.remove(&branch_id);
+    /// End the failure `snapshot_failures` holds for `state_id` on
+    /// `branch_id`, if any: the write or snapshot record at `sequence` took
+    /// a snapshot of it, or found none due. Nothing changes where the
+    /// outcome of a later write is already in.
+    fn clear_snapshot_failure(&self, branch_id: BranchId, state_id: &str, sequence: Sequence) {
+        let mut outcomes = self.snapshot_failures.lock();
+        let states = outcomes.entry(branch_id).or_default();
+        match states.get_mut(state_id) {
+            Some(outcome) if outcome.sequence > sequence => {}
+            Some(outcome) => {
+                outcome.sequence = sequence;
+                outcome.failure = None;
+            }
+            None => {
+                states.insert(
+                    state_id.to_string(),
+                    SnapshotOutcome {
+                        sequence,
+                        failure: None,
+                    },
+                );
             }
         }
     }
@@ -1124,7 +1177,8 @@ impl Store {
         state_id: &str,
         items: Vec<Vec<u8>>,
     ) -> Result<AppendedBatch> {
-        self.append_batch_with_builder(branch_id, state_id, move |_, _| Ok(items))
+        let empty = items.is_empty();
+        self.append_batch_with_builder(branch_id, state_id, empty, move |_, _| Ok(items))
     }
 
     /// `append_many_to_state` with each item given as a JSON value,
@@ -1213,7 +1267,7 @@ impl Store {
                  value at a key, so it can't carry both the record id and the sequence there"
             )));
         }
-        self.append_batch_with_builder(branch_id, state_id, |id, seq| {
+        self.append_batch_with_builder(branch_id, state_id, items.is_empty(), |id, seq| {
             if let Some(at) = items.iter().position(|item| !item.is_object()) {
                 return Err(StoreError::InvalidOperation(format!(
                     "payload must be a JSON object: item {} of the batch is not",
@@ -1230,23 +1284,35 @@ impl Store {
     /// The batched appends' common path: records the items `items_builder`
     /// gives, which may name the `(record_id, sequence)` the batch is about
     /// to take, as one `AppendMany` through `update_state_with_builder`, and
-    /// reads the first ordinal under the same lock.
+    /// reads the first ordinal under the same lock. `empty` says the builder
+    /// gives no items, a batch that is refused before anything is counted.
     fn append_batch_with_builder<F>(
         &self,
         branch_id: BranchId,
         state_id: &str,
+        empty: bool,
         items_builder: F,
     ) -> Result<AppendedBatch>
     where
         F: FnOnce(RecordId, Sequence) -> Result<Vec<Vec<u8>>>,
     {
+        // A head this session hasn't checked has its items counted here,
+        // before the write lock, as the count reads the state's whole value
+        // and every other writer of the store would wait on the lock while
+        // it did. The count is kept only if the head is where it was when
+        // the value was read, so it is the count of that head's value, and
+        // the builder below finds it checked, or, where a write in between
+        // left the head unchecked, counts again under the lock.
+        if !empty {
+            self.state.checked_item_count(branch_id, state_id)?;
+        }
         let mut first_ordinal = 0;
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
             // The builder runs under `write_lock`, so no other write to this
-            // state can land between this count and the batch. A head this
-            // session hasn't checked has its items counted first, unless the
-            // batch is empty, which is refused before it's written.
+            // state can land between this count and the batch. A head still
+            // unchecked has its items counted here, unless the batch is
+            // empty, which is refused before it's written.
             if !items.is_empty() {
                 first_ordinal = self.state.checked_item_count(branch_id, state_id)?;
             }
@@ -1415,7 +1481,7 @@ impl Store {
                 | StateOperation::DeltaSnapshot(_)
                 | StateOperation::TreeDeltaSnapshot(_)
         ) {
-            self.clear_snapshot_failure(branch.id, state_id);
+            self.clear_snapshot_failure(branch.id, state_id, next_seq);
         }
 
         // Broadcast state delta to subscribers
@@ -1440,7 +1506,7 @@ impl Store {
             // failure is counted for `snapshot_failures`, as a Node process
             // shows no `tracing` output.
             match self.auto_snapshot_if_needed(branch.id, state_id) {
-                Ok(()) => self.clear_snapshot_failure(branch.id, state_id),
+                Ok(()) => self.clear_snapshot_failure(branch.id, state_id, next_seq),
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -3046,6 +3112,10 @@ impl Store {
         self.branches.delete_branch(name)?;
         if let Some(branch_id) = branch_id {
             self.state.retire_branch(branch_id);
+            // A snapshot outcome that comes in after this, from a write that
+            // finished on the branch before it went, is kept until close;
+            // `snapshot_failures` doesn't list it.
+            self.snapshot_failures.lock().remove(&branch_id);
         }
 
         write.checkpoint_required = true;
@@ -4196,6 +4266,118 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A store with a state "s" of `items` appended one at a time, synced,
+    /// closed and opened again, so the head comes from `state.bin` and this
+    /// session hasn't checked its count. Auto-snapshots are off.
+    fn reopened_with_items(dir: &TempDir, items: usize) -> Store {
+        let config = test_config(dir);
+        {
+            let store = Store::create(config.clone()).unwrap();
+            store.set_auto_snapshot(false);
+            store
+                .register_state(StateRegistration {
+                    id: "s".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for i in 0..items {
+                store
+                    .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(i)).unwrap()))
+                    .unwrap();
+            }
+            store.sync().unwrap();
+        }
+        let store = Store::open(config).unwrap();
+        store.set_auto_snapshot(false);
+        store
+    }
+
+    /// A batch counts the items of a head this session hasn't checked before
+    /// it takes the write lock, so other writers don't wait while it reads
+    /// the whole value: here the count is read while the test holds the
+    /// lock, and the batch, once it has the lock, takes that count without
+    /// reading the value again.
+    #[test]
+    fn a_batch_counts_an_unchecked_head_before_it_takes_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 3);
+        let before = store.state_reconstruction_count();
+        std::thread::scope(|scope| {
+            let held = store.write_lock.lock();
+            let batch = scope.spawn(|| store.append_many_to_state_json("s", &[json!("a")]));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while store.state_reconstruction_count() == before && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let read_while_held = store.state_reconstruction_count() - before;
+            drop(held);
+            let batch = batch.join().unwrap().unwrap();
+            assert_eq!(read_while_held, 1, "the count read the value while another writer held the lock");
+            assert_eq!(batch.first_ordinal, 3);
+        });
+        assert_eq!(store.state_reconstruction_count(), before + 1, "the batch read the value once");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    /// The snapshot outcomes of writes are noted after the write lock is
+    /// dropped, so they can arrive out of order. An older one never
+    /// overwrites a newer one.
+    #[test]
+    fn an_older_snapshot_outcome_never_replaces_a_newer_one() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        let branch = store.current_branch();
+        let error = |n: u64| StoreError::Corruption(format!("attempt {n}"));
+        let listed = || {
+            store
+                .snapshot_failures()
+                .into_iter()
+                .map(|failure| (failure.state_id, failure.failures, failure.sequence.0, failure.error))
+                .collect::<Vec<_>>()
+        };
+
+        // A failure noted after a later write's clear.
+        store.clear_snapshot_failure(branch.id, "a", Sequence(6));
+        store.note_snapshot_failure(&branch, "a", Sequence(5), &error(5));
+        assert_eq!(listed(), [], "the later write found no snapshot due, or took it");
+
+        // A clear arriving after a later write's failure.
+        store.note_snapshot_failure(&branch, "b", Sequence(7), &error(7));
+        store.clear_snapshot_failure(branch.id, "b", Sequence(6));
+        assert_eq!(listed(), [("b".into(), 1, 7, error(7).to_string())]);
+
+        // Two failures noted out of order keep the later one as the latest.
+        store.note_snapshot_failure(&branch, "b", Sequence(9), &error(9));
+        store.note_snapshot_failure(&branch, "b", Sequence(8), &error(8));
+        assert_eq!(listed(), [("b".into(), 2, 9, error(9).to_string())]);
+
+        // Outcomes in order still apply: a clear ends the failure, and a
+        // later failure starts a new count. A write's own outcome comes in
+        // after the clear its snapshot record made, at the same sequence.
+        store.clear_snapshot_failure(branch.id, "b", Sequence(10));
+        assert_eq!(listed(), []);
+        store.note_snapshot_failure(&branch, "b", Sequence(10), &error(10));
+        assert_eq!(listed(), [("b".into(), 1, 10, error(10).to_string())]);
+    }
+
+    /// Deleting a branch drops the snapshot failures held for it, rather
+    /// than only leaving them out of the list.
+    #[test]
+    fn deleting_a_branch_drops_its_snapshot_failures() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        let side = store.create_branch("side", None).unwrap();
+        store.note_snapshot_failure(&side, "s", Sequence(1), &StoreError::Corruption("x".into()));
+        assert_eq!(store.snapshot_failures().len(), 1);
+        store.delete_branch("side").unwrap();
+        assert_eq!(store.snapshot_failures(), []);
+        assert!(!store.snapshot_failures.lock().contains_key(&side.id), "nothing is kept for it");
     }
 
     #[test]

@@ -434,6 +434,25 @@ pub(crate) fn sync_directory_at(directory: &Path) -> io::Result<()> {
     }
 }
 
+/// Sync the directory a save of the checkpoint at `path` renames into: the
+/// one holding the file its symbolic links lead to, as `atomic_write` finds
+/// it, or `path`'s own where it is no link. An error names that directory.
+#[cfg(unix)]
+pub(crate) fn sync_directory_of(path: &Path) -> io::Result<()> {
+    let target = resolve_links(path)?;
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_owned();
+    sync_directory_at(&parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot sync {}, the directory holding {}: {error}", parent.display(), target.display()),
+        )
+    })
+}
+
 /// Remove the staging files that interrupted saves left in the store
 /// directory. The caller holds the store lock, so no save of this store is in
 /// progress, and nothing reads them. One that can't be removed is reported

@@ -177,3 +177,64 @@ fn probe_open_time_over_a_large_log() {
         );
     }
 }
+
+/// How long the first batch after an open to a large state holds up a writer
+/// of something else. That batch counts the state's items, reading its whole
+/// value once, as the head came from `state.bin`; the probe times the batch
+/// and the slowest of the plain record appends another thread makes while
+/// it runs. Each point is one open through a warm page cache.
+#[test]
+#[ignore = "manual probe"]
+fn probe_first_batch_after_open_and_another_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    for items in [50_000usize, 200_000] {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = create_store(&dir);
+            register_log(&store, 100, 20);
+            for chunk in 0..items / 1_000 {
+                let batch: Vec<_> = (0..1_000)
+                    .map(|i| json!({"kind": "entry", "seq": chunk * 1_000 + i, "body": "x".repeat(64)}))
+                    .collect();
+                store.append_many_to_state_json("log", &batch).unwrap();
+            }
+            store.sync().unwrap();
+        }
+        let store = Store::open(StoreConfig {
+            path: dir.path().join("store"),
+            blob_cache_size: 1000,
+            create_if_missing: false,
+        })
+        .unwrap();
+        let start = Barrier::new(2);
+        let done = AtomicBool::new(false);
+        let (batch_ms, worst_ms, writes) = std::thread::scope(|scope| {
+            let batch = scope.spawn(|| {
+                start.wait();
+                let t = Instant::now();
+                store.append_many_to_state_json("log", &[json!({"kind": "entry"})]).unwrap();
+                let elapsed = t.elapsed();
+                done.store(true, Ordering::SeqCst);
+                elapsed
+            });
+            start.wait();
+            let mut worst = Duration::ZERO;
+            let mut writes = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                let t = Instant::now();
+                store.append(RecordInput::json("event", &json!({"n": writes})).unwrap()).unwrap();
+                worst = worst.max(t.elapsed());
+                writes += 1;
+            }
+            let batch = batch.join().unwrap();
+            (batch.as_secs_f64() * 1000.0, worst.as_secs_f64() * 1000.0, writes)
+        });
+        println!(
+            "items={:<8} first batch {:>8.1} ms   slowest other write {:>8.1} ms   ({} other writes)",
+            items, batch_ms, worst_ms, writes
+        );
+    }
+}

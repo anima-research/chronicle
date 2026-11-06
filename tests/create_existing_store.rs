@@ -110,13 +110,15 @@ fn open_or_create_refuses_a_damaged_store_whatever_create_if_missing_says() {
 
 /// A create aimed at a store another process has open writes nothing there.
 /// A read-only MANIFEST makes a write fail loudly for an ordinary user, and a
-/// manifest backdated a day catches a rewrite of identical bytes where the
-/// mode doesn't stop it (as root). Unix only: it sets file modes.
+/// manifest whose time is set far in the past catches a rewrite of identical
+/// bytes where the mode doesn't stop it (as root). The time is a whole
+/// second, so a filesystem that keeps coarser times (HFS+ and FAT keep 1 s
+/// and 2 s) holds it as set. Unix only: it sets file modes.
 #[cfg(unix)]
 #[test]
 fn create_aimed_at_an_open_store_writes_nothing_there() {
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, UNIX_EPOCH};
 
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
@@ -124,15 +126,15 @@ fn create_aimed_at_an_open_store_writes_nothing_there() {
 
     let manifest = path.join("MANIFEST");
     let before = fs::read(&manifest).unwrap();
-    let a_day_ago = SystemTime::now() - Duration::from_secs(86_400);
-    fs::File::options().write(true).open(&manifest).unwrap().set_modified(a_day_ago).unwrap();
+    let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    fs::File::options().write(true).open(&manifest).unwrap().set_modified(long_ago).unwrap();
     fs::set_permissions(&manifest, fs::Permissions::from_mode(0o444)).unwrap();
     let result = Store::create(config(&path));
     fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(matches!(result, Err(StoreError::Locked)), "got {:?}", result.err().map(|e| e.to_string()));
     assert_eq!(fs::read(&manifest).unwrap(), before);
-    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), a_day_ago, "MANIFEST was rewritten");
+    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), long_ago, "MANIFEST was rewritten");
     drop(held);
 }
 
@@ -149,14 +151,27 @@ fn open_or_create_creates_into_an_existing_empty_directory() {
 
 #[test]
 fn open_or_create_creates_at_a_fresh_volumes_root() {
-    // mke2fs leaves lost+found at the root of a new ext4 volume.
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("volume");
-    fs::create_dir_all(path.join("lost+found")).unwrap();
+    // What a new volume's root holds before anyone writes there: mke2fs
+    // leaves lost+found on ext4, macOS adds .fseventsd, .Spotlight-V100,
+    // .Trashes and .TemporaryItems to a volume it mounts, and Windows adds
+    // System Volume Information and $RECYCLE.BIN.
+    for entry in [
+        "lost+found",
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".TemporaryItems",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("volume");
+        fs::create_dir_all(path.join(entry)).unwrap();
 
-    drop(Store::open_or_create(config(&path)).unwrap());
-    assert!(path.join("MANIFEST").exists());
-    assert!(path.join("lost+found").is_dir(), "what was there stays");
+        drop(Store::open_or_create(config(&path)).unwrap_or_else(|error| panic!("{entry}: {error}")));
+        assert!(path.join("MANIFEST").exists(), "{entry}");
+        assert!(path.join(entry).is_dir(), "{entry}: what was there stays");
+    }
 }
 
 #[test]

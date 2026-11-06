@@ -373,3 +373,31 @@ fn a_marked_store_in_a_directory_that_cant_be_listed_still_opens() {
     }
     assert_eq!(opened.unwrap(), json!([1]));
 }
+
+/// A MANIFEST that is a symbolic link into another directory is marked
+/// there: the mark's rename is made in the directory holding the file the
+/// link leads to, and that is the directory open syncs for a marked store.
+/// The sync itself can't be seen from here; the store opens and reads its
+/// batch, and the link is still a link.
+#[cfg(unix)]
+#[test]
+fn a_marked_store_whose_manifest_links_into_another_directory_opens() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    drop(Store::create(config(&path)).unwrap());
+    fs::rename(path.join("MANIFEST"), elsewhere.join("MANIFEST")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("MANIFEST"), path.join("MANIFEST")).unwrap();
+    {
+        let store = Store::open(config(&path)).unwrap();
+        register_log(&store, "s");
+        store.append_many_to_state_json("s", &[json!(1)]).unwrap();
+        store.sync().unwrap();
+    }
+    assert!(fs::symlink_metadata(path.join("MANIFEST")).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(elsewhere.join("MANIFEST")).unwrap()[4], 2, "marked where the link leads");
+
+    let store = Store::open(config(&path)).unwrap();
+    assert_eq!(value(&store, "s"), json!([1]));
+}
