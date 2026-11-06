@@ -1252,8 +1252,9 @@ impl JsStore {
     /// Just before a store's first batch is written, its `MANIFEST` moves to
     /// version 2, and it stays there even if that batch then fails (see
     /// `appendManyToStateJsonWithIdentity`), so releases from before batched
-    /// appends refuse to open it, where the store's directory is synced (on
-    /// Windows, where this process may not open the directory, or on a
+    /// appends refuse to open it, where the directory holding the `MANIFEST`
+    /// (for a linked one, the one holding its target) is synced (on
+    /// Windows, where this process may not open that directory, or on a
     /// system that doesn't sync directories, a power loss can undo the move
     /// to version 2 and keep the batch; see Breaking).
     #[napi]
@@ -1307,9 +1308,10 @@ impl JsStore {
     /// Just before a store's first batch is written, by this call or
     /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it
     /// stays there even if that batch then fails, so releases from before
-    /// batched appends refuse to open it, where the store's directory is
-    /// synced (on Windows, where this process may not open the directory,
-    /// or on a system that doesn't sync directories, a power loss can undo
+    /// batched appends refuse to open it, where the directory holding the
+    /// `MANIFEST` (for a linked one, the one holding its target) is synced
+    /// (on Windows, where this process may not open that directory, or on a
+    /// system that doesn't sync directories, a power loss can undo
     /// the move to version 2 and keep the batch; see Breaking). If the move
     /// itself fails, the call throws and the batch isn't recorded; it throws
     /// too if only the
@@ -1434,7 +1436,8 @@ impl JsStore {
     /// value isn't an array. Throws the deserialization error if the state's
     /// bytes aren't one JSON value (no bytes at all read as an empty list),
     /// except the last item served from the head record alone, which reads
-    /// no earlier item.
+    /// no earlier item: an `appendToState`'s, or a batch's last item where
+    /// this session found the head's count exact.
     #[napi]
     pub fn get_state_item_json(
         &self,

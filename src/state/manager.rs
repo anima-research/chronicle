@@ -992,7 +992,8 @@ impl StateManager {
     ///
     /// Counting reads the whole value once (`get_state_items`, so its items
     /// stay cached for the batch and the reads after it), at most once per
-    /// head this session loaded or left unchecked. A value that doesn't
+    /// head this session loaded or left unchecked, except that counts racing
+    /// without the lock may each read it. A value that doesn't
     /// materialize as a JSON array has no items to count: the head keeps its
     /// stored count, which is returned, and the value isn't read for a count
     /// again until a write replaces it or leaves the head unchecked. An

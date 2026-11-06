@@ -6,17 +6,19 @@
   written. An earlier release refuses a version 2 store at open with
   "Unsupported store version: 2". Without the mark, what an earlier release
   does depends on the release and on where the batch lies. Past the last
-  checkpoint, 0.5.0 replays the log's state updates and skips the batch,
+  checkpoint, 0.5.0 and 0.5.1 replay the log's state updates and skip the
+  batch,
   which it can't decode, logging a warning; then, at the next update in
   that state's chain on that branch that isn't itself a batch, it refuses
   to open the store as corrupt ("cannot replay state ... does not match
   checkpoint/replayed head"). When only batches follow (the batch, or a run
-  of them, is the newest), 0.5.0 opens the store, and the state lacks all
+  of them, is the newest), 0.5.0 and 0.5.1 open the store, and the state
+  lacks all
   their items with only those warnings to say so. Releases before 0.5.0
   don't replay updates past the last checkpoint at all: they open the store
   without a word, and the state is what the checkpoint holds, without the
   batch or any other update to it past the checkpoint. Before the
-  checkpoint, on 0.3.0 to 0.5.0, a read of that state that reaches the batch
+  checkpoint, on 0.3.0 to 0.5.1, a read of that state that reaches the batch
   fails with "unknown variant `AppendMany`"; releases before 0.3.0 can't
   read the MessagePack state updates 0.3.0 and later write at all.
   An open that replays a batch the `MANIFEST` doesn't name, as when a power
@@ -34,8 +36,9 @@
     the Node API's `appendManyToStateJson` or
     `appendManyToStateJsonWithIdentity`. context-manager's presentation
     index is meant to be its first writer. A host rolled back must not call
-    `create` on a store it means to open. Where the store directory isn't
-    synced (this process may not open it, the system doesn't sync
+    `create` on a store it means to open. Where the directory holding the
+    `MANIFEST` (for a linked one, the one holding its target) isn't synced
+    (this process may not open it, the system doesn't sync
     directories, or the host runs Windows, where chronicle syncs none), a
     power loss can undo the `MANIFEST`'s move to version 2 and keep the
     batch's record, as it can undo a checkpoint save; an earlier release
@@ -66,4 +69,6 @@
   several items appended to an append-log state as one record (see Added).
   An exhaustive `match` on `StateOperation`, including one on the
   `operation` of a `StoreEvent::StateDelta`, needs an arm for it, even in a
-  host that never writes a batch.
+  host that never writes a batch. **Unchanged:** the existing variants,
+  their fields and their encoded names (see the MessagePack pin in
+  `tests/state_update_encoding.rs`); only the added arm is needed.

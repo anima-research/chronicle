@@ -310,7 +310,8 @@ pub enum StateOperation {
     /// A stored-format addition: a build that predates this variant can't
     /// read a chain that holds one. The store marks its MANIFEST when it
     /// writes its first batch, so such a build refuses the whole store when
-    /// it opens it (see `Store::update_state`).
+    /// it opens it, where the directory holding the MANIFEST is synced (see
+    /// `Store::update_state`).
     AppendMany(#[serde(with = "byte_items")] Vec<Vec<u8>>),
 
     /// Remove range from collection (AppendLog).
@@ -450,7 +451,8 @@ impl StateUpdateRecord {
     /// variant is therefore a stored-format change too: `AppendMany` is the
     /// first since the MessagePack migration, and the store's MANIFEST
     /// version keeps builds that predate it from opening a store that holds
-    /// one.
+    /// one, where the directory holding the MANIFEST is synced (see
+    /// `Store::update_state`).
     pub fn decode(record: &Record) -> Result<Self, crate::error::StoreError> {
         match record.encoding {
             PayloadEncoding::MessagePack => rmp_serde::from_slice(&record.payload)

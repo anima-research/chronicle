@@ -6,8 +6,9 @@
 //! error from that snapshot used to come back from the write, so a caller
 //! took a recorded write for one that didn't happen, and one that retried a
 //! write that isn't idempotent made it twice. The failure is now logged, the
-//! write returns its record, and the snapshot stays due for the next write
-//! to the state.
+//! write returns its record, and the next write to the state checks the
+//! cadence again and takes the snapshot if one is still due (after an Edit
+//! or Redact, a delta snapshot waits for the next full one).
 //!
 //! An item that isn't JSON stands in for the failure, as it does in the
 //! reviewers' probe: the store records it as given, and the snapshot that

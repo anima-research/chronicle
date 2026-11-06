@@ -1063,8 +1063,12 @@ impl Store {
     /// An `AppendMany` with no items is refused. The first `AppendMany` a
     /// store records also rewrites its MANIFEST, before the record is
     /// written, to format version 2 with the batch feature named, so a build
-    /// that predates the operation refuses the store when it opens it. A
-    /// store never asked to record one keeps version 1, which every release
+    /// that predates the operation refuses the store when it opens it, where
+    /// the directory holding the MANIFEST (for a linked one, the one holding
+    /// its target) is synced: on Windows, where this process may not open
+    /// that directory, or without directory sync, a power loss can undo the
+    /// move to version 2 and keep the batch (see Breaking in the changelog).
+    /// A store never asked to record one keeps version 1, which every release
     /// opens. If that rewrite fails, the error is returned and the batch
     /// isn't recorded; when only the directory sync after its rename failed,
     /// the MANIFEST is already at version 2, and the next batch makes the
@@ -1188,8 +1192,8 @@ impl Store {
     /// or drops it whole, as it has one sequence. It counts as one operation
     /// toward the state's snapshot cadence, and the first batch a store
     /// records marks its MANIFEST so that releases which predate batches
-    /// refuse the store (see
-    /// `update_state`). Each item must be one JSON value, as for an
+    /// refuse the store, where the directory holding the MANIFEST is synced
+    /// (see `update_state`). Each item must be one JSON value, as for an
     /// `Append`. An empty batch is refused with `InvalidOperation` and
     /// writes nothing. Once the batch is recorded, the call returns it: if
     /// the snapshot the write takes after it fails, that is logged and
@@ -1258,7 +1262,8 @@ impl Store {
     /// one operation toward the snapshot cadence, the returned
     /// `AppendedBatch` says which ordinals they took, and the first batch a
     /// store records marks its MANIFEST so that releases which predate
-    /// batches refuse the store (see `update_state`). A store never asked to
+    /// batches refuse the store, where the directory holding the MANIFEST is
+    /// synced (see `update_state`). A store never asked to
     /// record a batch, by this call or another, keeps the format every
     /// release opens.
     ///
@@ -1565,7 +1570,9 @@ impl Store {
         // isn't idempotent would make it twice. It is logged instead. The
         // snapshot stays due, since only a snapshot record resets the state's
         // count of operations since the last one, so the next write to the
-        // state on this branch checks the thresholds again and tries it.
+        // state on this branch checks the cadence again and takes the
+        // snapshot if one is still due (after an Edit or Redact, a delta
+        // snapshot waits for the next full one).
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(write);
@@ -1968,7 +1975,8 @@ impl Store {
     /// Returns `StoreError::Deserialization` if the state's bytes aren't one
     /// JSON value (no bytes at all read as an empty list), as
     /// `get_state_slice` does, except the last item served from the head
-    /// record alone, which reads no earlier item.
+    /// record alone, which reads no earlier item: an `Append`'s, or a batch's
+    /// last item where this session found the head's count exact.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
