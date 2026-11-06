@@ -106,7 +106,9 @@ pub struct JsAppendedBatch {
     /// whole value once, and `getStateLen` reports that count from then on:
     /// a count a release before 0.5.0 stored can be off. A value that isn't
     /// a JSON array, or holds an item that isn't JSON, has no items to count,
-    /// and this is then the length `getStateLen` reports.
+    /// and this is then the length `getStateLen` reports; the batch is
+    /// recorded, and the state then fails to materialize, as after an
+    /// `appendToState` to it, so the items can't be read at those indices.
     pub first_ordinal: i64,
 }
 
@@ -678,8 +680,9 @@ impl JsStore {
     }
 
     /// The states whose snapshot after a recorded write failed at its most
-    /// recent attempt, one entry per branch and state, ordered by branch and
-    /// then state id; an empty array when none has. The same on every handle
+    /// recent attempt, one entry per branch and state, ordered by when each
+    /// branch was created (its internal id), then by state id; an empty
+    /// array when none has. The same on every handle
     /// of the store.
     ///
     /// A write that reaches a state's snapshot cadence takes the snapshot
@@ -744,7 +747,9 @@ impl JsStore {
     /// Get several records by ID in one call. The result has one entry per
     /// ID, in the order given: the record, as `getRecord` returns it, or
     /// `null` for an ID with no record. IDs may repeat. Throws, reading
-    /// nothing, if an ID isn't a record ID.
+    /// nothing, if an ID isn't a record ID. A record that fails to read
+    /// throws its error, which doesn't name the ID; `getRecord` on each ID
+    /// finds which.
     #[napi]
     pub fn get_records(&self, ids: Vec<String>) -> Result<Vec<Option<JsRecord>>> {
         let store = self.get_store()?;

@@ -16,7 +16,8 @@
 //! Besides the `tracing` warning, which a process without a subscriber (a
 //! Node process, say) never shows, `Store::snapshot_failures` lists each
 //! state whose snapshot failed at its last attempt, until a snapshot of it
-//! is taken.
+//! is taken or a write finds none due. Kept in memory, so a reopen empties
+//! it; a deleted branch's entries aren't listed.
 
 use chronicle::{
     Record, Sequence, SnapshotFailure, StateOperation, StateRegistration, StateStrategy,

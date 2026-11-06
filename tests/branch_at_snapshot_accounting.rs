@@ -14,8 +14,9 @@
 //! ordinary `create_branch` child (the control, which copies the parent's head
 //! verbatim and was never affected).
 //!
-//! These tests use only the cursor API so they compile against the unfixed
-//! code; they fail there on the `create_branch_at` child.
+//! The first four tests use only the cursor API, so they compile against the
+//! unfixed code and fail there on the `create_branch_at` child; the batch
+//! tests at the end need `AppendMany`.
 
 use chronicle::{
     CompactionStats, Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,

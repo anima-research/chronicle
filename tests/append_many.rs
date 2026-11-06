@@ -4,9 +4,11 @@
 //! Every read must see a batch exactly as it would see the same items
 //! appended one at a time: values, lengths, tails, slices, point lookups,
 //! iteration, delta snapshots, field-index answers, historical reads and
-//! forks, before and after a reopen. What differs on purpose is the number
-//! of records and the snapshot cadence, which counts a batch as one
-//! operation, as it counts a `TreeBatch`.
+//! forks, before and after a reopen, except that a historical read or a
+//! fork cut by sequence keeps or drops a batch whole, as it has one
+//! sequence where single appends have one each. What differs on purpose is
+//! the number of records and the snapshot cadence, which counts a batch as
+//! one operation, as it counts a `TreeBatch`.
 //!
 //! The first batch written to a store also marks its MANIFEST, so a build
 //! that predates the variant refuses the whole store at open instead of

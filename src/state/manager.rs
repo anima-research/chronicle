@@ -1175,7 +1175,8 @@ impl StateManager {
     /// previous slice implementation. The point lookups (`get_state_item`,
     /// `get_state_items_by_ordinal`) answer `None` for such a state instead,
     /// where its bytes hold one JSON value; bytes that don't (`{`, `123abc`)
-    /// are a `Deserialization` error from every lookup.
+    /// are a `Deserialization` error from every lookup, except the last item
+    /// served from the head record alone, which reads no earlier item.
     pub fn get_state_items(
         &self,
         branch_id: BranchId,
@@ -1290,7 +1291,9 @@ impl StateManager {
     /// path. A state whose value isn't an array (a Snapshot state holding an
     /// object, a Tree state) has no item at any index: `None`, not the
     /// error `get_state_items` returns for it. Bytes that aren't one JSON
-    /// value are the `Deserialization` error, as from `get_state_items`.
+    /// value are the `Deserialization` error, as from `get_state_items`,
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item.
     pub fn get_state_item(
         &self,
         branch_id: BranchId,
@@ -1328,8 +1331,10 @@ impl StateManager {
     /// Point lookups of several AppendLog items in one call: for each
     /// ordinal in `ordinals`, in the order given, what `get_state_item`
     /// returns for it, `None` where it is out of range, the state has no
-    /// value on this branch, or its value isn't an array. Ordinals may
-    /// repeat and come in any order.
+    /// value on this branch, or its value isn't an array, except at the last
+    /// index of a head whose count this session hasn't checked, where
+    /// `get_state_item` answers from the stored count and this from the
+    /// value. Ordinals may repeat and come in any order.
     ///
     /// Every answer comes from one version of the state, and the version is
     /// read once: from the warm item cache when it is current; from the head

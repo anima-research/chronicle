@@ -6,8 +6,9 @@
 //!   end, or one a caller's `DeltaSnapshot` left. The head-record fast paths
 //!   of the batched calls serve only a count the session has checked.
 //! - The point lookups report malformed state bytes as the error they are,
-//!   and answer `None` only for a value that is one JSON value but not an
-//!   array.
+//!   except the last item served from the head record alone, which reads no
+//!   earlier item, and answer `None` only for a value that is one JSON value
+//!   but not an array.
 //! - The batched identity append refuses one key for both the id and the
 //!   sequence.
 

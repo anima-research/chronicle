@@ -62,7 +62,9 @@ pub struct AppendedBatch {
     /// that count, which `get_state_len` then reports: a count a release
     /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
     /// A value that doesn't materialize as a JSON array has no items to
-    /// count, and this is then the count `get_state_len` reports. An error
+    /// count, and this is then the count `get_state_len` reports; the batch
+    /// is recorded, and the state then fails to materialize, as after an
+    /// `Append` to it, so the items can't be read at those ordinals. An error
     /// reading the log for the count (an I/O error, or a record of the
     /// state's chain that fails its checksum) is returned, and the batch
     /// isn't recorded.
@@ -878,7 +880,8 @@ impl Store {
     /// given, what `get_record` returns for it, `None` for an ID with no
     /// record. IDs may repeat. Store-wide, like `get_record`. The IDs are
     /// looked up together and the records read under one hold of the log
-    /// file, rather than one each.
+    /// file, rather than one each. A record that fails to read returns its
+    /// error, which doesn't name the ID; `get_record` on each ID finds which.
     pub fn get_records(&self, ids: &[RecordId]) -> Result<Vec<Option<Record>>> {
         let offsets = self.index.get_offsets_by_id(ids);
         let found: Vec<u64> = offsets.iter().flatten().copied().collect();
