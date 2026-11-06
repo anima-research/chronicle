@@ -398,6 +398,12 @@ pub struct StateManager {
     /// untouched, which makes it the observable for "this read did not
     /// re-materialize".
     reconstructions: AtomicU64,
+
+    /// Run once by `lookup_state_items` between its read of the head and the
+    /// materialization, so a test can move the head in between, as a write
+    /// on another thread can.
+    #[cfg(test)]
+    after_lookup_head: parking_lot::Mutex<Option<Box<dyn FnOnce(&StateManager) + Send>>>,
 }
 
 /// Derive the field-index file path as a sibling of the state-index path.
@@ -433,6 +439,8 @@ impl StateManager {
             retired_branches: parking_lot::Mutex::new(Vec::new()),
             counts: RwLock::new(HashMap::new()),
             reconstructions: AtomicU64::new(0),
+            #[cfg(test)]
+            after_lookup_head: parking_lot::Mutex::new(None),
         })
     }
 
@@ -465,6 +473,8 @@ impl StateManager {
             retired_branches: parking_lot::Mutex::new(Vec::new()),
             counts: RwLock::new(HashMap::new()),
             reconstructions: AtomicU64::new(0),
+            #[cfg(test)]
+            after_lookup_head: parking_lot::Mutex::new(None),
         };
 
         if path.exists() {
@@ -1220,6 +1230,11 @@ impl StateManager {
             return Ok(ItemsLookup::Items(cached));
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self.after_lookup_head.lock().take() {
+            hook(self);
+        }
+
         // Materialize the full state once (served from the byte cache when
         // warm), then split into item spans without building a Value tree.
         let state = match self.get_state_shared(branch_id, state_id)? {
@@ -1252,9 +1267,25 @@ impl StateManager {
         };
         let items = Arc::new(items);
 
-        self.items_cache
-            .write()
-            .put(cache_key, head.head_offset, Arc::clone(&items));
+        // `get_state_shared` read the head again, and a write that moved it
+        // since the read above leaves `state` the newer head's value. Filed
+        // under the older offset, it would be what any branch still at that
+        // offset reads, and counts, as its own (#70). So the items are filed
+        // only if the head is still where it was read: heads only move
+        // forward, each to the offset of a newer record, so an unchanged head
+        // means the value is that head's. Otherwise they are returned
+        // uncached, as the newer version this read saw.
+        let unmoved = self
+            .index
+            .read()
+            .heads
+            .get(branch_id, state_id)
+            .is_some_and(|current| current.head_offset == head.head_offset);
+        if unmoved {
+            self.items_cache
+                .write()
+                .put(cache_key, head.head_offset, Arc::clone(&items));
+        }
 
         Ok(ItemsLookup::Items(items))
     }
@@ -2217,6 +2248,54 @@ mod tests {
         // Get state
         let state = manager.get_state(TEST_BRANCH, "counter").unwrap().unwrap();
         assert_eq!(state, b"42");
+    }
+
+    /// A write that moves a branch's head while a lookup of its items is
+    /// between reading the head and materializing it leaves the lookup with
+    /// the newer value. That value isn't filed under the older head, where a
+    /// branch still at that head would take it for its own (#70): here a
+    /// batch's count on a branch forked at the head, which the race would
+    /// set to the newer value's length.
+    #[test]
+    fn a_lookup_whose_head_moves_before_it_materializes_caches_nothing_under_the_old_head() {
+        const SIDE: BranchId = BranchId(2);
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let first = StateOperation::Append(b"1".to_vec());
+        let at_fork = append_state_update(&log, "items", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", at_fork, &first).unwrap();
+        manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
+        // Unchecked on both branches, as heads loaded from state.bin are.
+        manager.set_count_check(TEST_BRANCH, "items", None);
+        manager.set_count_check(SIDE, "items", None);
+
+        // The main branch's count reads its head, then a write moves it on.
+        let log_for_hook = Arc::clone(&log);
+        *manager.after_lookup_head.lock() = Some(Box::new(move |manager: &StateManager| {
+            let second = StateOperation::Append(b"2".to_vec());
+            let offset = append_state_update(&log_for_hook, "items", Some(at_fork), second.clone(), 2);
+            manager.record_update(TEST_BRANCH, "items", offset, &second).unwrap();
+        }));
+        manager.checked_item_count(TEST_BRANCH, "items").unwrap();
+        assert!(manager.after_lookup_head.lock().is_none(), "the write ran inside the lookup");
+        assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 2);
+
+        assert!(
+            manager.items_cache.write().live_at(at_fork).is_none(),
+            "nothing is filed under the head the write moved past"
+        );
+        assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 1, "the side branch holds one item");
+        let side_items = manager.get_state_items(SIDE, "items").unwrap().unwrap();
+        assert_eq!(side_items.len(), 1);
     }
 
     /// A batch counts outside the store's write lock, so its count can be

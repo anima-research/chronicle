@@ -522,7 +522,10 @@ pub struct SnapshotFailure {
     pub branch: String,
     /// How many writes in a row found the state's snapshot due on the branch
     /// and failed to take it, counted since the store opened or the last
-    /// snapshot of the state there.
+    /// snapshot of the state there. Outcomes are counted in sequence order:
+    /// where writes to the state race, a failure that comes in after a later
+    /// write's outcome isn't counted, so the count can be lower than the
+    /// number of writes that failed.
     pub failures: u64,
     /// The sequence of the most recent of those writes.
     pub sequence: Sequence,

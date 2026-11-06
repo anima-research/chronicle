@@ -497,3 +497,22 @@ fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
     assert_eq!(store.current_branch().head, head, "no record");
     assert_eq!(store.stats().unwrap().record_count, records);
 }
+
+/// An identity batch refused for an item that isn't an object leaves the
+/// state as it was, its stored count included: the refusal comes before the
+/// batch counts the state's items.
+#[test]
+fn a_refused_identity_batch_leaves_a_stale_count_as_it_was() {
+    let dir = TempDir::new().unwrap();
+    let path = legacy_store(&dir);
+    let store = open(&path);
+    assert_eq!(store.get_state_len("s").unwrap(), Some(0), "the stored count, as loaded");
+    let before = store.state_reconstruction_count();
+
+    assert!(matches!(
+        store.append_many_to_state_json_with_identity("s", &[json!({"a": 1}), json!(2)], "id", "seq"),
+        Err(StoreError::InvalidOperation(_))
+    ));
+    assert_eq!(store.get_state_len("s").unwrap(), Some(0), "nothing counted");
+    assert_eq!(store.state_reconstruction_count(), before, "nothing read");
+}

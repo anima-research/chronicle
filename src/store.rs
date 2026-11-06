@@ -1288,13 +1288,15 @@ impl Store {
                  value at a key, so it can't carry both the record id and the sequence there"
             )));
         }
+        // Refused before the batch counts the state's items, which it may do
+        // before it takes the write lock: a refused batch changes nothing.
+        if let Some(at) = items.iter().position(|item| !item.is_object()) {
+            return Err(StoreError::InvalidOperation(format!(
+                "payload must be a JSON object: item {} of the batch is not",
+                at
+            )));
+        }
         self.append_batch_with_builder(branch_id, state_id, items.is_empty(), |id, seq| {
-            if let Some(at) = items.iter().position(|item| !item.is_object()) {
-                return Err(StoreError::InvalidOperation(format!(
-                    "payload must be a JSON object: item {} of the batch is not",
-                    at
-                )));
-            }
             items
                 .iter()
                 .map(|item| stamp_identity(item.clone(), id_field, sequence_field, id, seq))

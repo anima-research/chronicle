@@ -18,7 +18,8 @@
   `tracing` subscriber; the Node binding installs none. The snapshot stays
   due, and the next write to the state tries it again; a state whose
   snapshot keeps failing adds to the report, and logs, at each write that
-  finds one due.
+  finds one due, except that where writes to the state race, a failure that
+  comes in after a later write's outcome isn't counted.
   A call whose own work is the snapshot, `compactState`
   (`Store::compact_state`) or `Store::create_snapshot_if_needed`, still
   returns its error. Refusals before the record (an empty batch, an item
