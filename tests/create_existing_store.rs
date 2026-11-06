@@ -370,6 +370,7 @@ fn open_or_create_on_a_directory_it_cant_list_returns_the_listing_error() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         if listable {
             // Running as root, where the mode doesn't stop a listing.
+            eprintln!("skipped: the directory could be listed despite its mode (running as root?)");
             return;
         }
 

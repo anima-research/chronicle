@@ -540,8 +540,10 @@ fn a_manifest_with_an_unknown_feature_is_refused() {
 /// too where the store directory can be synced (not where this process may
 /// not open it, nor where the system doesn't sync directories, nor on
 /// Windows): when the manifest can't be replaced, the batch fails and
-/// nothing is recorded.
-#[cfg(unix)]
+/// nothing is recorded. A directory where the MANIFEST was stops the
+/// replacement on every system: on Unix the save refuses it as no regular
+/// file (`InvalidInput`), elsewhere the rename onto it fails with the
+/// system's own error.
 #[test]
 fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
     let dir = TempDir::new().unwrap();
@@ -561,6 +563,7 @@ fn a_batch_whose_manifest_mark_fails_is_not_recorded() {
     std::fs::rename(path.join("MANIFEST.aside"), path.join("MANIFEST")).unwrap();
     match result {
         Err(StoreError::Io(error)) => {
+            #[cfg(unix)]
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
             let message = error.to_string();
             assert!(

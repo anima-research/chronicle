@@ -747,6 +747,49 @@ fn get_records_answers_each_id_in_order() {
     assert!(store.get_records(&[]).unwrap().is_empty());
 }
 
+/// A record that fails to read fails `get_records` with its error, as it
+/// fails `get_record`, instead of answering `None` in its place. The damage
+/// is made while the store is open: open checks every record's checksum
+/// and refuses a damaged one before the tail.
+#[test]
+fn get_records_returns_the_error_of_a_record_that_fails_to_read() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    let note = |text: &str| {
+        store
+            .append(RecordInput::json("note", &json!({ "text": text })).unwrap())
+            .unwrap()
+    };
+    let readable = note("readable");
+    let damaged = note("damaged-in-the-middle");
+    let last = note("last");
+
+    let log = dir.path().join("records.log");
+    let bytes = std::fs::read(&log).unwrap();
+    let marker = b"damaged-in-the-middle";
+    let at = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("the payload is in the log");
+    let mut handle = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+    handle.seek(SeekFrom::Start(at as u64)).unwrap();
+    handle.write_all(&[bytes[at] ^ 0x20]).unwrap();
+    drop(handle);
+
+    assert!(matches!(
+        store.get_record(damaged.id),
+        Err(StoreError::ChecksumMismatch { .. })
+    ));
+    assert!(matches!(
+        store.get_records(&[readable.id, damaged.id]),
+        Err(StoreError::ChecksumMismatch { .. })
+    ));
+    let others = store.get_records(&[readable.id, last.id]).unwrap();
+    assert!(others.iter().all(Option::is_some), "the other records still read");
+}
+
 // ---------------------------------------------------------------------------
 // state-delta events
 // ---------------------------------------------------------------------------

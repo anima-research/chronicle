@@ -465,7 +465,9 @@ fn replay_restores_batches_and_marks_the_manifest_again() {
     let dir = TempDir::new().unwrap();
     crash(dir.path(), "batch");
     let manifest = dir.path().join("MANIFEST");
-    assert_eq!(&std::fs::read(&manifest).unwrap()[..5], b"RST\0\x02");
+    // Version 2, naming the AppendMany feature (bit 0) and no other.
+    let marked = [b"RST\0\x02".as_slice(), &1u64.to_le_bytes()[..]].concat();
+    assert_eq!(std::fs::read(&manifest).unwrap(), marked);
     std::fs::write(&manifest, b"RST\0\x01").unwrap();
 
     let expected: Value =
@@ -474,7 +476,7 @@ fn replay_restores_batches_and_marks_the_manifest_again() {
         let store = open_store(dir.path()).unwrap();
         assert_eq!(observe(&store), expected);
         assert_eq!(value(&store, "items").as_array().unwrap().len(), 1 + 7 * 4 - 2 + 2);
-        assert_eq!(&std::fs::read(&manifest).unwrap()[..5], b"RST\0\x02");
+        assert_eq!(std::fs::read(&manifest).unwrap(), marked, "marked again, with the feature named");
     }
 }
 

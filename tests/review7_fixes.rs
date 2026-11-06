@@ -369,6 +369,7 @@ fn a_marked_store_in_a_directory_that_cant_be_listed_still_opens() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     if listable {
         // Running as root, where the mode doesn't stop a listing.
+        eprintln!("skipped: the directory could be listed despite its mode (running as root?)");
         return;
     }
     assert_eq!(opened.unwrap(), json!([1]));

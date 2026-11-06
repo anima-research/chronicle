@@ -142,7 +142,13 @@ try {
   assert.deepEqual(store.getStateItemsJson('obj', []), []);
   assert.deepEqual(store.getStateItemsJson('obj', [0]), [null]);
   assert.deepEqual(store.getStateItemsJson('obj', objProbes), objProbes.map(() => null));
-  ok('getStateItemsJson: negative-only and mixed requests, and a state that is not an array, answer as getStateItemJson does');
+  // Bytes that aren't one JSON value are an error, not a value of another
+  // type: both forms throw the deserialization error.
+  store.registerState({ id: 'malformed', strategy: 'snapshot' });
+  store.setState('malformed', Buffer.from('{'));
+  assert.throws(() => store.getStateItemJson('malformed', 0), /Deserialization/);
+  assert.throws(() => store.getStateItemsJson('malformed', [0]), /Deserialization/);
+  ok('getStateItemsJson: negative-only and mixed requests, and a state that is not an array, answer as getStateItemJson does; malformed bytes throw from both');
 
   // A reopened store has cold caches: the batched read must still match.
   const records = [a.record, d.record, afterRedact.record];
@@ -294,15 +300,26 @@ try {
     const next = writeIn(form, store, [{ id: 'c' }]);
     assert.equal(next.sequence, record.sequence + 1, form);
     assert.equal(store.currentSequence(), next.sequence, form);
+    // Both failures are in the report, with the latest one's sequence and
+    // error.
+    const failures = store.snapshotFailures();
+    assert.equal(failures.length, 1, form);
+    assert.match(failures[0].error, /Deserialization/, form);
+    assert.deepEqual(
+      { ...failures[0], error: undefined },
+      { stateId: 's', branch: 'main', failures: 2, sequence: next.sequence, error: undefined },
+      `${form}: snapshotFailures() lists the state`,
+    );
     store.close();
 
     store = JsStore.open({ path: failPath });
+    assert.deepEqual(store.snapshotFailures(), [], `${form}: the report is kept in memory only`);
     assert.equal(store.currentSequence(), next.sequence, `${form}: the writes survive a reopen`);
     assert.equal(store.getStateLen('s'), 2 + written, form);
     assert.equal(writeIn(form, store, [{ id: 'd' }]).sequence, next.sequence + 1, `${form}: after the reopen too`);
     store.close();
   }
-  ok('a write whose own snapshot fails returns its record, and the writes stay recorded across a reopen');
+  ok('a write whose own snapshot fails returns its record and goes into snapshotFailures(), and the writes stay recorded across a reopen');
 
   // The snapshot a failure left due is taken by the next write that can
   // take it. A full snapshot every 2 operations reads the whole value, so
@@ -313,9 +330,11 @@ try {
   store.appendToState('s', Buffer.from('not json'));
   const failed = store.appendManyToStateJsonWithIdentity('s', [{ id: 'a' }], 'by', 'at');
   assert.equal(store.currentSequence(), failed.record.sequence, 'the snapshot failed, nothing followed');
+  assert.deepEqual(store.snapshotFailures().map((f) => [f.stateId, f.failures, f.sequence]), [['s', 1, failed.record.sequence]]);
   const value = [{ id: 'a' }, { id: 'b' }];
   const set = store.setStateJson('s', value);
   assert.equal(store.currentSequence(), set.sequence + 1, 'the set, then the snapshot left due');
+  assert.deepEqual(store.snapshotFailures(), [], 'the snapshot ends the entry');
   const updates = store.getRecordIdsByType('state_update');
   const snapshot = JSON.parse(store.getStateUpdateJson(updates[updates.length - 1])).operation;
   assert.deepEqual(decode(snapshot.Snapshot), value, 'a full snapshot of the value the set wrote');

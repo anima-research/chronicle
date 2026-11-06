@@ -465,3 +465,168 @@ fn warm_cache_path_still_serves() {
         assert_eq!(item["n"], 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// MessagePack written by a release that predates AppendMany
+// ---------------------------------------------------------------------------
+
+/// The payload `StateUpdateRecord::encode` wrote for each operation in
+/// chronicle 0.5.x: built from origin/main ca78f74 (0.5.1, before
+/// `AppendMany`) with rmp-serde 1.3.1, the same `update(...)` fields as
+/// above, and printed as hex. Not this build's encoder.
+const LEGACY_MSGPACK: &[(&str, &str)] = &[
+    (
+        "Set",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a3536574c4055b312c325da974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "Delta",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a544656c746182a86f6c645f68617368dc00200707070707070707070707070707070707070707070707070707070707070707a96e65775f76616c7565c4035b335da974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "Append",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a6417070656e64c4077b2261223a317da974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "Redact",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a652656461637482a5737461727401a3656e6403a974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "Edit",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a44564697482a5696e64657802a96e65775f76616c7565c403226522a974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "Snapshot",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a8536e617073686f74c4055b302c315da974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "DeltaSnapshot",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81ad44656c7461536e617073686f74c4035b325da974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "TreeSet",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a75472656553657482a470617468a7612f622e747874a5656e74727983a9626c6f625f68617368d94061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162a473697a650ca46d6f6465cd01a4a974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "TreeRemove",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81aa5472656552656d6f766581a470617468a7612f632e747874a974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "TreeBatch",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a954726565426174636881a36f70739281a353657482a470617468a5642e747874a5656e74727983a9626c6f625f68617368d94061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162a473697a650ca46d6f6465cd01a481a652656d6f766581a470617468a5652e747874a974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "TreeDeltaSnapshot",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81b15472656544656c7461536e617073686f749181a652656d6f766581a470617468a5662e747874a974696d657374616d70cf00060a24181e4000",
+    ),
+    (
+        "Field",
+        "86a97265636f72645f696407af676c6f62616c5f73657175656e63652aa873746174655f6964a86d65737361676573b2707265765f7570646174655f6f6666736574cd04d2a96f7065726174696f6e81a54669656c6482a46e616d65a57469746c65a96f7065726174696f6e81a3536574c403227422a974696d657374616d70cf00060a24181e4000",
+    ),
+];
+
+/// A state update a 0.5.x build wrote decodes as the operation it was, and
+/// this build writes the same bytes for it, so a store this build never
+/// asked to record a batch stays one a 0.5.x build reads.
+///
+/// `AppendMany` sits between `Append` and `Redact` in `StateOperation`, so
+/// every variant after it has a new index. That is safe only because
+/// rmp-serde writes a variant by its name, as a map `{"Redact": ...}`, and
+/// never by its index (rmp-serde 1.1 and 1.3 alike, the versions
+/// Cargo.toml has allowed): the bytes above hold each name. A change to
+/// integer variant tags would make these fail.
+#[test]
+fn msgpack_written_before_append_many_decodes_and_is_written_the_same() {
+    use chronicle::types::{Hash, TreeEntry, TreeOp};
+
+    let entry = TreeEntry {
+        blob_hash: "ab".repeat(32),
+        size: 12,
+        mode: 0o644,
+    };
+    let operations: Vec<(&str, StateOperation)> = vec![
+        ("Set", StateOperation::Set(b"[1,2]".to_vec())),
+        (
+            "Delta",
+            StateOperation::Delta {
+                old_hash: Hash([7; 32]),
+                new_value: b"[3]".to_vec(),
+            },
+        ),
+        ("Append", StateOperation::Append(b"{\"a\":1}".to_vec())),
+        ("Redact", StateOperation::Redact { start: 1, end: 3 }),
+        (
+            "Edit",
+            StateOperation::Edit {
+                index: 2,
+                new_value: b"\"e\"".to_vec(),
+            },
+        ),
+        ("Snapshot", StateOperation::Snapshot(b"[0,1]".to_vec())),
+        ("DeltaSnapshot", StateOperation::DeltaSnapshot(b"[2]".to_vec())),
+        (
+            "TreeSet",
+            StateOperation::TreeSet {
+                path: "a/b.txt".into(),
+                entry: entry.clone(),
+            },
+        ),
+        (
+            "TreeRemove",
+            StateOperation::TreeRemove {
+                path: "a/c.txt".into(),
+            },
+        ),
+        (
+            "TreeBatch",
+            StateOperation::TreeBatch {
+                ops: vec![
+                    TreeOp::Set {
+                        path: "d.txt".into(),
+                        entry: entry.clone(),
+                    },
+                    TreeOp::Remove {
+                        path: "e.txt".into(),
+                    },
+                ],
+            },
+        ),
+        (
+            "TreeDeltaSnapshot",
+            StateOperation::TreeDeltaSnapshot(vec![TreeOp::Remove {
+                path: "f.txt".into(),
+            }]),
+        ),
+        (
+            "Field",
+            StateOperation::Field {
+                name: "title".into(),
+                operation: Box::new(StateOperation::Set(b"\"t\"".to_vec())),
+            },
+        ),
+    ];
+    assert_eq!(operations.len(), LEGACY_MSGPACK.len());
+
+    for ((name, operation), (written_as, hex)) in operations.into_iter().zip(LEGACY_MSGPACK) {
+        assert_eq!(name, *written_as);
+        let legacy = hex::decode(hex).unwrap();
+        assert!(
+            legacy.windows(name.len()).any(|window| window == name.as_bytes()),
+            "{name}: the variant is written by its name"
+        );
+
+        let decoded =
+            StateUpdateRecord::decode(&record_with(legacy.clone(), PayloadEncoding::MessagePack))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(decoded.record_id, RecordId(7), "{name}");
+        assert_eq!(decoded.global_sequence, Sequence(42), "{name}");
+        assert_eq!(decoded.state_id, "messages", "{name}");
+        assert_eq!(decoded.prev_update_offset, Some(1234), "{name}");
+        assert_eq!(decoded.timestamp, Timestamp(1_700_000_000_000_000), "{name}");
+        assert_eq!(format!("{:?}", decoded.operation), format!("{operation:?}"), "{name}");
+
+        let (encoded, encoding) = update(operation).encode().unwrap();
+        assert_eq!(encoding, PayloadEncoding::MessagePack);
+        assert_eq!(encoded, legacy, "{name}: this build writes what 0.5.x wrote");
+    }
+}
