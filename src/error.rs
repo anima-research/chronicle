@@ -105,8 +105,10 @@ impl From<rmp_serde::decode::Error> for StoreError {
 #[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorCode {
-    /// The operating system refused or failed a file operation, such as
-    /// opening a path that holds no store; the message carries its error.
+    /// A file operation failed, either because the operating system refused
+    /// or failed it, such as opening a path that holds no store, or because a
+    /// file ended before a read of it could finish; the message carries its
+    /// error.
     Io,
     /// An fsync of the record log failed. `sync()` throws it until the store
     /// is reopened, and so do the calls that checkpoint, unless a check of
