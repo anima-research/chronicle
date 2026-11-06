@@ -1349,7 +1349,8 @@ impl StateManager {
     /// path. A state whose value isn't an array (a Snapshot state holding an
     /// object, a Tree state) has no item at any index: `None`, not the
     /// error `get_state_items` returns for it. Bytes that aren't one JSON
-    /// value are the `Deserialization` error, as from `get_state_items`,
+    /// value (no bytes at all read as an empty list) are the
+    /// `Deserialization` error, as from `get_state_items`,
     /// except the last item served from the head record alone, which reads
     /// no earlier item.
     pub fn get_state_item(

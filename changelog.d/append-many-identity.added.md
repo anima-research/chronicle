@@ -16,7 +16,8 @@
   names, and leaves the sequence at that key, over the id.) Once the batch
   is recorded the call returns it: a failure of the snapshot the write
   takes after its record goes into the store's snapshot-failure report
-  (`snapshotFailures()`) and is tried again by the next write, not thrown (see Fixed, #39). Like any
+  (`snapshotFailures()`), not thrown, and the next write to the state
+  takes the snapshot if one is still due (see Fixed, #39). Like any
   batch, the first one a store records moves its `MANIFEST` to version 2;
   a store never asked to record a batch keeps version 1 (a batch that
   fails after its mark still leaves version 2; see Breaking). In Rust:

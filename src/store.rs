@@ -58,16 +58,19 @@ pub struct AppendedBatch {
     /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
     /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
     /// array), the batch first counts
-    /// the state's items, reading its whole value once, and the head keeps
-    /// that count, which `get_state_len` then reports: a count a release
+    /// the state's items, reading its whole value once, or again under the
+    /// write lock where another write to the state lands during that count,
+    /// and the head keeps that count, which `get_state_len` then reports: a
+    /// count a release
     /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
     /// A value that doesn't materialize as a JSON array has no items to
     /// count, and this is then the count `get_state_len` reports; the batch
     /// is recorded, and the state then fails to materialize, as after an
     /// `Append` to it, so the items can't be read at those ordinals. An error
     /// reading the log for the count (an I/O error, or a record of the
-    /// state's chain that fails its checksum) is returned, and the batch
-    /// isn't recorded.
+    /// state's chain that fails its checksum or whose framing is bad) is
+    /// returned, and the batch isn't recorded; the error says so, except a
+    /// failed checksum's, which carries no message of its own.
     pub first_ordinal: usize,
 }
 
@@ -1081,7 +1084,9 @@ impl Store {
     /// parse, the failure is logged as a `tracing` warning and counted in
     /// [`Store::snapshot_failures`], and the write returns its record. The
     /// snapshot stays due, so the next write to the state on that branch
-    /// tries it again. A state whose snapshot keeps failing, such as one
+    /// checks the cadence again and takes the snapshot if one is still due
+    /// (after an Edit or Redact, a delta snapshot waits for the next full
+    /// one). A state whose snapshot keeps failing, such as one
     /// holding an Append that isn't JSON, logs a warning at each write that
     /// finds a snapshot due, each counted there too, and takes none until a
     /// `Set` replaces its value.
@@ -1140,8 +1145,9 @@ impl Store {
     /// An `item` that isn't a JSON object is refused with `InvalidOperation`
     /// and writes nothing. Once the item is recorded, the call returns its
     /// record: if the snapshot the write takes after it fails, that is
-    /// logged and counted in `snapshot_failures`, and the next write tries
-    /// it again, as for `update_state` (issue #39).
+    /// logged and counted in `snapshot_failures`, and the next write to the
+    /// state takes the snapshot if one is still due, as for `update_state`
+    /// (issue #39).
     pub fn append_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -1187,8 +1193,8 @@ impl Store {
     /// `Append`. An empty batch is refused with `InvalidOperation` and
     /// writes nothing. Once the batch is recorded, the call returns it: if
     /// the snapshot the write takes after it fails, that is logged and
-    /// counted in `snapshot_failures`, and the next write tries it again, as
-    /// for `update_state` (issue #39).
+    /// counted in `snapshot_failures`, and the next write to the state takes
+    /// the snapshot if one is still due, as for `update_state` (issue #39).
     pub fn append_many_to_state(
         &self,
         state_id: &str,
@@ -1262,7 +1268,8 @@ impl Store {
     /// the record id and the sequence. Once the batch is recorded,
     /// the call returns it: if the snapshot the write takes after it fails,
     /// that is logged and counted in `snapshot_failures`, and the next write
-    /// tries it again, as for `update_state` (issue #39).
+    /// to the state takes the snapshot if one is still due, as for
+    /// `update_state` (issue #39).
     pub fn append_many_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -1568,7 +1575,8 @@ impl Store {
                         branch = %branch.name,
                         sequence = next_seq.0,
                         "the snapshot after a recorded state write failed: the write stands and \
-                         returns its record, and the next write to the state tries the snapshot again"
+                         returns its record, and the next write to the state takes the snapshot \
+                         if one is still due"
                     );
                     self.note_snapshot_failure(&branch, state_id, next_seq, &error);
                 }
@@ -1951,8 +1959,9 @@ impl Store {
     /// Returns `None` if the state doesn't exist, the index is out of range,
     /// or the state's value isn't an array (where `get_state_slice` errors).
     /// Returns `StoreError::Deserialization` if the state's bytes aren't one
-    /// JSON value, as `get_state_slice` does, except the last item served
-    /// from the head record alone, which reads no earlier item.
+    /// JSON value (no bytes at all read as an empty list), as
+    /// `get_state_slice` does, except the last item served from the head
+    /// record alone, which reads no earlier item.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -1975,8 +1984,9 @@ impl Store {
     /// one call: for each ordinal, in the order given, the item
     /// `get_state_item` returns for it, `None` where the ordinal is out of
     /// range, the state has no value, or its value isn't an array; the
-    /// `Deserialization` error where the state's bytes aren't one JSON value,
-    /// as for `get_state_item`, except the last item served from the head
+    /// `Deserialization` error where the state's bytes aren't one JSON value
+    /// (no bytes at all read as an empty list), as for `get_state_item`,
+    /// except the last item served from the head
     /// record alone, which reads no earlier item. It answers otherwise than
     /// `get_state_item` only at the last index of a head whose count this
     /// session hasn't found exact (unchecked, or checked on a value that

@@ -28,7 +28,9 @@
     `getStateLen` after it, and the index a later `editStateItem` is
     checked against then follow the state's items. A value that isn't a
     JSON array, or holds an item that isn't JSON, has no items to count:
-    the batch takes the stored count. A record of the state's chain that
+    the batch takes the stored count, is recorded, and the state then fails
+    to materialize, as after an `appendToState` to it, so the items can't be
+    read at those indices. A record of the state's chain that
     fails to read (an I/O error, a failed checksum, a record whose framing
     is bad) fails the batch with that error, writing nothing; the error
     says the batch was not recorded, except a failed checksum's, which

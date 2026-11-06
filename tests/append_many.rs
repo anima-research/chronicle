@@ -12,7 +12,10 @@
 //!
 //! The first batch written to a store also marks its MANIFEST, so a build
 //! that predates the variant refuses the whole store at open instead of
-//! failing part way through it.
+//! failing part way through it, where the store's directory is synced (on
+//! Windows, where this process may not open the directory, or on a system
+//! that doesn't sync directories, a power loss can undo the move to version
+//! 2 and keep the batch; see the Breaking note).
 
 use chronicle::{
     FieldIndexKind, Sequence, StateOperation, StateRegistration, StateStrategy,

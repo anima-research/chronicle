@@ -103,7 +103,9 @@ pub struct JsAppendedBatch {
     ///
     /// The first batch to a state on a branch the store opened with, or on
     /// one `createBranchAt` started, counts the state's items, reading its
-    /// whole value once, and `getStateLen` reports that count from then on:
+    /// whole value once, or again under the write lock where another write
+    /// to the state lands during that count, and `getStateLen` reports that
+    /// count from then on:
     /// a count a release before 0.5.0 stored can be off. A value that isn't
     /// a JSON array, or holds an item that isn't JSON, has no items to count,
     /// and this is then the length `getStateLen` reports; the batch is
@@ -1209,7 +1211,9 @@ impl JsStore {
     /// reaches the state's snapshot cadence takes the snapshot after its
     /// record, and if that snapshot fails the call still returns: the store
     /// logs a `tracing` warning and lists the state in `snapshotFailures()`,
-    /// and the next write to the state tries the snapshot again (issue #39).
+    /// and the next write to the state checks the cadence again and takes
+    /// the snapshot if one is still due (after an Edit or Redact, a delta
+    /// snapshot waits for the next full one; issue #39).
     #[napi]
     pub fn append_to_state_json_with_identity(
         &self,
@@ -1240,12 +1244,18 @@ impl JsStore {
     /// returns it. A write that reaches the snapshot cadence takes the
     /// snapshot after its record, and if that snapshot fails the call still
     /// returns: the store logs a `tracing` warning and lists the state in
-    /// `snapshotFailures()`, and the next write to the state tries the
-    /// snapshot again (issue #39).
+    /// `snapshotFailures()`, and the next write to the state checks the
+    /// cadence again and takes the snapshot if one is still due (after an
+    /// Edit or Redact, a delta snapshot waits for the next full one; issue
+    /// #39).
     ///
-    /// The first batch a store records changes its format: the store's
-    /// `MANIFEST` goes to version 2, and releases from before batched
-    /// appends refuse to open it.
+    /// Just before a store's first batch is written, its `MANIFEST` moves to
+    /// version 2, and it stays there even if that batch then fails (see
+    /// `appendManyToStateJsonWithIdentity`), so releases from before batched
+    /// appends refuse to open it, where the store's directory is synced (on
+    /// Windows, where this process may not open the directory, or on a
+    /// system that doesn't sync directories, a power loss can undo the move
+    /// to version 2 and keep the batch; see Breaking).
     #[napi]
     pub fn append_many_to_state_json(
         &self,
@@ -1289,14 +1299,20 @@ impl JsStore {
     /// returns it. A write that reaches the snapshot cadence takes the
     /// snapshot after its record, and if that snapshot fails the call still
     /// returns: the store logs a `tracing` warning and lists the state in
-    /// `snapshotFailures()`, and the next write to the state tries the
-    /// snapshot again (issue #39).
+    /// `snapshotFailures()`, and the next write to the state checks the
+    /// cadence again and takes the snapshot if one is still due (after an
+    /// Edit or Redact, a delta snapshot waits for the next full one; issue
+    /// #39).
     ///
     /// Just before a store's first batch is written, by this call or
     /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it
     /// stays there even if that batch then fails, so releases from before
-    /// batched appends refuse to open it. If the move itself fails, the call
-    /// throws and the batch isn't recorded; it throws too if only the
+    /// batched appends refuse to open it, where the store's directory is
+    /// synced (on Windows, where this process may not open the directory,
+    /// or on a system that doesn't sync directories, a power loss can undo
+    /// the move to version 2 and keep the batch; see Breaking). If the move
+    /// itself fails, the call throws and the batch isn't recorded; it throws
+    /// too if only the
     /// directory sync after the move fails, with the `MANIFEST` already at
     /// version 2. A store never asked to record a batch keeps the format they
     /// open.
@@ -1416,8 +1432,9 @@ impl JsStore {
     /// this for point lookups in large states. Returns `null` if the state
     /// doesn't exist, the index is negative or out of range, or the state's
     /// value isn't an array. Throws the deserialization error if the state's
-    /// bytes aren't one JSON value, except the last item served from the
-    /// head record alone, which reads no earlier item.
+    /// bytes aren't one JSON value (no bytes at all read as an empty list),
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1449,9 +1466,9 @@ impl JsStore {
     /// this session hasn't found exact (unchecked, or checked on a value that
     /// doesn't materialize), where `getStateItemJson` answers from the stored
     /// count and this from the value. Throws, as `getStateItemJson` does, if
-    /// the state's bytes aren't one JSON value, except the last item served
-    /// from the head record alone, which reads no earlier item. Indices may
-    /// repeat and come in any order.
+    /// the state's bytes aren't one JSON value (no bytes at all read as an
+    /// empty list), except the last item served from the head record alone,
+    /// which reads no earlier item. Indices may repeat and come in any order.
     ///
     /// Every entry comes from the same version of the state, and a cold
     /// state is materialized at most once for the whole call, not once per

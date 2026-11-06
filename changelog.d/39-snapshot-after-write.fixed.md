@@ -16,7 +16,10 @@
   logs a `tracing` warning ("the snapshot after a recorded state write
   failed") with the same fields, which reaches only a host that installs a
   `tracing` subscriber; the Node binding installs none. The snapshot stays
-  due, and the next write to the state tries it again; a state whose
+  due, and the next write to the state checks the cadence again and takes
+  the snapshot if one is still due (after an `editStateItem` or
+  `redactStateItems`, a delta snapshot waits for the next full one); a
+  state whose
   snapshot keeps failing adds to the report, and logs, at each write that
   finds one due, except that where writes to the state race, a failure that
   comes in after a later write's outcome isn't counted.
@@ -24,5 +27,6 @@
   (`Store::compact_state`) or `Store::create_snapshot_if_needed`, still
   returns its error. Refusals before the record (an empty batch, an item
   that isn't an object, an identity batch whose `idField` equals its
-  `sequenceField`, a `MANIFEST` that can't be marked) still throw and write
-  nothing.
+  `sequenceField`, a `MANIFEST` that can't be marked) still throw and
+  record nothing; a stale count the batch had already counted keeps the
+  corrected count, which the next sync saves.
