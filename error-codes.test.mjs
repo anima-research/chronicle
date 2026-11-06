@@ -41,9 +41,8 @@ function throwsCoded(call, code, message) {
 test('ErrorCode lists every code, each named as its value', () => {
   assert.deepEqual(Object.keys(ErrorCode).sort(), [
     'BlobNotFound', 'BranchExists', 'BranchNotFound', 'ChecksumMismatch', 'Corruption',
-    'Deserialization', 'DurabilityLost', 'HashMismatch', 'InvalidFieldIndexKind',
-    'InvalidFormat', 'InvalidHash', 'InvalidOperation', 'InvalidRecordId',
-    'InvalidSequence', 'InvalidStrategy', 'InvalidSubscriptionId', 'InvalidTreeOp', 'Io',
+    'Deserialization', 'DurabilityLost', 'HashMismatch', 'InvalidFormat', 'InvalidOperation',
+    'InvalidSequence', 'Io',
     'Locked', 'NotInitialized', 'RecordNotFound', 'Serialization', 'StateExists',
     'StateNotRegistered', 'StoreClosed', 'StrategyMismatch', 'SubscriptionDropped',
     'SubscriptionNotFound', 'Transaction',
@@ -121,30 +120,30 @@ test("a view's refusals carry theirs", () => {
 
 test("the binding's own refusals carry theirs", () => {
   const { store } = freshStore();
-  throwsCoded(() => store.getRecord('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
-  throwsCoded(() => store.getBlob('zz'), ErrorCode.InvalidHash, 'Invalid hash');
+  throwsCoded(() => store.getRecord('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
+  throwsCoded(() => store.getBlob('zz'), ErrorCode.InvalidOperation, 'Invalid hash');
   // Hex, of the wrong length.
-  throwsCoded(() => store.getBlob('abcd'), ErrorCode.InvalidHash, 'Invalid hash');
-  throwsCoded(() => store.getStateUpdateJson('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
-  throwsCoded(() => store.getEffects('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
-  throwsCoded(() => store.getLinksTo('abc'), ErrorCode.InvalidRecordId, 'Invalid record ID');
+  throwsCoded(() => store.getBlob('abcd'), ErrorCode.InvalidOperation, 'Invalid hash');
+  throwsCoded(() => store.getStateUpdateJson('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
+  throwsCoded(() => store.getEffects('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
+  throwsCoded(() => store.getLinksTo('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
   store.registerState({ id: 'log', strategy: 'append_log' });
   throwsCoded(
     () => store.registerStateFieldIndex('log', 'when', 'date'),
-    ErrorCode.InvalidFieldIndexKind,
+    ErrorCode.InvalidOperation,
     'Invalid field index kind \'date\': expected "number" or "string"',
   );
   throwsCoded(
     () => store.registerState({ id: 'odd', strategy: 'bogus' }),
-    ErrorCode.InvalidStrategy,
+    ErrorCode.InvalidOperation,
     'Invalid strategy',
   );
-  throwsCoded(() => store.pollSubscription('abc'), ErrorCode.InvalidSubscriptionId, 'Invalid subscription ID');
+  throwsCoded(() => store.pollSubscription('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
   throwsCoded(() => store.pollSubscription('4242'), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-  throwsCoded(() => store.pollSubscriptionTimeout('abc', 1), ErrorCode.InvalidSubscriptionId, 'Invalid subscription ID');
+  throwsCoded(() => store.pollSubscriptionTimeout('abc', 1), ErrorCode.InvalidOperation, 'Invalid subscription ID');
   throwsCoded(() => store.pollSubscriptionTimeout('4242', 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-  throwsCoded(() => store.unsubscribe('abc'), ErrorCode.InvalidSubscriptionId, 'Invalid subscription ID');
-  throwsCoded(() => store.catchUpSubscription('abc'), ErrorCode.InvalidSubscriptionId, 'Invalid subscription ID');
+  throwsCoded(() => store.unsubscribe('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
+  throwsCoded(() => store.catchUpSubscription('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
   // Never made, or unsubscribed: not found, whichever method asks.
   throwsCoded(() => store.catchUpSubscription('4242'), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   const gone = store.subscribe();
@@ -153,10 +152,10 @@ test("the binding's own refusals carry theirs", () => {
   store.registerState({ id: 'tree', strategy: 'tree' });
   throwsCoded(
     () => store.treeBatch('tree', [{ op: 'rename', path: 'a' }]),
-    ErrorCode.InvalidTreeOp,
+    ErrorCode.InvalidOperation,
     "Invalid tree op: 'rename', expected 'set' or 'remove'",
   );
-  throwsCoded(() => store.treeBatch('tree', [{ op: 'set', path: 'a' }]), ErrorCode.InvalidTreeOp, "TreeOp 'set' requires entry");
+  throwsCoded(() => store.treeBatch('tree', [{ op: 'set', path: 'a' }]), ErrorCode.InvalidOperation, "TreeOp 'set' requires entry");
   store.close();
   throwsCoded(() => store.stats(), ErrorCode.StoreClosed, 'Store has been closed');
 });

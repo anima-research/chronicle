@@ -438,7 +438,7 @@ fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateS
             delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
             full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
         },
-        _ => return Err(coded(ErrorCode::InvalidStrategy, "Invalid strategy")),
+        _ => return Err(coded(ErrorCode::InvalidOperation, "Invalid strategy")),
     })
 }
 
@@ -694,7 +694,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let record = store.get_record(RecordId(id)).map_err(to_napi_error)?;
         Ok(record.map(Into::into))
     }
@@ -713,7 +713,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let record = match store.get_record(RecordId(id)).map_err(to_napi_error)? {
             Some(r) => r,
             None => return Ok(None),
@@ -778,7 +778,7 @@ impl JsStore {
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
         let hash = crate::Hash::from_hex(&hash)
-            .map_err(|_| coded(ErrorCode::InvalidHash, "Invalid hash"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid hash"))?;
         let blob = store.get_blob(&hash).map_err(to_napi_error)?;
         Ok(blob.map(|b| Buffer::from(b.content)))
     }
@@ -1533,7 +1533,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let effects = store.index.get_caused_by(RecordId(id));
         Ok(effects.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1544,7 +1544,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidRecordId, "Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let links = store.index.get_linked_to(RecordId(id));
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1632,7 +1632,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         // Remove handle from our map
         self.subscription_handles.lock().remove(&id);
@@ -1660,7 +1660,7 @@ impl JsStore {
         let (store, branch) = self.target()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
         if !self.live_subscriptions.lock().contains(&id) {
             return Err(coded(ErrorCode::SubscriptionNotFound, "Subscription not found"));
         }
@@ -1688,7 +1688,7 @@ impl JsStore {
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
@@ -1714,7 +1714,7 @@ impl JsStore {
     ) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| coded(ErrorCode::InvalidSubscriptionId, "Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
@@ -1785,7 +1785,7 @@ impl JsStore {
             .map(|op| match op.op.as_str() {
                 "set" => {
                     let entry = op.entry.ok_or_else(|| {
-                        coded(ErrorCode::InvalidTreeOp, "TreeOp 'set' requires entry")
+                        coded(ErrorCode::InvalidOperation, "TreeOp 'set' requires entry")
                     })?;
                     Ok(TreeOp::Set {
                         path: op.path,
@@ -1798,7 +1798,7 @@ impl JsStore {
                 }
                 "remove" => Ok(TreeOp::Remove { path: op.path }),
                 other => Err(coded(
-                    ErrorCode::InvalidTreeOp,
+                    ErrorCode::InvalidOperation,
                     format!("Invalid tree op: '{}', expected 'set' or 'remove'", other),
                 )),
             })
@@ -1951,7 +1951,7 @@ impl JsStore {
             "string" => FieldIndexKind::String,
             _ => {
                 return Err(coded(
-                    ErrorCode::InvalidFieldIndexKind,
+                    ErrorCode::InvalidOperation,
                     format!(
                         "Invalid field index kind '{}': expected \"number\" or \"string\"",
                         kind

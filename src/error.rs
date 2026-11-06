@@ -157,8 +157,12 @@ pub enum ErrorCode {
     /// `switchBranch` on a view; deleting the main branch, the current one
     /// or the one a view is pinned to; changing a state's strategy to
     /// another kind; or a tree operation on a state that isn't a tree. Or
-    /// for one of these arguments: an edit index past the end; an invalid
-    /// tree path or field-index path; an item for
+    /// for one of these arguments: a record ID or subscription ID that isn't
+    /// a non-negative integer; a blob hash that isn't hex of the right
+    /// length; a strategy other than snapshot, append_log or tree; a field
+    /// index kind other than number or string; a tree operation other than
+    /// set or remove, or a set without an entry; an edit index past the
+    /// end; an invalid tree path or field-index path; an item for
     /// `appendToStateJsonWithIdentity` that isn't a JSON object; the
     /// reserved record type `state_update`; or a blob content type over
     /// 65,535 bytes.
@@ -168,23 +172,11 @@ pub enum ErrorCode {
     // The binding's own, for calls it refuses or can't complete itself.
     /// The store, or this view of it, was closed with `close()`.
     StoreClosed,
-    /// A state registration named a strategy other than snapshot, append_log or tree.
-    InvalidStrategy,
-    /// A record ID that isn't a non-negative integer.
-    InvalidRecordId,
-    /// A blob hash that isn't valid hex of the right length.
-    InvalidHash,
-    /// A subscription ID that isn't a non-negative integer.
-    InvalidSubscriptionId,
     /// No subscription with that ID can be reached: it was never made, was
     /// unsubscribed through any handle, was a view's when the view was
     /// closed, or was a handle's when the handle was garbage-collected. A
     /// poll reaches only the subscriptions made through its own handle.
     SubscriptionNotFound,
-    /// A tree operation other than set or remove, or a set without an entry.
-    InvalidTreeOp,
-    /// A field index kind other than number or string.
-    InvalidFieldIndexKind,
 }
 
 impl ErrorCode {
@@ -213,13 +205,7 @@ impl ErrorCode {
             ErrorCode::InvalidOperation => "InvalidOperation",
             ErrorCode::SubscriptionDropped => "SubscriptionDropped",
             ErrorCode::StoreClosed => "StoreClosed",
-            ErrorCode::InvalidStrategy => "InvalidStrategy",
-            ErrorCode::InvalidRecordId => "InvalidRecordId",
-            ErrorCode::InvalidHash => "InvalidHash",
-            ErrorCode::InvalidSubscriptionId => "InvalidSubscriptionId",
             ErrorCode::SubscriptionNotFound => "SubscriptionNotFound",
-            ErrorCode::InvalidTreeOp => "InvalidTreeOp",
-            ErrorCode::InvalidFieldIndexKind => "InvalidFieldIndexKind",
         }
     }
 }
@@ -332,13 +318,7 @@ mod tests {
     fn the_bindings_own_codes_keep_their_names() {
         let cases = [
             (ErrorCode::StoreClosed, "StoreClosed"),
-            (ErrorCode::InvalidStrategy, "InvalidStrategy"),
-            (ErrorCode::InvalidRecordId, "InvalidRecordId"),
-            (ErrorCode::InvalidHash, "InvalidHash"),
-            (ErrorCode::InvalidSubscriptionId, "InvalidSubscriptionId"),
             (ErrorCode::SubscriptionNotFound, "SubscriptionNotFound"),
-            (ErrorCode::InvalidTreeOp, "InvalidTreeOp"),
-            (ErrorCode::InvalidFieldIndexKind, "InvalidFieldIndexKind"),
         ];
         for (code, name) in cases {
             assert_eq!(code.as_str(), name);
