@@ -3661,11 +3661,12 @@ impl Store {
 
     /// The error for a failed read of a version 2 MANIFEST's feature bits.
     /// A file that ends before them is too short, which is its format; any
-    /// other failure is the read's own I/O error, naming the file.
+    /// other failure is the read's own I/O error. Both name the file.
     fn feature_bits_error(manifest: &Path, error: std::io::Error) -> StoreError {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
             StoreError::InvalidFormat(format!(
-                "Store manifest version 2 is too short to hold its format features: {error}"
+                "Store manifest version 2 {} is too short to hold its format features: {error}",
+                manifest.display()
             ))
         } else {
             StoreError::Io(std::io::Error::new(
@@ -4358,7 +4359,9 @@ mod tests {
         let manifest = Path::new("/stores/s/MANIFEST");
         let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer");
         match Store::feature_bits_error(manifest, eof) {
-            StoreError::InvalidFormat(message) => assert!(message.contains("too short"), "{message}"),
+            StoreError::InvalidFormat(message) => {
+                assert!(message.contains("too short") && message.contains("/stores/s/MANIFEST"), "{message}")
+            }
             other => panic!("{other:?}"),
         }
         let failed = std::io::Error::new(std::io::ErrorKind::Other, "Input/output error");

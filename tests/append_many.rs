@@ -533,9 +533,16 @@ fn a_manifest_with_an_unknown_feature_is_refused() {
         Ok(_) => panic!("opened a store with an unknown format feature"),
     }
 
-    // A truncated version-2 manifest is refused too.
-    std::fs::write(dir.path().join("MANIFEST"), b"RST\0\x02\x01\x00").unwrap();
-    assert!(matches!(Store::open(config(dir.path())), Err(StoreError::InvalidFormat(_))));
+    // A truncated version-2 manifest is refused too, naming the file.
+    let manifest = dir.path().join("MANIFEST");
+    std::fs::write(&manifest, b"RST\0\x02\x01\x00").unwrap();
+    match Store::open(config(dir.path())) {
+        Err(StoreError::InvalidFormat(message)) => {
+            assert!(message.contains(&*manifest.to_string_lossy()), "{message}")
+        }
+        Err(other) => panic!("expected InvalidFormat, got {other:?}"),
+        Ok(_) => panic!("opened a store whose MANIFEST is cut short in its feature bits"),
+    }
 }
 
 /// The flag is in place before the record is written, and on disk before it

@@ -1512,6 +1512,8 @@ impl StateManager {
         if let Some(cached) = self.tree_cache.write().get(&cache_key, head.head_offset) {
             return Ok(Some(cached));
         }
+        #[cfg(test)]
+        self.run_test_hook("tree lookup: head read");
 
         // Materialize the state bytes once (served from the byte cache when
         // warm), then decode the map once per head_offset.
@@ -1524,9 +1526,20 @@ impl StateManager {
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
         let tree = Arc::new(tree);
 
-        self.tree_cache
-            .write()
-            .put(cache_key, head.head_offset, Arc::clone(&tree));
+        // As in `lookup_state_items` (#70): `get_state_shared` read the head
+        // again, so the tree is filed under the head read above only if the
+        // head hasn't moved since, which makes it that head's tree.
+        let unmoved = self
+            .index
+            .read()
+            .heads
+            .get(branch_id, state_id)
+            .is_some_and(|current| current.head_offset == head.head_offset);
+        if unmoved {
+            self.tree_cache
+                .write()
+                .put(cache_key, head.head_offset, Arc::clone(&tree));
+        }
 
         Ok(Some(tree))
     }
@@ -2313,6 +2326,44 @@ mod tests {
         assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 1, "the side branch holds one item");
         let side_items = manager.get_state_items(SIDE, "items").unwrap().unwrap();
         assert_eq!(side_items.len(), 1);
+    }
+
+    /// The tree cache's form of #70: a write that moves the head while a
+    /// tree read is between its head read and the materialization leaves
+    /// the read with the newer tree, which isn't filed under the older head,
+    /// where a fork still at that head would read it as its own.
+    #[test]
+    fn a_tree_read_whose_head_moves_before_it_materializes_caches_nothing_under_the_old_head() {
+        const SIDE: BranchId = BranchId(2);
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "files".to_string(),
+                strategy: StateStrategy::Tree {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let entry = crate::types::TreeEntry { blob_hash: "ab".repeat(32), size: 1, mode: 0o644 };
+        let first = StateOperation::TreeSet { path: "a".into(), entry: entry.clone() };
+        let at_fork = append_state_update(&log, "files", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "files", at_fork, &first).unwrap();
+        manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
+
+        let log_for_hook = Arc::clone(&log);
+        manager.set_test_hook("tree lookup: head read", move |manager: &StateManager| {
+            let second = StateOperation::TreeSet { path: "b".into(), entry };
+            let offset = append_state_update(&log_for_hook, "files", Some(at_fork), second.clone(), 2);
+            manager.record_update(TEST_BRANCH, "files", offset, &second).unwrap();
+        });
+        assert_eq!(manager.get_tree_state(TEST_BRANCH, "files").unwrap().unwrap().len(), 2, "the newer tree");
+        assert!(manager.test_hooks.lock().is_empty(), "the write ran inside the read");
+
+        assert!(manager.tree_cache.write().live_at(at_fork).is_none(), "nothing filed under the old head");
+        let side = manager.get_tree_state(SIDE, "files").unwrap().unwrap();
+        assert_eq!(side.keys().collect::<Vec<_>>(), ["a"], "the fork's own tree");
     }
 
     /// A state "items" on the main branch holding `ops` appended in order,
