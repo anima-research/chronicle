@@ -5,6 +5,7 @@
   map, expected a sequence`). `getStateSlice` and `Store::get_state_slice(_on)`
   still throw for such a state. A state whose bytes aren't JSON at all (no
   bytes at all read as an empty list), such as `{`, still throws its
-  deserialization error from these lookups, and from `getStateItemsJson`
-  too, except the last item served from the head record alone (the state's
-  newest append), which reads no earlier item.
+  deserialization error from these lookups, and from the new
+  `getStateItemsJson` (see Added) too, except the last item served from the
+  head record alone (the state's newest append), which reads no earlier
+  item.

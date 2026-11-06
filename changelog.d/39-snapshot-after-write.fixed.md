@@ -3,13 +3,13 @@
   state's snapshot thresholds takes the snapshot right after its own record:
   `update_state` (Rust) and every call that goes through it, such as
   `appendToState`, `appendToStateJson`, `appendToStateJsonWithIdentity`,
-  `appendManyToStateJson`, `appendManyToStateJsonWithIdentity`, `setState`,
-  `editStateItem`, `redactStateItems`, `treeSet`, `treeRemove` and
-  `treeBatch`. If that snapshot failed, on a full disk, say, or reading back
-  an item that isn't JSON, the call threw although the write was recorded,
-  so a caller took it for a write that didn't happen, and one that retried
-  a write that isn't idempotent made it twice. The call now returns its
-  record, and the failure goes into the store's snapshot-failure report
+  `setState`, `editStateItem`, `redactStateItems`, `treeSet`, `treeRemove`
+  and `treeBatch`. If that snapshot failed, on a full disk, say, or
+  reading back an item that isn't JSON, the call threw although the write
+  was recorded, so a caller took it for a write that didn't happen, and one
+  that retried a write that isn't idempotent made it twice. The call now
+  returns its record, as the batched appends new in this release do (see
+  Added), and the failure goes into the store's snapshot-failure report
   (`snapshotFailures()`; `Store::snapshot_failures`), which Rust and Node
   callers can read: it counts the failures and keeps
   the last one's error, state, branch and sequence. The store also
@@ -25,8 +25,9 @@
   comes in after a later write's outcome isn't counted.
   A call whose own work is the snapshot, `compactState`
   (`Store::compact_state`) or `Store::create_snapshot_if_needed`, still
-  returns its error. Refusals before the record (an empty batch, an item
-  that isn't an object, an identity batch whose `idField` equals its
-  `sequenceField`, a `MANIFEST` that can't be marked) still throw and
-  record nothing; a stale count the batch had already counted keeps the
-  corrected count, which the next sync saves.
+  returns its error. Refusals before the record still throw and record
+  nothing. For a batched append, those are an empty batch, an item that
+  isn't an object, an identity batch whose `idField` equals its
+  `sequenceField`, and a `MANIFEST` that can't be marked, and a stale count
+  the refused batch had already counted keeps the corrected count, which
+  the next sync saves.
