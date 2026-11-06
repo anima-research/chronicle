@@ -30,8 +30,9 @@
     JSON array, or holds an item that isn't JSON, has no items to count:
     the batch takes the stored count. A record of the state's chain that
     fails to read (an I/O error, a failed checksum, a record whose framing
-    is bad) fails the batch with that error, writing nothing; but for a
-    failed checksum, the error says the batch was not recorded. In Rust, a
+    is bad) fails the batch with that error, writing nothing; the error
+    says the batch was not recorded, except a failed checksum's, which
+    carries no message of its own. In Rust, a
     `DeltaSnapshot` a caller writes through `update_state` leaves the count
     as it was, and the next batch counts the items again the same way.
     `compactState` before the batch takes a full snapshot, which recounts
