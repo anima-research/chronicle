@@ -474,9 +474,7 @@ fn the_first_batch_marks_the_manifest_so_older_builds_refuse_the_store() {
 
         store.update_state("log", batch(&[json!(1), json!(2)])).unwrap();
         let marked = manifest(dir.path());
-        assert_eq!(&marked[..5], b"RST\0\x02");
-        assert_eq!(u64::from_le_bytes(marked[5..13].try_into().unwrap()) & 1, 1, "the AppendMany flag");
-        assert_eq!(marked.len(), 13);
+        assert_eq!(marked, batches_manifest(), "version 2, the AppendMany flag and no other");
         assert_eq!(
             older_build_opens(&marked),
             Err("Unsupported store version: 2".to_string()),
@@ -513,7 +511,7 @@ fn the_first_batch_marks_the_manifest_so_older_builds_refuse_the_store() {
     assert_eq!(value(&store, "log"), json!([0, 1, 2, 3]));
     store.update_state("log", batch(&[json!(4)])).unwrap();
     assert_eq!(store.get_state_len("log").unwrap(), Some(5));
-    assert_eq!(&manifest(dir.path())[..5], b"RST\0\x02");
+    assert_eq!(manifest(dir.path()), batches_manifest());
 }
 
 /// A manifest naming a format feature this build doesn't know was written
@@ -1094,8 +1092,7 @@ fn the_first_identity_batch_marks_the_manifest() {
             .unwrap();
         assert_eq!(batch.first_ordinal, 5);
         let marked = manifest(dir.path());
-        assert_eq!(&marked[..5], b"RST\0\x02");
-        assert_eq!(u64::from_le_bytes(marked[5..13].try_into().unwrap()) & 1, 1, "the AppendMany flag");
+        assert_eq!(marked, batches_manifest(), "version 2, the AppendMany flag and no other");
         assert_eq!(
             older_build_opens(&marked),
             Err("Unsupported store version: 2".to_string())
@@ -1108,7 +1105,7 @@ fn the_first_identity_batch_marks_the_manifest() {
     }
     let store = Store::open(config(dir.path())).unwrap();
     assert_eq!(value(&store, "log"), expected);
-    assert_eq!(&manifest(dir.path())[..5], b"RST\0\x02");
+    assert_eq!(manifest(dir.path()), batches_manifest());
 }
 
 /// On a branch other than the current one, an identity batch counts that

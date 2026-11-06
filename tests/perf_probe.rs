@@ -232,6 +232,9 @@ fn probe_first_batch_after_open_and_another_writer() {
             let batch = batch.join().unwrap();
             (batch.as_secs_f64() * 1000.0, worst.as_secs_f64() * 1000.0, writes)
         });
+        // The slowest other write means something only where some ran while
+        // the batch did.
+        assert!(writes > 0, "no other write overlapped the batch");
         println!(
             "items={:<8} first batch {:>8.1} ms   slowest other write {:>8.1} ms   ({} other writes)",
             items, batch_ms, worst_ms, writes

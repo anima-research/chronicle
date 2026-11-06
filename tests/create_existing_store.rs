@@ -226,8 +226,8 @@ fn open_or_create_finishes_a_create_that_stopped_inside_its_manifest_save() {
     fs::write(&staged, b"CHR").unwrap();
 
     drop(Store::open_or_create(config(&path)).unwrap());
+    assert!(!staged.exists(), "the create swept the interrupted save's staging file");
     Store::open(config(&path)).unwrap();
-    assert!(!staged.exists(), "the interrupted save's staging file is swept");
 }
 
 #[test]

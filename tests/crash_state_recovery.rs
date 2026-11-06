@@ -512,7 +512,11 @@ fn replay_keeps_the_stamps_of_identity_batches() {
             assert_eq!(record.sequence, Sequence(*sequence));
             ordinal += count;
         }
-        assert_eq!(&std::fs::read(dir.path().join("MANIFEST")).unwrap()[..5], b"RST\0\x02");
+        assert_eq!(
+            std::fs::read(dir.path().join("MANIFEST")).unwrap(),
+            [b"RST\0\x02".as_slice(), &1u64.to_le_bytes()[..]].concat(),
+            "version 2, the AppendMany flag and no other"
+        );
     }
 }
 

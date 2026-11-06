@@ -13,6 +13,7 @@ on:
       - 'tests/create_existing_store.rs'
       - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
+      - 'tests/review7_fixes.rs'
   pull_request:
     paths:
       - '.github/workflows/checkpoint-platforms.yml'
@@ -25,6 +26,7 @@ on:
       - 'tests/create_existing_store.rs'
       - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
+      - 'tests/review7_fixes.rs'
   workflow_dispatch:
 
 permissions:
@@ -87,3 +89,10 @@ jobs:
       # Unix-only. The filter picks the three batch tests.
       - name: Batch replay after a crash tests
         run: cargo test --test crash_state_recovery batch -- --nocapture
+
+      # Open syncs the directory a marked MANIFEST was renamed into, and
+      # these two Unix tests (a directory that can't be listed, a MANIFEST
+      # linked into another directory) reach it; on Windows they are
+      # compiled out and the filter runs none.
+      - name: Marked store open tests
+        run: cargo test --test review7_fixes a_marked_store -- --nocapture
