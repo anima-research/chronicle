@@ -167,15 +167,17 @@ pub enum ErrorCode {
     /// reserved record type `state_update`; or a blob content type over
     /// 65,535 bytes.
     InvalidOperation,
-    /// The store dropped the subscription, because its buffer overran.
+    /// The store doesn't hold the subscription. It dropped it because its
+    /// buffer overran, or it was unsubscribed (to a poll, through another
+    /// handle); or, to a catch-up, it was never made.
     SubscriptionDropped,
     // The binding's own, for calls it refuses or can't complete itself.
     /// The store, or this view of it, was closed with `close()`.
     StoreClosed,
-    /// No subscription with that ID can be reached: it was never made, was
-    /// unsubscribed through any handle, was a view's when the view was
-    /// closed, or was a handle's when the handle was garbage-collected. A
-    /// poll reaches only the subscriptions made through its own handle.
+    /// The handle polled holds no subscription with that ID: it wasn't made
+    /// through that handle, was unsubscribed through it, or was the view's
+    /// when the view was closed. A poll reaches only the subscriptions made
+    /// through its own handle.
     SubscriptionNotFound,
 }
 

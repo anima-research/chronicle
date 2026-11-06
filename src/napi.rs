@@ -14,7 +14,7 @@ use crate::{
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Results from this binding's methods. An error one returns carries its
@@ -65,7 +65,6 @@ pub struct JsStore {
     detached: bool,
     /// Active subscription handles, stored by ID.
     subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
-    live_subscriptions: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl Drop for JsStore {
@@ -477,11 +476,6 @@ impl JsStore {
 
     fn release_subscriptions(&self) {
         let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
-        let mut live = self.live_subscriptions.lock();
-        for id in &handles {
-            live.remove(id);
-        }
-        drop(live);
         if let Some(store) = self.shared.read().as_ref() {
             for id in handles {
                 store.unsubscribe(SubscriptionId(id));
@@ -496,7 +490,6 @@ impl JsStore {
             pinned: None,
             detached: false,
             subscription_handles: Mutex::new(HashMap::new()),
-            live_subscriptions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -623,7 +616,6 @@ impl JsStore {
             }),
             detached: false,
             subscription_handles: Mutex::new(HashMap::new()),
-            live_subscriptions: Arc::clone(&self.live_subscriptions),
         })
     }
 
@@ -1621,7 +1613,6 @@ impl JsStore {
 
         // Store the handle for later polling
         self.subscription_handles.lock().insert(id, handle);
-        self.live_subscriptions.lock().insert(id);
 
         Ok(id.to_string())
     }
@@ -1636,7 +1627,6 @@ impl JsStore {
 
         // Remove handle from our map
         self.subscription_handles.lock().remove(&id);
-        self.live_subscriptions.lock().remove(&id);
 
         // Unsubscribe from store
         store.unsubscribe(SubscriptionId(id));
@@ -1649,21 +1639,18 @@ impl JsStore {
     /// subscription's `fromSequence` setting, from the branch of the handle
     /// it's called on: the current branch on the root, its own branch on a
     /// view. Any handle of the store can catch up a subscription made
-    /// through another, replaying its own branch. An ID that was never
-    /// made, was unsubscribed through any handle, was a view's when the view
-    /// was closed, or was a handle's when the handle was garbage-collected
-    /// throws `SubscriptionNotFound`. One the store has dropped because its
-    /// buffer overran, during a catch-up or live, throws
-    /// `SubscriptionDropped`.
+    /// through another, replaying its own branch. A subscription the store
+    /// doesn't hold throws `SubscriptionDropped`: one it dropped because its
+    /// buffer overran, during a catch-up or live, and one that was
+    /// unsubscribed through any handle, was a view's when the view was
+    /// closed, was a handle's when the handle was garbage-collected, or was
+    /// never made.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
         let (store, branch) = self.target()?;
         let id: u64 = subscription_id
             .parse()
             .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
-        if !self.live_subscriptions.lock().contains(&id) {
-            return Err(coded(ErrorCode::SubscriptionNotFound, "Subscription not found"));
-        }
 
         store
             .catch_up_subscription_on(branch, SubscriptionId(id))
@@ -1675,11 +1662,11 @@ impl JsStore {
     /// Returns null if no events are available. A poll reaches only the
     /// subscriptions made through its own handle; another ID throws
     /// `SubscriptionNotFound`. Once a subscription has ended and the events
-    /// queued for it are read, a poll throws why it ended: `StoreClosed`
-    /// after the root's `close()`, `SubscriptionNotFound` once it was
-    /// unsubscribed through another handle, and `SubscriptionDropped` once
-    /// the store dropped it because its buffer overran. After the root's
-    /// `close()` it's `StoreClosed`, whatever ended the subscription before.
+    /// queued for it are read, a poll throws `StoreClosed` after the root's
+    /// `close()`, whatever ended the subscription before, and otherwise
+    /// `SubscriptionDropped`: the store dropped it because its buffer
+    /// overran, or it was unsubscribed through another handle, which queues
+    /// a last `dropped` event saying so when the buffer has room for it.
     /// Its handle holds an ended subscription, buffer and all, until it's
     /// unsubscribed through that handle, the handle is a view that's closed,
     /// or the handle is garbage-collected. After the root's `close()`,
@@ -1698,7 +1685,7 @@ impl JsStore {
         match handle.try_recv() {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(self.ended(id)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(self.ended()),
         }
     }
 
@@ -1725,15 +1712,13 @@ impl JsStore {
         match handle.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.ended(id)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.ended()),
         }
     }
 
-    fn ended(&self, id: u64) -> napi::Error<ErrorCode> {
+    fn ended(&self) -> napi::Error<ErrorCode> {
         if self.shared.read().is_none() {
             coded(ErrorCode::StoreClosed, "Store has been closed")
-        } else if !self.live_subscriptions.lock().contains(&id) {
-            coded(ErrorCode::SubscriptionNotFound, "Subscription not found")
         } else {
             to_napi_error(StoreError::SubscriptionDropped)
         }

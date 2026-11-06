@@ -144,11 +144,11 @@ test("the binding's own refusals carry theirs", () => {
   throwsCoded(() => store.pollSubscriptionTimeout('4242', 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   throwsCoded(() => store.unsubscribe('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
   throwsCoded(() => store.catchUpSubscription('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
-  // Never made, or unsubscribed: not found, whichever method asks.
-  throwsCoded(() => store.catchUpSubscription('4242'), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  // A catch-up asks the store, which holds neither one never made nor one unsubscribed.
+  throwsCoded(() => store.catchUpSubscription('4242'), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   const gone = store.subscribe();
   store.unsubscribe(gone);
-  throwsCoded(() => store.catchUpSubscription(gone), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  throwsCoded(() => store.catchUpSubscription(gone), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   store.registerState({ id: 'tree', strategy: 'tree' });
   throwsCoded(
     () => store.treeBatch('tree', [{ op: 'rename', path: 'a' }]),
@@ -193,20 +193,20 @@ for (const [made, ownerOf] of owners) {
     store.close();
   });
 
-  test(`a poll of a subscription made through ${made} and unsubscribed through another handle returns what was queued, then says it is not found`, () => {
+  test(`a poll of a subscription made through ${made} and unsubscribed through another handle returns what was queued, the dropped event last, then says it was dropped`, () => {
     const { store } = freshStore();
     const owner = ownerOf(store);
     const other = owner === store ? store.view('main') : store;
     const id = owner.subscribe();
     other.unsubscribe(id);
     assert.equal(owner.pollSubscription(id)?.eventType, 'dropped');
-    throwsCoded(() => owner.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-    throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+    throwsCoded(() => owner.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+    throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
     store.close();
   });
 }
 
-test("a poll through a view that was closed of the view's own subscription says it is not found", () => {
+test("a poll through a view that was closed of the view's own subscription says it is not found, and a catch-up that it was dropped", () => {
   const { store } = freshStore();
   const view = store.view('main');
   const id = view.subscribe();
@@ -214,7 +214,7 @@ test("a poll through a view that was closed of the view's own subscription says 
   view.close();
   throwsCoded(() => view.pollSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   throwsCoded(() => view.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
-  throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   assert.equal(store.subscriptionCount(), 0);
   store.close();
 });
@@ -236,7 +236,7 @@ test('a root dropped without close() takes its own subscriptions with it, and a 
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(view.subscriptionCount(), 1);
-  for (const id of ids) throwsCoded(() => view.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  for (const id of ids) throwsCoded(() => view.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   view.catchUpSubscription(own);
   assert.equal(view.pollSubscription(own)?.eventType, 'caught_up');
   view = null;
@@ -267,7 +267,7 @@ test('a view dropped without close() takes its subscriptions with it, and the ro
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(store.subscriptionCount(), 1);
-  for (const id of ids) throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  for (const id of ids) throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   store.catchUpSubscription(own);
   assert.equal(store.pollSubscription(own)?.eventType, 'caught_up');
   store.close();
@@ -310,7 +310,7 @@ test('a catch-up that overruns the subscription\'s buffer drops it', () => {
   store.close();
 });
 
-test('a subscription is caught up, or not found once unsubscribed, through any handle of its store', () => {
+test('a subscription is caught up through any handle of its store, and once unsubscribed through any, a catch-up says it was dropped', () => {
   const { store } = freshStore();
   const view = store.view('main');
   const onRoot = store.subscribe();
@@ -323,14 +323,14 @@ test('a subscription is caught up, or not found once unsubscribed, through any h
   store.unsubscribe(onView);
   for (const handle of [store, view]) {
     for (const id of [onRoot, onView]) {
-      throwsCoded(() => handle.catchUpSubscription(id), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+      throwsCoded(() => handle.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
     }
   }
   const closing = store.view('main');
   const onClosing = closing.subscribe();
   assert.equal(store.subscriptionCount(), 1);
   closing.close();
-  throwsCoded(() => store.catchUpSubscription(onClosing), ErrorCode.SubscriptionNotFound, 'Subscription not found');
+  throwsCoded(() => store.catchUpSubscription(onClosing), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   store.close();
 });
 
