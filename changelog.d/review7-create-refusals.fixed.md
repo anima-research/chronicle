@@ -8,4 +8,8 @@
   features this build doesn't know) or isn't a regular file refuses with
   `InvalidOperation`, naming that file and what is wrong with it, and
   leaves it as it is. The refusal
-  doesn't name `open` or `openOrCreate`, which fail on that file too.
+  doesn't name `open` or `openOrCreate`, which fail on that file too. For a
+  `MANIFEST` too short to hold its header (empty, as a create from an
+  earlier release could leave it if interrupted), it says to remove the
+  file and create again when the directory holds no `records.log`,
+  `state.bin` or `branches.bin`.

@@ -401,3 +401,52 @@ fn a_marked_store_whose_manifest_links_into_another_directory_opens() {
     let store = Store::open(config(&path)).unwrap();
     assert_eq!(value(&store, "s"), json!([1]));
 }
+
+/// Flips one byte of the first copy of `marker` in `file`, through a handle
+/// of its own, as damage from outside the store would.
+fn damage(file: &Path, marker: &[u8]) {
+    use std::io::{Seek, SeekFrom, Write};
+    let bytes = fs::read(file).unwrap();
+    let at = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("the marker is in the file");
+    let mut handle = fs::OpenOptions::new().write(true).open(file).unwrap();
+    handle.seek(SeekFrom::Start(at as u64)).unwrap();
+    handle.write_all(&[bytes[at] ^ 0x20]).unwrap();
+}
+
+/// A batch whose count reads a record of the state's chain that fails its
+/// checksum is refused with that error and writes nothing. Open checks
+/// every record's checksum, so the damage is made after it. A value that
+/// reads and isn't an array is another matter: the batch takes the stored
+/// count (above).
+#[test]
+fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = Store::create(config(&path)).unwrap();
+        store.set_auto_snapshot(false);
+        register_log(&store, "s");
+        append(&store, "s", json!("first"));
+        append(&store, "s", json!("damaged-in-the-chain"));
+        append(&store, "s", json!("last"));
+        store.sync().unwrap();
+    }
+    let store = open(&path);
+    let head = store.current_branch().head;
+    let records = store.stats().unwrap().record_count;
+    damage(&path.join("records.log"), b"damaged-in-the-chain");
+
+    match store.append_many_to_state_json("s", &[json!(1)]) {
+        Err(StoreError::ChecksumMismatch { .. }) => {}
+        other => panic!(
+            "expected the checksum error, got {:?}",
+            other.map(|batch| batch.first_ordinal)
+        ),
+    }
+    assert_eq!(store.current_branch().head, head, "no record");
+    assert_eq!(store.stats().unwrap().record_count, records);
+    assert_eq!(store.get_state_len("s").unwrap(), Some(3), "the stored count, unchanged");
+}

@@ -966,7 +966,11 @@ impl StateManager {
     /// materialize as a JSON array has no items to count: the head keeps its
     /// stored count, which is returned, and the value isn't read for a count
     /// again until a write replaces it or leaves the head unchecked. An
-    /// error reading the log is returned, and nothing changes.
+    /// error reading the log is returned, and nothing changes: an I/O error,
+    /// or a record of the chain that fails its checksum or whose framing is
+    /// bad, damage that came after open checked every record. A record that
+    /// reads and doesn't decode, or an operation that doesn't apply (an Edit
+    /// past the end), is part of a value that doesn't materialize, as above.
     ///
     /// A write takes its ordinals from the count only while holding
     /// `Store::write_lock`, so the head can't move between the count and the
@@ -986,7 +990,11 @@ impl StateManager {
         let (count, exact) = match self.get_state_items(branch_id, state_id) {
             Ok(Some(items)) => (items.len(), true),
             Ok(None) => (0, true),
-            Err(StoreError::Io(error)) => return Err(StoreError::Io(error)),
+            Err(
+                error @ (StoreError::Io(_)
+                | StoreError::ChecksumMismatch { .. }
+                | StoreError::InvalidFormat(_)),
+            ) => return Err(error),
             Err(_) => (head.item_count, false),
         };
         let mut index = self.index.write();

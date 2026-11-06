@@ -412,6 +412,13 @@ fn create_on_a_manifest_that_isnt_a_stores_says_what_is_wrong_and_keeps_it() {
             !msg.contains("already holds") && !msg.contains("open_or_create") && !msg.contains("openOrCreate"),
             "{name}: it doesn't send the caller to calls that fail on this MANIFEST: {msg}"
         );
+        // Only a file too short to hold a header is one to remove: another
+        // file's bytes may be someone's.
+        assert_eq!(
+            msg.contains("remove the MANIFEST"),
+            bytes.len() < 5,
+            "{name}: {msg}"
+        );
         assert_eq!(fs::read(&manifest).unwrap(), bytes, "{name}: MANIFEST is untouched");
     }
 }
@@ -456,4 +463,37 @@ fn create_names_open_or_create_in_both_apis() {
         msg.contains("Store::open_or_create") && msg.contains("openOrCreate"),
         "{msg}"
     );
+}
+
+/// A MANIFEST that ends before its header does (empty, as an interrupted
+/// create from a release before 0.6 could leave it, or cut short) is
+/// refused by open and open_or_create as a format error naming it, and
+/// create's refusal says how to start over.
+#[test]
+fn a_manifest_cut_short_of_its_header_is_named_and_create_says_how_to_start_over() {
+    for bytes in [&b""[..], b"RST", b"RST\0"] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        fs::create_dir(&path).unwrap();
+        let manifest = path.join("MANIFEST");
+        fs::write(&manifest, bytes).unwrap();
+
+        for (call, result) in [("open", Store::open(config(&path))), ("open_or_create", Store::open_or_create(config(&path)))] {
+            match result {
+                Err(StoreError::InvalidFormat(msg)) => {
+                    assert!(msg.contains(&*manifest.to_string_lossy()), "{bytes:?}, {call}: {msg}")
+                }
+                Err(e) => panic!("{bytes:?}, {call}: expected InvalidFormat naming the MANIFEST, got {e}"),
+                Ok(_) => panic!("{bytes:?}, {call}: opened a store with no MANIFEST header"),
+            }
+        }
+        let msg = invalid_operation(Store::create(config(&path)));
+        assert!(
+            msg.contains("ends before a MANIFEST's header does")
+                && msg.contains("remove the MANIFEST and create again")
+                && msg.contains("records.log"),
+            "{bytes:?}: {msg}"
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), bytes, "{bytes:?}: MANIFEST is untouched");
+    }
 }

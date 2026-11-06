@@ -63,8 +63,9 @@ pub struct AppendedBatch {
     /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
     /// A value that doesn't materialize as a JSON array has no items to
     /// count, and this is then the count `get_state_len` reports. An error
-    /// reading the log for the count is returned, and the batch isn't
-    /// recorded.
+    /// reading the log for the count (an I/O error, or a record of the
+    /// state's chain that fails its checksum) is returned, and the batch
+    /// isn't recorded.
     pub first_ordinal: usize,
 }
 
@@ -105,6 +106,10 @@ const FEATURE_APPEND_MANY: u64 = 1 << 0;
 
 /// Every format feature this build reads.
 const KNOWN_FEATURES: u64 = FEATURE_APPEND_MANY;
+
+/// The length of a MANIFEST's header, the magic and the version byte, which
+/// every MANIFEST holds.
+const MANIFEST_HEADER_LEN: u64 = STORE_MAGIC.len() as u64 + 1;
 
 /// Admission state protected by the store's write mutex.
 #[derive(Default)]
@@ -309,7 +314,10 @@ impl Store {
     /// that open can't read (empty, cut short, another file's bytes, a
     /// version or format features this build doesn't know) is refused too,
     /// with what is wrong with it, and isn't written over; so is one that
-    /// isn't a regular file, which create doesn't open.
+    /// isn't a regular file, which create doesn't open. For one too short to
+    /// hold a header, as a create from a release before 0.6 could leave, the
+    /// refusal says to remove it and create again where the directory holds
+    /// no data file.
     ///
     /// It never writes a MANIFEST over a store's own, so it can't drop the
     /// format features a version 2 MANIFEST names. A create that did, even
@@ -335,14 +343,16 @@ impl Store {
             } else if found == "MANIFEST" {
                 // Only a regular file is read: opening a FIFO waits for a
                 // writer.
-                let checked = match fs::metadata(&manifest) {
+                let metadata = fs::metadata(&manifest);
+                // Only a create from a release before 0.6, which wrote the
+                // MANIFEST in place, or damage from outside leaves one cut
+                // short of its header. Beside no data file it holds nothing
+                // of a store, and removing it is the way out.
+                let short = matches!(&metadata, Ok(m) if m.is_file() && m.len() < MANIFEST_HEADER_LEN);
+                let checked = match metadata {
                     Ok(metadata) if !metadata.is_file() => Err("it isn't a regular file".to_string()),
-                    _ => Self::verify_manifest(&config.path).map(drop).map_err(|error| match error {
-                        StoreError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            "it ends before a MANIFEST's header does".to_string()
-                        }
-                        other => other.to_string(),
-                    }),
+                    _ if short => Err("it ends before a MANIFEST's header does".to_string()),
+                    _ => Self::verify_manifest(&config.path).map(drop).map_err(|error| error.to_string()),
                 };
                 match checked {
                     Ok(()) => format!(
@@ -350,8 +360,16 @@ impl Store {
                         config.path.display()
                     ),
                     Err(problem) => format!(
-                        "create: {} can't be read as a Chronicle store's MANIFEST: {problem}; create won't write over it",
+                        "create: {} can't be read as a Chronicle store's MANIFEST: {problem}; create won't write over it{}",
                         manifest.display(),
+                        if short {
+                            format!(
+                                ". If {} holds no records.log, state.bin or branches.bin, remove the MANIFEST and create again",
+                                config.path.display()
+                            )
+                        } else {
+                            String::new()
+                        },
                     ),
                 }
             } else {
@@ -3556,14 +3574,27 @@ impl Store {
             _ => e.into(),
         })?;
 
+        // A file that ends inside the header (empty, as a create from a
+        // release before 0.6 could leave it, or cut short) isn't a MANIFEST,
+        // which is its format; the error says which file it is.
+        let header_error = |error: std::io::Error| -> StoreError {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                StoreError::InvalidFormat(format!(
+                    "{} ends before a MANIFEST's header does: {error}",
+                    manifest_path.display()
+                ))
+            } else {
+                error.into()
+            }
+        };
         let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
+        file.read_exact(&mut magic).map_err(header_error)?;
         if &magic != STORE_MAGIC {
             return Err(StoreError::InvalidFormat("Invalid store magic".into()));
         }
 
         let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
+        file.read_exact(&mut version).map_err(header_error)?;
         match version[0] {
             STORE_VERSION => Ok(0),
             STORE_VERSION_FEATURES => {

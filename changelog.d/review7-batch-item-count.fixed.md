@@ -11,4 +11,6 @@
   through `update_state` leaves the count as it was, and the next batch
   counts the items again the same way. A value that isn't a JSON array,
   or holds an item that isn't JSON, has no items to count: the batch takes
-  the stored count.
+  the stored count. A record of the state's chain that fails to read (an
+  I/O error, a failed checksum, a record whose framing is bad) fails the
+  batch with that error, writing nothing.
