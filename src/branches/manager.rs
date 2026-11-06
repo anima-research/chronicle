@@ -904,6 +904,24 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_branch_that_is_not_there_is_branch_not_found() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+
+        for result in [
+            manager.delete_branch("nowhere"),
+            manager
+                .delete_branch_with_reparent("nowhere", None)
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::BranchNotFound(name)) if name == "nowhere"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_reparenting_delete_onto_a_missing_branch_is_refused_as_an_invalid_operation() {
         let dir = TempDir::new().unwrap();
         let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();

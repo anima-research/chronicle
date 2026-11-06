@@ -52,6 +52,7 @@ test('index.d.ts declares ErrorCode as a regular enum, which TypeScript can use 
 test("the store's errors carry their kind", () => {
   const { store } = freshStore();
   throwsCoded(() => store.switchBranch('nowhere'), ErrorCode.BranchNotFound, 'Branch not found: nowhere');
+  throwsCoded(() => store.deleteBranch('nowhere'), ErrorCode.BranchNotFound, 'Branch not found: nowhere');
   throwsCoded(() => store.createBranch('main'), ErrorCode.BranchExists, 'Branch already exists: main');
   store.registerState({ id: 'notes', strategy: 'snapshot' });
   throwsCoded(
@@ -168,6 +169,25 @@ for (const [made, ownerOf] of owners) {
     assert.equal(owner.pollSubscription(id)?.eventType, 'caught_up');
     throwsCoded(() => owner.pollSubscription(id), ErrorCode.StoreClosed, 'Store has been closed');
     throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.StoreClosed, 'Store has been closed');
+  });
+
+  test(`after the root's close(), a poll of a subscription made through ${made} that had already ended returns what was queued, then says the store is closed`, () => {
+    const { store } = freshStore();
+    const owner = ownerOf(store);
+    const other = owner === store ? store.view('main') : store;
+    const overflowed = owner.subscribe({ bufferSize: 1, filter: { includeRecords: true } });
+    owner.catchUpSubscription(overflowed);
+    store.append('note', Buffer.from('a'));
+    const unsubscribed = owner.subscribe();
+    other.unsubscribe(unsubscribed);
+    assert.equal(store.subscriptionCount(), 0);
+    store.close();
+    assert.equal(owner.pollSubscription(overflowed)?.eventType, 'caught_up');
+    assert.equal(owner.pollSubscription(unsubscribed)?.eventType, 'dropped');
+    for (const id of [overflowed, unsubscribed]) {
+      throwsCoded(() => owner.pollSubscription(id), ErrorCode.StoreClosed, 'Store has been closed');
+      throwsCoded(() => owner.pollSubscriptionTimeout(id, 1), ErrorCode.StoreClosed, 'Store has been closed');
+    }
   });
 
   test(`a poll of a subscription made through ${made} that its buffer overflowed returns what was queued, then says it was dropped`, () => {
@@ -313,6 +333,9 @@ test('a catch-up that overruns the subscription\'s buffer drops it', () => {
   throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   assert.equal(store.subscriptionCount(), 0);
   throwsCoded(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+  assert.equal(store.pollSubscription(id)?.eventType, 'record');
+  throwsCoded(() => store.pollSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+  throwsCoded(() => store.pollSubscriptionTimeout(id, 1), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   store.close();
 });
 
