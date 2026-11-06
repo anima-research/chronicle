@@ -17,13 +17,11 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Results from this binding's methods. An error one returns carries its
-/// [`ErrorCode`] as its status, which JavaScript sees as `error.code`, beside
-/// its message. (Errors napi raises while converting a call's arguments come
-/// before the method runs, and keep napi's own status.)
+// napi gives an error's status to JavaScript as `error.code`. Errors napi
+// raises while converting a call's arguments come before the method runs,
+// and keep napi's own status.
 type Result<T> = napi::Result<T, ErrorCode>;
 
-/// One of the binding's own errors, with its code.
 fn coded(code: ErrorCode, reason: impl ToString) -> napi::Error<ErrorCode> {
     napi::Error::new(code, reason)
 }

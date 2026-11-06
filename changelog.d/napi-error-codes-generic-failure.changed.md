@@ -14,4 +14,5 @@
     `Invalid operation:`, where it was `BranchNotFound` and began
     `Branch not found:`. In Rust, so does
     `BranchManager::delete_branch_with_reparent` naming a branch to reparent
-    onto that doesn't exist.
+    onto that doesn't exist, and `BranchManager::gc`, which calls it, lists
+    that refusal's new message among its errors.

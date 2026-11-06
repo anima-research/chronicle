@@ -1,8 +1,3 @@
-// Each error the binding raises for a store failure, or for a call it
-// refuses, carries an `ErrorCode` as `error.code`, beside its message. An
-// error napi raises while converting a call's arguments, before chronicle
-// runs, keeps napi's own code or none. These run the built binding (index.js
-// and index.d.ts), so they need the napi build first, as test.mjs does.
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -27,8 +22,6 @@ function freshStore() {
   return { store: JsStore.openOrCreate({ path: dir }), dir };
 }
 
-/** Runs `call` and checks it throws `code` with `message` (a string for
- *  the whole message, or a RegExp). */
 function throwsCoded(call, code, message) {
   assert.throws(call, (error) => {
     assert.equal(error.code, code);
@@ -82,7 +75,6 @@ test("the store's errors carry their kind", () => {
     ErrorCode.InvalidSequence,
     /^Invalid sequence: Seq\(\d+\) \(head is Seq\(\d+\)\)$/,
   );
-  // State bytes that aren't JSON, read as JSON.
   store.setState('notes', Buffer.from('not json'));
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
@@ -122,7 +114,6 @@ test("the binding's own refusals carry theirs", () => {
   const { store } = freshStore();
   throwsCoded(() => store.getRecord('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
   throwsCoded(() => store.getBlob('zz'), ErrorCode.InvalidOperation, 'Invalid hash');
-  // Hex, of the wrong length.
   throwsCoded(() => store.getBlob('abcd'), ErrorCode.InvalidOperation, 'Invalid hash');
   throwsCoded(() => store.getStateUpdateJson('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
   throwsCoded(() => store.getEffects('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
@@ -144,7 +135,6 @@ test("the binding's own refusals carry theirs", () => {
   throwsCoded(() => store.pollSubscriptionTimeout('4242', 1), ErrorCode.SubscriptionNotFound, 'Subscription not found');
   throwsCoded(() => store.unsubscribe('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
   throwsCoded(() => store.catchUpSubscription('abc'), ErrorCode.InvalidOperation, 'Invalid subscription ID');
-  // A catch-up asks the store, which holds neither one never made nor one unsubscribed.
   throwsCoded(() => store.catchUpSubscription('4242'), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   const gone = store.subscribe();
   store.unsubscribe(gone);

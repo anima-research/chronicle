@@ -105,7 +105,6 @@ impl From<rmp_serde::decode::Error> for StoreError {
 #[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorCode {
-    // One per `StoreError` variant.
     /// The operating system refused or failed a file operation, such as
     /// opening a path that holds no store; the message carries its error.
     Io,
@@ -158,7 +157,7 @@ pub enum ErrorCode {
     /// or the one a view is pinned to; changing a state's strategy to
     /// another kind; or a tree operation on a state that isn't a tree. Or
     /// for one of these arguments: a record ID or subscription ID that isn't
-    /// a non-negative integer; a blob hash that isn't hex of the right
+    /// an unsigned 64-bit integer; a blob hash that isn't hex of the right
     /// length; a strategy other than snapshot, append_log or tree; a field
     /// index kind other than number or string; a tree operation other than
     /// set or remove, or a set without an entry; an edit index past the
@@ -171,7 +170,6 @@ pub enum ErrorCode {
     /// buffer overran, or it was unsubscribed (to a poll, through another
     /// handle); or, to a catch-up, it was never made.
     SubscriptionDropped,
-    // The binding's own, for calls it refuses or can't complete itself.
     /// The store, or this view of it, was closed with `close()`.
     StoreClosed,
     /// The handle polled holds no subscription with that ID: it wasn't made
@@ -254,10 +252,6 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 mod tests {
     use super::*;
 
-    /// Each `StoreError` variant's code, by the name JavaScript sees. A code
-    /// is published as `error.code`, and as the value of `ErrorCode`'s
-    /// member, which napi takes from the variant's identifier; so changing
-    /// one breaks callers that branch on it, and this test pins both.
     #[test]
     fn each_store_error_has_its_published_code() {
         let hash = Hash([0u8; 32]);
@@ -314,8 +308,6 @@ mod tests {
         }
     }
 
-    /// The binding's own codes, by the name JavaScript sees, in `error.code`
-    /// and as the enum's value.
     #[test]
     fn the_bindings_own_codes_keep_their_names() {
         let cases = [
