@@ -399,16 +399,11 @@ pub struct StateManager {
     /// re-materialize".
     reconstructions: AtomicU64,
 
-    /// Run once by `lookup_state_items` between its read of the head and the
-    /// materialization, so a test can move the head in between, as a write
-    /// on another thread can.
+    /// Code a test runs once at a named point of a read (see
+    /// `run_test_hook`), so it can land a write or a count there, as another
+    /// thread can.
     #[cfg(test)]
-    after_lookup_head: parking_lot::Mutex<Option<Box<dyn FnOnce(&StateManager) + Send>>>,
-
-    /// Run once by `checked_item_count` between its read of the value and
-    /// its write-back of the count, so a test can move the head in between.
-    #[cfg(test)]
-    after_count_read: parking_lot::Mutex<Option<Box<dyn FnOnce(&StateManager) + Send>>>,
+    test_hooks: parking_lot::Mutex<HashMap<&'static str, Box<dyn FnOnce(&StateManager) + Send>>>,
 }
 
 /// Derive the field-index file path as a sibling of the state-index path.
@@ -445,9 +440,7 @@ impl StateManager {
             counts: RwLock::new(HashMap::new()),
             reconstructions: AtomicU64::new(0),
             #[cfg(test)]
-            after_lookup_head: parking_lot::Mutex::new(None),
-            #[cfg(test)]
-            after_count_read: parking_lot::Mutex::new(None),
+            test_hooks: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -481,9 +474,7 @@ impl StateManager {
             counts: RwLock::new(HashMap::new()),
             reconstructions: AtomicU64::new(0),
             #[cfg(test)]
-            after_lookup_head: parking_lot::Mutex::new(None),
-            #[cfg(test)]
-            after_count_read: parking_lot::Mutex::new(None),
+            test_hooks: parking_lot::Mutex::new(HashMap::new()),
         };
 
         if path.exists() {
@@ -935,6 +926,21 @@ impl StateManager {
         Ok(())
     }
 
+    /// Run the code a test set for `point`, once, if it set any.
+    #[cfg(test)]
+    fn run_test_hook(&self, point: &'static str) {
+        let hook = self.test_hooks.lock().remove(point);
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    /// Have `hook` run once at `point` (see `run_test_hook`).
+    #[cfg(test)]
+    fn set_test_hook(&self, point: &'static str, hook: impl FnOnce(&StateManager) + Send + 'static) {
+        self.test_hooks.lock().insert(point, Box::new(hook));
+    }
+
     /// This session's check of the count of the head of `state_id` on
     /// `branch_id`, if there is one for the head at `head_offset`.
     fn count_check(&self, branch_id: BranchId, state_id: &str, head_offset: u64) -> Option<CountCheck> {
@@ -946,11 +952,16 @@ impl StateManager {
             .filter(|check| check.at == head_offset)
     }
 
-    /// Whether this session knows the count of the head at `head_offset` to
-    /// be the number of items the state's value holds.
-    fn count_is_exact(&self, branch_id: BranchId, state_id: &str, head_offset: u64) -> bool {
-        self.count_check(branch_id, state_id, head_offset)
-            .is_some_and(|check| check.exact)
+    /// The head of `state_id` on `branch_id` and this session's check of its
+    /// count, read under one hold of the index. Every write that sets a
+    /// head's count and its check does both under the index's write lock,
+    /// so the pair is one moment's: read apart, a count landing between the
+    /// two reads would vouch for a count the copied head doesn't hold.
+    fn head_and_check(&self, branch_id: BranchId, state_id: &str) -> Option<(StateChainHead, Option<CountCheck>)> {
+        let index = self.index.read();
+        let head = index.heads.get(branch_id, state_id)?.clone();
+        let check = self.count_check(branch_id, state_id, head.head_offset);
+        Some((head, check))
     }
 
     fn set_count_check(&self, branch_id: BranchId, state_id: &str, check: Option<CountCheck>) {
@@ -1001,10 +1012,12 @@ impl StateManager {
     /// offset of a newer record), so the value read was that head's. A head
     /// that moved keeps its own count, which is returned.
     pub(crate) fn checked_item_count(&self, branch_id: BranchId, state_id: &str) -> Result<usize> {
-        let Some(head) = self.get_head(branch_id, state_id) else {
+        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
             return Ok(0);
         };
-        if self.count_check(branch_id, state_id, head.head_offset).is_some() {
+        #[cfg(test)]
+        self.run_test_hook("count: head read");
+        if check.is_some() {
             return Ok(head.item_count);
         }
         let (count, exact) = match self.get_state_items(branch_id, state_id) {
@@ -1018,9 +1031,7 @@ impl StateManager {
             Err(_) => (head.item_count, false),
         };
         #[cfg(test)]
-        if let Some(hook) = self.after_count_read.lock().take() {
-            hook(self);
-        }
+        self.run_test_hook("count: value read");
         let mut index = self.index.write();
         match index.heads.get_mut(branch_id, state_id) {
             // A write that landed after the value was read has moved the
@@ -1249,9 +1260,7 @@ impl StateManager {
         }
 
         #[cfg(test)]
-        if let Some(hook) = self.after_lookup_head.lock().take() {
-            hook(self);
-        }
+        self.run_test_hook("items lookup: head read");
 
         // Materialize the full state once (served from the byte cache when
         // warm), then split into item spans without building a Value tree.
@@ -1349,23 +1358,22 @@ impl StateManager {
         state_id: &str,
         index: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let head = {
-            let idx = self.index.read();
-            match idx.heads.get(branch_id, state_id) {
-                Some(h) => h.clone(),
-                None => return Ok(None),
-            }
+        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
+            return Ok(None);
         };
+        let exact = check.is_some_and(|check| check.exact);
 
         // Warm cache wins: O(1) and avoids even the head-record read.
         let cache_key = format!("{}:{}", branch_id.0, state_id);
         if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
             return Ok(cached.get(index).map(|item| item.to_vec()));
         }
+        #[cfg(test)]
+        self.run_test_hook("item lookup: cache missed");
 
         // Head-record fast path: last item + Append head.
         if head.item_count > 0 && index == head.item_count - 1 {
-            if let Some(item) = self.last_item_from_head(branch_id, state_id, &head)? {
+            if let Some(item) = self.last_item_from_head(&head, exact)? {
                 return Ok(Some(item));
             }
         }
@@ -1412,13 +1420,10 @@ impl StateManager {
         if ordinals.is_empty() {
             return Ok(Vec::new());
         }
-        let head = {
-            let idx = self.index.read();
-            match idx.heads.get(branch_id, state_id) {
-                Some(h) => h.clone(),
-                None => return Ok(vec![None; ordinals.len()]),
-            }
+        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
+            return Ok(vec![None; ordinals.len()]);
         };
+        let exact = check.is_some_and(|check| check.exact);
         let pick = |items: &StateItems| -> Vec<Option<Vec<u8>>> {
             ordinals
                 .iter()
@@ -1430,17 +1435,16 @@ impl StateManager {
         if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
             return Ok(pick(&cached));
         }
+        #[cfg(test)]
+        self.run_test_hook("item lookup: cache missed");
 
         // Only the last item asked for: the head record may hold it, as for
-        // `get_state_item`, where this session has checked the head's count,
-        // so that the last item is the one the count makes last.
-        if let Some(last) = head
-            .item_count
-            .checked_sub(1)
-            .filter(|_| self.count_is_exact(branch_id, state_id, head.head_offset))
-        {
+        // `get_state_item`, where this session has found the head's count
+        // exact, so that the last item is the one the count makes last. The
+        // check was read with the head, so it vouches for this head's count.
+        if let Some(last) = head.item_count.checked_sub(1).filter(|_| exact) {
             if ordinals.iter().all(|&i| i == last) {
-                if let Some(item) = self.last_item_from_head(branch_id, state_id, &head)? {
+                if let Some(item) = self.last_item_from_head(&head, exact)? {
                     return Ok(vec![Some(item); ordinals.len()]);
                 }
             }
@@ -1453,17 +1457,12 @@ impl StateManager {
     }
 
     /// The state's last item, read from its head record alone, when that
-    /// record is an `Append`, or an `AppendMany` whose head count this
-    /// session has checked; `None` for any other head (Edit / Redact /
-    /// snapshot / Set, an AppendMany with an unchecked count), whose last
-    /// item the record alone doesn't give or may not be the one the count
-    /// makes last.
-    fn last_item_from_head(
-        &self,
-        branch_id: BranchId,
-        state_id: &str,
-        head: &StateChainHead,
-    ) -> Result<Option<Vec<u8>>> {
+    /// record is an `Append`, or an `AppendMany` whose head count is `exact`
+    /// (the caller's check, read with `head`); `None` for any other head
+    /// (Edit / Redact / snapshot / Set, an AppendMany with a count not known
+    /// exact), whose last item the record alone doesn't give or may not be
+    /// the one the count makes last.
+    fn last_item_from_head(&self, head: &StateChainHead, exact: bool) -> Result<Option<Vec<u8>>> {
         let log = self
             .log
             .as_ref()
@@ -1474,11 +1473,7 @@ impl StateManager {
             StateOperation::Append(item) => Some(item),
             // A batch at the head ends with the last item, as the last of its
             // items appended one at a time would.
-            StateOperation::AppendMany(mut items)
-                if self.count_is_exact(branch_id, state_id, head.head_offset) =>
-            {
-                items.pop()
-            }
+            StateOperation::AppendMany(mut items) if exact => items.pop(),
             _ => None,
         })
     }
@@ -2302,13 +2297,13 @@ mod tests {
 
         // The main branch's count reads its head, then a write moves it on.
         let log_for_hook = Arc::clone(&log);
-        *manager.after_lookup_head.lock() = Some(Box::new(move |manager: &StateManager| {
+        manager.set_test_hook("items lookup: head read", move |manager: &StateManager| {
             let second = StateOperation::Append(b"2".to_vec());
             let offset = append_state_update(&log_for_hook, "items", Some(at_fork), second.clone(), 2);
             manager.record_update(TEST_BRANCH, "items", offset, &second).unwrap();
-        }));
+        });
         manager.checked_item_count(TEST_BRANCH, "items").unwrap();
-        assert!(manager.after_lookup_head.lock().is_none(), "the write ran inside the lookup");
+        assert!(manager.test_hooks.lock().is_empty(), "the write ran inside the lookup");
         assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 2);
 
         assert!(
@@ -2318,6 +2313,74 @@ mod tests {
         assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 1, "the side branch holds one item");
         let side_items = manager.get_state_items(SIDE, "items").unwrap().unwrap();
         assert_eq!(side_items.len(), 1);
+    }
+
+    /// A state "items" on the main branch holding `ops` appended in order,
+    /// whose head then has the stored count `stale` and no check, as a head
+    /// loaded from state.bin a release counted wrong would.
+    fn stale_head(ops: &[StateOperation], stale: usize) -> (TempDir, Arc<RecordLog>, StateManager) {
+        let (dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let mut prev = None;
+        for (seq, op) in ops.iter().enumerate() {
+            let offset = append_state_update(&log, "items", prev, op.clone(), seq as u64 + 1);
+            manager.record_update(TEST_BRANCH, "items", offset, op).unwrap();
+            prev = Some(offset);
+        }
+        manager.index.write().heads.get_mut(TEST_BRANCH, "items").unwrap().item_count = stale;
+        manager.set_count_check(TEST_BRANCH, "items", None);
+        (dir, log, manager)
+    }
+
+    fn appends(n: u8) -> Vec<StateOperation> {
+        (1..=n).map(|i| StateOperation::Append(vec![b'0' + i])).collect()
+    }
+
+    /// A count on another thread can correct a stale head between a
+    /// reader's read of the head and its read of the head's check. The
+    /// reader takes both under one lock, so it never pairs the stale count
+    /// it copied with the check that vouches for the corrected one: here a
+    /// batch's count, which would return the stale count as its first
+    /// ordinal.
+    #[test]
+    fn a_count_never_returns_a_stale_count_a_check_landed_beside() {
+        let (_dir, _log, manager) = stale_head(&appends(3), 0);
+        manager.set_test_hook("count: head read", |manager: &StateManager| {
+            assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        });
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        assert!(manager.test_hooks.lock().is_empty(), "the other count ran in between");
+    }
+
+    /// The same race for the item lookups' head-record paths: a count that
+    /// lands after the lookup copied the head (stored count 4, one too
+    /// many) must not let the copy's last index, 3, be served from the head
+    /// record as if it were in range.
+    #[test]
+    fn an_item_lookup_never_serves_a_stale_last_index_a_check_landed_beside() {
+        let correct = |manager: &StateManager| {
+            assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        };
+
+        let (_dir, _log, manager) = stale_head(&appends(3), 4);
+        manager.set_test_hook("item lookup: cache missed", correct);
+        assert_eq!(manager.get_state_items_by_ordinal(TEST_BRANCH, "items", &[3]).unwrap(), [None]);
+        assert!(manager.test_hooks.lock().is_empty());
+
+        let batch = StateOperation::AppendMany(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
+        let (_dir, _log, manager) = stale_head(&[batch], 4);
+        manager.set_test_hook("item lookup: cache missed", correct);
+        assert_eq!(manager.get_state_item(TEST_BRANCH, "items", 3).unwrap(), None);
+        assert!(manager.test_hooks.lock().is_empty());
     }
 
     /// A count read without the store's write lock can race a write that
@@ -2343,13 +2406,13 @@ mod tests {
         manager.set_count_check(TEST_BRANCH, "items", None);
 
         let log_for_hook = Arc::clone(&log);
-        *manager.after_count_read.lock() = Some(Box::new(move |manager: &StateManager| {
+        manager.set_test_hook("count: value read", move |manager: &StateManager| {
             let second = StateOperation::Append(b"2".to_vec());
             let offset = append_state_update(&log_for_hook, "items", Some(before), second.clone(), 2);
             manager.record_update(TEST_BRANCH, "items", offset, &second).unwrap();
-        }));
+        });
         assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 2, "the moved head's count");
-        assert!(manager.after_count_read.lock().is_none(), "the write ran after the read");
+        assert!(manager.test_hooks.lock().is_empty(), "the write ran after the read");
         assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 2, "the write's count stands");
         assert_eq!(manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap().len(), 2);
     }
