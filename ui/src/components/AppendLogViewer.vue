@@ -176,7 +176,16 @@ function handleWsEvent(event: { eventType: string; data: unknown }) {
       if (data.operation?.Append) {
         appended = [decodeAppended(data.operation.Append)];
       } else if (Array.isArray(data.operation?.AppendMany)) {
-        appended = data.operation.AppendMany.map(decodeAppended);
+        // Each item on its own, as if each were an Append: one that doesn't
+        // decode is dropped and logged, and isn't counted, without the rest
+        // of the batch.
+        for (const item of data.operation.AppendMany) {
+          try {
+            appended.push(decodeAppended(item));
+          } catch (e) {
+            console.error('Dropped an item of an AppendMany that does not decode:', e);
+          }
+        }
       }
 
       if (appended.length > 0) {

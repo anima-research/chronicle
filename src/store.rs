@@ -250,15 +250,17 @@ impl Store {
     /// refused with `InvalidOperation` where the directory now holds a
     /// `MANIFEST` lost to another create that finished after
     /// `open_or_create` looked, and the store that one made is opened (with
-    /// open's account of a `MANIFEST` it can't read). Any other result is
+    /// open's account of a `MANIFEST` it can't read). Where the directory
+    /// can't be looked at again, that error is returned: the refusal is
+    /// true only of what create saw under the lock. Any other result is
     /// returned as it is.
     fn open_if_another_created(config: StoreConfig, created: Result<Self>) -> Result<Self> {
         match created {
-            Err(StoreError::InvalidOperation(_))
-                if matches!(Self::present_store_file(&config.path), Ok(Some("MANIFEST"))) =>
-            {
-                Self::open(config)
-            }
+            Err(StoreError::InvalidOperation(refusal)) => match Self::present_store_file(&config.path) {
+                Ok(Some("MANIFEST")) => Self::open(config),
+                Err(error) => Err(error.into()),
+                Ok(_) => Err(StoreError::InvalidOperation(refusal)),
+            },
             other => other,
         }
     }
@@ -4280,6 +4282,40 @@ mod tests {
             Store::open_if_another_created(damaged_config, refused),
             Err(StoreError::InvalidOperation(message)) if message.contains("records.log")
         ));
+    }
+
+    /// Where open_or_create can't look at the directory again after its
+    /// create was refused, it returns that error, not the refusal, which is
+    /// true only of what create saw under the lock. Unix only: a directory
+    /// of mode 0o000 can't be looked into, except by root.
+    #[cfg(unix)]
+    #[test]
+    fn open_or_create_returns_the_error_of_its_second_look() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        fs::create_dir_all(&config.path).unwrap();
+        fs::set_permissions(&config.path, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::symlink_metadata(config.path.join("MANIFEST"))
+            .map_or_else(|e| e.kind() != std::io::ErrorKind::PermissionDenied, |_| true);
+        let result = Store::open_if_another_created(
+            config.clone(),
+            Err(StoreError::InvalidOperation("create: refused".into())),
+        );
+        fs::set_permissions(&config.path, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            eprintln!("skipped: the directory could be looked into despite its mode (running as root?)");
+            return;
+        }
+        match result {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{error}");
+                assert!(error.to_string().contains(&*config.path.to_string_lossy()), "{error}");
+            }
+            Err(other) => panic!("expected the second look's I/O error, got {other}"),
+            Ok(_) => panic!("opened a store it couldn't look at"),
+        }
     }
 
     /// A version 2 MANIFEST that ends before its feature bits is too short;
