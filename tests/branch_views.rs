@@ -767,6 +767,66 @@ fn a_child_registering_before_it_writes_reuses_the_parents_index() {
     assert_eq!(ts_range(&store, main, 11.0, 11.0), Some(vec![11]));
 }
 
+/// A batch keeps the field indexes of the branch it is written on, item by
+/// item at consecutive ordinals, and touches no other branch's.
+#[test]
+fn a_batch_maintains_only_its_own_branchs_field_index() {
+    use chronicle::FieldIndexKind;
+
+    fn batch_on(store: &Store, branch: BranchId, values: &[Value]) {
+        store
+            .update_state_on(
+                branch,
+                "messages",
+                StateOperation::AppendMany(values.iter().map(|v| serde_json::to_vec(v).unwrap()).collect()),
+            )
+            .unwrap();
+    }
+    fn msg(ts: u32, channel: &str) -> Value {
+        json!({ "ts": ts, "channel": channel })
+    }
+
+    let dir = TempDir::new().unwrap();
+    let (main, child);
+    {
+        let store = Store::create(config(&dir)).unwrap();
+        register_all(&store);
+        main = store.current_branch().id;
+        store.register_state_field_index("messages", "/ts", FieldIndexKind::Number).unwrap();
+        store.register_state_field_index("messages", "/channel", FieldIndexKind::String).unwrap();
+        batch_on(&store, main, &[msg(0, "a"), msg(10, "b"), msg(20, "a")]);
+        append_on(&store, main, msg(30, "b"));
+        batch_on(&store, main, &[msg(40, "a"), msg(50, "a")]);
+        assert_eq!(ts_range(&store, main, 10.0, 40.0), Some(vec![1, 2, 3, 4]));
+        assert_eq!(by_channel(&store, main, "a"), Some(vec![0, 2, 4, 5]));
+
+        child = store.create_branch("child", None).unwrap().id;
+        batch_on(&store, child, &[msg(60, "child"), msg(70, "child")]);
+        // The parent's index is untouched by the child's batch, and the
+        // child has none until it registers one.
+        assert_eq!(ts_range(&store, main, 0.0, 1e9), Some((0..6).collect()));
+        assert_eq!(by_channel(&store, main, "child"), Some(vec![]));
+        assert_eq!(ts_range(&store, child, 0.0, 1e9), None);
+
+        batch_on(&store, main, &[msg(55, "b")]);
+        assert_eq!(ts_range(&store, main, 50.0, 60.0), Some(vec![5, 6]));
+
+        store.register_state_field_index_on(child, "messages", "/channel", FieldIndexKind::String).unwrap();
+        assert_eq!(by_channel(&store, child, "child"), Some(vec![6, 7]));
+        batch_on(&store, child, &[msg(80, "a"), msg(90, "child")]);
+        assert_eq!(by_channel(&store, child, "child"), Some(vec![6, 7, 9]));
+        assert_eq!(by_channel(&store, child, "a"), Some(vec![0, 2, 4, 5, 8]));
+        assert_eq!(by_channel(&store, main, "a"), Some(vec![0, 2, 4, 5]));
+        store.sync().unwrap();
+    }
+
+    let store = Store::open(config(&dir)).unwrap();
+    assert_eq!(by_channel(&store, child, "child"), Some(vec![6, 7, 9]));
+    assert_eq!(ts_range(&store, main, 50.0, 60.0), Some(vec![5, 6]));
+    assert_eq!(messages_on(&store, child).len(), 10);
+    assert_eq!(messages_on(&store, main).len(), 7);
+}
+
 /// `state_head_offset_on` is an exact revision key for a state's value on a
 /// branch: equal across handles and across branches that share the value
 /// unchanged, changed by every write to that state (including a

@@ -1,7 +1,8 @@
 //! Differential check: `materialize_operations` must agree with folding
 //! `apply_operation` over the same op sequence — the equivalence the
 //! `materialize_operations` doc comment claims. Error *variants* must match;
-//! message text is allowed to differ.
+//! message text is allowed to differ. An `AppendMany` must also agree with
+//! its items appended one `Append` at a time (`check_batched`).
 
 use chronicle::state::{apply_operation, materialize_operations};
 use chronicle::types::{StateOperation, TreeEntry, TreeOp};
@@ -51,6 +52,52 @@ fn check(name: &str, ops: Vec<StateOperation>) {
 
 fn app(v: serde_json::Value) -> StateOperation {
     StateOperation::Append(serde_json::to_vec(&v).unwrap())
+}
+fn many(vs: &[serde_json::Value]) -> StateOperation {
+    StateOperation::AppendMany(vs.iter().map(|v| serde_json::to_vec(v).unwrap()).collect())
+}
+
+/// `ops` with every `AppendMany` replaced by one `Append` per item, in
+/// order: what the batch must be indistinguishable from. A `Field` whose
+/// batch is empty, which `update_state` refuses and so no store holds, is
+/// kept as it is: expanded, it would be no operation, where the Field still
+/// reads the field's bytes.
+fn expand_batches(ops: &[StateOperation]) -> Vec<StateOperation> {
+    ops.iter().flat_map(expand_batch).collect()
+}
+
+fn expand_batch(op: &StateOperation) -> Vec<StateOperation> {
+    match op {
+        StateOperation::AppendMany(items) => items.iter().cloned().map(StateOperation::Append).collect(),
+        StateOperation::Field { name, operation } => {
+            let inner = expand_batch(operation);
+            if inner.is_empty() {
+                return vec![op.clone()];
+            }
+            inner
+                .into_iter()
+                .map(|inner| StateOperation::Field { name: name.clone(), operation: Box::new(inner) })
+                .collect()
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// `check`, and the same ops with their batches expanded into single
+/// appends must materialize to the same bytes (or fail the same way).
+fn check_batched(name: &str, ops: Vec<StateOperation>) {
+    let expanded = expand_batches(&ops);
+    let batched = mat(ops.clone());
+    let single = mat(expanded);
+    assert_eq!(
+        show(&batched),
+        show(&single),
+        "BATCH DIVERGENCE in `{}`:\n  batched  = {}\n  expanded = {}",
+        name,
+        show(&batched),
+        show(&single)
+    );
+    check(name, ops);
 }
 fn set(v: serde_json::Value) -> StateOperation {
     StateOperation::Set(serde_json::to_vec(&v).unwrap())
@@ -130,6 +177,56 @@ fn differential_happy_paths() {
                     path: "c".to_string(),
                     entry: entry("cc"),
                 }],
+            },
+        ],
+    );
+}
+
+#[test]
+fn differential_batches() {
+    check_batched("batch_onto_nothing", vec![many(&[json!(1), json!({"b": 2, "a": 1})])]);
+    check_batched(
+        "batches_and_appends",
+        vec![app(json!(0)), many(&[json!(1), json!(2)]), app(json!(3)), many(&[json!(4)])],
+    );
+    check_batched(
+        "batch_after_snapshots",
+        vec![
+            StateOperation::Snapshot(serde_json::to_vec(&json!([1, 2])).unwrap()),
+            StateOperation::DeltaSnapshot(serde_json::to_vec(&json!([3])).unwrap()),
+            many(&[json!(4), json!(5)]),
+            edit(4, json!("E")),
+            StateOperation::Redact { start: 0, end: 2 },
+        ],
+    );
+    check_batched("empty_batch_onto_nothing", vec![many(&[])]);
+    // An empty batch inside a Field applies the Field to the field's bytes,
+    // which for an absent field don't parse; it isn't one `update_state`
+    // records, and the expansion keeps it as it is.
+    check_batched(
+        "empty_batch_in_an_absent_field",
+        vec![
+            set(json!({})),
+            StateOperation::Field { name: "items".into(), operation: Box::new(many(&[])) },
+        ],
+    );
+    check_batched("empty_batch_onto_scalar", vec![set(json!("s")), many(&[])]);
+    check_batched("batch_onto_scalar", vec![set(json!("s")), many(&[json!(1)])]);
+    check_batched("batch_onto_tree", vec![tset("a", "aa"), many(&[json!(1)])]);
+    check_batched(
+        "batch_with_a_bad_item",
+        vec![
+            app(json!(0)),
+            StateOperation::AppendMany(vec![b"1".to_vec(), b"{bad".to_vec()]),
+        ],
+    );
+    check_batched(
+        "batch_inside_a_field",
+        vec![
+            set(json!({"items": [1]})),
+            StateOperation::Field {
+                name: "items".to_string(),
+                operation: Box::new(many(&[json!(2), json!(3)])),
             },
         ],
     );
@@ -217,7 +314,7 @@ fn differential_fuzz() {
         let len = (next() % 12) as usize;
         let mut ops = Vec::new();
         for k in 0..len {
-            let pick = next() % 10;
+            let pick = next() % 12;
             ops.push(match pick {
                 0 => set(json!([k])),
                 1 => set(json!({"o": k})),
@@ -236,9 +333,28 @@ fn differential_fuzz() {
                     name: "f".to_string(),
                     operation: Box::new(app(json!(k))),
                 },
+                // Batches of 0 to 3 items, now and then with one that
+                // isn't JSON.
+                10 | 11 => {
+                    let n = (next() % 4) as usize;
+                    let mut items: Vec<Vec<u8>> =
+                        (0..n).map(|j| serde_json::to_vec(&json!({"b": k, "j": j})).unwrap()).collect();
+                    if n > 0 && next() % 8 == 0 {
+                        items[n - 1] = b"{nope".to_vec();
+                    }
+                    StateOperation::AppendMany(items)
+                }
                 _ => StateOperation::Snapshot(serde_json::to_vec(&json!([1, 2, 3])).unwrap()),
             });
         }
-        check(&format!("fuzz_case_{}", case), ops);
+        // A Set or Snapshot after a batch replaces the value and would hide
+        // a divergence the batch made, so every prefix that ends at a batch
+        // is checked too.
+        for end in 1..ops.len() {
+            if matches!(ops[end - 1], StateOperation::AppendMany(_)) {
+                check_batched(&format!("fuzz_case_{}_to_{}", case, end), ops[..end].to_vec());
+            }
+        }
+        check_batched(&format!("fuzz_case_{}", case), ops);
     }
 }

@@ -75,6 +75,31 @@ try {
     store.appendToState('log', Buffer.from(RAW_INTEGER_KEYS));
     return RAW_INTEGER_KEYS;
   });
+  const batchReads = [];
+  const appendBatchAndRead = (append) => {
+    const first = log.length;
+    const { batch, written } = append();
+    check(`firstOrdinal of the batch at ${first}`, batch.firstOrdinal, first);
+    log.push(...written.map(bytesOf));
+    const last = first + written.length - 1;
+    batchReads.push([[last], store.getStateItemsJson('log', [last]), [written.at(-1)]]);
+    const all = written.map((_, i) => first + i);
+    batchReads.push([all, store.getStateItemsJson('log', all), written]);
+  };
+  appendBatchAndRead(() => ({
+    batch: store.appendManyToStateJson('log', [item(16), item(17)]),
+    written: [item(16), item(17)],
+  }));
+  appendBatchAndRead(() => {
+    const own = { id: 'mine', zeta: 18, sequence: -1, alpha: { round: 18, call: 1 } };
+    const batch = store.appendManyToStateJsonWithIdentity('log', [own, item(19)], 'id', 'sequence');
+    const id = batch.record.id;
+    const sequence = Number(batch.record.sequence);
+    return {
+      batch,
+      written: [{ id, zeta: 18, sequence, alpha: { round: 18, call: 1 } }, { ...item(19), id, sequence }],
+    };
+  });
   for (let n = 9; n < 13; n++) {
     appendAndReadLast(() => {
       store.appendToStateJson('log', item(n));
@@ -95,8 +120,11 @@ try {
   for (const [index, value, expected] of lastItemReads) {
     check(`getStateItemJson(log, ${index}) straight after its append`, value, JSON.parse(expected));
   }
+  for (const [indices, values, expected] of batchReads) {
+    check(`getStateItemsJson(log, [${indices}]) straight after its batch`, values, expected);
+  }
   phaseHolds();
-  ok('the last item, read straight after each append, keeps its keys in the order written');
+  ok('the last item, read straight after each append, and a batch\'s items, read straight after it, keep their keys in the order written');
 
   const readAll = (label) => {
     for (const [id, expected] of records) {
@@ -115,6 +143,7 @@ try {
     for (let i = 0; i < log.length; i++) {
       check(`${label}: getStateItemJson(log, ${i})`, store.getStateItemJson('log', i), JSON.parse(log[i]));
     }
+    check(`${label}: getStateItemsJson(log)`, store.getStateItemsJson('log', log.map((_, i) => i)), JSON.parse(list(log)));
     check(`${label}: getStateSlice(log)`, text(store.getStateSlice('log', 2, 5)), list(log.slice(2, 7)));
     check(`${label}: getStateTail(log)`, text(store.getStateTail('log', 7)), list(log.slice(-7)));
     check(`${label}: getStateJsonAt(log)`, store.getStateJsonAt('log', logAt), JSON.parse(list(logAtBytes)));

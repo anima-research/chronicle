@@ -205,6 +205,17 @@ fn failed_checkpoint_child() {
         // Subscribers hear of the deletion once a checkpoint persists it.
         assert!(announced(&events).is_empty());
         repair(&branches_path, previous);
+        // An empty batch is refused before anything is done, the checkpoint
+        // the failure left pending included: it writes nothing.
+        assert!(matches!(
+            store.append_many_to_state_json("items", &[]),
+            Err(StoreError::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            store.append_many_to_state_json_with_identity("items", &[], "id", "seq"),
+            Err(StoreError::InvalidOperation(_))
+        ));
+        assert!(announced(&events).is_empty(), "an empty batch finished no checkpoint");
         store.sync().unwrap();
         assert_eq!(announced(&events), ["deleted feature"]);
         store.sync().unwrap();

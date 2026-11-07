@@ -57,7 +57,7 @@ pub use state::{
     FieldIndexKind, FieldIndexManager, SnapshotNeeded, StateChainHead, StateIndex, StateItems,
     StateManager, StateSelection,
 };
-pub use store::{CompactionSummary, Store, StoreConfig};
+pub use store::{AppendedBatch, CompactionSummary, Store, StoreConfig};
 pub use subscriptions::{
     BranchSummary, DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
     SubscriptionHandle, SubscriptionId, SubscriptionManager,
