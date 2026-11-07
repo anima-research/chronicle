@@ -2062,4 +2062,57 @@ mod tests {
             content
         );
     }
+
+    #[test]
+    fn an_identical_list_is_left_in_place() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let content = varied(100_000, 3);
+        let hash = storage.store_chunked(&content, "application/json").unwrap();
+        let path = storage.blob_path(&hash);
+        let before = same_file::Handle::from_path(&path).unwrap();
+        storage.store_chunked(&content, "application/json").unwrap();
+        assert_eq!(
+            same_file::Handle::from_path(&path).unwrap(),
+            before,
+            "the identical list was rewritten"
+        );
+    }
+
+    #[test]
+    fn a_chunked_store_replaces_a_cached_copy_of_the_content() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let content = varied(100_000, 5);
+        let hash = storage.store(&content, "a/a").unwrap();
+        assert!(storage.get(&hash).unwrap().is_some());
+        let file = storage.blob_path(&hash);
+        let len = fs::metadata(&file).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        storage.store_chunked(&content, "b/b").unwrap();
+        let blob = storage.get(&hash).unwrap().unwrap();
+        assert_eq!(blob.content_type, "b/b");
+    }
+
+    #[test]
+    fn a_chunked_store_that_found_the_blob_whole_takes_it_as_stored_afterwards() {
+        let dir = TempDir::new().unwrap();
+        let first = reopened(&dir);
+        let content = varied(100_000, 7);
+        let hash = first.store(&content, "application/json").unwrap();
+        let second = reopened(&dir);
+        second.store_chunked(&content, "application/json").unwrap();
+        let file = second.blob_path(&hash);
+        let mut bytes = fs::read(&file).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        fs::write(&file, &bytes).unwrap();
+        second.store_chunked(&content, "application/json").unwrap();
+        assert!(second.get(&hash).is_err());
+    }
 }

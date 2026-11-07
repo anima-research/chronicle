@@ -13,10 +13,14 @@
   as chunks cut where its own bytes say, at most 64 KiB each and at least
   2 KiB but the last, every chunk a blob of its own, under a file at the
   whole content's hash that names them in order and is written only once
-  every chunk is stored and each one this store wrote is synced. Content
-  sharing long runs of bytes with earlier chunked content shares those
-  chunks, so storing each request of a growing conversation writes mostly
-  what's new. `getBlob` returns the
+  every chunk is stored and each one this store wrote is synced. Where this
+  store writes a chunk, its content type is `application/octet-stream`,
+  which Rust's `Store::get_blob` returns for it (the Node API's `getBlob`
+  returns bytes only). Like any blob already stored, a chunk that reads back
+  whole is left as it is, content type included, whichever store of the
+  same bytes finds it. Content sharing long runs of bytes with earlier
+  chunked content shares those chunks, so storing each request of a growing
+  conversation writes mostly what's new. `getBlob` returns the
   content, and its hash is still the content's SHA-256. `stats()` counts
   each chunk, and the file naming them, as a blob, and Rust's
   `BlobStorage::list` lists them. A store that finds a blob already at its

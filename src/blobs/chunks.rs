@@ -110,4 +110,12 @@ mod tests {
         let changed = new.iter().filter(|piece| !old.contains(piece)).count();
         assert!(changed <= 3, "{changed} of {} chunks are new", new.len());
     }
+
+    #[test]
+    fn the_same_content_is_cut_where_it_was() {
+        assert_eq!(
+            chunk_ends(&pseudo_random(100_000, 1)),
+            [9264, 13724, 15823, 22140, 70166, 73550, 100000]
+        );
+    }
 }
