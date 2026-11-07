@@ -405,6 +405,14 @@ test('opening a store that is not there is InvalidFormat', () => {
   );
 });
 
+test('opening a store under a path that is a file is an Io error', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'chronicle-codes-'));
+  dirs.push(parent);
+  const file = join(parent, 'a-file');
+  writeFileSync(file, 'not a directory');
+  throwsCoded(() => JsStore.open({ path: join(file, 'store') }), ErrorCode.Io, /^IO error: /);
+});
+
 test("an error napi raises converting a call's arguments keeps napi's code, or has none", () => {
   const { store } = freshStore();
   const napiCode = (call) => {
