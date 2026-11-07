@@ -915,9 +915,10 @@ impl JsStore {
     /// Store a blob and return its hash. Bytes already stored are left as they
     /// are, unless their file is cut short, damaged or holds other bytes, which
     /// is replaced, as is a chunked blob's file (see `storeBlobAsync`) whose
-    /// chunks are missing, damaged or other bytes; bytes read or stored since
-    /// the store opened may be taken as stored from memory. A symbolic link at
-    /// the blob's name is read through, and one that leads nowhere is
+    /// chunks are missing, damaged or other bytes; bytes this open store has
+    /// stored, or read and checked while storing, may be taken as stored
+    /// without reading their file, until a `getBlob` of them fails. A symbolic
+    /// link at the blob's name is read through, and one that leads nowhere is
     /// replaced. Throws when something other than a regular file, such as a
     /// directory, is at the blob's name or a link's target, when its file can't
     /// be read or is in a blob format version newer than this chronicle reads,

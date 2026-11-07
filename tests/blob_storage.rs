@@ -194,7 +194,7 @@ fn storing_the_content_again_leaves_a_readable_copy_as_it_is() {
 }
 
 #[test]
-fn a_store_puts_back_a_file_removed_while_its_content_was_cached() {
+fn a_store_puts_back_a_file_removed_after_it_stored_the_content() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     let store = Store::create(config(&path)).unwrap();
@@ -263,7 +263,7 @@ fn a_store_leaves_a_directory_at_the_blobs_name_and_says_so() {
 }
 
 #[test]
-fn a_store_of_cached_bytes_refuses_a_directory_at_the_blobs_name() {
+fn a_store_of_bytes_it_stored_refuses_a_directory_at_the_blobs_name() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     let store = Store::create(config(&path)).unwrap();

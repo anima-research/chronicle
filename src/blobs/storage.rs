@@ -918,8 +918,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A new storage over the blobs in `dir`, with nothing cached, so its
-    /// reads and stores go to the files.
+    /// A new storage over the blobs in `dir`, with nothing cached or taken as
+    /// stored, so its reads and stores go to the files.
     fn reopened(dir: &TempDir) -> BlobStorage {
         BlobStorage::new(dir.path().join("blobs"), 100).unwrap()
     }
