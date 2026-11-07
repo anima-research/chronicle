@@ -411,7 +411,7 @@ impl BranchManager {
     /// Delete a branch (cannot delete main or current branch).
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         if name == MAIN_BRANCH {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete main branch".to_string(),
             ));
         }
@@ -425,7 +425,7 @@ impl BranchManager {
             .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
 
         if *id == current_id {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete current branch".to_string(),
             ));
         }
@@ -603,7 +603,7 @@ impl BranchManager {
         reparent_to: Option<&str>,
     ) -> Result<usize> {
         if name == MAIN_BRANCH {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete main branch".to_string(),
             ));
         }
@@ -617,19 +617,18 @@ impl BranchManager {
             .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
 
         if branch_id == current_id {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete current branch".to_string(),
             ));
         }
 
         // Get new parent ID if reparenting
         let new_parent_id = match reparent_to {
-            Some(parent_name) => Some(
-                *index
-                    .name_to_id
-                    .get(parent_name)
-                    .ok_or_else(|| StoreError::BranchNotFound(parent_name.to_string()))?,
-            ),
+            Some(parent_name) => Some(*index.name_to_id.get(parent_name).ok_or_else(|| {
+                StoreError::InvalidOperation(format!(
+                    "Cannot delete {name}: the branch to reparent its children onto, {parent_name}, doesn't exist"
+                ))
+            })?),
             None => None,
         };
 
@@ -893,8 +892,48 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
 
-        let result = manager.delete_branch(MAIN_BRANCH);
-        assert!(result.is_err());
+        for result in [
+            manager.delete_branch(MAIN_BRANCH),
+            manager.delete_branch_with_reparent(MAIN_BRANCH, None).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::InvalidOperation(m)) if m == "Cannot delete main branch"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_branch_that_is_not_there_is_branch_not_found() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+
+        for result in [
+            manager.delete_branch("nowhere"),
+            manager
+                .delete_branch_with_reparent("nowhere", None)
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::BranchNotFound(name)) if name == "nowhere"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reparenting_delete_onto_a_missing_branch_is_refused_as_an_invalid_operation() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+        manager.create_branch("child", None).unwrap();
+
+        let result = manager.delete_branch_with_reparent("child", Some("missing"));
+        assert!(
+            matches!(&result, Err(StoreError::InvalidOperation(m))
+                if m == "Cannot delete child: the branch to reparent its children onto, missing, doesn't exist"),
+            "{result:?}"
+        );
+        assert!(manager.get_branch("child").is_some());
     }
 
     #[test]
@@ -905,8 +944,15 @@ mod tests {
         manager.create_branch("feature", None).unwrap();
         manager.switch_branch("feature").unwrap();
 
-        let result = manager.delete_branch("feature");
-        assert!(result.is_err());
+        for result in [
+            manager.delete_branch("feature"),
+            manager.delete_branch_with_reparent("feature", None).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::InvalidOperation(m)) if m == "Cannot delete current branch"),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]

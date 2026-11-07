@@ -1,7 +1,7 @@
 //! NAPI bindings for Node.js/TypeScript.
 
 use crate::{
-    error::StoreError,
+    error::{ErrorCode, StoreError},
     state::StateSelection,
     subscriptions::{
         DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
@@ -16,6 +16,15 @@ use napi_derive::napi;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// napi gives an error's status to JavaScript as `error.code`. Errors napi
+// raises while converting a call's arguments come before the method runs,
+// and keep napi's own status.
+type Result<T> = napi::Result<T, ErrorCode>;
+
+fn coded(code: ErrorCode, reason: impl ToString) -> napi::Error<ErrorCode> {
+    napi::Error::new(code, reason)
+}
 
 /// JavaScript-friendly Store wrapper.
 ///
@@ -54,6 +63,12 @@ pub struct JsStore {
     detached: bool,
     /// Active subscription handles, stored by ID.
     subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
+}
+
+impl Drop for JsStore {
+    fn drop(&mut self) {
+        self.release_subscriptions();
+    }
 }
 
 /// The branch a view is bound to. Bound by id: ids are never reused, so a
@@ -454,8 +469,8 @@ pub struct JsTreeListEntry {
     pub mode: i32,
 }
 
-fn to_napi_error(e: StoreError) -> napi::Error {
-    napi::Error::from_reason(e.to_string())
+fn to_napi_error(e: StoreError) -> napi::Error<ErrorCode> {
+    napi::Error::new(e.code(), e.to_string())
 }
 
 /// Shared JsStateRegistration -> StateStrategy conversion for
@@ -471,7 +486,7 @@ fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateS
             delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
             full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
         },
-        _ => return Err(napi::Error::from_reason("Invalid strategy")),
+        _ => return Err(coded(ErrorCode::InvalidOperation, "Invalid strategy")),
     })
 }
 
@@ -480,12 +495,12 @@ impl JsStore {
     /// Get the inner store, returning an error if closed.
     fn get_store(&self) -> Result<Arc<Store>> {
         if self.detached {
-            return Err(napi::Error::from_reason("View has been closed"));
+            return Err(coded(ErrorCode::StoreClosed, "View has been closed"));
         }
         self.shared
             .read()
             .clone()
-            .ok_or_else(|| napi::Error::from_reason("Store has been closed"))
+            .ok_or_else(|| coded(ErrorCode::StoreClosed, "Store has been closed"))
     }
 
     /// The store plus the branch this handle's branch-dependent methods act
@@ -496,7 +511,7 @@ impl JsStore {
         let branch = match &self.pinned {
             Some(pinned) => {
                 if !store.branch_exists(pinned.id) {
-                    return Err(napi::Error::from_reason(format!(
+                    return Err(coded(ErrorCode::BranchNotFound, format!(
                         "Branch not found: '{}' (the branch this view is pinned to has been deleted)",
                         pinned.name
                     )));
@@ -506,6 +521,15 @@ impl JsStore {
             None => store.current_branch().id,
         };
         Ok((store, branch))
+    }
+
+    fn release_subscriptions(&self) {
+        let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
+        if let Some(store) = self.shared.read().as_ref() {
+            for id in handles {
+                store.unsubscribe(SubscriptionId(id));
+            }
+        }
     }
 
     /// Wrap a freshly opened store in a root handle.
@@ -557,7 +581,9 @@ impl JsStore {
     }
 
     /// Close the store, releasing the lock and any resources.
-    /// After closing, all operations on this store will fail.
+    /// After closing, the store's methods throw `StoreClosed`, but for
+    /// `isClosed()`, `pinnedBranch()` and `close()` itself, which answer as
+    /// before, and a poll, which first returns what was queued.
     ///
     /// On the root handle this closes the store itself: it is synced, every
     /// view made from this handle stops working ("Store has been closed"),
@@ -567,19 +593,17 @@ impl JsStore {
     /// can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
-    /// and its methods throw "View has been closed". The store stays open,
-    /// nothing is synced, and the root and other views are unaffected. A
-    /// view never needs to be closed; dropping it is enough.
+    /// and its methods throw "View has been closed", but for `isClosed()`,
+    /// `pinnedBranch()` and `close()`, and a poll, which finds no
+    /// subscription. The store stays open, nothing is synced, and the root
+    /// and other views are unaffected. A view never needs to be closed;
+    /// dropping it is enough. Any handle's subscriptions are removed when
+    /// it's garbage-collected.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
         if self.pinned.is_some() {
             if !self.detached {
-                let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
-                if let Some(store) = self.shared.read().as_ref() {
-                    for id in handles {
-                        store.unsubscribe(SubscriptionId(id));
-                    }
-                }
+                self.release_subscriptions();
                 self.detached = true;
             }
             return Ok(());
@@ -744,7 +768,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let record = store.get_record(RecordId(id)).map_err(to_napi_error)?;
         Ok(record.map(Into::into))
     }
@@ -763,9 +787,12 @@ impl JsStore {
         let ids = ids
             .iter()
             .map(|id| {
-                id.parse::<u64>()
-                    .map(RecordId)
-                    .map_err(|_| napi::Error::from_reason(format!("Invalid record ID: {:?}", id)))
+                id.parse::<u64>().map(RecordId).map_err(|_| {
+                    coded(
+                        ErrorCode::InvalidOperation,
+                        format!("Invalid record ID: {:?}", id),
+                    )
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let records = store.get_records(&ids).map_err(to_napi_error)?;
@@ -789,7 +816,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let record = match store.get_record(RecordId(id)).map_err(to_napi_error)? {
             Some(r) => r,
             None => return Ok(None),
@@ -800,7 +827,7 @@ impl JsStore {
         let update =
             crate::types::StateUpdateRecord::decode(&record).map_err(to_napi_error)?;
         let json = serde_json::to_string(&update)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         Ok(Some(json))
     }
 
@@ -854,7 +881,7 @@ impl JsStore {
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
         let hash = crate::Hash::from_hex(&hash)
-            .map_err(|_| napi::Error::from_reason("Invalid hash"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid hash"))?;
         let blob = store.get_blob(&hash).map_err(to_napi_error)?;
         Ok(blob.map(|b| Buffer::from(b.content)))
     }
@@ -1005,7 +1032,7 @@ impl JsStore {
     pub fn switch_branch(&self, name: String) -> Result<JsBranch> {
         let store = self.get_store()?;
         if let Some(pinned) = &self.pinned {
-            return Err(napi::Error::from_reason(format!(
+            return Err(coded(ErrorCode::InvalidOperation, format!(
                 "switchBranch is not available on a view (pinned to branch '{}'); \
                  call view('{}') on the store for a handle on that branch instead",
                 pinned.name, name
@@ -1028,7 +1055,7 @@ impl JsStore {
         let (store, branch) = self.target()?;
         let branch = store
             .get_branch_by_id(branch)
-            .ok_or_else(|| napi::Error::from_reason("Branch not found"))?;
+            .ok_or_else(|| coded(ErrorCode::BranchNotFound, "Branch not found"))?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
             name: branch.name,
@@ -1066,18 +1093,19 @@ impl JsStore {
     ///
     ///
     /// The main branch and the current branch cannot be deleted; nor can a
-    /// view delete the branch it is itself pinned to. A branch that OTHER
-    /// views are pinned to can be deleted — those views then throw
-    /// "Branch not found" from every branch-dependent method.
+    /// view delete the branch it is itself pinned to. Each of these throws
+    /// `InvalidOperation`. A branch that OTHER views are pinned to can be
+    /// deleted — those views then throw "Branch not found" from every
+    /// branch-dependent method.
     #[napi]
     pub fn delete_branch(&self, name: String) -> Result<()> {
         let store = self.get_store()?;
         if let Some(pinned) = &self.pinned {
             if pinned.name == name && store.branch_exists(pinned.id) {
-                return Err(napi::Error::from_reason(format!(
-                    "Branch not found: Cannot delete the branch this view is pinned to ('{}')",
+                return Err(to_napi_error(StoreError::InvalidOperation(format!(
+                    "Cannot delete the branch this view is pinned to ('{}')",
                     name
-                )));
+                ))));
             }
         }
         store.delete_branch(&name).map_err(to_napi_error)
@@ -1108,7 +1136,7 @@ impl JsStore {
     /// Update the strategy parameters of an already-registered state.
     /// Same strategy kind only; cadence fields (deltaSnapshotEvery /
     /// fullSnapshotEvery) are free to change and steer future snapshot
-    /// scheduling. Use after registerState throws "State already exists"
+    /// scheduling. Use after registerState throws with `code` `StateExists`
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
@@ -1141,7 +1169,7 @@ impl JsStore {
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -1162,8 +1190,8 @@ impl JsStore {
     #[napi]
     pub fn set_state_json(&self, state_id: String, value: serde_json::Value) -> Result<JsRecord> {
         let (store, branch) = self.target()?;
-        let bytes =
-            serde_json::to_vec(&value).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         let record = store
             .update_state_on(branch, &state_id, StateOperation::Set(bytes))
             .map_err(to_napi_error)?;
@@ -1188,8 +1216,8 @@ impl JsStore {
         item: serde_json::Value,
     ) -> Result<JsRecord> {
         let (store, branch) = self.target()?;
-        let bytes =
-            serde_json::to_vec(&item).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let bytes = serde_json::to_vec(&item)
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         let record = store
             .update_state_on(branch, &state_id, StateOperation::Append(bytes))
             .map_err(to_napi_error)?;
@@ -1454,7 +1482,7 @@ impl JsStore {
         match item {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -1505,7 +1533,7 @@ impl JsStore {
                 };
                 item.map(|bytes| {
                     serde_json::from_slice(&bytes)
-                        .map_err(|e| napi::Error::from_reason(e.to_string()))
+                        .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))
                 })
                 .transpose()
             })
@@ -1745,7 +1773,7 @@ impl JsStore {
         let (store, branch) = self.target()?;
         let branch = store
             .get_branch_by_id(branch)
-            .ok_or_else(|| napi::Error::from_reason("Branch not found"))?;
+            .ok_or_else(|| coded(ErrorCode::BranchNotFound, "Branch not found"))?;
         Ok(branch.head.0 as i64)
     }
 
@@ -1773,7 +1801,7 @@ impl JsStore {
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -1786,7 +1814,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let effects = store.index.get_caused_by(RecordId(id));
         Ok(effects.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1797,7 +1825,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let links = store.index.get_linked_to(RecordId(id));
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1808,9 +1836,11 @@ impl JsStore {
     /// periodic one, this throws that failure every time until the store is
     /// reopened, and publishes nothing: records written before it may not
     /// have reached the disk, and a later fsync can't show that they did.
-    /// Its message begins `Durability lost:`. Registering a state, changing
-    /// a strategy, and creating, deleting or switching a branch throw it too,
-    /// and so does any write while one of them waits for its checkpoint.
+    /// Its message begins `Durability lost:`, and its `code` is
+    /// `DurabilityLost`. Registering a state, changing a strategy, and
+    /// creating, deleting or switching a branch throw it too, unless a check
+    /// of their own refuses them first, and so does any write while one of
+    /// them waits for its checkpoint.
     /// Reopening the store is the only way to resume durable writes.
     /// Reopening can't tell whether records the operating system still caches
     /// reached the disk: if they didn't while later records did, an open
@@ -1882,7 +1912,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         // Remove handle from our map
         self.subscription_handles.lock().remove(&id);
@@ -1895,13 +1925,21 @@ impl JsStore {
     /// Perform catch-up for a subscription (replay historical data).
     ///
     /// This replays state snapshots and historical records based on the
-    /// subscription's `from_sequence` setting.
+    /// subscription's `fromSequence` setting, from the branch of the handle
+    /// it's called on: the current branch on the root, its own branch on a
+    /// view. Any handle of the store can catch up a subscription made
+    /// through another, replaying its own branch. A subscription the store
+    /// doesn't hold throws `SubscriptionDropped`: one it dropped because its
+    /// buffer overran, during a catch-up or live, and one that was
+    /// unsubscribed through any handle, was a view's when the view was
+    /// closed, was a handle's when the handle was garbage-collected, or was
+    /// never made.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
         let (store, branch) = self.target()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         store
             .catch_up_subscription_on(branch, SubscriptionId(id))
@@ -1910,30 +1948,40 @@ impl JsStore {
 
     /// Poll for the next event from a subscription (non-blocking).
     ///
-    /// Returns null if no events are available.
+    /// Returns null if no events are available. A poll reaches only the
+    /// subscriptions made through its own handle; another ID throws
+    /// `SubscriptionNotFound`. Once a subscription has ended and the events
+    /// queued for it are read, a poll throws `StoreClosed` after the root's
+    /// `close()`, whatever ended the subscription before, and otherwise
+    /// `SubscriptionDropped`: the store dropped it because its buffer
+    /// overran, or it was unsubscribed through another handle, which queues
+    /// a last `dropped` event saying so when the buffer has room for it.
+    /// Its handle holds an ended subscription, buffer and all, until it's
+    /// unsubscribed through that handle, the handle is a view that's closed,
+    /// or the handle is garbage-collected. After the root's `close()`,
+    /// `unsubscribe` throws `StoreClosed`, so only the last two free it.
     #[napi]
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
             .get(&id)
-            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+            .ok_or_else(|| coded(ErrorCode::SubscriptionNotFound, "Subscription not found"))?;
 
         match handle.try_recv() {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Err(napi::Error::from_reason("Subscription disconnected"))
-            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(self.ended()),
         }
     }
 
     /// Poll for the next event with a timeout (milliseconds).
     ///
-    /// Returns null if no event received within the timeout.
+    /// Returns null if no event received within the timeout. Throws as
+    /// `pollSubscription` does.
     #[napi]
     pub fn poll_subscription_timeout(
         &self,
@@ -1942,20 +1990,26 @@ impl JsStore {
     ) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
             .get(&id)
-            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+            .ok_or_else(|| coded(ErrorCode::SubscriptionNotFound, "Subscription not found"))?;
 
         let timeout = std::time::Duration::from_millis(timeout_ms as u64);
         match handle.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(napi::Error::from_reason("Subscription disconnected"))
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.ended()),
+        }
+    }
+
+    fn ended(&self) -> napi::Error<ErrorCode> {
+        if self.shared.read().is_none() {
+            coded(ErrorCode::StoreClosed, "Store has been closed")
+        } else {
+            to_napi_error(StoreError::SubscriptionDropped)
         }
     }
 
@@ -2004,9 +2058,9 @@ impl JsStore {
             .into_iter()
             .map(|op| match op.op.as_str() {
                 "set" => {
-                    let entry = op
-                        .entry
-                        .ok_or_else(|| napi::Error::from_reason("TreeOp 'set' requires entry"))?;
+                    let entry = op.entry.ok_or_else(|| {
+                        coded(ErrorCode::InvalidOperation, "TreeOp 'set' requires entry")
+                    })?;
                     Ok(TreeOp::Set {
                         path: op.path,
                         entry: TreeEntry {
@@ -2017,10 +2071,10 @@ impl JsStore {
                     })
                 }
                 "remove" => Ok(TreeOp::Remove { path: op.path }),
-                other => Err(napi::Error::from_reason(format!(
-                    "Invalid tree op: '{}', expected 'set' or 'remove'",
-                    other
-                ))),
+                other => Err(coded(
+                    ErrorCode::InvalidOperation,
+                    format!("Invalid tree op: '{}', expected 'set' or 'remove'", other),
+                )),
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -2170,10 +2224,13 @@ impl JsStore {
             "number" => FieldIndexKind::Number,
             "string" => FieldIndexKind::String,
             _ => {
-                return Err(napi::Error::from_reason(format!(
-                    "Invalid field index kind '{}': expected \"number\" or \"string\"",
-                    kind
-                )))
+                return Err(coded(
+                    ErrorCode::InvalidOperation,
+                    format!(
+                        "Invalid field index kind '{}': expected \"number\" or \"string\"",
+                        kind
+                    ),
+                ))
             }
         };
         store

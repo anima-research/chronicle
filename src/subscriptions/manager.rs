@@ -132,12 +132,13 @@ impl SubscriptionManager {
     /// Mark a subscription as caught up (finished historical replay).
     pub fn mark_caught_up(&self, id: SubscriptionId) -> Result<()> {
         let mut subs = self.subscriptions.write();
-        if let Some(sub) = subs.get_mut(&id) {
-            sub.caught_up = true;
-            if !sub.try_send(StoreEvent::CaughtUp) {
-                subs.remove(&id);
-                return Err(StoreError::SubscriptionDropped);
-            }
+        let Some(sub) = subs.get_mut(&id) else {
+            return Err(StoreError::SubscriptionDropped);
+        };
+        sub.caught_up = true;
+        if !sub.try_send(StoreEvent::CaughtUp) {
+            subs.remove(&id);
+            return Err(StoreError::SubscriptionDropped);
         }
         Ok(())
     }
@@ -266,14 +267,18 @@ impl SubscriptionManager {
     // --- Catch-up Helpers ---
 
     /// Send an event directly to a subscription (for catch-up).
-    /// Returns false if the subscription was dropped.
+    /// Returns false if the subscription was dropped: it was gone already, or
+    /// it couldn't take the event and is dropped now.
     pub fn send_to(&self, id: SubscriptionId, event: StoreEvent) -> bool {
-        let subs = self.subscriptions.read();
-        if let Some(sub) = subs.get(&id) {
-            sub.try_send(event)
-        } else {
-            false
+        let mut subs = self.subscriptions.write();
+        let Some(sub) = subs.get(&id) else {
+            return false;
+        };
+        if sub.try_send(event) {
+            return true;
         }
+        subs.remove(&id);
+        false
     }
 
     /// Get the config for a subscription (for catch-up logic).
@@ -414,5 +419,28 @@ mod tests {
 
         // Should NOT receive (not caught up yet)
         assert!(matches!(handle.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_send_to_a_subscription_whose_receiver_is_gone_drops_it() {
+        let manager = SubscriptionManager::new();
+        let handle = manager.subscribe(SubscriptionConfig::default());
+        let id = handle.id;
+        assert_eq!(manager.subscription_count(), 1);
+        drop(handle);
+        assert!(!manager.send_to(id, StoreEvent::CaughtUp));
+        assert_eq!(manager.subscription_count(), 0);
+    }
+
+    #[test]
+    fn marking_a_subscription_that_is_gone_caught_up_says_it_was_dropped() {
+        let manager = SubscriptionManager::new();
+        let handle = manager.subscribe(SubscriptionConfig::default());
+        assert!(manager.mark_caught_up(handle.id).is_ok());
+        manager.unsubscribe(handle.id);
+        assert!(matches!(
+            manager.mark_caught_up(handle.id),
+            Err(StoreError::SubscriptionDropped)
+        ));
     }
 }

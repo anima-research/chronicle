@@ -92,5 +92,242 @@ impl From<rmp_serde::decode::Error> for StoreError {
     }
 }
 
+/// What kind of failure an error from the Node binding is. Each error the
+/// binding raises for a store failure, or for a call it refuses, carries one
+/// as its `code`, beside its message, so a caller can tell kinds apart
+/// without matching message text. (An error napi raises while it converts a
+/// call's arguments, before chronicle runs, keeps napi's own code or none.)
+/// Each member's value is its name, kept across releases.
+// A code's name is its variant's identifier: napi's string enum takes each
+// value from it, and `as_str` spells the same name for `error.code`, so
+// renaming a variant would change a published code.
+#[cfg_attr(feature = "napi-bindings", napi_derive::napi(string_enum))]
+#[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorCode {
+    /// A file operation failed, either because the operating system refused
+    /// or failed it, or because a file ended before a read of it could
+    /// finish; the message carries its error.
+    Io,
+    /// An fsync of the record log failed. `sync()` throws it until the store
+    /// is reopened, and so do the calls that checkpoint, unless a check of
+    /// their own refuses them first.
+    DurabilityLost,
+    /// Not raised by this release.
+    RecordNotFound,
+    /// No branch has that name, or the branch a view is pinned to was
+    /// deleted.
+    BranchNotFound,
+    /// Not raised by this release.
+    BlobNotFound,
+    /// No state is registered under that ID.
+    StateNotRegistered,
+    /// A state is already registered under that ID.
+    StateExists,
+    /// A branch was asked to start at a sequence past its parent's head.
+    InvalidSequence,
+    /// A branch already has that name.
+    BranchExists,
+    /// A value couldn't be encoded, as JSON or in the store's own format.
+    Serialization,
+    /// Bytes couldn't be decoded, as JSON or from the store's own format.
+    Deserialization,
+    /// A store file holds what no write leaves, such as a damaged log entry
+    /// with valid ones after it, which open refuses.
+    Corruption,
+    /// Not raised by this release: a state's strategy conflicts are
+    /// `InvalidOperation`.
+    StrategyMismatch,
+    /// The store is open already, in another process or through another
+    /// open of it.
+    Locked,
+    /// Not raised through this binding: `open` of a path that holds no store
+    /// fails with `InvalidFormat`.
+    NotInitialized,
+    /// A store or blob file isn't in a format this release reads, or is
+    /// damaged, or the store's `LOCK` isn't a regular file. Or the path holds
+    /// no `MANIFEST`, or one that's a link leading nowhere: `open` refuses
+    /// such a path whatever else is there, and `openOrCreate` refuses it
+    /// unless it holds nothing a new store can't sit beside, where it creates
+    /// one.
+    InvalidFormat,
+    /// A record or blob read from its file doesn't match its checksum.
+    ChecksumMismatch,
+    /// A blob's bytes don't match the hash they're stored under.
+    HashMismatch,
+    /// Not raised by this release.
+    Transaction,
+    /// A call refused for one of these reasons. Not allowed as things stand:
+    /// `create` of a path that already holds a store's `MANIFEST`,
+    /// `records.log`, `state.bin` or `branches.bin` (and `openOrCreate`, when
+    /// one of the last three appears there while it creates and no `MANIFEST`
+    /// does); `switchBranch` on a view; deleting the main branch, the current
+    /// one or the one a view is pinned to; changing a state's strategy to
+    /// another kind; or a tree operation on a state that isn't a tree. Or
+    /// for one of these arguments: a record ID or subscription ID that isn't
+    /// an unsigned 64-bit integer; a blob hash that isn't hex of the right
+    /// length; a strategy other than snapshot, append_log or tree; a field
+    /// index kind other than number or string; a tree operation other than
+    /// set or remove, or a set without an entry; an edit index past the
+    /// end; an invalid tree path or field-index path; an item for
+    /// `appendToStateJsonWithIdentity` or `appendManyToStateJsonWithIdentity`
+    /// that isn't a JSON object; a batch with no items for
+    /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`; the
+    /// same key as both the id field and the sequence field of
+    /// `appendManyToStateJsonWithIdentity`; the reserved record type
+    /// `state_update`; or a blob content type over 65,535 bytes.
+    InvalidOperation,
+    /// The store doesn't hold the subscription. It dropped it because its
+    /// buffer overran, or it was unsubscribed (to a poll, through another
+    /// handle); or, to a catch-up, it was never made.
+    SubscriptionDropped,
+    /// The store, or this view of it, was closed with `close()`.
+    StoreClosed,
+    /// The handle polled holds no subscription with that ID: it wasn't made
+    /// through that handle, was unsubscribed through it, or was the view's
+    /// when the view was closed. A poll reaches only the subscriptions made
+    /// through its own handle.
+    SubscriptionNotFound,
+}
+
+impl ErrorCode {
+    /// The code's name, as JavaScript sees it in `error.code`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorCode::Io => "Io",
+            ErrorCode::DurabilityLost => "DurabilityLost",
+            ErrorCode::RecordNotFound => "RecordNotFound",
+            ErrorCode::BranchNotFound => "BranchNotFound",
+            ErrorCode::BlobNotFound => "BlobNotFound",
+            ErrorCode::StateNotRegistered => "StateNotRegistered",
+            ErrorCode::StateExists => "StateExists",
+            ErrorCode::InvalidSequence => "InvalidSequence",
+            ErrorCode::BranchExists => "BranchExists",
+            ErrorCode::Serialization => "Serialization",
+            ErrorCode::Deserialization => "Deserialization",
+            ErrorCode::Corruption => "Corruption",
+            ErrorCode::StrategyMismatch => "StrategyMismatch",
+            ErrorCode::Locked => "Locked",
+            ErrorCode::NotInitialized => "NotInitialized",
+            ErrorCode::InvalidFormat => "InvalidFormat",
+            ErrorCode::ChecksumMismatch => "ChecksumMismatch",
+            ErrorCode::HashMismatch => "HashMismatch",
+            ErrorCode::Transaction => "Transaction",
+            ErrorCode::InvalidOperation => "InvalidOperation",
+            ErrorCode::SubscriptionDropped => "SubscriptionDropped",
+            ErrorCode::StoreClosed => "StoreClosed",
+            ErrorCode::SubscriptionNotFound => "SubscriptionNotFound",
+        }
+    }
+}
+
+impl AsRef<str> for ErrorCode {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl StoreError {
+    /// This error's kind, which the Node binding gives as `error.code`.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            StoreError::Io(_) => ErrorCode::Io,
+            StoreError::DurabilityLost(_) => ErrorCode::DurabilityLost,
+            StoreError::RecordNotFound(_) => ErrorCode::RecordNotFound,
+            StoreError::BranchNotFound(_) => ErrorCode::BranchNotFound,
+            StoreError::BlobNotFound(_) => ErrorCode::BlobNotFound,
+            StoreError::StateNotRegistered(_) => ErrorCode::StateNotRegistered,
+            StoreError::StateExists(_) => ErrorCode::StateExists,
+            StoreError::InvalidSequence(..) => ErrorCode::InvalidSequence,
+            StoreError::BranchExists(_) => ErrorCode::BranchExists,
+            StoreError::Serialization(_) => ErrorCode::Serialization,
+            StoreError::Deserialization(_) => ErrorCode::Deserialization,
+            StoreError::Corruption(_) => ErrorCode::Corruption,
+            StoreError::StrategyMismatch { .. } => ErrorCode::StrategyMismatch,
+            StoreError::Locked => ErrorCode::Locked,
+            StoreError::NotInitialized => ErrorCode::NotInitialized,
+            StoreError::InvalidFormat(_) => ErrorCode::InvalidFormat,
+            StoreError::ChecksumMismatch { .. } => ErrorCode::ChecksumMismatch,
+            StoreError::HashMismatch { .. } => ErrorCode::HashMismatch,
+            StoreError::Transaction(_) => ErrorCode::Transaction,
+            StoreError::InvalidOperation(_) => ErrorCode::InvalidOperation,
+            StoreError::SubscriptionDropped => ErrorCode::SubscriptionDropped,
+        }
+    }
+}
+
 /// Result type for store operations.
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_store_error_has_its_published_code() {
+        let hash = Hash([0u8; 32]);
+        let cases: Vec<(StoreError, &str)> = vec![
+            (StoreError::Io(std::io::Error::other("disk")), "Io"),
+            (StoreError::DurabilityLost("x".into()), "DurabilityLost"),
+            (StoreError::RecordNotFound(RecordId(7)), "RecordNotFound"),
+            (StoreError::BranchNotFound("main".into()), "BranchNotFound"),
+            (StoreError::BlobNotFound(hash), "BlobNotFound"),
+            (
+                StoreError::StateNotRegistered("s".into()),
+                "StateNotRegistered",
+            ),
+            (StoreError::StateExists("s".into()), "StateExists"),
+            (
+                StoreError::InvalidSequence(Sequence(1), Sequence(2)),
+                "InvalidSequence",
+            ),
+            (StoreError::BranchExists("b".into()), "BranchExists"),
+            (StoreError::Serialization("x".into()), "Serialization"),
+            (StoreError::Deserialization("x".into()), "Deserialization"),
+            (StoreError::Corruption("x".into()), "Corruption"),
+            (
+                StoreError::StrategyMismatch {
+                    expected: "a".into(),
+                    got: "b".into(),
+                },
+                "StrategyMismatch",
+            ),
+            (StoreError::Locked, "Locked"),
+            (StoreError::NotInitialized, "NotInitialized"),
+            (StoreError::InvalidFormat("x".into()), "InvalidFormat"),
+            (
+                StoreError::ChecksumMismatch {
+                    expected: 1,
+                    got: 2,
+                },
+                "ChecksumMismatch",
+            ),
+            (
+                StoreError::HashMismatch {
+                    expected: hash,
+                    got: hash,
+                },
+                "HashMismatch",
+            ),
+            (StoreError::Transaction("x".into()), "Transaction"),
+            (StoreError::InvalidOperation("x".into()), "InvalidOperation"),
+            (StoreError::SubscriptionDropped, "SubscriptionDropped"),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.code().as_str(), code, "{error}");
+            assert_eq!(format!("{:?}", error.code()), code, "{error}");
+        }
+    }
+
+    #[test]
+    fn the_bindings_own_codes_keep_their_names() {
+        let cases = [
+            (ErrorCode::StoreClosed, "StoreClosed"),
+            (ErrorCode::SubscriptionNotFound, "SubscriptionNotFound"),
+        ];
+        for (code, name) in cases {
+            assert_eq!(code.as_str(), name);
+            assert_eq!(format!("{code:?}"), name);
+        }
+    }
+}
