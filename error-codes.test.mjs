@@ -363,10 +363,14 @@ test('a subscription is caught up through any handle of its store, and once unsu
   store.close();
 });
 
-test('opening a store that is not there is an Io error', () => {
+test('opening a store that is not there is InvalidFormat', () => {
   const parent = mkdtempSync(join(tmpdir(), 'chronicle-codes-'));
   dirs.push(parent);
-  throwsCoded(() => JsStore.open({ path: join(parent, 'nothing-here') }), ErrorCode.Io, /^IO error: /);
+  throwsCoded(
+    () => JsStore.open({ path: join(parent, 'nothing-here') }),
+    ErrorCode.InvalidFormat,
+    /^Invalid store format: .*nothing-here has no MANIFEST, so it isn't a Chronicle store$/,
+  );
 });
 
 test("an error napi raises converting a call's arguments keeps napi's code, or has none", () => {

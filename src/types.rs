@@ -299,6 +299,21 @@ pub enum StateOperation {
     /// Append to collection (AppendLog).
     Append(#[serde(with = "serde_bytes")] Vec<u8>),
 
+    /// Append several items to a collection, in order, as one record
+    /// (AppendLog). Reads see what the same items appended one `Append` at a
+    /// time would give, except that a historical read or a fork cut by
+    /// sequence keeps or drops the batch whole. The record takes one
+    /// sequence and counts as one operation toward the snapshot cadence, as a
+    /// `TreeBatch` does, whatever its number of items. A batch must hold at
+    /// least one item; `update_state` refuses an empty one.
+    ///
+    /// A stored-format addition: a build that predates this variant can't
+    /// read a chain that holds one. The store marks its MANIFEST when it
+    /// writes its first batch, so such a build refuses the whole store when
+    /// it opens it, where the directory holding the MANIFEST is synced (see
+    /// `Store::update_state`).
+    AppendMany(#[serde(with = "byte_items")] Vec<Vec<u8>>),
+
     /// Remove range from collection (AppendLog).
     Redact { start: usize, end: usize },
 
@@ -336,6 +351,44 @@ pub enum StateOperation {
         name: String,
         operation: Box<StateOperation>,
     },
+}
+
+impl StateOperation {
+    /// Whether this operation is, or carries inside a `Field`, an
+    /// `AppendMany`: the variant a build that predates it can't read.
+    pub fn contains_append_many(&self) -> bool {
+        match self {
+            StateOperation::AppendMany(_) => true,
+            StateOperation::Field { operation, .. } => operation.contains_append_many(),
+            _ => false,
+        }
+    }
+
+    /// Whether this operation is, or carries inside a `Field`, an
+    /// `AppendMany` with no items.
+    pub(crate) fn contains_empty_batch(&self) -> bool {
+        match self {
+            StateOperation::AppendMany(items) => items.is_empty(),
+            StateOperation::Field { operation, .. } => operation.contains_empty_batch(),
+            _ => false,
+        }
+    }
+}
+
+/// `serde_bytes` for each item of a `Vec<Vec<u8>>`: MessagePack stores every
+/// item as a raw `bin` payload, and JSON renders each as an integer array,
+/// the shape `Append` has in both.
+mod byte_items {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(items: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(items.iter().map(|item| serde_bytes::Bytes::new(item)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        let items = Vec::<serde_bytes::ByteBuf>::deserialize(deserializer)?;
+        Ok(items.into_iter().map(serde_bytes::ByteBuf::into_vec).collect())
+    }
 }
 
 /// A state update in the chain.
@@ -393,6 +446,13 @@ impl StateUpdateRecord {
     /// MessagePack as JSON. Once a store contains MessagePack state records
     /// it can no longer be opened by chronicle versions predating this
     /// method (forward-only migration).
+    ///
+    /// An operation variant this build doesn't know fails to decode. A new
+    /// variant is therefore a stored-format change too: `AppendMany` is the
+    /// first since the MessagePack migration, and the store's MANIFEST
+    /// version keeps builds that predate it from opening a store that holds
+    /// one, where the directory holding the MANIFEST is synced (see
+    /// `Store::update_state`).
     pub fn decode(record: &Record) -> Result<Self, crate::error::StoreError> {
         match record.encoding {
             PayloadEncoding::MessagePack => rmp_serde::from_slice(&record.payload)
@@ -451,6 +511,29 @@ pub enum TreeChange {
 
 /// The tree state itself: a sorted map of path → TreeEntry.
 pub type TreeState = BTreeMap<String, TreeEntry>;
+
+/// A state whose snapshot after a recorded write failed at its most recent
+/// attempt on a branch, as `Store::snapshot_failures` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotFailure {
+    /// The state.
+    pub state_id: String,
+    /// The branch the writes and their snapshots were on.
+    pub branch_id: BranchId,
+    /// That branch's name.
+    pub branch: String,
+    /// How many writes in a row found the state's snapshot due on the branch
+    /// and failed to take it, counted since the store opened or the last
+    /// snapshot of the state there. Outcomes are counted in sequence order:
+    /// where writes to the state race, a failure that comes in after a later
+    /// write's outcome isn't counted, so the count can be lower than the
+    /// number of writes that failed.
+    pub failures: u64,
+    /// The sequence of the most recent of those writes.
+    pub sequence: Sequence,
+    /// The error the most recent attempt failed with.
+    pub error: String,
+}
 
 /// Store statistics.
 #[derive(Clone, Debug, Default)]

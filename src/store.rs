@@ -7,10 +7,11 @@ use crate::records::{RecordIndex, RecordLog, RecoveryReport};
 use crate::state::{StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
-    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence,
+    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence, SnapshotFailure,
     StateOperation, StateRegistration, StateUpdateRecord, StoreStats, Timestamp,
     TreeChange, TreeEntry, TreeOp, TreeState,
 };
+use std::collections::BTreeMap;
 use fs2::FileExt;
 use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
@@ -41,6 +42,38 @@ impl Default for StoreConfig {
     }
 }
 
+/// What a batched append to an append-log state recorded
+/// (`Store::append_many_to_state` and its forms, and
+/// `Store::append_many_to_state_json_with_identity`).
+#[derive(Clone, Debug)]
+pub struct AppendedBatch {
+    /// The one record that holds the whole batch, at one sequence.
+    pub record: Record,
+    /// The ordinal the batch's first item took: the number of items the
+    /// state held on the branch just before the batch, read under the same
+    /// lock as the write. Item `i` of the batch is at `first_ordinal + i`, so
+    /// a caller has every item's ordinal without a read.
+    ///
+    /// Where this session hasn't kept the state's count on the branch itself
+    /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
+    /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
+    /// array), the batch first counts
+    /// the state's items, reading its whole value once, or again under the
+    /// write lock where another write to the state lands during that count,
+    /// and the head keeps that count, which `get_state_len` then reports: a
+    /// count a release
+    /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
+    /// A value that doesn't materialize as a JSON array has no items to
+    /// count, and this is then the count `get_state_len` reports; the batch
+    /// is recorded, and the state then fails to materialize, as after an
+    /// `Append` to it, so the items can't be read at those ordinals. An error
+    /// reading the log for the count (an I/O error, or a record of the
+    /// state's chain that fails its checksum or whose framing is bad) is
+    /// returned, and the batch isn't recorded; the error says so, except a
+    /// failed checksum's, which carries no message of its own.
+    pub first_ordinal: usize,
+}
+
 /// Summary of compaction potential across all states.
 #[derive(Clone, Debug)]
 pub struct CompactionSummary {
@@ -59,8 +92,29 @@ pub struct CompactionSummary {
 /// Magic bytes for store manifest.
 const STORE_MAGIC: &[u8; 4] = b"RST\0";
 
-/// Current store format version.
+/// Store format version of a store every release reads: the MANIFEST is the
+/// magic and this byte. A new store starts at it, and stays at it until it
+/// first holds something a build without a format feature can't read.
 const STORE_VERSION: u8 = 1;
+
+/// Store format version of a store whose MANIFEST also names format
+/// features: after the magic and this byte, a little-endian `u64` of feature
+/// bits. Builds that know only version 1 refuse such a store at open
+/// ("Unsupported store version: 2"), before they read any of it, instead of
+/// meeting a record they can't decode part way through the log. This build
+/// refuses a feature bit it doesn't know the same way.
+const STORE_VERSION_FEATURES: u8 = 2;
+
+/// Format feature: the log holds `StateOperation::AppendMany` records. Set
+/// in the MANIFEST before the first one is written.
+const FEATURE_APPEND_MANY: u64 = 1 << 0;
+
+/// Every format feature this build reads.
+const KNOWN_FEATURES: u64 = FEATURE_APPEND_MANY;
+
+/// The length of a MANIFEST's header, the magic and the version byte, which
+/// every MANIFEST holds.
+const MANIFEST_HEADER_LEN: u64 = STORE_MAGIC.len() as u64 + 1;
 
 /// Admission state protected by the store's write mutex.
 #[derive(Default)]
@@ -74,6 +128,11 @@ struct WriteState {
     /// Subscribers hear of it once one does, as its caller does. At most one
     /// is ever pending, since a mutation first finishes a failed checkpoint.
     pending_branch_event: Option<BranchEvent>,
+
+    /// The format features the MANIFEST on disk names (0 for a version 1
+    /// manifest). A write that needs one it lacks rewrites the MANIFEST
+    /// first; see `Store::require_features`.
+    features: u64,
 }
 
 /// A branch change to announce once a checkpoint persists it.
@@ -124,35 +183,223 @@ pub struct Store {
 
     /// What `open` had to recover, for [`Store::recovery`].
     recovery: Option<RecoveryReport>,
+
+    /// The latest snapshot outcome taken in for each state a write reached,
+    /// per branch, for [`Store::snapshot_failures`]. A write takes its
+    /// snapshot after it drops the write lock, so outcomes can come in out
+    /// of order; each is taken in only if no later write's has been. A
+    /// state's entry outlives its failure, keeping the sequence for that
+    /// check, until its branch is deleted or the store closes.
+    snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotOutcome>>>,
+}
+
+/// The snapshot outcome a [`Store`] has taken in last for one state on one
+/// branch.
+struct SnapshotOutcome {
+    /// The sequence of the write it came from, or of the snapshot record
+    /// that ended a failure.
+    sequence: Sequence,
+    /// The failure, where the outcome was one, counting the writes in a row
+    /// whose snapshot failed.
+    failure: Option<SnapshotFailure>,
 }
 
 impl Store {
     /// Open an existing store or create a new one.
+    ///
+    /// A directory that holds any of a store's files (`MANIFEST`,
+    /// `records.log`, `state.bin`, `branches.bin`, a symbolic link counting
+    /// even when its target is missing) is opened, so one whose `MANIFEST`
+    /// is missing or unusable is refused, with open's account of what it
+    /// found, whatever `create_if_missing` says. Otherwise it is created into
+    /// (when `create_if_missing` is set) only if it is missing or holds
+    /// nothing but what a new store can sit beside: what a fresh volume's
+    /// root holds (`lost+found` from mke2fs; `.fseventsd`,
+    /// `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`, which macOS adds
+    /// to a volume it mounts; `System Volume Information` and
+    /// `$RECYCLE.BIN`, which Windows adds), Finder's `.DS_Store`, the `LOCK`
+    /// and `blobs/` a create
+    /// leaves when it stops before its manifest, and a checkpoint's staging
+    /// file, as a create leaves when it stops during its manifest save. A
+    /// directory holding anything else, such as a mistaken path to a project,
+    /// isn't taken for a place to put a store. A directory whose entries
+    /// can't be listed, as one this process may write and search but not
+    /// read, fails with the listing's I/O error, naming it, whatever
+    /// `create_if_missing` says.
+    ///
+    /// The directory is looked at before create takes the store's lock, so
+    /// another create can finish in between. Create then finds the
+    /// `MANIFEST` that create wrote and refuses the directory, and this
+    /// opens the store there instead, as if it had been there to begin with.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
-        if config.path.exists() {
-            Self::open(config)
-        } else if config.create_if_missing {
-            Self::create(config)
+        if Self::present_store_file(&config.path)?.is_some() {
+            return Self::open(config);
+        }
+        if let Some(other) = Self::foreign_entry(&config.path)? {
+            return Err(StoreError::InvalidFormat(format!(
+                "{} has no MANIFEST and holds {other}, so it isn't a Chronicle store or an empty place for one",
+                config.path.display()
+            )));
+        }
+        if config.create_if_missing {
+            let created = Self::create(config.clone());
+            Self::open_if_another_created(config, created)
         } else {
             Err(StoreError::NotInitialized)
         }
     }
 
+    /// What `open_or_create` returns once its `create` has run. A create
+    /// refused with `InvalidOperation` where the directory now holds a
+    /// `MANIFEST` lost to another create that finished after
+    /// `open_or_create` looked, and the store that one made is opened (with
+    /// open's account of a `MANIFEST` it can't read). Where the directory
+    /// can't be looked at again, that error is returned: the refusal is
+    /// true only of what create saw under the lock. Any other result is
+    /// returned as it is.
+    fn open_if_another_created(config: StoreConfig, created: Result<Self>) -> Result<Self> {
+        match created {
+            Err(StoreError::InvalidOperation(refusal)) => match Self::present_store_file(&config.path) {
+                Ok(Some("MANIFEST")) => Self::open(config),
+                Err(error) => Err(error.into()),
+                Ok(_) => Err(StoreError::InvalidOperation(refusal)),
+            },
+            other => other,
+        }
+    }
+
+    /// The first entry of `path` a new store can't sit beside, if any; none
+    /// for a missing directory. An error listing the directory is returned,
+    /// naming it: a directory whose entries can't be read can't be told
+    /// empty.
+    fn foreign_entry(path: &Path) -> std::io::Result<Option<String>> {
+        let allowed = |name: &str| {
+            [
+                "lost+found",
+                ".fseventsd",
+                ".Spotlight-V100",
+                ".Trashes",
+                ".TemporaryItems",
+                "System Volume Information",
+                "$RECYCLE.BIN",
+                ".DS_Store",
+                "LOCK",
+                "blobs",
+            ]
+            .contains(&name)
+                || name.starts_with(crate::atomic_file::STAGING_PREFIX)
+        };
+        let listing_error = |error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot list {} to tell whether a new store can go there: {error}",
+                    path.display()
+                ),
+            )
+        };
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(listing_error(error)),
+        };
+        for entry in entries {
+            let name = entry.map_err(listing_error)?.file_name().to_string_lossy().into_owned();
+            if !allowed(&name) {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a new store.
+    ///
+    /// Refuses a directory that already holds a store: creating over one
+    /// used to keep its records but publish empty state and branch indexes
+    /// over its own at the first sync (#34). Use [`Store::open`] or
+    /// [`Store::open_or_create`] for a store that may exist. A `MANIFEST`
+    /// that open can't read (empty, cut short, another file's bytes, a
+    /// version or format features this build doesn't know) is refused too,
+    /// with what is wrong with it, and isn't written over; so is one that
+    /// isn't a regular file, which create doesn't open. For one too short to
+    /// hold a header, as a create from a release before 0.6 could leave, the
+    /// refusal says to remove it and create again where the directory holds
+    /// no data file.
+    ///
+    /// It never writes a MANIFEST over a store's own, so it can't drop the
+    /// format features a version 2 MANIFEST names. A create that did, even
+    /// one that then failed on the lock, let a build that predates those
+    /// features open a store it can't read: open names a feature again only
+    /// for the records past the checkpoint.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
-        fs::create_dir_all(config.path.join("blobs"))?;
 
-        // Write manifest
-        Self::write_manifest(&config.path)?;
-
-        // Acquire lock
+        // The lock comes first, so a create aimed at a store another process
+        // has open writes nothing there before it fails (#34).
         let lock_file = Self::acquire_lock(&config.path)?;
+        if let Some(found) = Self::present_store_file(&config.path)? {
+            let manifest = config.path.join("MANIFEST");
+            return Err(StoreError::InvalidOperation(if found == "MANIFEST"
+                && matches!(fs::metadata(&manifest), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                format!(
+                    "create: {}, so create won't write through it; once it leads to the store's MANIFEST, open the store with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
+                    Self::link_to_nothing(&manifest)
+                )
+            } else if found == "MANIFEST" {
+                // Only a regular file is read: opening a FIFO waits for a
+                // writer.
+                let metadata = fs::metadata(&manifest);
+                // Only a create from a release before 0.6, which wrote the
+                // MANIFEST in place, or damage from outside leaves one cut
+                // short of its header. Beside no data file it holds nothing
+                // of a store, and removing it is the way out.
+                let short = matches!(&metadata, Ok(m) if m.is_file() && m.len() < MANIFEST_HEADER_LEN);
+                let checked = match metadata {
+                    Ok(metadata) if !metadata.is_file() => Err("it isn't a regular file".to_string()),
+                    _ if short => Err("it ends before a MANIFEST's header does".to_string()),
+                    _ => Self::verify_manifest(&config.path).map(drop).map_err(|error| error.to_string()),
+                };
+                match checked {
+                    Ok(()) => format!(
+                        "create: {} already holds a Chronicle store; open it with Store::open or Store::open_or_create (open or openOrCreate in the Node API)",
+                        config.path.display()
+                    ),
+                    Err(problem) => format!(
+                        "create: {} can't be read as a Chronicle store's MANIFEST: {problem}; create won't write over it{}",
+                        manifest.display(),
+                        if short {
+                            format!(
+                                ". If {} holds no records.log, state.bin or branches.bin, remove the MANIFEST and create again",
+                                config.path.display()
+                            )
+                        } else {
+                            String::new()
+                        },
+                    ),
+                }
+            } else {
+                format!(
+                    "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over",
+                    config.path.display()
+                )
+            }));
+        }
+
+        // With the lock held, staging files here were left by interrupted
+        // saves, a create's own manifest save among them (as open sweeps them).
+        crate::atomic_file::remove_staging_files(&config.path);
+        fs::create_dir_all(config.path.join("blobs"))?;
+        Self::write_manifest(&config.path)?;
 
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
+        // A blobs/ directory can outlive the rest of an earlier store (create
+        // refuses only the store's data files), and hold staging files its
+        // interrupted blob stores left. The lock is held, as at open.
+        blobs.remove_staging_files();
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
 
@@ -174,6 +421,7 @@ impl Store {
             write_lock: Mutex::new(WriteState::default()),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery: None,
+            snapshot_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -184,6 +432,27 @@ impl Store {
 
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
+        let mut features = Self::verify_manifest(&config.path)?;
+
+        // A MANIFEST naming format features was renamed into place by a
+        // batch's mark, and a failed directory sync after that rename left
+        // the rename in the system's cache only: this open reads version 2
+        // from there, and a power loss could still bring back version 1
+        // under a log that holds a batch. Syncing the directory the rename
+        // was made in before anything is written makes it durable, or fails
+        // the open. That is the store's directory, or, for a MANIFEST that
+        // is a symbolic link, the one holding the file it leads to, which
+        // the mark renamed into.
+        #[cfg(unix)]
+        if features != 0 {
+            let manifest = config.path.join("MANIFEST");
+            crate::atomic_file::sync_directory_of(&manifest).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("open: {} names format features: {error}", manifest.display()),
+                )
+            })?;
+        }
 
         // With the lock held, no save of this store is in progress, so its
         // own staging files here were left by interrupted saves. The sweep's
@@ -255,6 +524,8 @@ impl Store {
         let mut undecodable = 0u64;
         let mut first_undecodable = None;
         let mut on_missing_branches = 0u64;
+        // Format features the replayed tail's operations need.
+        let mut replayed_features = 0u64;
         let index = RecordIndex::rebuild_from_log_with(
             config.path.join("records.idx"),
             &log,
@@ -273,6 +544,7 @@ impl Store {
                     first_undecodable.get_or_insert(offset);
                     return Ok(());
                 };
+                replayed_features |= Self::features_of(&update.operation);
 
                 // Earlier releases saved a branch only at sync, so a crash can
                 // leave updates on a branch that branches.bin doesn't hold.
@@ -328,6 +600,23 @@ impl Store {
                  nothing can read those branches"
             );
         }
+        // The MANIFEST names a feature before the first record that needs it
+        // is written, so this finds nothing missing unless that rewrite was
+        // lost, as a power loss can lose a rename that wasn't synced. The
+        // tail past the checkpoint is all this sees; it marks the store
+        // again so an older build still refuses it. A mark lost once the
+        // batch is behind the checkpoint isn't found here, which is why
+        // create never writes over an existing MANIFEST.
+        let missing = replayed_features & !features;
+        if missing != 0 {
+            tracing::warn!(
+                features = missing,
+                "the log holds records whose format features the MANIFEST doesn't name; \
+                 naming them now"
+            );
+            features |= missing;
+            Self::write_manifest_features(&config.path, features)?;
+        }
         let unregistered_states: Vec<_> = unregistered.into_iter().collect();
         let recovery = match log.recovery() {
             Some(torn) => Some(RecoveryReport {
@@ -361,9 +650,13 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
-            write_lock: Mutex::new(WriteState::default()),
+            write_lock: Mutex::new(WriteState {
+                features,
+                ..WriteState::default()
+            }),
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery,
+            snapshot_failures: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -382,6 +675,92 @@ impl Store {
     /// `tracing` warnings out of logs.
     pub fn recovery(&self) -> Option<RecoveryReport> {
         self.recovery.clone()
+    }
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, one entry per branch and state, ordered by branch id
+    /// and then state id; empty when none has.
+    ///
+    /// A write that reaches a state's snapshot thresholds takes the snapshot
+    /// after its record, and that snapshot's failure doesn't fail the write
+    /// (see [`Store::update_state`]). Each such failure is logged as a
+    /// `tracing` warning and counted here, with the sequence of the write
+    /// and the error, so a process that shows no `tracing` output, such as a
+    /// Node one, can see it. An entry goes once a snapshot of the state on
+    /// that branch is recorded (by a later write, `compact_state`,
+    /// `create_snapshot_if_needed`, or a snapshot the caller writes), or a
+    /// write finds none due. A snapshot asked for directly, which returns
+    /// its own error, isn't counted. Entries are kept in memory only: a
+    /// reopened store lists none until a write's snapshot fails again. A
+    /// deleted branch's entries aren't listed. Each write's outcome comes in
+    /// after the write, so writes to a state that race can finish out of
+    /// order: the entry follows the latest of them by sequence, and an
+    /// earlier write's outcome that comes in after it changes nothing.
+    pub fn snapshot_failures(&self) -> Vec<SnapshotFailure> {
+        self.snapshot_failures
+            .lock()
+            .iter()
+            .filter(|(branch_id, _)| self.branches.get_branch_by_id(**branch_id).is_some())
+            .flat_map(|(_, states)| states.values().filter_map(|outcome| outcome.failure.clone()))
+            .collect()
+    }
+
+    /// Count a failed snapshot after the write at `sequence` to `state_id`
+    /// on `branch`, for `snapshot_failures`, unless the outcome of a later
+    /// write is already in.
+    fn note_snapshot_failure(&self, branch: &Branch, state_id: &str, sequence: Sequence, error: &StoreError) {
+        let mut outcomes = self.snapshot_failures.lock();
+        let states = outcomes.entry(branch.id).or_default();
+        let failure = |failures| SnapshotFailure {
+            state_id: state_id.to_string(),
+            branch_id: branch.id,
+            branch: branch.name.clone(),
+            failures,
+            sequence,
+            error: error.to_string(),
+        };
+        match states.get_mut(state_id) {
+            Some(outcome) if outcome.sequence > sequence => {}
+            Some(outcome) => {
+                let before = outcome.failure.as_ref().map_or(0, |failure| failure.failures);
+                outcome.sequence = sequence;
+                outcome.failure = Some(failure(before + 1));
+            }
+            None => {
+                states.insert(
+                    state_id.to_string(),
+                    SnapshotOutcome {
+                        sequence,
+                        failure: Some(failure(1)),
+                    },
+                );
+            }
+        }
+    }
+
+    /// End the failure `snapshot_failures` holds for `state_id` on
+    /// `branch_id`, if any: the write or snapshot record at `sequence` took
+    /// a snapshot of it, or found none due. Nothing changes where the
+    /// outcome of a later write is already in.
+    fn clear_snapshot_failure(&self, branch_id: BranchId, state_id: &str, sequence: Sequence) {
+        let mut outcomes = self.snapshot_failures.lock();
+        let states = outcomes.entry(branch_id).or_default();
+        match states.get_mut(state_id) {
+            Some(outcome) if outcome.sequence > sequence => {}
+            Some(outcome) => {
+                outcome.sequence = sequence;
+                outcome.failure = None;
+            }
+            None => {
+                states.insert(
+                    state_id.to_string(),
+                    SnapshotOutcome {
+                        sequence,
+                        failure: None,
+                    },
+                );
+            }
+        }
     }
 
     /// Toggle the auto-snapshot pass inside `update_state`.
@@ -500,6 +879,24 @@ impl Store {
         } else {
             Ok(None)
         }
+    }
+
+    /// Get several records by ID in one call: for each ID, in the order
+    /// given, what `get_record` returns for it, `None` for an ID with no
+    /// record. IDs may repeat. Store-wide, like `get_record`. The IDs are
+    /// looked up together and the records read under one hold of the log
+    /// file, rather than one each, so a long list holds other reads and
+    /// appends of the store until it is read; split it to let them in. A
+    /// record that fails to read returns its error, which doesn't name the
+    /// ID; `get_record` on each ID finds which.
+    pub fn get_records(&self, ids: &[RecordId]) -> Result<Vec<Option<Record>>> {
+        let offsets = self.index.get_offsets_by_id(ids);
+        let found: Vec<u64> = offsets.iter().flatten().copied().collect();
+        let mut records = self.log.read_many_at(&found)?.into_iter();
+        Ok(offsets
+            .iter()
+            .map(|offset| offset.and_then(|_| records.next()))
+            .collect())
     }
 
     /// Get the IDs of a type's records across all branches, in ascending ID
@@ -661,11 +1058,42 @@ impl Store {
     /// before it's recorded: an Edit's index against the state's length, and a
     /// Tree operation against its strategy. Other operations are recorded as
     /// given, and one that can't be applied, such as an Append of bytes that
-    /// aren't JSON, shows when the state is next materialized. That can be
-    /// this call's own auto-snapshot, so an error can come back for an
-    /// operation already recorded (issue #39).
+    /// aren't JSON, shows when the state is next materialized.
     ///
-    /// Snapshots are automatically created when thresholds are reached.
+    /// An `AppendMany` with no items is refused. The first `AppendMany` a
+    /// store records also rewrites its MANIFEST, before the record is
+    /// written, to format version 2 with the batch feature named, so a build
+    /// that predates the operation refuses the store when it opens it, where
+    /// the directory holding the MANIFEST (for a linked one, the one holding
+    /// its target) is synced: on Windows, where this process may not open
+    /// that directory, or without directory sync, a power loss can undo the
+    /// move to version 2 and keep the batch (see Breaking in the changelog).
+    /// A store never asked to record one keeps version 1, which every release
+    /// opens. If that rewrite fails, the error is returned and the batch
+    /// isn't recorded; when only the directory sync after its rename failed,
+    /// the MANIFEST is already at version 2, and the next batch makes the
+    /// rewrite again. On Unix, an open that finds a version 2 MANIFEST syncs
+    /// the directory the mark renamed into (the store's, or for a linked
+    /// MANIFEST the one holding its target) before it writes anything, and
+    /// fails if that sync fails, except where this process may not open it or
+    /// the system doesn't sync directories, as for every checkpoint save. If
+    /// the record then fails to be written, the error is returned and the
+    /// store stays at version 2 with no batch.
+    ///
+    /// Snapshots are created automatically when the state's thresholds are
+    /// reached, by the write that reaches them, once its record is written
+    /// (unless `set_auto_snapshot(false)`). A recorded write never returns
+    /// an error from that snapshot (issue #39). If the snapshot fails, on a
+    /// full disk, say, or because it materializes an item that doesn't
+    /// parse, the failure is logged as a `tracing` warning and counted in
+    /// [`Store::snapshot_failures`], and the write returns its record. The
+    /// snapshot stays due, so the next write to the state on that branch
+    /// checks the cadence again and takes the snapshot if one is still due
+    /// (after an Edit or Redact, a delta snapshot waits for the next full
+    /// one). A state whose snapshot keeps failing, such as one
+    /// holding an Append that isn't JSON, logs a warning at each write that
+    /// finds a snapshot due, each counted there too, and takes none until a
+    /// `Set` replaces its value.
     pub fn update_state(
         &self,
         state_id: &str,
@@ -717,6 +1145,13 @@ impl Store {
     /// id as a string (matching the napi `JsRecord.id` shape); `sequence_field`
     /// receives the assigned sequence as a number. Existing values at those
     /// keys are overwritten.
+    ///
+    /// An `item` that isn't a JSON object is refused with `InvalidOperation`
+    /// and writes nothing. Once the item is recorded, the call returns its
+    /// record: if the snapshot the write takes after it fails, that is
+    /// logged and counted in `snapshot_failures`, and the next write to the
+    /// state takes the snapshot if one is still due, as for `update_state`
+    /// (issue #39).
     pub fn append_to_state_json_with_identity(
         &self,
         state_id: &str,
@@ -743,26 +1178,223 @@ impl Store {
         sequence_field: &str,
     ) -> Result<Record> {
         self.update_state_with_builder(branch_id, state_id, false, None, move |id, seq| {
-            let mut item = item;
-            let map = match &mut item {
-                serde_json::Value::Object(map) => map,
-                _ => {
-                    return Err(StoreError::InvalidOperation(
-                        "payload must be a JSON object".into(),
-                    ));
-                }
-            };
-            map.insert(
-                id_field.to_string(),
-                serde_json::Value::String(id.0.to_string()),
-            );
-            map.insert(
-                sequence_field.to_string(),
-                serde_json::Value::Number(serde_json::Number::from(seq.0)),
-            );
-            let bytes = serde_json::to_vec(&item)?;
+            let bytes = stamp_identity(item, id_field, sequence_field, id, seq)?;
             Ok(StateOperation::Append(bytes))
         })
+    }
+
+    /// Append several items to an AppendLog state as one record, at one
+    /// sequence (a `StateOperation::AppendMany`), and say which ordinals
+    /// they took. See `AppendedBatch::first_ordinal`.
+    ///
+    /// Reads see the batch as they would see the same items appended one at
+    /// a time, except that a historical read or a fork cut by sequence keeps
+    /// or drops it whole, as it has one sequence. It counts as one operation
+    /// toward the state's snapshot cadence, and the first batch a store
+    /// records marks its MANIFEST so that releases which predate batches
+    /// refuse the store, where the directory holding the MANIFEST is synced
+    /// (see `update_state`). Each item must be one JSON value, as for an
+    /// `Append`. An empty batch is refused with `InvalidOperation` and
+    /// writes nothing. Once the batch is recorded, the call returns it: if
+    /// the snapshot the write takes after it fails, that is logged and
+    /// counted in `snapshot_failures`, and the next write to the state takes
+    /// the snapshot if one is still due, as for `update_state` (issue #39).
+    pub fn append_many_to_state(
+        &self,
+        state_id: &str,
+        items: Vec<Vec<u8>>,
+    ) -> Result<AppendedBatch> {
+        self.append_many_to_state_on(self.branches.current_id(), state_id, items)
+    }
+
+    /// `append_many_to_state` against the given branch.
+    pub fn append_many_to_state_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items: Vec<Vec<u8>>,
+    ) -> Result<AppendedBatch> {
+        let empty = items.is_empty();
+        self.append_batch_with_builder(branch_id, state_id, empty, move |_, _| Ok(items))
+    }
+
+    /// `append_many_to_state` with each item given as a JSON value,
+    /// serialized as `serde_json` writes it.
+    pub fn append_many_to_state_json(
+        &self,
+        state_id: &str,
+        items: &[serde_json::Value],
+    ) -> Result<AppendedBatch> {
+        self.append_many_to_state_json_on(self.branches.current_id(), state_id, items)
+    }
+
+    /// `append_many_to_state_json` against the given branch.
+    pub fn append_many_to_state_json_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items: &[serde_json::Value],
+    ) -> Result<AppendedBatch> {
+        let items = items
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.append_many_to_state_on(branch_id, state_id, items)
+    }
+
+    /// Append several JSON objects to an AppendLog state as one record, at
+    /// one sequence, writing that record's id and sequence into each of them
+    /// first: the batched form of `append_to_state_json_with_identity`, as
+    /// `append_many_to_state_json` is of a plain JSON append.
+    ///
+    /// Each item is stamped exactly as `append_to_state_json_with_identity`
+    /// stamps its one item: `id_field` receives the record id as a string,
+    /// `sequence_field` the sequence as a number, existing values at those
+    /// keys are overwritten, and the object is serialized as `serde_json`
+    /// writes it. The batch is one record, so every item of it carries the
+    /// same id and sequence, those of the record that holds it. A reader
+    /// that cuts by an item's sequence (`create_branch_at` at that
+    /// sequence keeps the item, at the one before drops it) keeps or drops
+    /// the whole batch with it.
+    ///
+    /// Otherwise it is `append_many_to_state_json`: reads see the items as
+    /// the same stamped objects appended one at a time, the batch counts as
+    /// one operation toward the snapshot cadence, the returned
+    /// `AppendedBatch` says which ordinals they took, and the first batch a
+    /// store records marks its MANIFEST so that releases which predate
+    /// batches refuse the store, where the directory holding the MANIFEST is
+    /// synced (see `update_state`). A store never asked to
+    /// record a batch, by this call or another, keeps the format every
+    /// release opens.
+    ///
+    /// Refused with `InvalidOperation`, writing nothing, when `items` is
+    /// empty, any item isn't a JSON object, or `id_field` and
+    /// `sequence_field` are the same key, where an item couldn't hold both
+    /// the record id and the sequence. Once the batch is recorded,
+    /// the call returns it: if the snapshot the write takes after it fails,
+    /// that is logged and counted in `snapshot_failures`, and the next write
+    /// to the state takes the snapshot if one is still due, as for
+    /// `update_state` (issue #39).
+    pub fn append_many_to_state_json_with_identity(
+        &self,
+        state_id: &str,
+        items: &[serde_json::Value],
+        id_field: &str,
+        sequence_field: &str,
+    ) -> Result<AppendedBatch> {
+        self.append_many_to_state_json_with_identity_on(
+            self.branches.current_id(),
+            state_id,
+            items,
+            id_field,
+            sequence_field,
+        )
+    }
+
+    /// `append_many_to_state_json_with_identity` against the given branch.
+    pub fn append_many_to_state_json_with_identity_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        items: &[serde_json::Value],
+        id_field: &str,
+        sequence_field: &str,
+    ) -> Result<AppendedBatch> {
+        if id_field == sequence_field {
+            return Err(StoreError::InvalidOperation(format!(
+                "the id field and the sequence field are both \"{id_field}\": an item holds one \
+                 value at a key, so it can't carry both the record id and the sequence there"
+            )));
+        }
+        // Refused before the batch counts the state's items, which it may do
+        // before it takes the write lock: a refused batch changes nothing.
+        if let Some(at) = items.iter().position(|item| !item.is_object()) {
+            return Err(StoreError::InvalidOperation(format!(
+                "payload must be a JSON object: item {} of the batch is not",
+                at
+            )));
+        }
+        self.append_batch_with_builder(branch_id, state_id, items.is_empty(), |id, seq| {
+            items
+                .iter()
+                .map(|item| stamp_identity(item.clone(), id_field, sequence_field, id, seq))
+                .collect()
+        })
+    }
+
+    /// The batched appends' common path: records the items `items_builder`
+    /// gives, which may name the `(record_id, sequence)` the batch is about
+    /// to take, as one `AppendMany` through `update_state_with_builder`, and
+    /// reads the first ordinal under the same lock. `empty` says the builder
+    /// gives no items: such a batch is refused here, before it takes the
+    /// lock, so it does nothing, not even the checkpoint an earlier failure
+    /// left pending, which every write first finishes.
+    fn append_batch_with_builder<F>(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        empty: bool,
+        items_builder: F,
+    ) -> Result<AppendedBatch>
+    where
+        F: FnOnce(RecordId, Sequence) -> Result<Vec<Vec<u8>>>,
+    {
+        if empty {
+            return Err(StoreError::InvalidOperation(
+                "AppendMany needs at least one item: an empty batch would be a record that \
+                 appends nothing"
+                    .into(),
+            ));
+        }
+        // A head this session hasn't checked has its items counted here,
+        // before the write lock, as the count reads the state's whole value
+        // and every other writer of the store would wait on the lock while
+        // it did. The count is kept only if the head is where it was when
+        // the value was read, so it is the count of that head's value, and
+        // the builder below finds it checked, or, where a write in between
+        // left the head unchecked, counts again under the lock.
+        self.state
+            .checked_item_count(branch_id, state_id)
+            .map_err(Self::count_error)?;
+        let mut first_ordinal = 0;
+        let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
+            let items = items_builder(id, seq)?;
+            // The builder runs under `write_lock`, so no other write to this
+            // state can land between this count and the batch. A head still
+            // unchecked has its items counted here, unless the batch is
+            // empty, which is refused before it's written.
+            if !items.is_empty() {
+                first_ordinal = self
+                    .state
+                    .checked_item_count(branch_id, state_id)
+                    .map_err(Self::count_error)?;
+            }
+            Ok(StateOperation::AppendMany(items))
+        })?;
+        Ok(AppendedBatch {
+            record,
+            first_ordinal,
+        })
+    }
+
+    /// The error of a batch whose count failed to read the state's chain,
+    /// which says the batch wasn't recorded, as a failed mark does: an I/O
+    /// error keeps its kind, and a record whose framing is bad stays
+    /// `InvalidFormat`. A failed checksum carries no message to add it to,
+    /// and comes back as it is.
+    fn count_error(error: StoreError) -> StoreError {
+        match error {
+            StoreError::Io(error) => StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "the batch was not recorded, because reading the state's records to count its items failed: {error}"
+                ),
+            )),
+            StoreError::InvalidFormat(message) => StoreError::InvalidFormat(format!(
+                "the batch was not recorded, because a record the count read is damaged: {message}"
+            )),
+            other => other,
+        }
     }
 
     /// Core update path. Builds the operation via a closure that receives the
@@ -803,8 +1435,17 @@ impl Store {
 
         let operation = operation_builder(next_id, next_seq)?;
 
+        if operation.contains_empty_batch() {
+            return Err(StoreError::InvalidOperation(
+                "AppendMany needs at least one item: an empty batch would be a record that \
+                 appends nothing"
+                    .into(),
+            ));
+        }
+
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
-        // - Append: Always succeeds, no validation needed
+        // - Append, AppendMany: Always succeed, no validation needed (beyond
+        //   the batch holding an item, above)
         // - Edit: Just check index < len
         // - Redact: No validation: when it's applied, a range past the end is
         //   clamped to the length and a reversed one removes nothing
@@ -843,9 +1484,16 @@ impl Store {
                     )));
                 }
             }
-            // Append, Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
+            // Append, AppendMany, Set, Snapshot, DeltaSnapshot,
+            // TreeDeltaSnapshot - no validation needed
             _ => {}
         }
+
+        // A record a build without one of the format features can't read
+        // goes into the log only once the MANIFEST names that feature, so
+        // such a build refuses the store at open instead of part way
+        // through it. If the MANIFEST can't be rewritten, nothing is written.
+        self.require_features(&mut write, Self::features_of(&operation))?;
 
         // Create the state update record payload
         let update = StateUpdateRecord {
@@ -898,18 +1546,55 @@ impl Store {
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
 
+        // A snapshot record, whoever wrote it, ends any snapshot failure on
+        // record for the state on this branch.
+        if matches!(
+            operation,
+            StateOperation::Snapshot(_)
+                | StateOperation::DeltaSnapshot(_)
+                | StateOperation::TreeDeltaSnapshot(_)
+        ) {
+            self.clear_snapshot_failure(branch.id, state_id, next_seq);
+        }
+
         // Broadcast state delta to subscribers
         self.subscriptions.broadcast_state_delta(state_id, operation, next_seq);
         self.subscriptions.broadcast_branch_head(&branch.name, next_seq);
 
         // Auto-snapshot if needed (based on strategy thresholds)
         // Done after indices/branch update so the snapshot sees consistent state
+        //
+        // The write is recorded by now, so the snapshot's failure isn't
+        // returned (issue #39): a caller that got an error would take the
+        // write for one that didn't happen, and one that retried a write that
+        // isn't idempotent would make it twice. It is logged instead. The
+        // snapshot stays due, since only a snapshot record resets the state's
+        // count of operations since the last one, so the next write to the
+        // state on this branch checks the cadence again and takes the
+        // snapshot if one is still due (after an Edit or Redact, a delta
+        // snapshot waits for the next full one).
         if !skip_auto_snapshot && self.auto_snapshot_enabled.load(Ordering::Relaxed) {
             // Drop the lock before calling auto_snapshot to avoid deadlock
             drop(write);
             // Same branch as the write above — never the cursor, which may
-            // point elsewhere (or have moved) by now.
-            self.auto_snapshot_if_needed(branch.id, state_id)?;
+            // point elsewhere (or have moved) by now. Besides the warning, the
+            // failure is counted for `snapshot_failures`, as a Node process
+            // shows no `tracing` output.
+            match self.auto_snapshot_if_needed(branch.id, state_id) {
+                Ok(()) => self.clear_snapshot_failure(branch.id, state_id, next_seq),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        state_id,
+                        branch = %branch.name,
+                        sequence = next_seq.0,
+                        "the snapshot after a recorded state write failed: the write stands and \
+                         returns its record, and the next write to the state takes the snapshot \
+                         if one is still due"
+                    );
+                    self.note_snapshot_failure(&branch, state_id, next_seq, &error);
+                }
+            }
         }
 
         Ok(record)
@@ -1285,7 +1970,13 @@ impl Store {
     /// Get a single item of an AppendLog state by index, as raw JSON bytes.
     ///
     /// O(item size) once the per-item cache is warm (see `get_state_slice`).
-    /// Returns `None` if the state doesn't exist or the index is out of range.
+    /// Returns `None` if the state doesn't exist, the index is out of range,
+    /// or the state's value isn't an array (where `get_state_slice` errors).
+    /// Returns `StoreError::Deserialization` if the state's bytes aren't one
+    /// JSON value (no bytes at all read as an empty list), as
+    /// `get_state_slice` does, except the last item served from the head
+    /// record alone, which reads no earlier item: an `Append`'s, or a batch's
+    /// last item where this session found the head's count exact.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -1302,6 +1993,41 @@ impl Store {
         // from the head record in O(1) instead of re-materializing the whole
         // state (see StateManager::get_state_item).
         self.state.get_state_item(branch_id, state_id, index)
+    }
+
+    /// Several items of an AppendLog state by ordinal, as raw JSON bytes, in
+    /// one call: for each ordinal, in the order given, the item
+    /// `get_state_item` returns for it, `None` where the ordinal is out of
+    /// range, the state has no value, or its value isn't an array; the
+    /// `Deserialization` error where the state's bytes aren't one JSON value
+    /// (no bytes at all read as an empty list), as for `get_state_item`,
+    /// except the last item served from the head
+    /// record alone, which reads no earlier item. It answers otherwise than
+    /// `get_state_item` only at the last index of a head whose count this
+    /// session hasn't found exact (unchecked, or checked on a value that
+    /// doesn't materialize), where `get_state_item` answers from the stored
+    /// count and this from the value. Ordinals may repeat and come in any
+    /// order. All of them are answered from one version of the state, read at
+    /// most once, and an empty request reads nothing (see
+    /// `StateManager::get_state_items_by_ordinal`).
+    pub fn get_state_items_by_ordinal(
+        &self,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.get_state_items_by_ordinal_on(self.branches.current_id(), state_id, ordinals)
+    }
+
+    /// `get_state_items_by_ordinal` against the given branch.
+    pub fn get_state_items_by_ordinal_on(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.branch_by_id(branch_id)?;
+        self.state
+            .get_state_items_by_ordinal(branch_id, state_id, ordinals)
     }
 
     /// Get the last N items from an AppendLog state.
@@ -1356,6 +2082,18 @@ impl Store {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     items_collected.push(value);
+                }
+                StateOperation::AppendMany(items) => {
+                    // Newest first, as the walk collects; only as many as
+                    // the tail still needs.
+                    for item in items.iter().rev() {
+                        if items_collected.len() >= count {
+                            break;
+                        }
+                        let value: serde_json::Value = serde_json::from_slice(item)
+                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                        items_collected.push(value);
+                    }
                 }
                 StateOperation::DeltaSnapshot(data) => take_last(&mut items_collected, data)?,
                 StateOperation::Snapshot(data) | StateOperation::Set(data) => {
@@ -1664,9 +2402,11 @@ impl Store {
 
     /// Compute items added since the last delta or full snapshot.
     ///
-    /// This walks the chain collecting Append operations until hitting a full or
-    /// delta snapshot, and returns None if it meets a Redact, an Edit, a Set or a
-    /// Delta first.
+    /// This walks the chain collecting the items of Append and AppendMany
+    /// operations until hitting a full or delta snapshot, and returns None if
+    /// it meets a Redact, an Edit, a Set or a Delta first. A delta snapshot
+    /// replaces every operation it covers on later reads, so an append-only
+    /// operation this walk skipped would lose its items.
     fn compute_delta_items(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Vec<u8>>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
@@ -1686,6 +2426,15 @@ impl Store {
                     let value: serde_json::Value = serde_json::from_slice(item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     appended_items.push(value);
+                }
+                StateOperation::AppendMany(items) => {
+                    // Newest first, like the walk: the reverse below puts
+                    // the batch back in its own order.
+                    for item in items.iter().rev() {
+                        let value: serde_json::Value = serde_json::from_slice(item)
+                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                        appended_items.push(value);
+                    }
                 }
                 StateOperation::Snapshot(_) | StateOperation::DeltaSnapshot(_) => {
                     // Hit a snapshot, stop collecting
@@ -2448,6 +3197,10 @@ impl Store {
         self.branches.delete_branch(name)?;
         if let Some(branch_id) = branch_id {
             self.state.retire_branch(branch_id);
+            // A snapshot outcome that comes in after this, from a write that
+            // finished on the branch before it went, is kept until close;
+            // `snapshot_failures` doesn't list it.
+            self.snapshot_failures.lock().remove(&branch_id);
         }
 
         write.checkpoint_required = true;
@@ -2521,6 +3274,38 @@ impl Store {
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.sync_locked(&mut write)
+    }
+
+    /// Make the MANIFEST name `required` format features before a record
+    /// that needs them is written. A no-op once it names them all, so it
+    /// writes the MANIFEST at most once per feature over the store's life.
+    /// Call only while holding write_lock.
+    fn require_features(&self, write: &mut WriteState, required: u64) -> Result<()> {
+        if required & !write.features == 0 {
+            return Ok(());
+        }
+        let features = write.features | required;
+        Self::write_manifest_features(&self.config.path, features).map_err(|error| match error {
+            StoreError::Io(error) => StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "the batch was not recorded, because of an error marking {} for batched appends: {error}",
+                    self.config.path.join("MANIFEST").display()
+                ),
+            )),
+            other => other,
+        })?;
+        write.features = features;
+        Ok(())
+    }
+
+    /// The format features a store must name to hold `operation`.
+    fn features_of(operation: &StateOperation) -> u64 {
+        if operation.contains_append_many() {
+            FEATURE_APPEND_MANY
+        } else {
+            0
+        }
     }
 
     /// Finish a failed metadata checkpoint before admitting another mutation.
@@ -2778,41 +3563,142 @@ impl Store {
 
     // --- Private Helpers ---
 
-    fn write_manifest(path: &Path) -> Result<()> {
-        use std::io::Write;
+    /// The files whose presence means a directory already holds a store.
+    const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
 
-        let manifest_path = path.join("MANIFEST");
-        let mut file = File::create(manifest_path)?;
-
-        file.write_all(STORE_MAGIC)?;
-        file.write_all(&[STORE_VERSION])?;
-        file.sync_all()?;
-
-        Ok(())
+    fn link_to_nothing(link: &Path) -> String {
+        format!(
+            "{} is a symbolic link (to {}) that leads to nothing",
+            link.display(),
+            fs::read_link(link)
+                .map(|target| target.display().to_string())
+                .unwrap_or_else(|_| "a path that can't be read".into())
+        )
     }
 
-    fn verify_manifest(path: &Path) -> Result<()> {
+    fn present_store_file(path: &Path) -> std::io::Result<Option<&'static str>> {
+        for file in Self::STORE_FILES {
+            match fs::symlink_metadata(path.join(file)) {
+                Ok(_) => return Ok(Some(file)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
+                    ))
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    // Published whole, through a staging file renamed over it, so a crash
+    // mid-write can't leave a MANIFEST that create refuses and open can't read.
+    // Only create calls it, under the lock and once it has found no MANIFEST,
+    // so a version 2 MANIFEST is never written back to version 1.
+    fn write_manifest(path: &Path) -> Result<()> {
+        crate::atomic_file::Checkpoint::default().save(&path.join("MANIFEST"), &[STORE_MAGIC, &[STORE_VERSION]])
+    }
+
+    /// Rewrite the MANIFEST as format version 2 naming `features`. It goes
+    /// through a new file beside it, synced and renamed over it, so a crash
+    /// leaves the old MANIFEST or the new one, never a torn one. Where the
+    /// system and the directory's permissions allow, the directory is synced
+    /// too, so the new one is on disk before this returns; where they don't
+    /// (a directory this process may not open, a system that doesn't sync
+    /// directories, or Windows, where nothing here syncs one), a power loss
+    /// can undo the rename, as it can undo a checkpoint save. A version 1
+    /// store is never written back: features are only ever added.
+    fn write_manifest_features(path: &Path, features: u64) -> Result<()> {
+        crate::atomic_file::Checkpoint::default().save(
+            &path.join("MANIFEST"),
+            &[STORE_MAGIC, &[STORE_VERSION_FEATURES], &features.to_le_bytes()],
+        )
+    }
+
+    /// Check the MANIFEST and return the format features it names (none
+    /// for version 1).
+    fn verify_manifest(path: &Path) -> Result<u64> {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
-        let mut file = File::open(manifest_path)?;
+        let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => match Self::present_store_file(path) {
+                Err(error) => error.into(),
+                Ok(Some("MANIFEST")) => StoreError::InvalidFormat(format!(
+                    "{}, so the store can't be opened until it leads to the store's MANIFEST: mount the volume it points into, say, or point the link where that MANIFEST is",
+                    Self::link_to_nothing(&manifest_path)
+                )),
+                Ok(Some(found)) => StoreError::InvalidFormat(format!(
+                    "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
+                    path.display()
+                )),
+                Ok(None) => StoreError::InvalidFormat(format!(
+                    "{} has no MANIFEST, so it isn't a Chronicle store",
+                    path.display()
+                )),
+            },
+            _ => e.into(),
+        })?;
 
+        // A file that ends inside the header (empty, as a create from a
+        // release before 0.6 could leave it, or cut short) isn't a MANIFEST,
+        // which is its format; the error says which file it is.
+        let header_error = |error: std::io::Error| -> StoreError {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                StoreError::InvalidFormat(format!(
+                    "{} ends before a MANIFEST's header does: {error}",
+                    manifest_path.display()
+                ))
+            } else {
+                error.into()
+            }
+        };
         let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
+        file.read_exact(&mut magic).map_err(header_error)?;
         if &magic != STORE_MAGIC {
             return Err(StoreError::InvalidFormat("Invalid store magic".into()));
         }
 
         let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
-        if version[0] != STORE_VERSION {
-            return Err(StoreError::InvalidFormat(format!(
-                "Unsupported store version: {}",
-                version[0]
-            )));
+        file.read_exact(&mut version).map_err(header_error)?;
+        match version[0] {
+            STORE_VERSION => Ok(0),
+            STORE_VERSION_FEATURES => {
+                let mut bits = [0u8; 8];
+                file.read_exact(&mut bits)
+                    .map_err(|e| Self::feature_bits_error(&manifest_path, e))?;
+                let features = u64::from_le_bytes(bits);
+                let unknown = features & !KNOWN_FEATURES;
+                if unknown != 0 {
+                    return Err(StoreError::InvalidFormat(format!(
+                        "Store uses format features this build can't read (bits {unknown:#x}); \
+                         it was written by a newer chronicle"
+                    )));
+                }
+                Ok(features)
+            }
+            other => Err(StoreError::InvalidFormat(format!(
+                "Unsupported store version: {other}"
+            ))),
         }
+    }
 
-        Ok(())
+    /// The error for a failed read of a version 2 MANIFEST's feature bits.
+    /// A file that ends before them is too short, which is its format; any
+    /// other failure is the read's own I/O error. Both name the file.
+    fn feature_bits_error(manifest: &Path, error: std::io::Error) -> StoreError {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            StoreError::InvalidFormat(format!(
+                "Store manifest version 2 {} is too short to hold its format features: {error}",
+                manifest.display()
+            ))
+        } else {
+            StoreError::Io(std::io::Error::new(
+                error.kind(),
+                format!("reading the format features of {}: {error}", manifest.display()),
+            ))
+        }
     }
 
     // LOCK is opened without truncating it, and nothing is written to it. It
@@ -2851,6 +3737,34 @@ impl Store {
 
         Ok(lock_file)
     }
+}
+
+/// The item an identity append stores: `item`, which must be a JSON object,
+/// with the record id it is about to be written under at `id_field` (as a
+/// string, matching the napi `JsRecord.id` shape) and that record's sequence
+/// at `sequence_field` (as a number), serialized as `serde_json` writes it.
+/// Existing values at those keys are overwritten. The single and the batched
+/// identity appends both stamp through this, so an item reads the same
+/// whichever wrote it, given the same record.
+fn stamp_identity(
+    mut item: serde_json::Value,
+    id_field: &str,
+    sequence_field: &str,
+    id: RecordId,
+    seq: Sequence,
+) -> Result<Vec<u8>> {
+    let map = item.as_object_mut().ok_or_else(|| {
+        StoreError::InvalidOperation("payload must be a JSON object".into())
+    })?;
+    map.insert(
+        id_field.to_string(),
+        serde_json::Value::String(id.0.to_string()),
+    );
+    map.insert(
+        sequence_field.to_string(),
+        serde_json::Value::Number(serde_json::Number::from(seq.0)),
+    );
+    Ok(serde_json::to_vec(&item)?)
 }
 
 /// What a failed `try_lock_exclusive` on LOCK means. fs2 reports another
@@ -2926,6 +3840,13 @@ impl StateItemIterator {
                     let value: serde_json::Value = serde_json::from_slice(&item)
                         .map_err(|e| StoreError::Deserialization(e.to_string()))?;
                     self.items_buffer.push(value);
+                }
+                StateOperation::AppendMany(items) => {
+                    for item in items {
+                        let value: serde_json::Value = serde_json::from_slice(&item)
+                            .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                        self.items_buffer.push(value);
+                    }
                 }
                 StateOperation::Snapshot(data) | StateOperation::DeltaSnapshot(data) => {
                     let arr: Vec<serde_json::Value> = serde_json::from_slice(&data)
@@ -3188,6 +4109,45 @@ mod tests {
         assert_eq!(retrieved.payload, record.payload);
     }
 
+    // Open reads each record twice: the log's validating scan, then the
+    // index rebuild. The rebuild's iterator used to read every record a
+    // second time to find where it ended, so open read each one three times.
+    #[test]
+    fn open_reads_each_record_once_to_validate_and_once_to_index() {
+        use crate::records::RECORD_DECODES;
+        let dir = TempDir::new().unwrap();
+        {
+            let store = Store::create(test_config(&dir)).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "log".to_string(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 10,
+                        full_snapshot_every: 4,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for i in 0..40 {
+                let input = RecordInput::json("event", &json!({ "n": i })).unwrap();
+                store.append(input).unwrap();
+                store
+                    .update_state("log", StateOperation::Append(format!("{i}").into_bytes()))
+                    .unwrap();
+            }
+        }
+        let records = reopen(test_config(&dir)).log.iter().count() as u64;
+        assert!(
+            records > 80,
+            "40 records, 40 appends and their snapshots: {records}"
+        );
+
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        let store = reopen(test_config(&dir));
+        assert_eq!(RECORD_DECODES.with(|decodes| decodes.get()), 2 * records);
+        assert_eq!(store.get_state_len("log").unwrap(), Some(40));
+    }
+
     #[test]
     fn test_store_blob() {
         let dir = TempDir::new().unwrap();
@@ -3334,6 +4294,252 @@ mod tests {
                 other => panic!("{code}: {other:?}"),
             }
         }
+    }
+
+    /// open_or_create looks at the directory before create takes the lock,
+    /// so another create can finish in between. Create then finds that
+    /// store's MANIFEST and refuses; open_or_create opens the store instead.
+    #[test]
+    fn open_or_create_opens_the_store_a_create_it_lost_to_made() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let winner = Store::create(config.clone()).unwrap();
+            winner
+                .register_state(StateRegistration {
+                    id: "s".into(),
+                    strategy: crate::types::StateStrategy::Snapshot,
+                    initial_value: None,
+                })
+                .unwrap();
+            winner.update_state("s", StateOperation::Set(b"1".to_vec())).unwrap();
+            winner.sync().unwrap();
+        }
+        let lost = Store::create(config.clone());
+        assert!(matches!(lost, Err(StoreError::InvalidOperation(_))));
+        let opened = Store::open_if_another_created(config.clone(), lost).unwrap();
+        assert_eq!(opened.get_state("s").unwrap().unwrap(), b"1");
+        drop(opened);
+
+        // A store another process holds open stays its own: Locked comes
+        // back as it is.
+        let held = Store::open(config.clone()).unwrap();
+        assert!(matches!(
+            Store::open_if_another_created(config.clone(), Store::create(config.clone())),
+            Err(StoreError::Locked)
+        ));
+        drop(held);
+
+        // A damaged store (a data file, no MANIFEST) isn't one to open: the
+        // refusal comes back as it is.
+        let damaged = TempDir::new().unwrap();
+        let damaged_config = test_config(&damaged);
+        fs::create_dir_all(&damaged_config.path).unwrap();
+        fs::write(damaged_config.path.join("records.log"), b"x").unwrap();
+        let refused = Store::create(damaged_config.clone());
+        assert!(matches!(
+            Store::open_if_another_created(damaged_config, refused),
+            Err(StoreError::InvalidOperation(message)) if message.contains("records.log")
+        ));
+    }
+
+    /// Where open_or_create can't look at the directory again after its
+    /// create was refused, it returns that error, not the refusal, which is
+    /// true only of what create saw under the lock. Unix only: a directory
+    /// of mode 0o000 can't be looked into, except by root.
+    #[cfg(unix)]
+    #[test]
+    fn open_or_create_returns_the_error_of_its_second_look() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        fs::create_dir_all(&config.path).unwrap();
+        fs::set_permissions(&config.path, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::symlink_metadata(config.path.join("MANIFEST"))
+            .map_or_else(|e| e.kind() != std::io::ErrorKind::PermissionDenied, |_| true);
+        let result = Store::open_if_another_created(
+            config.clone(),
+            Err(StoreError::InvalidOperation("create: refused".into())),
+        );
+        fs::set_permissions(&config.path, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            eprintln!("skipped: the directory could be looked into despite its mode (running as root?)");
+            return;
+        }
+        match result {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{error}");
+                assert!(error.to_string().contains(&*config.path.to_string_lossy()), "{error}");
+            }
+            Err(other) => panic!("expected the second look's I/O error, got {other}"),
+            Ok(_) => panic!("opened a store it couldn't look at"),
+        }
+    }
+
+    /// A version 2 MANIFEST that ends before its feature bits is too short;
+    /// any other failure to read them is the read's I/O error.
+    #[test]
+    fn only_a_short_manifest_is_reported_as_too_short() {
+        let manifest = Path::new("/stores/s/MANIFEST");
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer");
+        match Store::feature_bits_error(manifest, eof) {
+            StoreError::InvalidFormat(message) => {
+                assert!(message.contains("too short") && message.contains("/stores/s/MANIFEST"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let failed = std::io::Error::new(std::io::ErrorKind::Other, "Input/output error");
+        match Store::feature_bits_error(manifest, failed) {
+            StoreError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                let text = error.to_string();
+                assert!(
+                    text.contains("/stores/s/MANIFEST") && text.contains("Input/output error") && !text.contains("too short"),
+                    "{text}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A store with a state "s" of `items` appended one at a time, synced,
+    /// closed and opened again, so the head comes from `state.bin` and this
+    /// session hasn't checked its count. Auto-snapshots are off.
+    fn reopened_with_items(dir: &TempDir, items: usize) -> Store {
+        let config = test_config(dir);
+        {
+            let store = Store::create(config.clone()).unwrap();
+            store.set_auto_snapshot(false);
+            store
+                .register_state(StateRegistration {
+                    id: "s".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for i in 0..items {
+                store
+                    .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(i)).unwrap()))
+                    .unwrap();
+            }
+            store.sync().unwrap();
+        }
+        let store = Store::open(config).unwrap();
+        store.set_auto_snapshot(false);
+        store
+    }
+
+    /// A batch counts the items of a head this session hasn't checked before
+    /// it takes the write lock, so other writers don't wait while it reads
+    /// the whole value: here the count is read while the test holds the
+    /// lock, and the batch, once it has the lock, takes that count without
+    /// reading the value again.
+    #[test]
+    fn a_batch_counts_an_unchecked_head_before_it_takes_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 3);
+        let before = store.state_reconstruction_count();
+        std::thread::scope(|scope| {
+            let held = store.write_lock.lock();
+            let batch = scope.spawn(|| store.append_many_to_state_json("s", &[json!("a")]));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while store.state_reconstruction_count() == before && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let read_while_held = store.state_reconstruction_count() - before;
+            drop(held);
+            let batch = batch.join().unwrap().unwrap();
+            assert_eq!(read_while_held, 1, "the count read the value while another writer held the lock");
+            assert_eq!(batch.first_ordinal, 3);
+        });
+        assert_eq!(store.state_reconstruction_count(), before + 1, "the batch read the value once");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    /// A count that can't read the state's records fails the batch with the
+    /// read's I/O error, which says the batch was not recorded, and writes
+    /// nothing.
+    #[test]
+    fn a_batch_whose_count_fails_to_read_says_it_was_not_recorded() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 3);
+        let head = store.current_branch().head;
+        let size = store.stats().unwrap().total_size_bytes;
+        *store.log.read_failures.lock() = 1;
+        match store.append_many_to_state_json("s", &[json!("a")]) {
+            Err(StoreError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                let text = error.to_string();
+                assert!(
+                    text.contains("the batch was not recorded, because reading the state's records")
+                        && text.contains("injected read failure"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected the read's I/O error, got {:?}", other.map(|b| b.first_ordinal)),
+        }
+        assert_eq!(store.current_branch().head, head, "no record");
+        assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
+        assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
+    }
+
+    /// The snapshot outcomes of writes are noted after the write lock is
+    /// dropped, so they can arrive out of order. An older one never
+    /// overwrites a newer one.
+    #[test]
+    fn an_older_snapshot_outcome_never_replaces_a_newer_one() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        let branch = store.current_branch();
+        let error = |n: u64| StoreError::Corruption(format!("attempt {n}"));
+        let listed = || {
+            store
+                .snapshot_failures()
+                .into_iter()
+                .map(|failure| (failure.state_id, failure.failures, failure.sequence.0, failure.error))
+                .collect::<Vec<_>>()
+        };
+
+        // A failure noted after a later write's clear.
+        store.clear_snapshot_failure(branch.id, "a", Sequence(6));
+        store.note_snapshot_failure(&branch, "a", Sequence(5), &error(5));
+        assert_eq!(listed(), [], "the later write found no snapshot due, or took it");
+
+        // A clear arriving after a later write's failure.
+        store.note_snapshot_failure(&branch, "b", Sequence(7), &error(7));
+        store.clear_snapshot_failure(branch.id, "b", Sequence(6));
+        assert_eq!(listed(), [("b".into(), 1, 7, error(7).to_string())]);
+
+        // Two failures noted out of order keep the later one as the latest.
+        store.note_snapshot_failure(&branch, "b", Sequence(9), &error(9));
+        store.note_snapshot_failure(&branch, "b", Sequence(8), &error(8));
+        assert_eq!(listed(), [("b".into(), 2, 9, error(9).to_string())]);
+
+        // Outcomes in order still apply: a clear ends the failure, and a
+        // later failure starts a new count. A write's own outcome comes in
+        // after the clear its snapshot record made, at the same sequence.
+        store.clear_snapshot_failure(branch.id, "b", Sequence(10));
+        assert_eq!(listed(), []);
+        store.note_snapshot_failure(&branch, "b", Sequence(10), &error(10));
+        assert_eq!(listed(), [("b".into(), 1, 10, error(10).to_string())]);
+    }
+
+    /// Deleting a branch drops the snapshot failures held for it, rather
+    /// than only leaving them out of the list.
+    #[test]
+    fn deleting_a_branch_drops_its_snapshot_failures() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        let side = store.create_branch("side", None).unwrap();
+        store.note_snapshot_failure(&side, "s", Sequence(1), &StoreError::Corruption("x".into()));
+        assert_eq!(store.snapshot_failures().len(), 1);
+        store.delete_branch("side").unwrap();
+        assert_eq!(store.snapshot_failures(), []);
+        assert!(!store.snapshot_failures.lock().contains_key(&side.id), "nothing is kept for it");
     }
 
     #[test]
@@ -3559,6 +4765,89 @@ mod tests {
         let tail = store.get_state_tail("items", 0).unwrap().unwrap();
         let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
         assert_eq!(arr, Vec::<i32>::new());
+    }
+
+    /// A delta snapshot holds the items appended since the snapshot before
+    /// it, and its chain still links back through the appends it covers. A
+    /// tail longer than the newest delta must skip those appends and take
+    /// its older items from the delta before, as reconstruction does, not
+    /// collect the covered appends a second time. Batches and single
+    /// appends alike.
+    #[test]
+    fn test_get_state_tail_past_a_delta_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 3,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        }).unwrap();
+        store.register_state(StateRegistration {
+            id: "batched".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 2,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        }).unwrap();
+
+        // Deltas after 3, 6 and 9; 10 and 11 are newer than the last.
+        for i in 1..=11 {
+            store.update_state("items", StateOperation::Append(
+                serde_json::to_vec(&i).unwrap()
+            )).unwrap();
+        }
+        // Batches [1,2] [3]: delta; [4,5] [6,7,8]: delta; [9,10,11].
+        for batch in [&[1, 2][..], &[3], &[4, 5], &[6, 7, 8], &[9, 10, 11]] {
+            store.update_state("batched", StateOperation::AppendMany(
+                batch.iter().map(|i| serde_json::to_vec(i).unwrap()).collect()
+            )).unwrap();
+        }
+        assert_eq!(store.get_compaction_stats("items").unwrap().delta_snapshots_since_full, 3);
+        assert_eq!(store.get_compaction_stats("batched").unwrap().delta_snapshots_since_full, 2);
+
+        for id in ["items", "batched"] {
+            for count in 1..=11 {
+                let tail = store.get_state_tail(id, count).unwrap().unwrap();
+                let arr: Vec<i32> = serde_json::from_slice(&tail).unwrap();
+                assert_eq!(arr, ((12 - count as i32)..=11).collect::<Vec<_>>(), "{id}: tail of {count}");
+            }
+        }
+    }
+
+    /// The items a delta snapshot is built from: every item of every batch
+    /// since the last snapshot, in order, between the single appends.
+    #[test]
+    fn test_compute_delta_items_takes_every_item_of_a_batch() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.register_state(StateRegistration {
+            id: "items".to_string(),
+            strategy: crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        }).unwrap();
+        let main = store.current_branch().id;
+
+        store.update_state("items", StateOperation::Append(b"0".to_vec())).unwrap();
+        store.compact_state("items").unwrap();
+        store.update_state("items", StateOperation::Append(b"1".to_vec())).unwrap();
+        store.update_state("items", StateOperation::AppendMany(
+            vec![b"2".to_vec(), b"{\"b\":3, \"a\":3}".to_vec(), b"4".to_vec()]
+        )).unwrap();
+        store.update_state("items", StateOperation::Append(b"5".to_vec())).unwrap();
+        store.update_state("items", StateOperation::AppendMany(vec![b"6".to_vec()])).unwrap();
+
+        let delta = store
+            .compute_delta_items(main, "items")
+            .unwrap()
+            .expect("no Redact, Edit, Set or Delta since the snapshot");
+        assert_eq!(delta, br#"[1,2,{"b":3,"a":3},4,5,6]"#);
     }
 
     #[test]

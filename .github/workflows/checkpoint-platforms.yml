@@ -7,18 +7,26 @@ on:
       - 'Cargo.toml'
       - 'build.rs'
       - 'src/**'
+      - 'tests/append_many.rs'
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
+      - 'tests/create_existing_store.rs'
+      - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
+      - 'tests/review7_fixes.rs'
   pull_request:
     paths:
       - '.github/workflows/checkpoint-platforms.yml'
       - 'Cargo.toml'
       - 'build.rs'
       - 'src/**'
+      - 'tests/append_many.rs'
       - 'tests/atomic_metadata.rs'
       - 'tests/blob_storage.rs'
+      - 'tests/create_existing_store.rs'
+      - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
+      - 'tests/review7_fixes.rs'
   workflow_dispatch:
 
 permissions:
@@ -65,3 +73,26 @@ jobs:
 
       - name: Lock error mapping test
         run: cargo test --lib store::tests::only_another_holders_lock_is_reported_as_locked -- --nocapture
+
+      # A store's first batch marks its MANIFEST through the same checkpoint
+      # replacement, and create's refusal of an existing store reads each
+      # platform's directory entries and file types, so their tests run here
+      # too.
+      - name: Batched append tests
+        run: cargo test --test append_many -- --nocapture
+
+      - name: Create over an existing store tests
+        run: cargo test --test create_existing_store -- --nocapture
+
+      # The batch replay tests re-run the test binary as a child that writes
+      # and is killed or exits, then cut the log with set_len: nothing
+      # Unix-only. The filter picks the three batch tests.
+      - name: Batch replay after a crash tests
+        run: cargo test --test crash_state_recovery batch -- --nocapture
+
+      # Open syncs the directory a marked MANIFEST was renamed into, and
+      # these two Unix tests (a directory that can't be listed, a MANIFEST
+      # linked into another directory) reach it; on Windows they are
+      # compiled out and the filter runs none.
+      - name: Marked store open tests
+        run: cargo test --test review7_fixes a_marked_store -- --nocapture

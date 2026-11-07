@@ -12,6 +12,307 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.6.0 — 2026-11-07
+
+### Breaking
+
+- **Hosts that open a store on an existing directory that holds no store:**
+  with `create_if_missing`, which `JsStore.openOrCreate` always sets,
+  `Store::open_or_create` now creates a store in a directory that's empty or
+  holds nothing but a fresh volume's root entries, Finder's `.DS_Store`, or
+  what a create left when it stopped before its manifest (see Fixed), where
+  it used to fail. So a store started before its volume mounts (an unmounted
+  mount point is an empty directory) now creates a fresh empty store that the
+  volume hides once it mounts, and a pre-flight check that opens a path to see
+  whether it's a store now makes one. **To act:** if you relied on that
+  failure, check the mount or the directory before opening. connectome-host's
+  store audit is one such caller. **Unchanged:** existing stores keep opening,
+  and a missing directory is still created (#34).
+
+- **On-disk format (stores that record a batched append):** a state update
+  can now be a `StateOperation::AppendMany`, several items appended to an
+  append-log state as one record (see Added). Earlier releases can't decode
+  it, so the first `AppendMany` a store records rewrites its `MANIFEST` from
+  format version 1 to version 2, naming the feature, before the record is
+  written. An earlier release refuses a version 2 store at open with
+  "Unsupported store version: 2". Without the mark, what an earlier release
+  does depends on the release and on where the batch lies. Past the last
+  checkpoint, 0.5.0 and 0.5.1 replay the log's state updates and skip the
+  batch, which they can't decode; then, at the next update in that state's
+  chain on that branch that isn't itself a batch, they refuse to open the
+  store as corrupt ("cannot replay state ... does not match
+  checkpoint/replayed head"). When only batches follow (the batch, or a run
+  of them, is the newest), they open the store, and the state lacks all
+  their items. The only sign is one `tracing` warning at each open,
+  counting the state updates it skipped, which reaches only a host that
+  installs a `tracing` subscriber; their Node binding installs none.
+  Releases before 0.5.0 don't replay updates past the last checkpoint at
+  all: they open the store without a word, and the state is what the
+  checkpoint holds, without the batch or any other update to it past the
+  checkpoint. Before the checkpoint, on 0.3.0 to 0.5.1, a read of that
+  state that reaches the batch fails with "unknown variant `AppendMany`";
+  releases before 0.3.0 can't read the MessagePack state updates 0.3.0 and
+  later write at all.
+  An open that replays a batch the `MANIFEST` doesn't name, as when a power
+  loss undid the rewrite, names it again, but it sees only the batches past
+  the last checkpoint: a mark lost once they are behind it stays lost.
+  `Store::create` (and `JsStore.create`) now refuses a directory that
+  already holds a store, and takes the lock before it writes anything (see
+  Fixed), so it can't drop the mark. Before that fix, a create aimed at a
+  version 2 store rewrote its `MANIFEST` to version 1, even when it then
+  failed because the store was open, and an earlier release's `create`
+  still does.
+  **Who needs to act:**
+  - **Hosts that may be rolled back:** anyone who may roll a host back to an
+    earlier chronicle after the host has written a batch, from Rust or with
+    the Node API's `appendManyToStateJson` or
+    `appendManyToStateJsonWithIdentity`. context-manager's presentation
+    index is meant to be its first writer. A host rolled back must not call
+    `create` on a store it means to open. Where the directory holding the
+    `MANIFEST` (for a linked one, the one holding its target) isn't synced
+    (this process may not open it, the system doesn't sync
+    directories, or the host runs Windows, where chronicle syncs none), a
+    power loss can undo the `MANIFEST`'s move to version 2 and keep the
+    batch's record, as it can undo a checkpoint save; an earlier release
+    then meets the batch in a store without the mark, as described above.
+  - **State-delta subscribers:** a batch reaches a subscription as one
+    `state_delta` event, whose `operation` is an `AppendMany` holding all of
+    its items (see Added). A subscriber that keeps its own copy of an
+    append-log state from `Append` events must take each item of an
+    `AppendMany` too, in order, as if each were an `Append`, or it misses
+    every item a batch writes. That holds for a subscriber that never calls
+    the batch APIs itself, once any writer to the store does. chronicle's
+    dev UI was one: its append-log viewer took only `Append`, and in this
+    release it takes the items of an `AppendMany` as well.
+
+  **Migration:** none going forward. Going back, there is none for a store
+  that holds a batch: keep a copy of the store from before the upgrade if a
+  rollback must stay possible. A first batch whose rewritten `MANIFEST` is in
+  place but whose record never is, because of a crash, an error syncing the
+  `MANIFEST`'s directory or an error writing the record (a full disk, say),
+  can leave a version 2 store that holds no batch, which earlier releases
+  refuse all the same. This release refuses a version 2 `MANIFEST` naming a
+  feature it doesn't know, as written by a later one.
+  **Unchanged:** a store never asked to record a batch keeps its version 1
+  `MANIFEST` and opens on every earlier release, as before, and existing
+  stores open on this one unchanged. The record framing and the encodings of
+  `state.bin`, `branches.bin` and `state-indexes.bin` are unchanged.
+- **Rust embedders:** `StateOperation` has a new variant, `AppendMany`, for
+  several items appended to an append-log state as one record (see Added).
+  An exhaustive `match` on `StateOperation`, including one on the
+  `operation` of a `StoreEvent::StateDelta`, needs an arm for it, even in a
+  host that never writes a batch. **Unchanged:** the existing variants,
+  their fields and their encoded names (see the MessagePack pin in
+  `tests/state_update_encoding.rs`); only the added arm is needed.
+
+### Added
+
+- `appendManyToStateJsonWithIdentity(stateId, items, idField, sequenceField)`
+  in the Node API is the batched form of `appendToStateJsonWithIdentity`, as
+  `appendManyToStateJson` is of `appendToStateJson`. It appends several JSON
+  objects to an append-log state as one record, at one sequence (an
+  `AppendMany`), and returns `{ record, firstOrdinal }`. Before the record is
+  written, each item gets that record's id (a string, as `JsRecord.id`) at
+  `idField` and its sequence (a number) at `sequenceField`, overwriting what
+  was there, as the single form stamps its one item. The batch is one
+  record, so every item of it carries the same id and sequence, and a
+  branch cut by an item's sequence keeps or drops the whole batch. Reads see
+  the stamped items as if each had been appended alone, and field indexes
+  take each at its own ordinal. An empty `items`, an item that isn't an
+  object, or an `idField` equal to `sequenceField` (an item holds one value
+  at a key, so it couldn't carry both the record id and the sequence)
+  throws and writes nothing, and leaves the `MANIFEST` alone. (The single form takes equal
+  names, and leaves the sequence at that key, over the id.) Once the batch
+  is recorded the call returns it: a failure of the snapshot the write
+  takes after its record goes into the store's snapshot-failure report
+  (`snapshotFailures()`), not thrown, and the next write to the state
+  takes the snapshot if one is still due (see Fixed, #39). Like any
+  batch, the first one a store records moves its `MANIFEST` to version 2;
+  a store never asked to record a batch keeps version 1 (a batch that
+  fails after its mark still leaves version 2; see Breaking). In Rust:
+  `Store::append_many_to_state_json_with_identity(_on)`, which returns an
+  `AppendedBatch` and refuses those with `InvalidOperation`.
+
+- `StateOperation::AppendMany(Vec<Vec<u8>>)` (Rust): appends several items to
+  an append-log state as one record, at one sequence, through
+  `update_state`. These reads see what the same items appended one `Append`
+  at a time would give: the value, `get_state_len`, tails, slices, point
+  lookups (except the last item on a value that doesn't materialize; see
+  `get_state_item`), iteration, delta snapshots, field indexes (each item
+  at its own ordinal), and replay after a crash, which keeps or drops a batch whole. A
+  historical read or a fork cut by sequence keeps or drops it whole too,
+  since it has one sequence. It counts as one operation toward the
+  snapshot cadence, as a `TreeBatch` does, and is append-only, so delta
+  snapshots go on as for single appends. The per-item cache advances through
+  a batch without re-materializing, and the head-record fast path serves its
+  last item. `update_state` refuses an empty batch with `InvalidOperation`.
+  A state-delta event, and `getStateUpdateJson`, carry it as
+  `{"AppendMany": [[...], ...]}`, each item an integer array as an `Append`'s
+  is. Storing one changes the store's format; see Breaking.
+
+- Batched calls in the Node API, each one call where the single forms take
+  one per item:
+  - `appendManyToStateJson(stateId, items)` appends several JSON items to an
+    append-log state as one record, at one sequence (an `AppendMany`), and
+    returns `{ record, firstOrdinal }`: the record, and the index the first
+    item took, so item `i` is at `firstOrdinal + i` without a read. That
+    index is the state's length just before the batch, as `getStateLen`
+    counts it once the batch has counted the items, taken under the write
+    lock. Reads see the items as if each
+    were appended with `appendToStateJson`, except that a historical read or
+    a branch cut by sequence keeps or drops the batch whole, as it has one
+    sequence. An empty `items` throws and writes nothing. The first batch a
+    store records moves its `MANIFEST` to version 2 (see Breaking).
+    **Migration:** a store last written by chronicle 0.1.0 to 0.4.x can hold
+    an append-log state whose stored count is wrong (see 0.5.0's Fixed): one
+    whose chain holds, from those builds, a `Redact` running past the end, a
+    `Delta` that replaced the value, or an empty `Set` or `Delta`. Such a
+    count stays as it is until a full snapshot, or an array or empty
+    `setState`, sets it again. For each state the store already held when
+    it was opened, and each a `createBranchAt` branch starts with, this
+    release counts the items at the state's first batch on each branch
+    (`appendManyToStateJson`, `appendManyToStateJsonWithIdentity`, or
+    `Store::append_many_to_state` and its forms in Rust), reading the
+    state's whole value once, before the batch takes the write lock, so
+    other writers wait only for each record it reads, not the whole count;
+    if another write to the state lands during the count, the batch counts
+    again under the write lock. That batch's `firstOrdinal`,
+    `getStateLen` after it, and the index a later `editStateItem` is
+    checked against then follow the state's items. A value that isn't a
+    JSON array, or holds an item that isn't JSON, has no items to count:
+    the batch takes the stored count, is recorded, and the state then fails
+    to materialize, as after an `appendToState` to it, so the items can't be
+    read at those indices. A record of the state's chain that
+    fails to read (an I/O error, a failed checksum, a record whose framing
+    is bad) fails the batch with that error, writing nothing; the error
+    says the batch was not recorded, except a failed checksum's, which
+    carries no message of its own. In Rust, a
+    `DeltaSnapshot` a caller writes through `update_state` leaves the count
+    as it was, and the next batch counts the items again the same way.
+    `compactState` before the batch takes a full snapshot, which recounts
+    them too.
+  - `getStateItemsJson(stateId, ordinals)` returns, for each index in the
+    order given, what `getStateItemJson` returns for it (except at the last
+    index of a head whose count this session hasn't found exact (unchecked, or
+    checked on a value that doesn't materialize), where `getStateItemJson`
+    answers from the stored count and this from the value): `null` for an
+    index that is negative or out of range, for a state with no value, and for
+    a state whose value isn't an array (see Changed). Indices may repeat and
+    come in any order. All the answers come from one version of the state,
+    which a cold cache materializes at most once for the call, not once per
+    index. A request with no index of zero or more (an empty one, or one of
+    negative indices only) reads nothing. An index past the end costs what it
+    costs `getStateItemJson`: on a cold cache, the one materialization that
+    finds the end.
+  - `getRecords(ids)` returns, for each ID in the order given, what
+    `getRecord` returns for it, or `null` for an ID with no record. The IDs
+    are looked up together and the records read under one hold of the log
+    file, so a long list holds other reads and appends of the store until
+    it is read; split it to let them in. A malformed ID throws before
+    anything is read.
+  - A batch reaches subscribers as one `state_delta` event, whose
+    `operation` is `{"AppendMany": [[...], ...]}` with each item an integer
+    array, as an `Append`'s item is. The `JsStoreEvent.data` doc now says so.
+- Rust: `Store::append_many_to_state(_on)` and
+  `append_many_to_state_json(_on)` return an `AppendedBatch { record,
+  first_ordinal }`; `Store::get_state_items_by_ordinal(_on)` and
+  `StateManager::get_state_items_by_ordinal` read several items of a state
+  in one call; `Store::get_records` reads several records by ID, through
+  `RecordIndex::get_offsets_by_id` and `RecordLog::read_many_at`.
+
+- `snapshotFailures()` (`Store::snapshot_failures`) lists each state whose
+  snapshot after a recorded write failed at its most recent attempt, per
+  branch: the state, the branch, how many writes in a row failed to take
+  it, the sequence of the latest of them, and its error. The writes are
+  counted in sequence order: where writes to the state race, a failure that
+  comes in after a later write's outcome isn't counted, so the count can be
+  lower than the number that failed. A write whose own
+  snapshot fails still returns its record (#39), and the store logs a
+  `tracing` warning, which a Node process doesn't show. An entry goes once
+  a snapshot of the state on that branch is recorded or a write finds none
+  due. The list is kept in memory: a reopened store lists none until a
+  snapshot fails again.
+
+### Changed
+
+- Opening a directory with no `MANIFEST` now fails with `InvalidFormat` naming the directory, and saying whether it holds a damaged store's files or no store at all, instead of a bare `IO error: No such file or directory` that named neither (#34).
+- `Store::open` and `Store::open_or_create` (`open`, `openOrCreate`) on a `MANIFEST` that ends before its header does (empty, or cut short) now fail with `InvalidFormat` naming the file, instead of a bare `IO error: failed to fill whole buffer` that named none.
+- `Store::open_or_create` on a directory with no `MANIFEST` now fails with `InvalidFormat`, whatever `create_if_missing` says, when the directory holds a store's data files (`records.log`, `state.bin` or `branches.bin`), naming the file as `open` does, or anything else a new store can't sit beside, naming one of them. On a directory holding neither, with `create_if_missing` unset, it now fails with `NotInitialized`. Each used to fail with the bare IO `NotFound` (#34).
+
+- `getStateItemJson` and `Store::get_state_item(_on)` answer `null`
+  (`None`) for an index of zero or more on a state whose value isn't an
+  array, such as a Snapshot state holding an object, as they do for an
+  index out of range. They threw the deserialization error (`invalid type:
+  map, expected a sequence`). `getStateSlice` and `Store::get_state_slice(_on)`
+  still throw for such a state. A state whose bytes aren't JSON at all (no
+  bytes at all read as an empty list), such as `{`, still throws its
+  deserialization error from these lookups, and from the new
+  `getStateItemsJson` (see Added) too, except the last item served from the
+  head record alone (the state's newest append), which reads no earlier
+  item.
+
+- Opening a store reads each record of the log twice, once to validate it
+  and once to index it, where it read each three times: the iterator that
+  rebuilds the index read every record a second time to find where it
+  ended. It now reads each once, which also halves the reads of
+  `Store::iter_from(_on)` and of the record replay in
+  `catchUpSubscription`. Through a warm page cache, opening a store of
+  200,000 small records took 2.0 s where it took 2.9 s, and one pass of the
+  iterator 1.0 s where it took 1.9 s.
+
+### Fixed
+
+- `Store::create` (and `JsStore.create`) on a directory that already holds a store no longer resets it. It used to keep the records but publish empty state and branch indexes over the store's own at the first sync, losing every registration and branch with no error. It now refuses with `InvalidOperation`, naming the path, both for a store and for a damaged one (its `records.log`, `state.bin` or `branches.bin` without a `MANIFEST`), a store file left as a symbolic link counting even when its target is missing. It also takes the store's lock before writing anything, so a create aimed at a store another process has open no longer rewrites that store's `MANIFEST` before failing with `Locked`, and it writes `MANIFEST` atomically, so a crash can't leave one cut short (#34). Its refusals for a directory that already holds a store, and for a `MANIFEST` left as a symbolic link that leads to nothing, name the calls that open the store in both APIs: `Store::open` or `Store::open_or_create` (`open` or `openOrCreate` in the Node API). On a directory whose `MANIFEST` open can't read (empty, cut short, another file's bytes, a version or format features this build doesn't know) or isn't a regular file, it refuses with `InvalidOperation`, naming that file and what is wrong with it, and leaves it as it is, where it used to write over it; that refusal doesn't name `open` or `openOrCreate`, which fail on that file too. For a `MANIFEST` too short to hold its header (empty, as a create from an earlier release could leave it if interrupted), it says to remove the file and create again when the directory holds no `records.log`, `state.bin` or `branches.bin`.
+- `Store::open_or_create` on a directory without a `MANIFEST` that holds nothing but what a fresh volume's root holds (`lost+found` from mke2fs; `.fseventsd`, `.Spotlight-V100`, `.Trashes` and `.TemporaryItems` from macOS; `System Volume Information` and `$RECYCLE.BIN` from Windows), Finder's `.DS_Store`, or the `LOCK` and `blobs/` of a create that stopped before its manifest now creates the store there (with `create_if_missing`), instead of failing to open it (#34).
+
+- A state write no longer throws after its record is written when the
+  snapshot it takes after that record fails (#39). A write that reaches a
+  state's snapshot thresholds takes the snapshot right after its own record:
+  `update_state` (Rust) and every call that goes through it, such as
+  `appendToState`, `appendToStateJson`, `appendToStateJsonWithIdentity`,
+  `setState`, `editStateItem`, `redactStateItems`, `treeSet`, `treeRemove`
+  and `treeBatch`. If that snapshot failed, on a full disk, say, or
+  reading back an item that isn't JSON, the call threw although the write
+  was recorded, so a caller took it for a write that didn't happen, and one
+  that retried a write that isn't idempotent made it twice. The call now
+  returns its record, as the batched appends new in this release do (see
+  Added), and the failure goes into the store's snapshot-failure report
+  (`snapshotFailures()`; `Store::snapshot_failures`), which Rust and Node
+  callers can read: it counts the failures and keeps
+  the last one's error, state, branch and sequence. The store also
+  logs a `tracing` warning ("the snapshot after a recorded state write
+  failed") with the same fields, which reaches only a host that installs a
+  `tracing` subscriber; the Node binding installs none. The snapshot stays
+  due, and the next write to the state checks the cadence again and takes
+  the snapshot if one is still due (after an `editStateItem` or
+  `redactStateItems`, a delta snapshot waits for the next full one); a
+  state whose
+  snapshot keeps failing adds to the report, and logs, at each write that
+  finds one due, except that where writes to the state race, a failure that
+  comes in after a later write's outcome isn't counted.
+  A call whose own work is the snapshot, `compactState`
+  (`Store::compact_state`) or `Store::create_snapshot_if_needed`, still
+  returns its error. Refusals before the record still throw and record
+  nothing. For a batched append, those are an empty batch, an item that
+  isn't an object, an identity batch whose `idField` equals its
+  `sequenceField`, and a `MANIFEST` that can't be marked, and a stale count
+  the refused batch had already counted keeps the corrected count, which
+  the next sync saves.
+
+- The native module now builds with `lru` 0.18.2 or a later 0.18 release,
+  which fixes GHSA-rhfx-m35p-ff5j and RUSTSEC-2026-0253 (#68). chronicle's own
+  calls to `lru` reach neither.
+
+- A read of a state's items (`getStateItemJson`, `getStateSlice` and the
+  other item reads), or of a tree state's map (`treeGet`, `treeList`,
+  `treeDiff` and the other tree reads), that raced a write to the state on
+  the same branch could file the newer value under the head it had read
+  before the write. Another branch still at that head, a fork's, then read
+  that value as its own (#70). A value is now filed only under a head that
+  hasn't moved since it was read, and the batched calls new in this release
+  (see Added) file theirs the same way. Only a host that calls the store
+  from several threads can meet this: Node calls run one at a time.
+
 ## 0.5.1 — 2026-10-30
 
 ### Fixed
