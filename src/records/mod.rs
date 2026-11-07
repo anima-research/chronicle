@@ -7,4 +7,6 @@ mod log;
 mod index;
 
 pub use log::{RecordLog, RecoveryReport};
+#[cfg(test)]
+pub(crate) use log::RECORD_DECODES;
 pub use index::RecordIndex;

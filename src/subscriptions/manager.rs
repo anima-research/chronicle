@@ -182,6 +182,13 @@ impl SubscriptionManager {
     }
 
     /// Broadcast a state delta to matching subscriptions.
+    ///
+    /// One event per recorded operation, carrying the operation as it was
+    /// recorded. A batched append (`StateOperation::AppendMany`) is therefore
+    /// one event holding every item of the batch, at the batch's one
+    /// sequence, not one event per item: a subscriber that follows an append
+    /// log by its deltas must take each item of an `AppendMany` as it takes
+    /// an `Append`.
     pub fn broadcast_state_delta(
         &self,
         state_id: &str,

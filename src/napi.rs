@@ -167,6 +167,29 @@ impl From<Record> for JsRecord {
     }
 }
 
+/// What `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`
+/// recorded.
+#[napi(object)]
+pub struct JsAppendedBatch {
+    /// The one record that holds the whole batch, at one sequence.
+    pub record: JsRecord,
+    /// The index the batch's first item took: the number of items the state
+    /// held on the handle's branch just before the batch. Item `i` of the
+    /// batch is at `firstOrdinal + i`.
+    ///
+    /// The first batch to a state on a branch the store opened with, or on
+    /// one `createBranchAt` started, counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write
+    /// to the state lands during that count, and `getStateLen` reports that
+    /// count from then on:
+    /// a count a release before 0.5.0 stored can be off. A value that isn't
+    /// a JSON array, or holds an item that isn't JSON, has no items to count,
+    /// and this is then the length `getStateLen` reports; the batch is
+    /// recorded, and the state then fails to materialize, as after an
+    /// `appendToState` to it, so the items can't be read at those indices.
+    pub first_ordinal: i64,
+}
+
 /// Branch info returned to JavaScript.
 #[napi(object)]
 pub struct JsBranch {
@@ -256,6 +279,26 @@ pub struct JsUnregisteredState {
     pub id: String,
     /// How many of its updates were replayed.
     pub updates: i64,
+}
+
+/// A state whose snapshot after a recorded write failed at its most recent
+/// attempt on a branch, as `snapshotFailures()` lists it.
+#[napi(object)]
+pub struct JsSnapshotFailure {
+    pub state_id: String,
+    /// The name of the branch the writes and their snapshots were on.
+    pub branch: String,
+    /// How many writes in a row found the state's snapshot due on the branch
+    /// and failed to take it, counted since the store opened or the last
+    /// snapshot of the state there. Outcomes are counted in sequence order:
+    /// where writes to the state race, a failure that comes in after a later
+    /// write's outcome isn't counted, so the count can be lower than the
+    /// number of writes that failed.
+    pub failures: i64,
+    /// The sequence of the most recent of those writes.
+    pub sequence: i64,
+    /// The error the most recent attempt failed with.
+    pub error: String,
 }
 
 /// Configuration for creating a store.
@@ -398,6 +441,14 @@ pub struct JsStoreEvent {
     /// "branch_created", "branch_deleted", "caught_up", "dropped"
     pub event_type: String,
     /// JSON-serialized event data.
+    ///
+    /// A "state_delta" carries `state_id`, `sequence` and the recorded
+    /// `operation`, keyed by its variant name. An item's bytes are an array
+    /// of integers: `{"Append": [..]}` for one item, and
+    /// `{"AppendMany": [[..], [..], ..]}` for a batch from
+    /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`, which
+    /// is one event for the whole batch at its one sequence. A subscriber
+    /// that follows an append log by its deltas needs both.
     pub data: String,
 }
 
@@ -551,7 +602,9 @@ impl JsStore {
         }
     }
 
-    /// Create a new store at the given path.
+    /// Create a new store at the given path. Refuses a path that already holds
+    /// a store (its MANIFEST, records.log, state.bin or branches.bin); use
+    /// `openOrCreate` or `open` for a store that may exist.
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -721,6 +774,37 @@ impl JsStore {
         }))
     }
 
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, one entry per branch and state, ordered by when each
+    /// branch was created (its internal id), then by state id; an empty
+    /// array when none has. The same on every handle
+    /// of the store.
+    ///
+    /// A write that reaches a state's snapshot cadence takes the snapshot
+    /// after its record, and when that snapshot fails, the write still
+    /// returns its record (issue #39). The store logs a `tracing` warning,
+    /// which a Node process doesn't show, and counts the failure here, with
+    /// the sequence of the write and the error. An entry goes once a
+    /// snapshot of the state on that branch is recorded (by a later write
+    /// or `compactState`), or a write finds none due. Kept in memory only: a
+    /// reopened store lists none until a write's snapshot fails again. A
+    /// deleted branch's entries aren't listed.
+    #[napi]
+    pub fn snapshot_failures(&self) -> Result<Vec<JsSnapshotFailure>> {
+        let store = self.get_store()?;
+        Ok(store
+            .snapshot_failures()
+            .into_iter()
+            .map(|failure| JsSnapshotFailure {
+                state_id: failure.state_id,
+                branch: failure.branch,
+                failures: failure.failures as i64,
+                sequence: failure.sequence.0 as i64,
+                error: failure.error,
+            })
+            .collect())
+    }
+
     // --- Records ---
 
     /// Append a record to the store.
@@ -753,6 +837,32 @@ impl JsStore {
             .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
         let record = store.get_record(RecordId(id)).map_err(to_napi_error)?;
         Ok(record.map(Into::into))
+    }
+
+    /// Get several records by ID in one call. The result has one entry per
+    /// ID, in the order given: the record, as `getRecord` returns it, or
+    /// `null` for an ID with no record. IDs may repeat. The records are read
+    /// under one hold of the log file, so a long list holds other reads and
+    /// appends of the store until it is read; split it to let them in.
+    /// Throws, reading nothing, if an ID isn't a record ID. A record that
+    /// fails to read throws its error, which doesn't name the ID;
+    /// `getRecord` on each ID finds which.
+    #[napi]
+    pub fn get_records(&self, ids: Vec<String>) -> Result<Vec<Option<JsRecord>>> {
+        let store = self.get_store()?;
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<u64>()
+                    .map(RecordId)
+                    .map_err(|_| napi::Error::from_reason(format!("Invalid record ID: {:?}", id)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let records = store.get_records(&ids).map_err(to_napi_error)?;
+        Ok(records
+            .into_iter()
+            .map(|record| record.map(Into::into))
+            .collect())
     }
 
     /// Decode a `state_update` record's payload to a JSON string, regardless
@@ -1260,6 +1370,15 @@ impl JsStore {
     /// `appendToStateJson` + `editStateItem` when the caller wants each
     /// stored item to carry its own chronicle identity — it avoids the
     /// follow-up Edit that would otherwise promote every snapshot to Full.
+    ///
+    /// Throws, writing nothing, for an `item` that isn't a JSON object.
+    /// Once the item is recorded the call returns its record. A write that
+    /// reaches the state's snapshot cadence takes the snapshot after its
+    /// record, and if that snapshot fails the call still returns: the store
+    /// logs a `tracing` warning and lists the state in `snapshotFailures()`,
+    /// and the next write to the state checks the cadence again and takes
+    /// the snapshot if one is still due (after an Edit or Redact, a delta
+    /// snapshot waits for the next full one; issue #39).
     #[napi]
     pub fn append_to_state_json_with_identity(
         &self,
@@ -1273,6 +1392,119 @@ impl JsStore {
             .append_to_state_json_with_identity_on(branch, &state_id, item, &id_field, &sequence_field)
             .map_err(to_napi_error)?;
         Ok(record.into())
+    }
+
+    /// Append several JSON items to an AppendLog state as one record, at one
+    /// sequence, and return that record with the index the first item took
+    /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`. `JsAppendedBatch`
+    /// says when the batch counts the state's items to find that index.
+    ///
+    /// Reads see the items exactly as if each had been appended with
+    /// `appendToStateJson`, in order, except that a historical read or a
+    /// branch cut by sequence keeps or drops the batch whole, as it has one
+    /// sequence. The batch counts as one operation
+    /// toward the state's snapshot cadence, and subscribers get one
+    /// "state_delta" event for it (see `JsStoreEvent.data`). Throws, writing
+    /// nothing, for an empty `items`. Once the batch is recorded the call
+    /// returns it. A write that reaches the snapshot cadence takes the
+    /// snapshot after its record, and if that snapshot fails the call still
+    /// returns: the store logs a `tracing` warning and lists the state in
+    /// `snapshotFailures()`, and the next write to the state checks the
+    /// cadence again and takes the snapshot if one is still due (after an
+    /// Edit or Redact, a delta snapshot waits for the next full one; issue
+    /// #39).
+    ///
+    /// Just before a store's first batch is written, its `MANIFEST` moves to
+    /// version 2, and it stays there even if that batch then fails (see
+    /// `appendManyToStateJsonWithIdentity`), so releases from before batched
+    /// appends refuse to open it, where the directory holding the `MANIFEST`
+    /// (for a linked one, the one holding its target) is synced (on
+    /// Windows, where this process may not open that directory, or on a
+    /// system that doesn't sync directories, a power loss can undo the move
+    /// to version 2 and keep the batch; see Breaking).
+    #[napi]
+    pub fn append_many_to_state_json(
+        &self,
+        state_id: String,
+        items: Vec<serde_json::Value>,
+    ) -> Result<JsAppendedBatch> {
+        let (store, branch) = self.target()?;
+        let batch = store
+            .append_many_to_state_json_on(branch, &state_id, &items)
+            .map_err(to_napi_error)?;
+        Ok(JsAppendedBatch {
+            record: batch.record.into(),
+            first_ordinal: batch.first_ordinal as i64,
+        })
+    }
+
+    /// Append several JSON objects to an AppendLog state as one record, at
+    /// one sequence, writing that record's id and sequence into each of them
+    /// first, and return the record with the index the first item took
+    /// (`firstOrdinal`, found as `JsAppendedBatch` says); item `i` is at
+    /// `firstOrdinal + i`. It is the batched form of
+    /// `appendToStateJsonWithIdentity`, as `appendManyToStateJson` is of
+    /// `appendToStateJson`.
+    ///
+    /// Each item is stamped as `appendToStateJsonWithIdentity` stamps its
+    /// one item: `idField` receives the record id (as a string, matching
+    /// `JsRecord.id`), `sequenceField` the sequence (as a number), and
+    /// existing values at those keys are overwritten. The batch is one
+    /// record, so every item of it carries the same id and sequence, those
+    /// of `record`. A branch cut by an item's sequence (`createBranchAt` at
+    /// it keeps the item, at the one before drops it) keeps or drops the
+    /// whole batch with it.
+    ///
+    /// Otherwise it is `appendManyToStateJson`: reads see the stamped items
+    /// as if each had been appended alone, the batch counts as one operation
+    /// toward the snapshot cadence, and subscribers get one "state_delta"
+    /// event for it. Throws, writing nothing, for an empty `items`, an item
+    /// that isn't a JSON object, or an `idField` equal to `sequenceField`,
+    /// where an item couldn't hold both the record id and the sequence. Once
+    /// the batch is recorded the call
+    /// returns it. A write that reaches the snapshot cadence takes the
+    /// snapshot after its record, and if that snapshot fails the call still
+    /// returns: the store logs a `tracing` warning and lists the state in
+    /// `snapshotFailures()`, and the next write to the state checks the
+    /// cadence again and takes the snapshot if one is still due (after an
+    /// Edit or Redact, a delta snapshot waits for the next full one; issue
+    /// #39).
+    ///
+    /// Just before a store's first batch is written, by this call or
+    /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it
+    /// stays there even if that batch then fails, so releases from before
+    /// batched appends refuse to open it, where the directory holding the
+    /// `MANIFEST` (for a linked one, the one holding its target) is synced
+    /// (on Windows, where this process may not open that directory, or on a
+    /// system that doesn't sync directories, a power loss can undo
+    /// the move to version 2 and keep the batch; see Breaking). If the move
+    /// itself fails, the call throws and the batch isn't recorded; it throws
+    /// too if only the
+    /// directory sync after the move fails, with the `MANIFEST` already at
+    /// version 2. A store never asked to record a batch keeps the format they
+    /// open.
+    #[napi]
+    pub fn append_many_to_state_json_with_identity(
+        &self,
+        state_id: String,
+        items: Vec<serde_json::Value>,
+        id_field: String,
+        sequence_field: String,
+    ) -> Result<JsAppendedBatch> {
+        let (store, branch) = self.target()?;
+        let batch = store
+            .append_many_to_state_json_with_identity_on(
+                branch,
+                &state_id,
+                &items,
+                &id_field,
+                &sequence_field,
+            )
+            .map_err(to_napi_error)?;
+        Ok(JsAppendedBatch {
+            record: batch.record.into(),
+            first_ordinal: batch.first_ordinal as i64,
+        })
     }
 
     /// Edit an item in an AppendLog state.
@@ -1365,7 +1597,12 @@ impl JsStore {
     /// O(item size) once the per-item cache is warm — unlike `getStateJson`,
     /// which materializes and converts the entire state on every call. Use
     /// this for point lookups in large states. Returns `null` if the state
-    /// doesn't exist or the index is out of range.
+    /// doesn't exist, the index is negative or out of range, or the state's
+    /// value isn't an array. Throws the deserialization error if the state's
+    /// bytes aren't one JSON value (no bytes at all read as an empty list),
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item: an `appendToState`'s, or a batch's last item where
+    /// this session found the head's count exact.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1387,6 +1624,57 @@ impl JsStore {
             }
             None => Ok(None),
         }
+    }
+
+    /// Get several items of an AppendLog state by index, as JSON, in one
+    /// call. The result has one entry per index in `ordinals`, in the order
+    /// given: what `getStateItemJson` returns for that index, so `null` if it
+    /// is negative or out of range, the state doesn't exist, or the state's
+    /// value isn't an array, except at the last index of a head whose count
+    /// this session hasn't found exact (unchecked, or checked on a value that
+    /// doesn't materialize), where `getStateItemJson` answers from the stored
+    /// count and this from the value. Throws, as `getStateItemJson` does, if
+    /// the state's bytes aren't one JSON value (no bytes at all read as an
+    /// empty list), except the last item served from the head record alone,
+    /// which reads no earlier item. Indices may repeat and come in any order.
+    ///
+    /// Every entry comes from the same version of the state, and a cold
+    /// state is materialized at most once for the whole call, not once per
+    /// index. A request with no index that is zero or more (an empty one,
+    /// or one of negative indices only) reads nothing.
+    #[napi]
+    pub fn get_state_items_json(
+        &self,
+        state_id: String,
+        ordinals: Vec<i64>,
+    ) -> Result<Vec<Option<serde_json::Value>>> {
+        // A negative index answers null without a read, as getStateItemJson's
+        // does; only the others go to the store.
+        let asked: Vec<Option<usize>> = ordinals.iter().map(|&i| usize::try_from(i).ok()).collect();
+        let wanted: Vec<usize> = asked.iter().flatten().copied().collect();
+        if wanted.is_empty() {
+            return Ok(vec![None; ordinals.len()]);
+        }
+        let (store, branch) = self.target()?;
+        let mut items = store
+            .get_state_items_by_ordinal_on(branch, &state_id, &wanted)
+            .map_err(to_napi_error)?
+            .into_iter();
+        asked
+            .into_iter()
+            .map(|ordinal| {
+                // One answer per index the store was asked for, in order.
+                let item = match ordinal {
+                    Some(_) => items.next().flatten(),
+                    None => None,
+                };
+                item.map(|bytes| {
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| napi::Error::from_reason(e.to_string()))
+                })
+                .transpose()
+            })
+            .collect()
     }
 
     /// Get the last N items from an AppendLog state.
