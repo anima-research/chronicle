@@ -2115,4 +2115,25 @@ mod tests {
         second.store_chunked(&content, "application/json").unwrap();
         assert!(second.get(&hash).is_err());
     }
+
+    #[test]
+    fn a_chunk_keeps_the_content_type_its_bytes_were_first_stored_with() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let content = varied(100_000, 9);
+        let ends = chunks::chunk_ends(&content);
+        let first = &content[..ends[0]];
+        let second = &content[ends[0]..ends[1]];
+
+        let stored_whole = storage.store(first, "text/plain").unwrap();
+        reopened(&dir)
+            .store_chunked(&content, "application/json")
+            .unwrap();
+        let blob = reopened(&dir).get(&stored_whole).unwrap().unwrap();
+        assert_eq!(blob.content_type, "text/plain");
+
+        let stored_as_chunk = reopened(&dir).store(second, "text/plain").unwrap();
+        let blob = reopened(&dir).get(&stored_as_chunk).unwrap().unwrap();
+        assert_eq!(blob.content_type, CHUNK_CONTENT_TYPE);
+    }
 }
