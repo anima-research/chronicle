@@ -98,7 +98,7 @@ fn open_of_a_locked_store_leaves_its_blob_staging_files() {
 }
 
 // A content type longer than 65,535 bytes is refused for content the store
-// already holds, whether it has the blob cached or reads its file, as it is
+// already holds, whether it stored the blob itself or reads its file, as it is
 // for new content, and the file stays as it was. A store of content already
 // there used to return its hash whatever the content type.
 #[test]

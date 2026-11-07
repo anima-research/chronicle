@@ -165,7 +165,8 @@ never do.
 ## Building and testing
 
 You need Node 22.12 or later, the floor `package.json`'s `engines` declares,
-and a Rust toolchain.
+and a Rust toolchain. `npm test` also runs `tools/unchunk-blobs.py`, so it
+needs Python 3 on the `PATH`, as `python3`, or as `python` on Windows.
 
 ```bash
 npm ci                                          # strict lockfile install
