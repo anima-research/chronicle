@@ -106,9 +106,8 @@ impl From<rmp_serde::decode::Error> for StoreError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     /// A file operation failed, either because the operating system refused
-    /// or failed it, such as opening a path that holds no store, or because a
-    /// file ended before a read of it could finish; the message carries its
-    /// error.
+    /// or failed it, or because a file ended before a read of it could
+    /// finish; the message carries its error.
     Io,
     /// An fsync of the record log failed. `sync()` throws it until the store
     /// is reopened, and so do the calls that checkpoint, unless a check of
@@ -143,10 +142,14 @@ pub enum ErrorCode {
     /// open of it.
     Locked,
     /// Not raised through this binding: `open` of a path that holds no store
-    /// fails with `Io`.
+    /// fails with `InvalidFormat`.
     NotInitialized,
     /// A store or blob file isn't in a format this release reads, or is
-    /// damaged, or the store's `LOCK` isn't a regular file.
+    /// damaged, or the store's `LOCK` isn't a regular file. Or the path holds
+    /// no `MANIFEST`, or one that's a link leading nowhere: `open` refuses
+    /// such a path whatever else is there, and `openOrCreate` refuses it
+    /// unless it holds nothing a new store can't sit beside, where it creates
+    /// one.
     InvalidFormat,
     /// A record or blob read from its file doesn't match its checksum.
     ChecksumMismatch,
@@ -155,8 +158,11 @@ pub enum ErrorCode {
     /// Not raised by this release.
     Transaction,
     /// A call refused for one of these reasons. Not allowed as things stand:
-    /// `switchBranch` on a view; deleting the main branch, the current one
-    /// or the one a view is pinned to; changing a state's strategy to
+    /// `create` of a path that already holds a store's `MANIFEST`,
+    /// `records.log`, `state.bin` or `branches.bin` (and `openOrCreate`, when
+    /// one of the last three appears there while it creates and no `MANIFEST`
+    /// does); `switchBranch` on a view; deleting the main branch, the current
+    /// one or the one a view is pinned to; changing a state's strategy to
     /// another kind; or a tree operation on a state that isn't a tree. Or
     /// for one of these arguments: a record ID or subscription ID that isn't
     /// an unsigned 64-bit integer; a blob hash that isn't hex of the right
@@ -164,9 +170,12 @@ pub enum ErrorCode {
     /// index kind other than number or string; a tree operation other than
     /// set or remove, or a set without an entry; an edit index past the
     /// end; an invalid tree path or field-index path; an item for
-    /// `appendToStateJsonWithIdentity` that isn't a JSON object; the
-    /// reserved record type `state_update`; or a blob content type over
-    /// 65,535 bytes.
+    /// `appendToStateJsonWithIdentity` or `appendManyToStateJsonWithIdentity`
+    /// that isn't a JSON object; a batch with no items for
+    /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`; the
+    /// same key as both the id field and the sequence field of
+    /// `appendManyToStateJsonWithIdentity`; the reserved record type
+    /// `state_update`; or a blob content type over 65,535 bytes.
     InvalidOperation,
     /// The store doesn't hold the subscription. It dropped it because its
     /// buffer overran, or it was unsubscribed (to a poll, through another

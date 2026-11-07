@@ -1,6 +1,6 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
@@ -82,6 +82,7 @@ test("the store's errors carry their kind", () => {
   store.registerState({ id: 'items', strategy: 'append_log' });
   store.appendToState('items', Buffer.from('not json'));
   throwsCoded(() => store.getStateItemJson('items', 0), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  throwsCoded(() => store.getStateItemsJson('items', [0]), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.deleteBranch('main'), ErrorCode.InvalidOperation, 'Invalid operation: Cannot delete main branch');
   store.createBranch('side');
   store.switchBranch('side');
@@ -114,6 +115,7 @@ test("a view's refusals carry theirs", () => {
 test("the binding's own refusals carry theirs", () => {
   const { store } = freshStore();
   throwsCoded(() => store.getRecord('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
+  throwsCoded(() => store.getRecords(['abc']), ErrorCode.InvalidOperation, 'Invalid record ID: "abc"');
   throwsCoded(() => store.getBlob('zz'), ErrorCode.InvalidOperation, 'Invalid hash');
   throwsCoded(() => store.getBlob('abcd'), ErrorCode.InvalidOperation, 'Invalid hash');
   throwsCoded(() => store.getStateUpdateJson('abc'), ErrorCode.InvalidOperation, 'Invalid record ID');
@@ -149,6 +151,36 @@ test("the binding's own refusals carry theirs", () => {
   throwsCoded(() => store.treeBatch('tree', [{ op: 'set', path: 'a' }]), ErrorCode.InvalidOperation, "TreeOp 'set' requires entry");
   store.close();
   throwsCoded(() => store.stats(), ErrorCode.StoreClosed, 'Store has been closed');
+});
+
+test("batched appends, and create or openOrCreate where something is already there, refuse with theirs", () => {
+  const { store, dir } = freshStore();
+  store.registerState({ id: 'batch', strategy: 'append_log' });
+  throwsCoded(
+    () => store.appendManyToStateJson('batch', []),
+    ErrorCode.InvalidOperation,
+    /^Invalid operation: AppendMany needs at least one item/,
+  );
+  throwsCoded(
+    () => store.appendManyToStateJsonWithIdentity('batch', [{}], 'key', 'key'),
+    ErrorCode.InvalidOperation,
+    /^Invalid operation: the id field and the sequence field are both "key"/,
+  );
+  throwsCoded(
+    () => store.appendManyToStateJsonWithIdentity('batch', [1], 'id', 'seq'),
+    ErrorCode.InvalidOperation,
+    'Invalid operation: payload must be a JSON object: item 0 of the batch is not',
+  );
+  store.close();
+  throwsCoded(() => JsStore.create({ path: dir }), ErrorCode.InvalidOperation, /^Invalid operation: create: .* already holds a Chronicle store/);
+  const other = mkdtempSync(join(tmpdir(), 'chronicle-codes-'));
+  dirs.push(other);
+  writeFileSync(join(other, 'notes.txt'), 'not a store');
+  throwsCoded(
+    () => JsStore.openOrCreate({ path: other }),
+    ErrorCode.InvalidFormat,
+    /^Invalid store format: .* has no MANIFEST and holds notes\.txt, so it isn't a Chronicle store or an empty place for one$/,
+  );
 });
 
 test('a second open of a store in use is Locked', () => {
