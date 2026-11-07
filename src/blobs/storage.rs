@@ -75,7 +75,7 @@ pub struct BlobStorage {
     path: PathBuf,
 
     /// LRU cache for recently accessed blobs. It holds only blobs this
-    /// storage wrote, or read from a whole file.
+    /// storage read from a whole file.
     cache: Mutex<LruCache<Hash, CachedBlob>>,
 
     known: Mutex<HashMap<Hash, u64>>,
@@ -1006,7 +1006,7 @@ mod tests {
 
     // A whole file is left as it is: storing its content again from a
     // storage that hasn't read it writes nothing, and the file keeps the
-    // content type it was first stored with, which the cache then answers.
+    // content type it was first stored with, which a get then answers.
     #[test]
     fn storing_content_already_held_whole_writes_nothing() {
         let dir = TempDir::new().unwrap();
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     // The limit on a content type doesn't depend on what is stored: content
-    // this storage has cached, and content whose whole file it finds, are
+    // this storage has stored, and content whose whole file it finds, are
     // refused as new content is, and the file is left as it was.
     #[test]
     fn a_content_type_too_long_is_refused_for_content_already_stored() {
@@ -1045,7 +1045,10 @@ mod tests {
         let path = storage.blob_path(&hash);
         let whole = fs::read(&path).unwrap();
 
-        for (how, storage) in [("cached", storage), ("read from its file", reopened(&dir))] {
+        for (how, storage) in [
+            ("stored by this storage", storage),
+            ("read from its file", reopened(&dir)),
+        ] {
             let error = storage.store(b"stored", &too_long).unwrap_err();
             assert!(
                 matches!(error, StoreError::InvalidOperation(_)),
@@ -1065,7 +1068,7 @@ mod tests {
     // blob directory when it made a shard there, and the shard when it
     // renamed a blob into it, each before the store returns. A store that
     // writes nothing syncs nothing more: one of content this storage has
-    // cached, or of content whose whole file it finds, which in a new
+    // stored, or of content whose whole file it finds, which in a new
     // storage syncs only the blob directory's entry.
     #[cfg(unix)]
     #[test]
@@ -1105,7 +1108,7 @@ mod tests {
 
     // A rename that fails removes the staging file and returns its error.
     // Nothing reaches the blob's path, a damaged file that was there stays
-    // as it was, nothing is cached, and the next store writes the blob.
+    // as it was, nothing is taken as stored, and the next store writes the blob.
     #[test]
     fn a_failed_rename_removes_the_staging_file_and_leaves_the_path_as_it_was() {
         let dir = TempDir::new().unwrap();
@@ -1130,7 +1133,7 @@ mod tests {
         storage.store(b"renamed", "text/plain").unwrap_err();
         assert_eq!(staged(&blobs), 0);
         assert_eq!(fs::read(&path).unwrap(), b"BLB\0");
-        assert!(!storage.cache.lock().contains(&hash));
+        assert!(!storage.known.lock().contains_key(&hash));
 
         assert_eq!(storage.store(b"renamed", "text/plain").unwrap(), hash);
         assert_eq!(staged(&blobs), 0);
@@ -1141,7 +1144,7 @@ mod tests {
     }
 
     // A sync of the shard that fails after the rename returns its error with
-    // the blob in place and whole, and nothing cached. The next store of the
+    // the blob in place and whole, and nothing taken as stored. The next store of the
     // content through this storage finds the file whole and tries that sync
     // again, and once it has gone through, a later store makes none.
     #[test]
@@ -1161,7 +1164,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(staged(&dir.path().join("blobs")), 0);
-        assert!(!storage.cache.lock().contains(&hash));
+        assert!(!storage.known.lock().contains_key(&hash));
         assert_eq!(
             reopened(&dir).get(&hash).unwrap().unwrap().content,
             b"in place"
@@ -1172,7 +1175,7 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(synced_directories(), [shard]);
         }
-        assert!(storage.cache.lock().contains(&hash));
+        assert!(storage.known.lock().contains_key(&hash));
         assert_eq!(storage.store(b"in place", "text/plain").unwrap(), hash);
         assert_eq!(synced_directories(), Vec::<PathBuf>::new());
     }
