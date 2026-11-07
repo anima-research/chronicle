@@ -965,12 +965,17 @@ impl JsStore {
     /// own, about 10 KiB on average, and a `getBlob` of a chunked blob reads
     /// each one the blob cache doesn't hold, so content sharing nothing with
     /// what's stored takes more files to store and to read than it would
-    /// whole, and more disk, since each file takes whole blocks. A chronicle
-    /// release from before `storeBlobAsync` can't read a chunked blob: its
-    /// `getBlob` of that hash throws, naming an unsupported blob version, and
-    /// it reads blobs stored whole as before. Chronicle's repository has
-    /// `tools/unchunk-blobs.py`, which rewrites a closed store's chunked
-    /// blobs whole.
+    /// whole, and more disk, since each file takes whole blocks. Only
+    /// `chunked: true` writes a chunked blob, and nothing else in a store
+    /// changes with it. A chronicle release from before `storeBlobAsync`,
+    /// 0.6.0 included, can't read a chunked blob: its `getBlob` of that hash
+    /// throws, naming an unsupported blob version, and it reads blobs stored
+    /// whole as before. To go back, close the store and run
+    /// `tools/unchunk-blobs.py <store> --apply` from chronicle's repository
+    /// with Python 3: it rewrites each chunked blob whole under the same
+    /// hash, and those releases then read it. It stops at a chunked blob
+    /// whose list or a chunk it can't read, naming its file, and leaves that
+    /// blob and those after it as they are.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn store_blob_async(
         &self,
