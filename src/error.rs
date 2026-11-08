@@ -111,9 +111,11 @@ impl From<rmp_serde::decode::Error> for StoreError {
 #[cfg_attr(not(feature = "napi-bindings"), derive(Clone, Copy))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorCode {
-    /// A file operation failed, either because the operating system refused
-    /// or failed it, or because a file ended before a read of it could
-    /// finish; the message carries its error.
+    /// A file operation failed: the operating system refused or failed it,
+    /// a file ended before a read of it could finish, or chronicle refused a
+    /// blob or checkpoint file that isn't a regular file, or a checkpoint
+    /// reached through more links than it follows. The message carries its
+    /// error.
     Io,
     /// An fsync of the record log failed. `sync()` throws it until the store
     /// is reopened, and so do the calls that checkpoint, unless a check of
@@ -167,27 +169,12 @@ pub enum ErrorCode {
     HashMismatch,
     /// Not raised by this release.
     Transaction,
-    /// A call refused for one of these reasons. Not allowed as things stand:
-    /// `create` of a path that already holds a store's `MANIFEST`,
-    /// `records.log`, `state.bin` or `branches.bin` (and `openOrCreate`, when
-    /// one of the last three appears there while it creates and no `MANIFEST`
-    /// does); `switchBranch` on a view; deleting the main branch, the current
-    /// one or the one a view is pinned to; changing a state's strategy to
-    /// another kind; or a tree operation on a state that isn't a tree. Or
-    /// for one of these arguments: a record ID or subscription ID that isn't
-    /// an unsigned 64-bit integer; a blob hash that isn't hex of the right
-    /// length; a strategy other than snapshot, append_log or tree; a field
-    /// index kind other than number or string; a tree operation other than
-    /// set or remove, or a set without an entry; an edit index past the
-    /// end; an invalid tree path or field-index path; an item for
-    /// `appendToStateJsonWithIdentity` or `appendManyToStateJsonWithIdentity`
-    /// that isn't a JSON object; a batch with no items for
-    /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`; the
-    /// same key as both the id field and the sequence field of
-    /// `appendManyToStateJsonWithIdentity`; the reserved record type
-    /// `state_update`; content that `storeBlobAsync` with `chunked: true`
-    /// would cut into more chunks than a chunked blob's file can name
-    /// (4,294,967,295); or a blob content type over 65,535 bytes.
+    /// The call was refused as asked: it was given an argument it rejects,
+    /// such as a record ID that isn't an unsigned 64-bit integer, an edit
+    /// index past the end or the reserved record type `state_update`; or
+    /// the store or the handle doesn't allow it, such as deleting the main
+    /// branch or the current one, `create` of a path that already holds a
+    /// store, or `switchBranch` on a view. The message says which.
     InvalidOperation,
     /// The store doesn't hold the subscription. It dropped it because its
     /// buffer overran, or it was unsubscribed (to a poll, through another

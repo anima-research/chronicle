@@ -900,6 +900,7 @@ mod tests {
                 matches!(&result, Err(StoreError::InvalidOperation(m)) if m == "Cannot delete main branch"),
                 "{result:?}"
             );
+            assert!(manager.get_branch(MAIN_BRANCH).is_some());
         }
     }
 
@@ -952,6 +953,7 @@ mod tests {
                 matches!(&result, Err(StoreError::InvalidOperation(m)) if m == "Cannot delete current branch"),
                 "{result:?}"
             );
+            assert!(manager.get_branch("feature").is_some());
         }
     }
 
