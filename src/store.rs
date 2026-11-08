@@ -4069,9 +4069,16 @@ mod tests {
     }
 
     fn try_reopen(config: StoreConfig) -> Result<Store> {
+        waiting_out_locked(|| Store::open(config.clone()))
+    }
+
+    /// Runs `attempt` again while it fails with `Locked`, for up to 5 s, for
+    /// a call that takes the lock of a store this process closed a moment
+    /// ago (see `reopen`).
+    fn waiting_out_locked<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match Store::open(config.clone()) {
+            match attempt() {
                 Err(StoreError::Locked) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(5))
                 }
@@ -4320,15 +4327,20 @@ mod tests {
             winner.update_state("s", StateOperation::Set(b"1".to_vec())).unwrap();
             winner.sync().unwrap();
         }
-        let lost = Store::create(config.clone());
-        assert!(matches!(lost, Err(StoreError::InvalidOperation(_))));
-        let opened = Store::open_if_another_created(config.clone(), lost).unwrap();
+        let refusal = match waiting_out_locked(|| Store::create(config.clone())) {
+            Err(StoreError::InvalidOperation(refusal)) => refusal,
+            other => panic!("expected InvalidOperation, got {:?}", other.err()),
+        };
+        let opened = waiting_out_locked(|| {
+            Store::open_if_another_created(config.clone(), Err(StoreError::InvalidOperation(refusal.clone())))
+        })
+        .unwrap();
         assert_eq!(opened.get_state("s").unwrap().unwrap(), b"1");
         drop(opened);
 
         // A store another process holds open stays its own: Locked comes
         // back as it is.
-        let held = Store::open(config.clone()).unwrap();
+        let held = reopen(config.clone());
         assert!(matches!(
             Store::open_if_another_created(config.clone(), Store::create(config.clone())),
             Err(StoreError::Locked)
@@ -4433,7 +4445,7 @@ mod tests {
             }
             store.sync().unwrap();
         }
-        let store = Store::open(config).unwrap();
+        let store = reopen(config);
         store.set_auto_snapshot(false);
         store
     }
@@ -5436,7 +5448,7 @@ mod tests {
         let expected = store.get_state("s0").unwrap().unwrap();
         assert_eq!(store.get_state_len("s0").unwrap(), Some(5));
         drop(store);
-        let store = Store::open(test_config(&dir)).unwrap();
+        let store = reopen(test_config(&dir));
         assert_eq!(store.get_state("s0").unwrap().unwrap(), expected);
         assert_eq!(store.state.head_count(), baseline_heads);
         assert_eq!(store.list_branches().len(), 1);
@@ -5498,7 +5510,7 @@ mod tests {
         store.sync().unwrap();
         assert_eq!(store.state.head_count(), 1);
         drop(store);
-        let store = Store::open(test_config(&dir)).unwrap();
+        let store = reopen(test_config(&dir));
         assert!(store.get_branch("child").is_none());
         assert_eq!(store.get_state_len("log").unwrap(), Some(7));
     }
