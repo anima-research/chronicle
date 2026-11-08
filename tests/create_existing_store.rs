@@ -483,7 +483,6 @@ fn open_on_a_manifest_that_isnt_a_regular_file_refuses_without_hanging() {
             Err(_) => panic!("{call} on a FIFO MANIFEST didn't return within 10 s"),
         }
         assert!(!path.join("records.log").exists(), "{call} wrote nothing");
-        std::mem::forget(dir); // a thread that hung on main may still hold it
     }
 }
 
