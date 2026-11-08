@@ -102,6 +102,7 @@ test("a view's refusals carry theirs", () => {
     "Invalid operation: Cannot delete the branch this view is pinned to ('pinned')",
   );
   store.deleteBranch('pinned');
+  throwsCoded(() => view.deleteBranch('pinned'), ErrorCode.BranchNotFound, 'Branch not found: pinned');
   throwsCoded(
     () => view.getStateJson('anything'),
     ErrorCode.BranchNotFound,
@@ -485,7 +486,7 @@ test('opening a store that is not there is InvalidFormat', () => {
   );
 });
 
-test('opening a store under a path that is a file is an Io error', () => {
+test('opening a store under a path that is a file is an Io error', { skip: process.platform === 'win32' && 'relies on the POSIX error for a path through a regular file' }, () => {
   const parent = mkdtempSync(join(tmpdir(), 'chronicle-codes-'));
   dirs.push(parent);
   const file = join(parent, 'a-file');

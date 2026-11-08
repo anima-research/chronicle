@@ -1,7 +1,8 @@
 - **`error.code` on the binding's errors:** every error the Node binding raised
   for chronicle carried napi's `GenericFailure` as `code`. It now carries the
   error's `ErrorCode` instead, so a check for `GenericFailure` no longer
-  matches them. Two kinds of error also change their message:
+  matches them. The four errors of the new `storeBlobAsync` that Added
+  names carry no `ErrorCode`. Two kinds of error also change their message:
   - A poll of a subscription that has ended, once the events queued for it
     are read, throws `StoreClosed` (`Store has been closed`) after the
     root's `close()`, and otherwise `SubscriptionDropped`
