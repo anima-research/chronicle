@@ -3537,7 +3537,12 @@ impl Store {
         if config.filter.include_records {
             let payload_threshold = 4096; // Same as manager default
 
-            for result in self.iter_from_on(branch_id, from_seq) {
+            let start = self
+                .index
+                .query_range(branch_id, Some(from_seq), None, 1, false)
+                .first()
+                .map(|&(_, offset)| offset);
+            for result in start.into_iter().flat_map(|offset| self.log.iter_from(offset)) {
                 let (_offset, record) = result?;
 
                 // Skip records not on current branch
