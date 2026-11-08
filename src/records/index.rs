@@ -257,6 +257,20 @@ impl RecordIndex {
         }
     }
 
+    /// The smallest log offset among `branch`'s records at or after `from`.
+    ///
+    /// Where the branch's sequences sit in log order, that's the record at
+    /// the smallest such sequence. A store written before 0.2.6 can hold a
+    /// sequence reissued after an unclean shutdown, later in the log than
+    /// higher ones; the original it shadows here counts for nothing.
+    pub(crate) fn first_offset_from(&self, branch: BranchId, from: Sequence) -> Option<u64> {
+        self.entries
+            .read()
+            .range((branch, from)..=(branch, Sequence(u64::MAX)))
+            .map(|(_, offset)| *offset)
+            .min()
+    }
+
     /// Get count of records.
     pub fn count(&self) -> usize {
         self.id_to_offset.read().len()
