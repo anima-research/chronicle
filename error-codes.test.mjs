@@ -1,6 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
@@ -393,6 +394,85 @@ test('a subscription is caught up through any handle of its store, and once unsu
   closing.close();
   throwsCoded(() => store.catchUpSubscription(onClosing), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
   store.close();
+});
+
+function thrownBy(call) {
+  try {
+    call();
+  } catch (error) {
+    return error;
+  }
+  assert.fail('expected a throw');
+}
+
+test('storeBlobAsync rejects with the code and message storeBlob throws for the same failure', async () => {
+  const { store, dir } = freshStore();
+  const longType = 'x'.repeat(65_536);
+  const refused = thrownBy(() => store.storeBlob(Buffer.from('x'), longType));
+  assert.equal(refused.code, ErrorCode.InvalidOperation);
+  await assert.rejects(store.storeBlobAsync(Buffer.from('x'), longType), (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.code, ErrorCode.InvalidOperation);
+    assert.equal(error.message, refused.message);
+    return true;
+  });
+
+  const content = randomBytes(100_000);
+  const hash = createHash('sha256').update(content).digest('hex');
+  mkdirSync(join(dir, 'blobs', hash.slice(0, 2), hash), { recursive: true });
+  const failed = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
+  assert.equal(failed.code, ErrorCode.Io);
+  for (const chunked of [false, true]) {
+    await assert.rejects(store.storeBlobAsync(content, 'application/octet-stream', { chunked }), (error) => {
+      assert.equal(error.code, ErrorCode.Io);
+      assert.equal(error.message, failed.message);
+      return true;
+    });
+  }
+  store.close();
+});
+
+test('storeBlobAsync on a closed view or store throws StoreClosed', () => {
+  const { store } = freshStore();
+  const view = store.view('main');
+  view.close();
+  throwsCoded(() => view.storeBlobAsync(Buffer.from('x'), 'text/plain'), ErrorCode.StoreClosed, 'View has been closed');
+  const left = store.view('main');
+  store.close();
+  throwsCoded(() => store.storeBlobAsync(Buffer.from('x'), 'text/plain'), ErrorCode.StoreClosed, 'Store has been closed');
+  throwsCoded(() => left.storeBlobAsync(Buffer.from('x'), 'text/plain'), ErrorCode.StoreClosed, 'Store has been closed');
+});
+
+test("damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch", async () => {
+  const { store, dir } = freshStore();
+  const contents = [0, 1, 2, 3].map(() => randomBytes(200_000));
+  const hashes = [];
+  for (const [i, content] of contents.entries()) {
+    hashes.push(await store.storeBlobAsync(content, 'application/octet-stream', { chunked: i < 3 }));
+  }
+  store.close();
+  const blobFile = (hash) => join(dir, 'blobs', hash.slice(0, 2), hash);
+  const firstChunk = (hash) => {
+    const list = readFileSync(blobFile(hash));
+    const at = 19 + list.readUInt16LE(5);
+    return list.subarray(at, at + 32).toString('hex');
+  };
+  const flipLastButFour = (path) => {
+    const bytes = readFileSync(path);
+    bytes[bytes.length - 5] ^= 0xff;
+    writeFileSync(path, bytes);
+  };
+  flipLastButFour(blobFile(firstChunk(hashes[0])));
+  flipLastButFour(blobFile(hashes[1]));
+  rmSync(blobFile(firstChunk(hashes[2])));
+  flipLastButFour(blobFile(hashes[3]));
+
+  const reopened = JsStore.open({ path: dir });
+  throwsCoded(() => reopened.getBlob(hashes[0]), ErrorCode.InvalidFormat, /names the chunk [0-9a-f]{64}, which is damaged: its checksum doesn't match/);
+  throwsCoded(() => reopened.getBlob(hashes[1]), ErrorCode.InvalidFormat, /is damaged: its checksum doesn't match/);
+  throwsCoded(() => reopened.getBlob(hashes[2]), ErrorCode.InvalidFormat, /names the chunk [0-9a-f]{64}, which isn't stored/);
+  throwsCoded(() => reopened.getBlob(hashes[3]), ErrorCode.ChecksumMismatch, /.+/);
+  reopened.close();
 });
 
 test('opening a store that is not there is InvalidFormat', () => {

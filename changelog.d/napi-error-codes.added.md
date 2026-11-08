@@ -8,4 +8,8 @@
   than on message text: compare it with `ErrorCode`'s members, whose names
   are kept across releases. An error napi raises while converting a call's
   arguments, before the call reaches chronicle, keeps napi's own code
-  (`StringExpected`, `InvalidArg`) or has none.
+  (`StringExpected`, `InvalidArg`) or has none. The four errors of
+  `storeBlobAsync` that are neither a store failure nor a refusal, which
+  `ErrorCode`'s docs name, carry no chronicle code: three carry napi's
+  `GenericFailure`, and when it can't make its promise, `storeBlobAsync`
+  throws the error napi raises.

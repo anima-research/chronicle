@@ -97,6 +97,12 @@ impl From<rmp_serde::decode::Error> for StoreError {
 /// as its `code`, beside its message, so a caller can tell kinds apart
 /// without matching message text. (An error napi raises while it converts a
 /// call's arguments, before chronicle runs, keeps napi's own code or none.)
+/// Four errors of `storeBlobAsync` are neither, and carry no chronicle code:
+/// it throws the error napi raises when it can't make its promise, and
+/// napi's `GenericFailure` when it can't start the thread that stores blobs,
+/// and its promise rejects with `GenericFailure` when storing panicked
+/// partway or that thread has stopped, both faults in the binding rather
+/// than the store's.
 /// Each member's value is its name, kept across releases.
 // A code's name is its variant's identifier: napi's string enum takes each
 // value from it, and `as_str` spells the same name for `error.code`, so
@@ -149,9 +155,13 @@ pub enum ErrorCode {
     /// no `MANIFEST`, or one that's a link leading nowhere: `open` refuses
     /// such a path whatever else is there, and `openOrCreate` refuses it
     /// unless it holds nothing a new store can't sit beside, where it creates
-    /// one.
+    /// one. For a chunked blob (see `storeBlobAsync`), it's also the code
+    /// when the blob's file is damaged, or a chunk it names is missing,
+    /// damaged or holds other bytes.
     InvalidFormat,
-    /// A record or blob read from its file doesn't match its checksum.
+    /// A record, or a blob stored whole, read from its file doesn't match its
+    /// checksum. (A chunked blob's file or chunk that doesn't is
+    /// `InvalidFormat`.)
     ChecksumMismatch,
     /// A blob's bytes don't match the hash they're stored under.
     HashMismatch,
@@ -175,7 +185,9 @@ pub enum ErrorCode {
     /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`; the
     /// same key as both the id field and the sequence field of
     /// `appendManyToStateJsonWithIdentity`; the reserved record type
-    /// `state_update`; or a blob content type over 65,535 bytes.
+    /// `state_update`; content that `storeBlobAsync` with `chunked: true`
+    /// would cut into more chunks than a chunked blob's file can name
+    /// (4,294,967,295); or a blob content type over 65,535 bytes.
     InvalidOperation,
     /// The store doesn't hold the subscription. It dropped it because its
     /// buffer overran, or it was unsubscribed (to a poll, through another
