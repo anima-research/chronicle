@@ -3627,6 +3627,16 @@ impl Store {
         use std::io::Read;
 
         let manifest_path = path.join("MANIFEST");
+        // Only a regular file is opened, as create does: opening a FIFO for
+        // reading waits for a writer, and a directory isn't a MANIFEST.
+        if let Ok(metadata) = fs::metadata(&manifest_path) {
+            if !metadata.is_file() {
+                return Err(StoreError::InvalidFormat(format!(
+                    "{} isn't a regular file, so it isn't a Chronicle store's MANIFEST",
+                    manifest_path.display()
+                )));
+            }
+        }
         let mut file = File::open(&manifest_path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => match Self::present_store_file(path) {
                 Err(error) => error.into(),
