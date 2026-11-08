@@ -154,12 +154,12 @@ pub enum ErrorCode {
     NotInitialized,
     /// A store or blob file isn't in a format this release reads, or is
     /// damaged, or the store's `LOCK` isn't a regular file. Or the path holds
-    /// no `MANIFEST`, or one that's a link leading nowhere: `open` refuses
-    /// such a path whatever else is there, and `openOrCreate` refuses it
-    /// unless it holds nothing a new store can't sit beside, where it creates
-    /// one. For a chunked blob (see `storeBlobAsync`), it's also the code
-    /// when the blob's file is damaged, or a chunk it names is missing,
-    /// damaged or holds other bytes.
+    /// no `MANIFEST`: `open` refuses such a path whatever else is there, and
+    /// `openOrCreate` refuses it unless it holds nothing a new store can't
+    /// sit beside, where it creates one. Both refuse a path whose `MANIFEST`
+    /// is a link whose target doesn't exist. For a chunked blob (see
+    /// `storeBlobAsync`), it's also the code when the blob's file is
+    /// damaged, or a chunk it names is missing, damaged or holds other bytes.
     InvalidFormat,
     /// A record, or a blob stored whole, read from its file doesn't match its
     /// checksum. (A chunked blob's file or chunk that doesn't is

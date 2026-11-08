@@ -1,7 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
@@ -211,6 +211,7 @@ for (const [made, ownerOf] of owners) {
     const other = owner === store ? store.view('main') : store;
     const overflowed = owner.subscribe({ bufferSize: 1, filter: { includeRecords: true } });
     owner.catchUpSubscription(overflowed);
+    assert.equal(store.subscriptionCount(), 1);
     store.append('note', Buffer.from('a'));
     const unsubscribed = owner.subscribe();
     other.unsubscribe(unsubscribed);
@@ -229,6 +230,7 @@ for (const [made, ownerOf] of owners) {
     const owner = ownerOf(store);
     const id = owner.subscribe({ bufferSize: 1, filter: { includeRecords: true } });
     owner.catchUpSubscription(id);
+    assert.equal(store.subscriptionCount(), 1);
     store.append('note', Buffer.from('a'));
     assert.equal(store.subscriptionCount(), 0);
     assert.equal(owner.pollSubscription(id)?.eventType, 'caught_up');
@@ -257,6 +259,7 @@ for (const [made, ownerOf] of owners) {
     const other = owner === store ? store.view('main') : store;
     const id = owner.subscribe({ bufferSize: 1 });
     owner.catchUpSubscription(id);
+    assert.equal(store.subscriptionCount(), 1);
     other.unsubscribe(id);
     assert.equal(store.subscriptionCount(), 0);
     assert.equal(owner.pollSubscription(id)?.eventType, 'caught_up');
@@ -333,13 +336,17 @@ test('a view dropped without close() takes its subscriptions with it, and the ro
   store.close();
 });
 
-test('a catch-up replays the branch of the handle it is called on', () => {
+test('a catch-up replays the branch of the handle it is called on, its records and its states', () => {
   const { store } = freshStore();
   store.append('on-main', Buffer.from('m'));
+  store.registerState({ id: 'mood', strategy: 'snapshot' });
+  store.setStateJson('mood', { on: 'main' });
   store.createBranch('side');
   const side = store.view('side');
   side.append('on-side', Buffer.from('s'));
-  const config = { fromSequence: 0, filter: { includeRecords: true } };
+  side.setStateJson('mood', { on: 'side' });
+  const config = { fromSequence: 0, filter: { includeRecords: true, includeStateChanges: true, stateIds: ['mood'] } };
+  const snapshot = (events) => events.filter((e) => e.eventType === 'state_snapshot').map((e) => e.data);
   const events = (id) => {
     const out = [];
     for (let event = side.pollSubscription(id); event; event = side.pollSubscription(id)) out.push(event);
@@ -351,11 +358,22 @@ test('a catch-up replays the branch of the handle it is called on', () => {
   assert.equal(fromRoot.at(-1)?.eventType, 'caught_up');
   assert.ok(fromRoot.some((e) => e.eventType === 'record' && e.data.includes('"on-main"')), JSON.stringify(fromRoot));
   assert.ok(!fromRoot.some((e) => e.data.includes('"on-side"')), JSON.stringify(fromRoot));
+  assert.equal(snapshot(fromRoot).length, 1, JSON.stringify(fromRoot));
+  assert.match(snapshot(fromRoot)[0], /"on":"main"/);
   const throughSide = side.subscribe(config);
   side.catchUpSubscription(throughSide);
   const fromSide = events(throughSide);
   assert.equal(fromSide.at(-1)?.eventType, 'caught_up');
   assert.ok(fromSide.some((e) => e.eventType === 'record' && e.data.includes('"on-side"')), JSON.stringify(fromSide));
+  assert.equal(snapshot(fromSide).length, 1, JSON.stringify(fromSide));
+  assert.match(snapshot(fromSide)[0], /"on":"side"/);
+  const at = { fromSequence: side.currentSequence(), filter: { includeStateChanges: true, stateIds: ['mood'] } };
+  const atRoot = side.subscribe(at);
+  store.catchUpSubscription(atRoot);
+  assert.match(snapshot(events(atRoot))[0] ?? '', /"on":"main"/);
+  const atSide = side.subscribe(at);
+  side.catchUpSubscription(atSide);
+  assert.match(snapshot(events(atSide))[0] ?? '', /"on":"side"/);
   store.close();
 });
 
@@ -484,6 +502,16 @@ test('opening a store that is not there is InvalidFormat', () => {
     ErrorCode.InvalidFormat,
     /^Invalid store format: .*nothing-here has no MANIFEST, so it isn't a Chronicle store$/,
   );
+});
+
+test('a store whose MANIFEST is a link whose target does not exist is InvalidFormat to open and to openOrCreate', { skip: process.platform === 'win32' && 'making a symbolic link needs a privilege on Windows' }, () => {
+  const parent = mkdtempSync(join(tmpdir(), 'chronicle-codes-'));
+  dirs.push(parent);
+  const dir = join(parent, 'store');
+  mkdirSync(dir);
+  symlinkSync(join(parent, 'gone'), join(dir, 'MANIFEST'));
+  throwsCoded(() => JsStore.open({ path: dir }), ErrorCode.InvalidFormat, /MANIFEST is a symbolic link \(to .*gone\) that leads to nothing/);
+  throwsCoded(() => JsStore.openOrCreate({ path: dir }), ErrorCode.InvalidFormat, /MANIFEST is a symbolic link \(to .*gone\) that leads to nothing/);
 });
 
 test('opening a store under a path that is a file is an Io error', { skip: process.platform === 'win32' && 'relies on the POSIX error for a path through a regular file' }, () => {
