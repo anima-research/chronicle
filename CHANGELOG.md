@@ -12,6 +12,163 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.7.0 — 2026-11-09
+
+### Breaking
+
+- **Running an earlier chronicle on a store with chunked blobs:** releases
+  before this one open such a store and read its blobs stored whole, but
+  can't read a chunked one. In 0.5.0, 0.5.1 and 0.6.0, `getBlob` of it throws
+  `Invalid store format: Unsupported blob version 2 in <file>: …`, and so
+  does `storeBlob` of the same content, which leaves the chunked file as it
+  is. In 0.4.0 and earlier, `getBlob` of it throws
+  `Invalid store format: Unsupported blob version: 2`, and `storeBlob` of
+  the same content returns the hash and leaves the chunked file as it is.
+  Either way the blob stays unreadable there. **Who needs to act:** a host
+  that stores blobs with `storeBlobAsync`'s `chunked: true` and may run an
+  earlier chronicle on the same store. **Migration:** before running an
+  earlier release on such a store, close it and run
+  `tools/unchunk-blobs.py <store> --apply` from chronicle's repository
+  with Python 3 (the npm package doesn't carry it), which rewrites each
+  chunked blob whole under the same hash, so earlier releases read it;
+  without `--apply` it lists them. A blob it stops at because its list or
+  a chunk can't be read, such as one with a damaged chunk, can't be read by
+  this release either. With the store open in this release, store its
+  content again with `storeBlob`, which writes it
+  whole. If that throws, as it does for a chunk in a newer format or one
+  this account can't read, delete the blob's file, then store the content;
+  without the content, only delete the file. Then close the store and run
+  the script again. **Unchanged:** only `storeBlobAsync` with
+  `chunked: true` writes a chunked blob, and nothing else in a store
+  changes with it: blobs stored whole and the store's other files keep the
+  formats earlier releases read. Opening a store reads no blob.
+
+- **Hosts that check a chronicle error's `code`, or match its message:**
+  every error the Node binding raised for chronicle carried napi's
+  `GenericFailure` as `code`. It now carries the error's `ErrorCode`
+  instead, so a check for `GenericFailure` no longer matches them. The four
+  errors of the new `storeBlobAsync` that Added names carry no `ErrorCode`.
+  Two kinds of error also change their message:
+  - A poll of a subscription that has ended, once the events queued for it
+    are read, throws `StoreClosed` (`Store has been closed`) after the
+    root's `close()`, and otherwise `SubscriptionDropped`
+    (`Subscription was dropped`), instead of `Subscription disconnected`:
+    the store dropped it because its buffer overran, or it was
+    unsubscribed through another handle.
+  - Deleting the main branch or the current branch, or a view's deleting the
+    branch it is pinned to, now throws `InvalidOperation` (in Rust,
+    `StoreError::InvalidOperation`), whose message begins
+    `Invalid operation:`, where it was `BranchNotFound` and began
+    `Branch not found:`. In Rust, so does
+    `BranchManager::delete_branch_with_reparent` naming a branch to reparent
+    onto that doesn't exist, and `BranchManager::gc`, which calls it, lists
+    that refusal's new message among its errors.
+
+  **Who needs to act:** a host that compares `error.code` with
+  `GenericFailure`, or that matches `Subscription disconnected`, or
+  `Branch not found:` on one of those deletions; and Rust code that matches
+  `StoreError::BranchNotFound` there. **Migration:** compare `error.code`
+  with `ErrorCode`'s members (Added): an ended subscription's poll gives
+  `SubscriptionDropped` or `StoreClosed`, and those deletions give
+  `InvalidOperation`. **Unchanged:** nothing on disk; a store opens and
+  reads as before.
+
+### Added
+
+- `storeBlobAsync(content, contentType, options)` stores a blob without
+  holding the calling thread. It resolves with the blob's hash once it's
+  stored, and rejects with the error that stopped it. Without `chunked`,
+  it stores as `storeBlob` does, and rejects with the error `storeBlob`
+  would throw. The bytes are copied before it returns, so the buffer can be
+  reused at once. The open store's own thread, which its root handle and
+  views share, takes these stores one at a time, in the order they're called
+  on any of them; a `storeBlob` meanwhile isn't ordered with them. The
+  root's `close()` waits for every one already called, holding the calling
+  thread while it does, and a store whose root and views are all dropped
+  without `close()` finishes them before it releases its lock.
+- `storeBlobAsync` with `chunked: true` cuts content where its own bytes
+  say, into chunks of at most 64 KiB, each at least 2 KiB but the last, and
+  stores it as chunks wherever that cut makes more than one, which any
+  content over 2 KiB can: every chunk a blob of its own, under a file at the
+  whole content's hash that names them in order and is written only once
+  every chunk is stored and each one this store wrote is synced. Where this
+  store writes a chunk, its content type is `application/octet-stream`,
+  which Rust's `Store::get_blob` returns for it (the Node API's `getBlob`
+  returns bytes only). Like any blob already stored, a chunk that reads back
+  whole is left as it is, content type included, whichever store of the
+  same bytes finds it. Content sharing long runs of bytes with earlier
+  chunked content shares those chunks, so storing each request of a growing
+  conversation writes mostly what's new. `getBlob` returns the
+  content, and its hash is still the content's SHA-256. `stats()` counts
+  each chunk, and the file naming them, as a blob, and Rust's
+  `BlobStorage::list` lists them. A store that finds a blob already at its
+  hash in the other form leaves it when it reads back as the content.
+
+- **Error codes:** an error the Node binding raises for a store failure, or for
+  a call it refuses, now carries `code`, one of the values of the new
+  `ErrorCode` enum, such as `BranchNotFound`, `Locked` or `StoreClosed`. A
+  failed fsync of the record log gives `DurabilityLost`, which `sync()` then
+  throws until the store is reopened, and so do the calls that checkpoint,
+  unless a check of their own refuses them first. Messages
+  are unchanged, except the ones Breaking and Changed name. Branch on
+  `error.code` rather than on message text: compare it with `ErrorCode`'s
+  members, whose names are kept across releases. An error napi raises
+  while converting a call's arguments, before the call reaches chronicle,
+  keeps napi's own code
+  (`StringExpected`, `InvalidArg`) or has none. The four errors of
+  `storeBlobAsync` that are neither a store failure nor a refusal, which
+  `ErrorCode`'s docs name, carry no chronicle code: three carry napi's
+  `GenericFailure`, and when it can't make its promise, `storeBlobAsync`
+  throws the error napi raises.
+
+### Changed
+
+- `storeBlob` and `storeBlobAsync` no longer put the bytes they store in the
+  blob cache, which now holds what `getBlob` reads, so storing large blobs
+  no longer holds up to `blobCacheSize` of them in memory. A `getBlob` of a
+  blob stored but not read yet reads its file. A store of bytes the open
+  store has already stored whole, or read and checked whole while storing,
+  still returns without reading their file again while a regular file
+  of the same length is at their name, until a read of that file fails. A
+  `getBlob` records nothing of the kind, so storing bytes only `getBlob` has
+  read reads their file once. A check of such a file that races a store
+  replacing it on another thread can drop the entry that store has just
+  made, until the store that checked reads the file and records it again;
+  a store of the same bytes in between reads the file once. A chunked
+  blob's own file, which names its chunks, is read each time the same
+  content is stored again: by a chunked store, with its chunks
+  taken the same way, and by `storeBlob`, with its chunks read. `getBlob` of
+  a chunked blob caches its chunks, not the whole.
+- A store whose sync of the directories holding a blob's file fails now
+  names that file as not written (`cannot sync the directories holding
+  <dir>: <error>; <file> wasn't written, and storing the blob again tries
+  the sync again`), where it said `nothing was stored`: a chunked store
+  whose sync fails at a later chunk has stored the chunks before it.
+
+### Fixed
+
+- A catch-up that overruns the subscription's buffer (`catchUpSubscription`,
+  and in Rust `Store::catch_up_subscription` and `catch_up_subscription_on`)
+  now drops the subscription, as overrunning it with live events does. When
+  the overrun fell on a replayed event, it used to fail with
+  `Subscription was dropped` while the subscription stayed registered, and
+  a poll of it returned `null`; now a poll throws `SubscriptionDropped`
+  once the events queued for it are read. In
+  Rust, `SubscriptionManager::send_to` now removes a subscription that can't
+  take the event, and `Store::mark_subscription_caught_up` and
+  `SubscriptionManager::mark_caught_up` fail with `SubscriptionDropped` for
+  one that's gone, where they returned `Ok`.
+- A handle, the root or a view, dropped without `close()` now gives up its
+  subscriptions when it's garbage-collected. A subscription it had made and
+  not caught up used to stay in the store, counted by `subscriptionCount()`,
+  until the store closed.
+
+- `Store::open` and `Store::open_or_create` (and `JsStore.open` and
+  `openOrCreate`) on a store whose `MANIFEST` isn't a regular file now fail
+  with `InvalidFormat`, naming the file, without opening it. On a FIFO they
+  used to wait for a writer, though 0.6.0's notes said they fail there; on a
+  directory they failed with an I/O error (#34).
+
 ## 0.6.0 — 2026-11-07
 
 ### Breaking
