@@ -208,9 +208,9 @@ impl Store {
     /// Open an existing store or create a new one.
     ///
     /// A directory that holds any of a store's files (`MANIFEST`,
-    /// `records.log`, `state.bin`, `branches.bin`, `state-indexes.bin`, a
-    /// symbolic link counting even when its target is missing, or a `blobs/`
-    /// with data in it) is opened, so one whose `MANIFEST`
+    /// `records.log`, `state.bin`, `branches.bin` or `state-indexes.bin`, a
+    /// symbolic link counting even when its target is missing; or a `blobs/`
+    /// with data in it, in place or through a link) is opened, so one whose `MANIFEST`
     /// is missing or unusable is refused, with open's account of what it
     /// found, whatever `create_if_missing` says. Otherwise it is created into
     /// (when `create_if_missing` is set) only if it is missing or holds
@@ -220,8 +220,8 @@ impl Store {
     /// to a volume it mounts; `System Volume Information` and
     /// `$RECYCLE.BIN`, which Windows adds), Finder's `.DS_Store`, the `LOCK`
     /// and the `blobs/` a create leaves when it stops before its manifest,
-    /// holding nothing but those names (a `blobs` link read as what it leads
-    /// to), and a checkpoint's staging
+    /// holding nothing but a fresh volume's names or `.DS_Store` (a `blobs`
+    /// link read as what it leads to), and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
     /// isn't taken for a place to put a store. A directory whose entries
@@ -3561,7 +3561,6 @@ impl Store {
 
     // --- Private Helpers ---
 
-    /// The files whose presence means a directory already holds a store.
     /// What a fresh volume's root holds (`lost+found` from mke2fs;
     /// `.fseventsd`, `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`,
     /// which macOS adds to a volume it mounts; `System Volume Information`
@@ -3578,6 +3577,7 @@ impl Store {
         ".DS_Store",
     ];
 
+    /// The files whose presence means a directory already holds a store.
     const STORE_FILES: [&'static str; 5] =
         ["MANIFEST", "records.log", "state.bin", "branches.bin", "state-indexes.bin"];
 
