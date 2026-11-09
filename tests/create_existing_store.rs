@@ -550,3 +550,110 @@ fn a_manifest_cut_short_of_its_header_is_named_and_create_says_how_to_start_over
         assert_eq!(fs::read(&manifest).unwrap(), bytes, "{bytes:?}: MANIFEST is untouched");
     }
 }
+
+/// `state-indexes.bin` is one of a store's data files: beside no MANIFEST it
+/// is a damaged store, which create won't write over and open_or_create won't
+/// create into.
+#[test]
+fn state_indexes_without_a_manifest_is_a_damaged_store() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("state-indexes.bin"), b"").unwrap();
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("state-indexes.bin") && msg.contains("damaged"), "{msg}");
+    match Store::open_or_create(config(&path)) {
+        Err(StoreError::InvalidFormat(msg)) => {
+            assert!(msg.contains("state-indexes.bin") && msg.contains("damaged"), "{msg}")
+        }
+        Err(other) => panic!("expected InvalidFormat, got {other:?}"),
+        Ok(_) => panic!("open_or_create made a store beside state-indexes.bin"),
+    }
+    assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+}
+
+/// A `blobs/` holding data, beside no MANIFEST, is what's left of a store:
+/// create writes no blob before its MANIFEST. Neither create nor
+/// open_or_create makes a new store over it, and the data stays.
+#[test]
+fn blobs_with_data_and_no_manifest_is_a_damaged_store() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir_all(path.join("blobs")).unwrap();
+    fs::write(path.join("blobs").join("x"), b"hello").unwrap();
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("blobs/ with data in it") && msg.contains("damaged"), "{msg}");
+    match Store::open_or_create(config(&path)) {
+        Err(StoreError::InvalidFormat(msg)) => {
+            assert!(msg.contains("blobs/ with data in it") && msg.contains("damaged"), "{msg}")
+        }
+        Err(other) => panic!("expected InvalidFormat, got {other:?}"),
+        Ok(_) => panic!("open_or_create made a store over blobs/ with data"),
+    }
+    assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+    assert_eq!(fs::read(path.join("blobs").join("x")).unwrap(), b"hello", "the data stays");
+}
+
+/// A `blobs/` holding only what a volume or Finder puts there is not data: a
+/// create that stopped after making it is finished.
+#[test]
+fn blobs_holding_only_a_finder_or_volume_entry_is_not_data() {
+    for entry in [".DS_Store", "lost+found"] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        fs::create_dir_all(path.join("blobs")).unwrap();
+        if entry == "lost+found" {
+            fs::create_dir(path.join("blobs").join(entry)).unwrap();
+        } else {
+            fs::write(path.join("blobs").join(entry), b"").unwrap();
+        }
+        Store::open_or_create(config(&path)).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        assert!(path.join("MANIFEST").exists(), "{entry}");
+    }
+}
+
+/// Create's advice for a MANIFEST cut short of its header names everything
+/// that makes the directory a store's, so following it can't end in another
+/// refusal: `state-indexes.bin` and a `blobs/` with data count too.
+#[test]
+fn create_advice_on_a_short_manifest_names_every_data_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("MANIFEST"), b"").unwrap();
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(
+        msg.contains("remove the MANIFEST and create again")
+            && msg.contains("state-indexes.bin")
+            && msg.contains("blobs/ with data in it"),
+        "{msg}"
+    );
+}
+
+/// A `blobs/` that can't be listed can't be told empty: open_or_create fails
+/// with the listing's I/O error, naming it, and creates nothing.
+#[cfg(unix)]
+#[test]
+fn open_or_create_on_a_blobs_directory_it_cannot_list_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let blobs = path.join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    fs::set_permissions(&blobs, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&blobs).is_ok() {
+        // Running as a user the mode doesn't stop (root): nothing to test.
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let opened = Store::open_or_create(config(&path));
+    fs::set_permissions(&blobs, fs::Permissions::from_mode(0o755)).unwrap();
+    match opened {
+        Err(StoreError::Io(error)) => assert!(error.to_string().contains(&*blobs.to_string_lossy()), "{error}"),
+        Err(other) => panic!("expected Io naming blobs, got {other:?}"),
+        Ok(_) => panic!("open_or_create made a store beside a blobs/ it couldn't list"),
+    }
+    assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+}
