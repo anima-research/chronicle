@@ -4072,9 +4072,6 @@ mod tests {
         waiting_out_locked(|| Store::open(config.clone()))
     }
 
-    /// Runs `attempt` again while it fails with `Locked`, for up to 5 s, for
-    /// a call that takes the lock of a store this process closed a moment
-    /// ago (see `reopen`).
     fn waiting_out_locked<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
