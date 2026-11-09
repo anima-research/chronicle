@@ -218,8 +218,9 @@ impl Store {
     /// `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`, which macOS adds
     /// to a volume it mounts; `System Volume Information` and
     /// `$RECYCLE.BIN`, which Windows adds), Finder's `.DS_Store`, the `LOCK`
-    /// and `blobs/` a create
-    /// leaves when it stops before its manifest, and a checkpoint's staging
+    /// and the empty `blobs/` (or one holding only `.DS_Store` or
+    /// `lost+found`) a create leaves when it stops before its manifest, a
+    /// `blobs` link, and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
     /// isn't taken for a place to put a store. A directory whose entries
@@ -371,7 +372,7 @@ impl Store {
                         manifest.display(),
                         if short {
                             format!(
-                                ". If {} holds no records.log, state.bin or branches.bin, remove the MANIFEST and create again",
+                                ". If {} holds no records.log, state.bin, branches.bin or state-indexes.bin and no blobs/ with data in it, remove the MANIFEST and create again",
                                 config.path.display()
                             )
                         } else {
@@ -396,9 +397,11 @@ impl Store {
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
-        // A blobs/ directory can outlive the rest of an earlier store (create
-        // refuses only the store's data files), and hold staging files its
-        // interrupted blob stores left. The lock is held, as at open.
+        // A blobs/ that is a directory reaches here holding nothing but what
+        // a volume or Finder puts there (create refuses one with data in it
+        // as a damaged store), but a blobs link is taken as it is, and what
+        // it leads to can hold staging files interrupted blob stores left.
+        // The lock is held, as at open.
         blobs.remove_staging_files();
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
@@ -3569,7 +3572,8 @@ impl Store {
     // --- Private Helpers ---
 
     /// The files whose presence means a directory already holds a store.
-    const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
+    const STORE_FILES: [&'static str; 5] =
+        ["MANIFEST", "records.log", "state.bin", "branches.bin", "state-indexes.bin"];
 
     fn link_to_nothing(link: &Path) -> String {
         format!(
@@ -3592,6 +3596,36 @@ impl Store {
                         format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
                     ))
                 }
+            }
+        }
+        Self::blobs_with_data(path)
+    }
+
+    /// `blobs/ with data in it` where `path` holds a `blobs` directory with
+    /// anything in it but what a volume or Finder puts there. A create
+    /// writes no blob before its MANIFEST, so its own leftover `blobs/` is
+    /// empty; one with data in it is what's left of a store. A `blobs` link
+    /// says nothing here, since it may lead to a directory shared with
+    /// something else. A `blobs/` that can't be listed is an error, naming
+    /// it: this can't say it holds nothing.
+    fn blobs_with_data(path: &Path) -> std::io::Result<Option<&'static str>> {
+        let blobs = path.join("blobs");
+        let unread = |error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot tell whether {} holds a store's blobs: {error}", blobs.display()),
+            )
+        };
+        match fs::symlink_metadata(&blobs) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unread(error)),
+        }
+        for entry in fs::read_dir(&blobs).map_err(unread)? {
+            let name = entry.map_err(unread)?.file_name();
+            if name != ".DS_Store" && name != "lost+found" {
+                return Ok(Some("blobs/ with data in it"));
             }
         }
         Ok(None)
