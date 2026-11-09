@@ -208,8 +208,9 @@ impl Store {
     /// Open an existing store or create a new one.
     ///
     /// A directory that holds any of a store's files (`MANIFEST`,
-    /// `records.log`, `state.bin`, `branches.bin`, a symbolic link counting
-    /// even when its target is missing) is opened, so one whose `MANIFEST`
+    /// `records.log`, `state.bin`, `branches.bin`, `state-indexes.bin`, a
+    /// symbolic link counting even when its target is missing, or a `blobs/`
+    /// with data in it) is opened, so one whose `MANIFEST`
     /// is missing or unusable is refused, with open's account of what it
     /// found, whatever `create_if_missing` says. Otherwise it is created into
     /// (when `create_if_missing` is set) only if it is missing or holds
@@ -218,9 +219,9 @@ impl Store {
     /// `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`, which macOS adds
     /// to a volume it mounts; `System Volume Information` and
     /// `$RECYCLE.BIN`, which Windows adds), Finder's `.DS_Store`, the `LOCK`
-    /// and the empty `blobs/` (or one holding only `.DS_Store` or
-    /// `lost+found`) a create leaves when it stops before its manifest, a
-    /// `blobs` link, and a checkpoint's staging
+    /// and the `blobs/` a create leaves when it stops before its manifest,
+    /// holding nothing but those names (a `blobs` link read as what it leads
+    /// to), and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
     /// isn't taken for a place to put a store. A directory whose entries
@@ -275,19 +276,8 @@ impl Store {
     /// empty.
     fn foreign_entry(path: &Path) -> std::io::Result<Option<String>> {
         let allowed = |name: &str| {
-            [
-                "lost+found",
-                ".fseventsd",
-                ".Spotlight-V100",
-                ".Trashes",
-                ".TemporaryItems",
-                "System Volume Information",
-                "$RECYCLE.BIN",
-                ".DS_Store",
-                "LOCK",
-                "blobs",
-            ]
-            .contains(&name)
+            Self::VOLUME_ENTRIES.contains(&name)
+                || ["LOCK", "blobs"].contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
         let listing_error = |error: std::io::Error| {
@@ -397,11 +387,11 @@ impl Store {
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
-        // A blobs/ that is a directory reaches here holding nothing but what
-        // a volume or Finder puts there (create refuses one with data in it
-        // as a damaged store), but a blobs link is taken as it is, and what
-        // it leads to can hold staging files interrupted blob stores left.
-        // The lock is held, as at open.
+        // A blobs/, in place or through a link, reaches here holding nothing
+        // but VOLUME_ENTRIES' names (create refuses one with data in it as a
+        // damaged store). The sweep runs under this store's lock, which
+        // covers no other user of the directory: a blob directory isn't
+        // shared between stores.
         blobs.remove_staging_files();
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
@@ -3572,6 +3562,22 @@ impl Store {
     // --- Private Helpers ---
 
     /// The files whose presence means a directory already holds a store.
+    /// What a fresh volume's root holds (`lost+found` from mke2fs;
+    /// `.fseventsd`, `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`,
+    /// which macOS adds to a volume it mounts; `System Volume Information`
+    /// and `$RECYCLE.BIN`, which Windows adds) and Finder's `.DS_Store`: what
+    /// a new store can sit beside, and what doesn't make a `blobs/` hold data.
+    const VOLUME_ENTRIES: [&'static str; 8] = [
+        "lost+found",
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".TemporaryItems",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        ".DS_Store",
+    ];
+
     const STORE_FILES: [&'static str; 5] =
         ["MANIFEST", "records.log", "state.bin", "branches.bin", "state-indexes.bin"];
 
@@ -3602,12 +3608,13 @@ impl Store {
     }
 
     /// `blobs/ with data in it` where `path` holds a `blobs` directory with
-    /// anything in it but what a volume or Finder puts there. A create
-    /// writes no blob before its MANIFEST, so its own leftover `blobs/` is
-    /// empty; one with data in it is what's left of a store. A `blobs` link
-    /// says nothing here, since it may lead to a directory shared with
-    /// something else. A `blobs/` that can't be listed is an error, naming
-    /// it: this can't say it holds nothing.
+    /// anything in it but the names in `VOLUME_ENTRIES`. A create writes no
+    /// blob before its MANIFEST, so its own leftover `blobs/` is empty; one
+    /// with data in it is what's left of a store. A `blobs` link is read as
+    /// what it leads to, so a damaged store reached through one is refused
+    /// as one in place is, and a link to nothing holds nothing. A `blobs/`
+    /// that can't be listed is an error, naming it: this can't say it holds
+    /// nothing.
     fn blobs_with_data(path: &Path) -> std::io::Result<Option<&'static str>> {
         let blobs = path.join("blobs");
         let unread = |error: std::io::Error| {
@@ -3616,7 +3623,7 @@ impl Store {
                 format!("cannot tell whether {} holds a store's blobs: {error}", blobs.display()),
             )
         };
-        match fs::symlink_metadata(&blobs) {
+        match fs::metadata(&blobs) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3624,7 +3631,7 @@ impl Store {
         }
         for entry in fs::read_dir(&blobs).map_err(unread)? {
             let name = entry.map_err(unread)?.file_name();
-            if name != ".DS_Store" && name != "lost+found" {
+            if !Self::VOLUME_ENTRIES.contains(&&*name.to_string_lossy()) {
                 return Ok(Some("blobs/ with data in it"));
             }
         }
