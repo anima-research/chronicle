@@ -3537,11 +3537,19 @@ impl Store {
         if config.filter.include_records {
             let payload_threshold = 4096; // Same as manager default
 
-            for result in self.iter_from_on(branch_id, from_seq) {
+            let start = self.index.first_offset_from(branch_id, from_seq);
+            for result in start.into_iter().flat_map(|offset| self.log.iter_from(offset)) {
                 let (_offset, record) = result?;
 
                 // Skip records not on current branch
                 if record.branch != current_branch.id {
+                    continue;
+                }
+
+                // A store written before 0.2.6 can hold a sequence reissued
+                // after an unclean shutdown, so records below `from_seq` can
+                // follow the start.
+                if record.sequence < from_seq {
                     continue;
                 }
 
@@ -5130,6 +5138,72 @@ mod tests {
         }
 
         assert_eq!(received, vec![3, 4, 5]);
+    }
+
+    /// Ten records, then one at reissued sequence 6, as a store written
+    /// before 0.2.6 can hold after an unclean shutdown left `branches.bin`
+    /// behind the log; reopened, so its index is rebuilt from the log and
+    /// points 6 at the reissued record, the last in the log.
+    fn store_with_reissued_six(dir: &TempDir) -> Store {
+        let store = Store::create(test_config(dir)).unwrap();
+        for i in 1..=10 {
+            store
+                .append(RecordInput::json("message", &serde_json::json!({ "i": i })).unwrap())
+                .unwrap();
+        }
+        let main = store.branches.current_id();
+        let (record, offset) = store
+            .log
+            .append(RecordInput::raw("message", b"reissued 6".to_vec()), main, Sequence(6))
+            .unwrap();
+        store.index.add(
+            record.id,
+            main,
+            Sequence(6),
+            offset,
+            &record.record_type,
+            &record.caused_by,
+            &record.linked_to,
+        );
+        store.sync().unwrap();
+        drop(store);
+        Store::open(test_config(dir)).unwrap()
+    }
+
+    /// The sequences of the records a catch-up from `from` replays.
+    fn records_caught_up_from(store: &Store, from: u64) -> Vec<u64> {
+        use crate::subscriptions::{StoreEvent, SubscriptionConfig, SubscriptionFilter};
+        use std::time::Duration;
+
+        let handle = store.subscribe(SubscriptionConfig {
+            filter: SubscriptionFilter::records(),
+            from_sequence: Some(Sequence(from)),
+            ..Default::default()
+        });
+        store.catch_up_subscription(handle.id).unwrap();
+        let mut received = Vec::new();
+        while let Ok(event) = handle.recv_timeout(Duration::from_millis(50)) {
+            match event {
+                StoreEvent::Record { record } => received.push(record.sequence.0),
+                StoreEvent::CaughtUp => break,
+                _ => {}
+            }
+        }
+        received
+    }
+
+    #[test]
+    fn catch_up_skips_a_reissued_sequence_below_from_sequence() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_reissued_six(&dir);
+        assert_eq!(records_caught_up_from(&store, 8), vec![8, 9, 10]);
+    }
+
+    #[test]
+    fn catch_up_from_a_reissued_sequence_reaches_the_originals_above_it() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_reissued_six(&dir);
+        assert_eq!(records_caught_up_from(&store, 6), vec![7, 8, 9, 10, 6]);
     }
 
     #[test]
