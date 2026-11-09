@@ -9,9 +9,10 @@
   root's `close()` waits for every one already called, holding the calling
   thread while it does, and a store whose root and views are all dropped
   without `close()` finishes them before it releases its lock.
-- `storeBlobAsync` with `chunked: true` stores content longer than one chunk
-  as chunks cut where its own bytes say, at most 64 KiB each and at least
-  2 KiB but the last, every chunk a blob of its own, under a file at the
+- `storeBlobAsync` with `chunked: true` cuts content where its own bytes
+  say, into chunks of at most 64 KiB, each at least 2 KiB but the last, and
+  stores it as chunks wherever that cut makes more than one, which any
+  content over 2 KiB can: every chunk a blob of its own, under a file at the
   whole content's hash that names them in order and is written only once
   every chunk is stored and each one this store wrote is synced. Where this
   store writes a chunk, its content type is `application/octet-stream`,

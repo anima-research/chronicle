@@ -4,10 +4,11 @@
   failed fsync of the record log gives `DurabilityLost`, which `sync()` then
   throws until the store is reopened, and so do the calls that checkpoint,
   unless a check of their own refuses them first. Messages
-  are unchanged, except the ones Changed names. Branch on `error.code` rather
-  than on message text: compare it with `ErrorCode`'s members, whose names
-  are kept across releases. An error napi raises while converting a call's
-  arguments, before the call reaches chronicle, keeps napi's own code
+  are unchanged, except the ones Breaking and Changed name. Branch on
+  `error.code` rather than on message text: compare it with `ErrorCode`'s
+  members, whose names are kept across releases. An error napi raises
+  while converting a call's arguments, before the call reaches chronicle,
+  keeps napi's own code
   (`StringExpected`, `InvalidArg`) or has none. The four errors of
   `storeBlobAsync` that are neither a store failure nor a refusal, which
   `ErrorCode`'s docs name, carry no chronicle code: three carry napi's

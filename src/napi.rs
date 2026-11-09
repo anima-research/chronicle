@@ -990,15 +990,15 @@ impl JsStore {
     /// ones already called, and then releases its lock. On a closed store or
     /// view this throws, as every method does.
     ///
-    /// With `chunked: true`, content longer than one chunk is cut where its
-    /// own bytes say, into chunks of at most 64 KiB, each at least 2 KiB but
-    /// the last, so content sharing long
+    /// With `chunked: true`, content is cut where its own bytes say, into
+    /// chunks of at most 64 KiB, each at least 2 KiB but the last, so any
+    /// content over 2 KiB can be cut into more than one, and content sharing long
     /// runs of bytes with earlier chunked content shares those runs' chunks
     /// too. Each chunk
     /// is stored as a blob, and a file under the whole content's hash names
     /// them in order, written only once every chunk is stored and each one
     /// this store wrote is synced.
-    /// Content of one chunk or less is stored whole. `getBlob` returns the
+    /// Content the cut leaves as one chunk is stored whole. `getBlob` returns the
     /// content either way, and a blob already stored in the other form is
     /// left as it is when it reads back as the content. Chunking pays where
     /// content repeats earlier chunked content: each chunk is a file of its
