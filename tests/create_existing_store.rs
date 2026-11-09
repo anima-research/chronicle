@@ -453,6 +453,58 @@ fn create_on_a_manifest_that_isnt_a_regular_file_refuses_without_hanging() {
     }
 }
 
+/// `open` and `open_or_create` refuse a MANIFEST that isn't a regular file
+/// without opening it, as create does: opening a FIFO for reading waits for a
+/// writer, and 0.6.0's open waited there.
+#[cfg(unix)]
+#[test]
+fn open_on_a_manifest_that_isnt_a_regular_file_refuses_without_hanging() {
+    for call in ["open", "open_or_create"] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("store");
+        fs::create_dir(&path).unwrap();
+        let manifest = path.join("MANIFEST");
+        let c_path = std::ffi::CString::new(manifest.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (done, result) = std::sync::mpsc::channel();
+        let store_config = config(&path);
+        let which = call.to_string();
+        std::thread::spawn(move || {
+            let opened = if which == "open" { Store::open(store_config) } else { Store::open_or_create(store_config) };
+            let _ = done.send(opened.map(drop));
+        });
+        match result.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Err(StoreError::InvalidFormat(msg))) => assert!(
+                msg.contains(&*manifest.to_string_lossy()) && msg.contains("isn't a regular file"),
+                "{call}: {msg}"
+            ),
+            Ok(other) => panic!("{call}: {other:?}"),
+            Err(_) => panic!("{call} on a FIFO MANIFEST didn't return within 10 s"),
+        }
+        assert!(!path.join("records.log").exists(), "{call} wrote nothing");
+    }
+}
+
+/// A directory named MANIFEST is refused the same way, on every platform.
+#[test]
+fn open_on_a_manifest_that_is_a_directory_says_so() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir_all(path.join("MANIFEST")).unwrap();
+    for (call, opened) in [("open", Store::open(config(&path))), ("open_or_create", Store::open_or_create(config(&path)))] {
+        match opened {
+            Err(StoreError::InvalidFormat(msg)) => assert!(
+                msg.contains(&*path.join("MANIFEST").to_string_lossy()) && msg.contains("isn't a regular file"),
+                "{call}: {msg}"
+            ),
+            Err(other) => panic!("{call}: expected InvalidFormat, got {other:?}"),
+            Ok(_) => panic!("{call} opened a store on a MANIFEST directory"),
+        }
+    }
+    assert!(path.join("MANIFEST").is_dir());
+}
+
 #[test]
 fn create_names_open_or_create_in_both_apis() {
     let dir = TempDir::new().unwrap();

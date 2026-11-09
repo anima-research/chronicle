@@ -153,7 +153,8 @@ pub enum ErrorCode {
     /// fails with `InvalidFormat`.
     NotInitialized,
     /// A store or blob file isn't in a format this release reads, or is
-    /// damaged, or the store's `LOCK` isn't a regular file. Or the path holds
+    /// damaged, or the store's `LOCK` or `MANIFEST` isn't a regular file (a
+    /// FIFO or a directory, say). Or the path holds
     /// no `MANIFEST`: `open` refuses such a path whatever else is there, and
     /// `openOrCreate` refuses it unless it holds nothing a new store can't
     /// sit beside, where it creates one. Both refuse a path whose `MANIFEST`
