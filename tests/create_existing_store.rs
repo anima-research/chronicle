@@ -596,18 +596,28 @@ fn blobs_with_data_and_no_manifest_is_a_damaged_store() {
     assert_eq!(fs::read(path.join("blobs").join("x")).unwrap(), b"hello", "the data stays");
 }
 
-/// A `blobs/` holding only what a volume or Finder puts there is not data: a
-/// create that stopped after making it is finished.
+/// A `blobs/` holding only what a fresh volume's root holds, or Finder's
+/// `.DS_Store`, is not data (a volume mounted at `blobs/`, or a create that
+/// stopped after making it): the names a new store can sit beside.
 #[test]
 fn blobs_holding_only_a_finder_or_volume_entry_is_not_data() {
-    for entry in [".DS_Store", "lost+found"] {
+    for entry in [
+        "lost+found",
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".TemporaryItems",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        ".DS_Store",
+    ] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("store");
         fs::create_dir_all(path.join("blobs")).unwrap();
-        if entry == "lost+found" {
-            fs::create_dir(path.join("blobs").join(entry)).unwrap();
-        } else {
+        if entry == ".DS_Store" {
             fs::write(path.join("blobs").join(entry), b"").unwrap();
+        } else {
+            fs::create_dir(path.join("blobs").join(entry)).unwrap();
         }
         Store::open_or_create(config(&path)).unwrap_or_else(|e| panic!("{entry}: {e}"));
         assert!(path.join("MANIFEST").exists(), "{entry}");
@@ -626,14 +636,16 @@ fn create_advice_on_a_short_manifest_names_every_data_file() {
     let msg = invalid_operation(Store::create(config(&path)));
     assert!(
         msg.contains("remove the MANIFEST and create again")
-            && msg.contains("state-indexes.bin")
-            && msg.contains("blobs/ with data in it"),
+            && ["records.log", "state.bin", "branches.bin", "state-indexes.bin", "blobs/ with data in it"]
+                .iter()
+                .all(|name| msg.contains(name)),
         "{msg}"
     );
 }
 
-/// A `blobs/` that can't be listed can't be told empty: open_or_create fails
-/// with the listing's I/O error, naming it, and creates nothing.
+/// A `blobs/` that can't be listed can't be told empty: open and
+/// open_or_create fail with the listing's I/O error, naming it, and create
+/// nothing.
 #[cfg(unix)]
 #[test]
 fn open_or_create_on_a_blobs_directory_it_cannot_list_says_so() {
@@ -648,12 +660,65 @@ fn open_or_create_on_a_blobs_directory_it_cannot_list_says_so() {
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }
-    let opened = Store::open_or_create(config(&path));
+    let results = [("open", Store::open(config(&path))), ("open_or_create", Store::open_or_create(config(&path)))];
     fs::set_permissions(&blobs, fs::Permissions::from_mode(0o755)).unwrap();
-    match opened {
-        Err(StoreError::Io(error)) => assert!(error.to_string().contains(&*blobs.to_string_lossy()), "{error}"),
-        Err(other) => panic!("expected Io naming blobs, got {other:?}"),
-        Ok(_) => panic!("open_or_create made a store beside a blobs/ it couldn't list"),
+    for (call, opened) in results {
+        match opened {
+            Err(StoreError::Io(error)) => {
+                assert!(error.to_string().contains(&*blobs.to_string_lossy()), "{call}: {error}")
+            }
+            Err(other) => panic!("{call}: expected Io naming blobs, got {other:?}"),
+            Ok(_) => panic!("{call} opened a store beside a blobs/ it couldn't list"),
+        }
     }
     assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+}
+
+/// A `blobs` link is read as what it leads to. One leading to a directory
+/// with data in it, beside no MANIFEST, is a damaged store as a `blobs/` in
+/// place is: neither create nor open_or_create makes a store through it, and
+/// the data stays. A store doesn't share its blob directory with another;
+/// open and create sweep its staging files under this store's lock alone.
+#[cfg(unix)]
+#[test]
+fn a_blobs_link_to_a_directory_with_data_is_a_damaged_store() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("elsewhere");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("x"), b"hello").unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    std::os::unix::fs::symlink(&target, path.join("blobs")).unwrap();
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("blobs/ with data in it") && msg.contains("damaged"), "{msg}");
+    match Store::open_or_create(config(&path)) {
+        Err(StoreError::InvalidFormat(msg)) => {
+            assert!(msg.contains("blobs/ with data in it") && msg.contains("damaged"), "{msg}")
+        }
+        Err(other) => panic!("expected InvalidFormat, got {other:?}"),
+        Ok(_) => panic!("open_or_create made a store through a blobs link to data"),
+    }
+    assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+    assert_eq!(fs::read_dir(&target).unwrap().count(), 1, "nothing was written through the link");
+    assert_eq!(fs::read(target.join("x")).unwrap(), b"hello", "the data stays");
+}
+
+/// A `blobs` link to an empty directory holds no data: create and
+/// open_or_create make a store through it, as they do with an empty
+/// `blobs/`.
+#[cfg(unix)]
+#[test]
+fn a_blobs_link_to_an_empty_directory_is_taken() {
+    for call in ["create", "open_or_create"] {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        let path = dir.path().join("store");
+        fs::create_dir(&path).unwrap();
+        std::os::unix::fs::symlink(&target, path.join("blobs")).unwrap();
+        let made = if call == "create" { Store::create(config(&path)) } else { Store::open_or_create(config(&path)) };
+        made.unwrap_or_else(|e| panic!("{call}: {e}"));
+        assert!(path.join("MANIFEST").exists(), "{call}");
+    }
 }
