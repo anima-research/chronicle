@@ -494,7 +494,10 @@ fn open_on_a_manifest_that_is_a_directory_says_so() {
     fs::create_dir_all(path.join("MANIFEST")).unwrap();
     for (call, opened) in [("open", Store::open(config(&path))), ("open_or_create", Store::open_or_create(config(&path)))] {
         match opened {
-            Err(StoreError::InvalidFormat(msg)) => assert!(msg.contains("isn't a regular file"), "{call}: {msg}"),
+            Err(StoreError::InvalidFormat(msg)) => assert!(
+                msg.contains(&*path.join("MANIFEST").to_string_lossy()) && msg.contains("isn't a regular file"),
+                "{call}: {msg}"
+            ),
             Err(other) => panic!("{call}: expected InvalidFormat, got {other:?}"),
             Ok(_) => panic!("{call} opened a store on a MANIFEST directory"),
         }
