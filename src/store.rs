@@ -208,8 +208,9 @@ impl Store {
     /// Open an existing store or create a new one.
     ///
     /// A directory that holds any of a store's files (`MANIFEST`,
-    /// `records.log`, `state.bin`, `branches.bin`, a symbolic link counting
-    /// even when its target is missing) is opened, so one whose `MANIFEST`
+    /// `records.log`, `state.bin`, `branches.bin` or `state-indexes.bin`, a
+    /// symbolic link counting even when its target is missing; or a `blobs/`
+    /// with data in it, in place or through a link) is opened, so one whose `MANIFEST`
     /// is missing or unusable is refused, with open's account of what it
     /// found, whatever `create_if_missing` says. Otherwise it is created into
     /// (when `create_if_missing` is set) only if it is missing or holds
@@ -218,8 +219,9 @@ impl Store {
     /// `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`, which macOS adds
     /// to a volume it mounts; `System Volume Information` and
     /// `$RECYCLE.BIN`, which Windows adds), Finder's `.DS_Store`, the `LOCK`
-    /// and `blobs/` a create
-    /// leaves when it stops before its manifest, and a checkpoint's staging
+    /// and the `blobs/` a create leaves when it stops before its manifest,
+    /// holding nothing but a fresh volume's names or `.DS_Store` (a `blobs`
+    /// link read as what it leads to), and a checkpoint's staging
     /// file, as a create leaves when it stops during its manifest save. A
     /// directory holding anything else, such as a mistaken path to a project,
     /// isn't taken for a place to put a store. A directory whose entries
@@ -231,6 +233,18 @@ impl Store {
     /// another create can finish in between. Create then finds the
     /// `MANIFEST` that create wrote and refuses the directory, and this
     /// opens the store there instead, as if it had been there to begin with.
+    ///
+    /// The refusal of a `blobs/` with data in it says to move `blobs/` aside
+    /// to start over, which loses nothing: blobs are content-addressed. A
+    /// `blobs` link that leads to nothing is refused too, naming it, as a
+    /// store file's is: its target may be on a volume that isn't mounted.
+    ///
+    /// A store's `blobs/`, or the directory a `blobs` link leads to, belongs
+    /// to that store alone: open and create clear blob staging files there
+    /// under this store's lock only, and a directory with data in it is read
+    /// as what's left of this store. Two stores whose `blobs` lead to one
+    /// directory aren't refused, but a blob being stored in one can fail when
+    /// the other opens.
     pub fn open_or_create(config: StoreConfig) -> Result<Self> {
         if Self::present_store_file(&config.path)?.is_some() {
             return Self::open(config);
@@ -274,19 +288,8 @@ impl Store {
     /// empty.
     fn foreign_entry(path: &Path) -> std::io::Result<Option<String>> {
         let allowed = |name: &str| {
-            [
-                "lost+found",
-                ".fseventsd",
-                ".Spotlight-V100",
-                ".Trashes",
-                ".TemporaryItems",
-                "System Volume Information",
-                "$RECYCLE.BIN",
-                ".DS_Store",
-                "LOCK",
-                "blobs",
-            ]
-            .contains(&name)
+            Self::VOLUME_ENTRIES.contains(&name)
+                || ["LOCK", "blobs"].contains(&name)
                 || name.starts_with(crate::atomic_file::STAGING_PREFIX)
         };
         let listing_error = |error: std::io::Error| {
@@ -331,6 +334,18 @@ impl Store {
     /// one that then failed on the lock, let a build that predates those
     /// features open a store it can't read: open names a feature again only
     /// for the records past the checkpoint.
+    ///
+    /// A directory with no `MANIFEST` that holds `state-indexes.bin` or a
+    /// `blobs/` with data in it is refused as a damaged store; for the
+    /// `blobs/`, the refusal says to move it aside to start over. A `blobs`
+    /// link that leads to nothing is refused, naming it.
+    ///
+    /// A store's `blobs/`, or the directory a `blobs` link leads to, belongs
+    /// to that store alone: open and create clear blob staging files there
+    /// under this store's lock only, and a directory with data in it is read
+    /// as what's left of this store. Two stores whose `blobs` lead to one
+    /// directory aren't refused, but a blob being stored in one can fail when
+    /// the other opens.
     pub fn create(config: StoreConfig) -> Result<Self> {
         // Create directory structure
         fs::create_dir_all(&config.path)?;
@@ -371,7 +386,7 @@ impl Store {
                         manifest.display(),
                         if short {
                             format!(
-                                ". If {} holds no records.log, state.bin or branches.bin, remove the MANIFEST and create again",
+                                ". If {} holds no records.log, state.bin, branches.bin or state-indexes.bin and no blobs/ with data in it, remove the MANIFEST and create again",
                                 config.path.display()
                             )
                         } else {
@@ -379,10 +394,16 @@ impl Store {
                         },
                     ),
                 }
+            } else if found == Self::BLOBS_LINK_TO_NOTHING {
+                format!(
+                    "create: {}, so create won't write through it; once it leads to a directory (mount the volume it points into, say), create again",
+                    Self::link_to_nothing(&config.path.join("blobs"))
+                )
             } else {
                 format!(
-                    "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over",
-                    config.path.display()
+                    "create: {} holds {found} but no MANIFEST: a damaged Chronicle store, which create won't write over{}",
+                    config.path.display(),
+                    Self::way_out(found)
                 )
             }));
         }
@@ -396,9 +417,11 @@ impl Store {
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
-        // A blobs/ directory can outlive the rest of an earlier store (create
-        // refuses only the store's data files), and hold staging files its
-        // interrupted blob stores left. The lock is held, as at open.
+        // A blobs/, in place or through a link, reaches here holding nothing
+        // but VOLUME_ENTRIES' names (create refuses one with data in it as a
+        // damaged store). The sweep runs under this store's lock, which
+        // covers no other user of the directory: a blob directory isn't
+        // shared between stores.
         blobs.remove_staging_files();
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
@@ -3568,8 +3591,40 @@ impl Store {
 
     // --- Private Helpers ---
 
+    /// What a fresh volume's root holds (`lost+found` from mke2fs;
+    /// `.fseventsd`, `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`,
+    /// which macOS adds to a volume it mounts; `System Volume Information`
+    /// and `$RECYCLE.BIN`, which Windows adds) and Finder's `.DS_Store`: what
+    /// a new store can sit beside, and what doesn't make a `blobs/` hold data.
+    const VOLUME_ENTRIES: [&'static str; 8] = [
+        "lost+found",
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".TemporaryItems",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        ".DS_Store",
+    ];
+
     /// The files whose presence means a directory already holds a store.
-    const STORE_FILES: [&'static str; 4] = ["MANIFEST", "records.log", "state.bin", "branches.bin"];
+    const STORE_FILES: [&'static str; 5] =
+        ["MANIFEST", "records.log", "state.bin", "branches.bin", "state-indexes.bin"];
+
+    /// What `blobs_with_data` reports for a `blobs` symbolic link that
+    /// leads to nothing.
+    const BLOBS_LINK_TO_NOTHING: &'static str = "a blobs link to nothing";
+
+    /// How to start over where a refusal found `found` and no MANIFEST: a
+    /// `blobs/` with data can be moved aside losing nothing, since blobs are
+    /// content-addressed. A data file has no such way out here.
+    fn way_out(found: &str) -> &'static str {
+        if found == "blobs/ with data in it" {
+            "; to create a new store here, move blobs/ aside"
+        } else {
+            ""
+        }
+    }
 
     fn link_to_nothing(link: &Path) -> String {
         format!(
@@ -3592,6 +3647,44 @@ impl Store {
                         format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
                     ))
                 }
+            }
+        }
+        Self::blobs_with_data(path)
+    }
+
+    /// `blobs/ with data in it` where `path` holds a `blobs` directory with
+    /// anything in it but the names in `VOLUME_ENTRIES`. A create writes no
+    /// blob before its MANIFEST, so its own leftover `blobs/` is empty; one
+    /// with data in it is what's left of a store. A `blobs` link is read as
+    /// what it leads to, so a damaged store reached through one is refused
+    /// as one in place is. A link that leads to nothing is reported as
+    /// `BLOBS_LINK_TO_NOTHING`, as a store file's is: its target may be on a
+    /// volume that isn't mounted, so it can't be told empty. A `blobs/`
+    /// that can't be listed is an error, naming it: this can't say it holds
+    /// nothing.
+    fn blobs_with_data(path: &Path) -> std::io::Result<Option<&'static str>> {
+        let blobs = path.join("blobs");
+        let unread = |error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot tell whether {} holds a store's blobs: {error}", blobs.display()),
+            )
+        };
+        match fs::metadata(&blobs) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return match fs::symlink_metadata(&blobs) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(Self::BLOBS_LINK_TO_NOTHING)),
+                    _ => Ok(None),
+                }
+            }
+            Err(error) => return Err(unread(error)),
+        }
+        for entry in fs::read_dir(&blobs).map_err(unread)? {
+            let name = entry.map_err(unread)?.file_name();
+            if !Self::VOLUME_ENTRIES.contains(&&*name.to_string_lossy()) {
+                return Ok(Some("blobs/ with data in it"));
             }
         }
         Ok(None)
@@ -3644,9 +3737,15 @@ impl Store {
                     "{}, so the store can't be opened until it leads to the store's MANIFEST: mount the volume it points into, say, or point the link where that MANIFEST is",
                     Self::link_to_nothing(&manifest_path)
                 )),
+                Ok(Some(found)) if found == Self::BLOBS_LINK_TO_NOTHING => StoreError::InvalidFormat(format!(
+                    "{} has no MANIFEST, and {}, so whether a store's blobs are there can't be told: mount the volume it points into, say, or point the link at a directory",
+                    path.display(),
+                    Self::link_to_nothing(&path.join("blobs"))
+                )),
                 Ok(Some(found)) => StoreError::InvalidFormat(format!(
-                    "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is",
-                    path.display()
+                    "{} has no MANIFEST but holds {found}: a damaged Chronicle store, which neither open nor create will take as it is{}",
+                    path.display(),
+                    Self::way_out(found)
                 )),
                 Ok(None) => StoreError::InvalidFormat(format!(
                     "{} has no MANIFEST, so it isn't a Chronicle store",
