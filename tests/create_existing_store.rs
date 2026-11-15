@@ -811,10 +811,7 @@ fn stats_works_beside_a_volume_entry_it_cannot_list() {
     assert_eq!(stats.unwrap_or_else(|e| panic!("stats: {e}")).blob_count, 1);
 }
 
-/// A junction, the usual way to put `blobs` on another drive on Windows, is
-/// read as what it leads to, as a Unix link is: one to a directory with data
-/// in it is a damaged store, one to an empty directory is taken (R1-5).
-/// `mklink /J` needs no privilege.
+/// `mklink /J` makes a junction, and needs no privilege.
 #[cfg(windows)]
 fn junction(target: &Path, link: &Path) {
     let status = std::process::Command::new("cmd")
@@ -826,6 +823,9 @@ fn junction(target: &Path, link: &Path) {
     assert!(status.success(), "mklink /J {} {}", link.display(), target.display());
 }
 
+/// A junction, the usual way to put `blobs` on another drive on Windows, is
+/// read as what it leads to, as a Unix link is: one to a directory with data
+/// in it is a damaged store, one to an empty directory is taken (R1-5).
 #[cfg(windows)]
 #[test]
 fn a_blobs_junction_to_a_directory_with_data_is_a_damaged_store() {
@@ -851,6 +851,7 @@ fn a_blobs_junction_to_a_directory_with_data_is_a_damaged_store() {
     assert_eq!(fs::read(target.join("x")).unwrap(), b"hello", "the data stays");
 }
 
+/// A junction to an empty directory holds no data, and is taken (R1-5).
 #[cfg(windows)]
 #[test]
 fn a_blobs_junction_to_an_empty_directory_is_taken() {
@@ -865,4 +866,89 @@ fn a_blobs_junction_to_an_empty_directory_is_taken() {
         made.unwrap_or_else(|e| panic!("{call}: {e}"));
         assert!(path.join("MANIFEST").exists(), "{call}");
     }
+}
+
+/// A junction whose target is gone, as one to a drive that isn't mounted, is
+/// refused by create, open_or_create and open, naming it, as a Unix link to
+/// nothing is (R2-4).
+#[cfg(windows)]
+#[test]
+fn a_blobs_junction_to_nothing_is_refused_naming_the_link() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("elsewhere");
+    fs::create_dir(&target).unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    junction(&target, &path.join("blobs"));
+    fs::remove_dir(&target).unwrap();
+    let names_it = |msg: &str| msg.contains("leads to nothing");
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(names_it(&msg), "create: {msg}");
+    for (call, opened) in [("open_or_create", Store::open_or_create(config(&path))), ("open", Store::open(config(&path)))] {
+        match opened {
+            Err(StoreError::InvalidFormat(msg)) => assert!(names_it(&msg), "{call}: {msg}"),
+            Err(other) => panic!("{call}: expected InvalidFormat naming the junction, got {other:?}"),
+            Ok(_) => panic!("{call} opened a store through a blobs junction to nothing"),
+        }
+    }
+    assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+    assert!(!target.exists(), "nothing was written through the junction");
+}
+
+/// A `blobs` that isn't a directory (a file left by a deploy script, say) is
+/// refused by create and open_or_create, naming it, instead of reaching
+/// `create_dir_all`'s bare "File exists" (R2-2).
+#[test]
+fn a_blobs_that_is_a_file_is_refused_naming_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("blobs"), b"placeholder").unwrap();
+    let blobs = path.join("blobs");
+    let names_it = |msg: &str| msg.contains(&*blobs.to_string_lossy()) && msg.contains("isn't a directory");
+
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(names_it(&msg), "create: {msg}");
+    match Store::open_or_create(config(&path)) {
+        Err(StoreError::InvalidFormat(msg)) => assert!(names_it(&msg), "open_or_create: {msg}"),
+        Err(other) => panic!("open_or_create: expected InvalidFormat naming blobs, got {other:?}"),
+        Ok(_) => panic!("open_or_create made a store beside a blobs file"),
+    }
+    assert!(!path.join("MANIFEST").exists(), "nothing was created there");
+    assert_eq!(fs::read(&blobs).unwrap(), b"placeholder", "the file stays");
+}
+
+/// A `blobs` link to a file is read as what it leads to, a file, and refused
+/// the same way (R2-2).
+#[cfg(unix)]
+#[test]
+fn a_blobs_link_to_a_file_is_refused_naming_it() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("a-file");
+    fs::write(&target, b"x").unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    std::os::unix::fs::symlink(&target, path.join("blobs")).unwrap();
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("isn't a directory"), "create: {msg}");
+    match Store::open_or_create(config(&path)) {
+        Err(StoreError::InvalidFormat(msg)) => assert!(msg.contains("isn't a directory"), "open_or_create: {msg}"),
+        Err(other) => panic!("open_or_create: expected InvalidFormat, got {other:?}"),
+        Ok(_) => panic!("open_or_create made a store through a blobs link to a file"),
+    }
+    assert_eq!(fs::read(&target).unwrap(), b"x", "the file stays");
+}
+
+/// Create's advice for a short MANIFEST names a `blobs` link to nothing and a
+/// `blobs` that isn't a directory too, so following it can't end in a second
+/// refusal (R2-3).
+#[test]
+fn create_advice_on_a_short_manifest_names_every_blobs_shape() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("MANIFEST"), b"").unwrap();
+    let msg = invalid_operation(Store::create(config(&path)));
+    assert!(msg.contains("no blobs link that leads to nothing") && msg.contains("no blobs that isn't a directory"), "{msg}");
 }
