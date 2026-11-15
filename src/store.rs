@@ -338,7 +338,9 @@ impl Store {
     /// A directory with no `MANIFEST` that holds `state-indexes.bin` or a
     /// `blobs/` with data in it is refused as a damaged store; for the
     /// `blobs/`, the refusal says to move it aside to start over. A `blobs`
-    /// link that leads to nothing is refused, naming it.
+    /// link that leads to nothing, or a `blobs` that isn't a directory, is
+    /// refused, naming it, and a `blobs/` that can't be listed fails with the
+    /// listing's I/O error, naming it.
     ///
     /// A store's `blobs/`, or the directory a `blobs` link leads to, belongs
     /// to that store alone: open and create clear blob staging files there
@@ -386,7 +388,7 @@ impl Store {
                         manifest.display(),
                         if short {
                             format!(
-                                ". If {} holds no records.log, state.bin, branches.bin or state-indexes.bin and no blobs/ with data in it, remove the MANIFEST and create again",
+                                ". If {} holds no records.log, state.bin, branches.bin or state-indexes.bin, no blobs/ with data in it, no blobs link that leads to nothing and no blobs that isn't a directory, remove the MANIFEST and create again",
                                 config.path.display()
                             )
                         } else {
@@ -394,6 +396,11 @@ impl Store {
                         },
                     ),
                 }
+            } else if found == Self::BLOBS_NOT_A_DIRECTORY {
+                format!(
+                    "create: {} isn't a directory, so a store's blobs can't go there; move it aside and create again",
+                    config.path.join("blobs").display()
+                )
             } else if found == Self::BLOBS_LINK_TO_NOTHING {
                 format!(
                     "create: {}, so create won't write through it; once it leads to a directory (mount the volume it points into, say), create again",
@@ -3615,6 +3622,10 @@ impl Store {
     /// leads to nothing.
     const BLOBS_LINK_TO_NOTHING: &'static str = "a blobs link to nothing";
 
+    /// What `blobs_with_data` reports for a `blobs` that isn't a directory
+    /// (a file, or a link to one).
+    const BLOBS_NOT_A_DIRECTORY: &'static str = "a blobs that isn't a directory";
+
     /// How to start over where a refusal found `found` and no MANIFEST: a
     /// `blobs/` with data can be moved aside losing nothing, since blobs are
     /// content-addressed. A data file has no such way out here.
@@ -3659,7 +3670,9 @@ impl Store {
     /// what it leads to, so a damaged store reached through one is refused
     /// as one in place is. A link that leads to nothing is reported as
     /// `BLOBS_LINK_TO_NOTHING`, as a store file's is: its target may be on a
-    /// volume that isn't mounted, so it can't be told empty. A `blobs/`
+    /// volume that isn't mounted, so it can't be told empty. A `blobs` that
+    /// isn't a directory (a file, or a link to one) is reported as
+    /// `BLOBS_NOT_A_DIRECTORY`: create can't put a store's blobs there. A `blobs/`
     /// that can't be listed is an error, naming it: this can't say it holds
     /// nothing.
     fn blobs_with_data(path: &Path) -> std::io::Result<Option<&'static str>> {
@@ -3672,7 +3685,7 @@ impl Store {
         };
         match fs::metadata(&blobs) {
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Ok(None),
+            Ok(_) => return Ok(Some(Self::BLOBS_NOT_A_DIRECTORY)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return match fs::symlink_metadata(&blobs) {
                     Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(Self::BLOBS_LINK_TO_NOTHING)),
@@ -3736,6 +3749,11 @@ impl Store {
                 Ok(Some("MANIFEST")) => StoreError::InvalidFormat(format!(
                     "{}, so the store can't be opened until it leads to the store's MANIFEST: mount the volume it points into, say, or point the link where that MANIFEST is",
                     Self::link_to_nothing(&manifest_path)
+                )),
+                Ok(Some(found)) if found == Self::BLOBS_NOT_A_DIRECTORY => StoreError::InvalidFormat(format!(
+                    "{} has no MANIFEST, and {} isn't a directory, so it isn't a Chronicle store or a place for one: move it aside to create one here",
+                    path.display(),
+                    path.join("blobs").display()
                 )),
                 Ok(Some(found)) if found == Self::BLOBS_LINK_TO_NOTHING => StoreError::InvalidFormat(format!(
                     "{} has no MANIFEST, and {}, so whether a store's blobs are there can't be told: mount the volume it points into, say, or point the link at a directory",

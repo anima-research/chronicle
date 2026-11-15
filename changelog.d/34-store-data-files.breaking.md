@@ -20,18 +20,27 @@
   names, is still taken. **Changed codes:**
   - `open` on a directory with no `MANIFEST`, no other data file, and a
     `blobs/` it can't list: `InvalidFormat` becomes `Io`, naming `blobs/`;
-    `open_or_create` there used to create a store and now fails the same way.
+    `open_or_create` and `create` there used to create a store and now fail
+    the same way (`create` leaving its `LOCK`).
   - In Rust, `open_or_create` with `create_if_missing: false` over that
-    directory: `NotInitialized` becomes `Io`; over a `blobs/` with data,
+    directory: `NotInitialized` becomes `Io`; over a `blobs/` with data, a
+    `blobs` link that leads to nothing, or a `blobs` that isn't a directory,
     `NotInitialized` becomes `InvalidFormat`. (The Node binding always
-    creates if missing, so these two don't reach it.)
-  - A `blobs` link that leads to nothing, beside no `MANIFEST`: `create`
-    and `open_or_create` used to fail with `Io` (`File exists (os error
-    17)`, naming no path, leaving a `LOCK`); now `create` refuses with
+    creates if missing, so these don't reach it.)
+  - A `blobs` link that leads to nothing, beside no `MANIFEST`: `create`,
+    and `open_or_create` with `create_if_missing` set, used to fail with a
+    bare `Io` already-exists error naming no path (`File exists (os error
+    17)` on Unix), leaving a `LOCK`; now `create` refuses with
     `InvalidOperation` and `open_or_create` with `InvalidFormat`, each
     naming the link and its target, as a store file's link to nothing is
     named. `open` there keeps `InvalidFormat`, and its message names the
     link where it said the directory isn't a store.
+  - A `blobs` that isn't a directory (a file, or a link to one), beside no
+    `MANIFEST`: `create`, and `open_or_create` with `create_if_missing`
+    set, used to fail with that same bare already-exists error; now
+    `create` refuses with `InvalidOperation` and `open_or_create` with
+    `InvalidFormat`, each naming `blobs` and saying to move it aside. `open`
+    keeps `InvalidFormat`, with that message.
 
   **Changed messages:** `open`'s for a directory holding only
   `state-indexes.bin`, or a `blobs/` with data, goes from
@@ -42,5 +51,6 @@
   `open_or_create`'s for `state-indexes.bin` alone moves from
   `… so it isn't a Chronicle store or an empty place for one` to the same
   damaged-store wording. `Store::create`'s advice for a `MANIFEST` cut short
-  of its header now names `state-indexes.bin` and a `blobs/` with data among
-  what must be absent before removing it.
+  of its header now names `state-indexes.bin`, a `blobs/` with data, a
+  `blobs` link that leads to nothing and a `blobs` that isn't a directory
+  among what must be absent before removing it.
