@@ -11,9 +11,10 @@
 #
 # This tool is for a store whose every state update is JSON, as chronicle wrote them before 0.3.0. On a store with a
 # MessagePack update, written by chronicle 0.3.0 or newer, it stops with exit code 2 and writes nothing. From 0.5.0,
-# open rebuilds state.bin from records.log where every state update is on the store's first branch. Where a second
-# branch holds a state update, open refuses the store, and no tool here rebuilds it. From 0.5.0, open also refuses a
-# store with a broken chain, whatever state.bin holds, so the head this tool keeps doesn't open there either.
+# open rebuilds state.bin from records.log for a store with one branch. With more branches, open can refuse the
+# store, or leave a branch without the states it inherited, and no tool here rebuilds it. From 0.5.0, open also
+# refuses a store with a broken chain once its state.bin is lost, and after this tool rebuilds state.bin with the
+# longer chain as the head.
 import sys, struct, zlib, json, os
 
 store = sys.argv[1]
@@ -49,8 +50,8 @@ while f.tell() < size:
     if rtype != 'state_update': continue
     if enc == 1:
         print('rebuild-state-index.py: this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds '
-              'state.bin from records.log where every state update is on the store\'s first branch; where a second '
-              'branch holds a state update, open refuses the store, and no tool here rebuilds it; this tool is for a '
+              'state.bin from records.log for a store with one branch; with more branches, open can refuse the store, '
+              'or leave a branch without the states it inherited, and no tool here rebuilds it; this tool is for a '
               'store whose every state update is JSON.', file=sys.stderr)
         sys.exit(2)
     upd = json.loads(payload)

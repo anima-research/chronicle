@@ -11,9 +11,11 @@ import { JsStore } from '../index.js';
 const tools = dirname(fileURLToPath(import.meta.url));
 const scratch = mkdtempSync(join(tmpdir(), 'chronicle-tools-'));
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
-const REBUILD_REFUSES = 'this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds state.bin';
+const REBUILD_REFUSES = 'this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds state.bin from '
+  + 'records.log for a store with one branch; with more branches, open can refuse the store, or leave a branch without '
+  + 'the states it inherited, and no tool here rebuilds it';
 const FIXTURE_ITEMS = Array.from({ length: 50 }, (_, n) => ({ n, text: `message ${n} says hello` }));
-const NOT_WRITTEN_HERE = { Delta: 'no strategy the JS API registers writes it', Field: 'nothing in src writes it' };
+const NOT_WRITTEN_HERE = { Delta: 'no strategy the JS API registers writes it' };
 
 function python(args) {
   const run = spawnSync(PYTHON, args, { encoding: 'utf8', cwd: tools });
@@ -42,6 +44,28 @@ function scanIsClean(store, label, trees = []) {
     assert.equal(chain.ops, expected[chain.state_id], `scan-delta-poison.py's ${chain.state_id} chain of ${label} should hold each of its updates`);
   }
   console.log(`ok: scan-delta-poison.py reads each chain of ${label}`);
+}
+
+function copyWithPayload(from, name, update, edit) {
+  const to = join(scratch, name);
+  cpSync(from, to, { recursive: true });
+  const log = readFileSync(join(to, 'records.log'));
+  const size = log.readUInt32LE(update.payload - 4);
+  const payload = edit(Buffer.from(log.subarray(update.payload, update.payload + size)));
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(payload.length);
+  writeFileSync(join(to, 'records.log'),
+    Buffer.concat([log.subarray(0, update.payload - 4), length, payload, log.subarray(update.payload + size)]));
+  return to;
+}
+
+function bothToolsStop(store, label, says) {
+  for (const name of ['chain-report.py', 'scan-delta-poison.py']) {
+    const run = python([join(tools, name), name === 'chain-report.py' ? join(store, 'records.log') : store]);
+    assert.equal(run.status, 2, `${name} on ${label} exited ${run.status}:\n${run.out}${run.err}`);
+    assert.ok(run.err.includes(says), `${name} on ${label} should say "${says}":\n${run.err}`);
+  }
+  console.log(`ok: chain-report.py and scan-delta-poison.py stop with exit 2 at ${label}`);
 }
 
 function updates(store) {
@@ -133,19 +157,23 @@ try {
   assert.ok(readFileSync(join(built, 'state.bin')).equals(index), 'rebuild-state-index.py changed state.bin as it refused');
   console.log('ok: rebuild-state-index.py refuses it, exit 2, and leaves state.bin as it was');
 
-  const damaged = join(scratch, 'damaged');
-  cpSync(built, damaged, { recursive: true });
-  const update = held.find(({ state }) => state === 'messages');
-  const log = readFileSync(join(damaged, 'records.log'));
-  log[update.payload] = 0xc1;
-  writeFileSync(join(damaged, 'records.log'), log);
-  for (const name of ['chain-report.py', 'scan-delta-poison.py']) {
-    const run = python([join(tools, name), name === 'chain-report.py' ? join(damaged, 'records.log') : damaged]);
-    assert.equal(run.status, 2, `${name} on a state update that doesn't decode exited ${run.status}:\n${run.out}${run.err}`);
-    assert.ok(run.err.includes(`at offset ${update.record} `), `${name} should name the record's offset:\n${run.err}`);
-  }
-  console.log('ok: chain-report.py and scan-delta-poison.py stop with exit 2 at a state update that doesn\'t decode');
+  const first = held.find(({ state }) => state === 'messages');
+  const damaged = copyWithPayload(built, 'damaged', first, (payload) => {
+    payload[0] = 0xc1;
+    return payload;
+  });
+  bothToolsStop(damaged, 'a state update that doesn\'t decode', `the record at offset ${first.record} `);
+  const unread = 'Field';
+  assert.ok(unread in notRead, `the premise: tools/chronicle_payload.py names ${unread} as not read`);
+  const renamed = copyWithPayload(built, 'unread', first, (payload) => {
+    const at = payload.indexOf(Buffer.from('\xa6Append', 'latin1'));
+    assert.ok(at >= 0, 'the premise: the first update of messages is an Append');
+    return Buffer.concat([payload.subarray(0, at), Buffer.from(`${String.fromCharCode(0xa0 | unread.length)}${unread}`, 'latin1'),
+      payload.subarray(at + 7)]);
+  });
+  bothToolsStop(renamed, `a state update of kind ${unread}`, `of kind ${unread} at offset ${first.record}, `);
 
+  // The three stores below pin what rebuild-state-index.py's refusal says of open without state.bin: change them with it.
   const bare = join(scratch, 'bare');
   cpSync(built, bare, { recursive: true });
   rmSync(join(bare, 'state.bin'));
@@ -168,6 +196,23 @@ try {
   assert.throws(() => JsStore.open({ path: branched }), /cannot replay state 'messages'/,
     'a store whose second branch holds a state update should be refused without state.bin');
   console.log('ok: without state.bin, this build refuses a store whose second branch holds a state update');
+
+  const unwritten = join(scratch, 'unwritten');
+  const sideUnwritten = JsStore.create({ path: unwritten });
+  sideUnwritten.registerState(REGISTRATIONS[0]);
+  sideUnwritten.appendToStateJson('messages', { n: 0, text: 'on main' });
+  sideUnwritten.createBranch('side', 'main');
+  sideUnwritten.sync();
+  sideUnwritten.close();
+  rmSync(join(unwritten, 'state.bin'));
+  const reopenedUnwritten = JsStore.open({ path: unwritten });
+  reopenedUnwritten.registerState(REGISTRATIONS[0]);
+  assert.deepEqual(reopenedUnwritten.getStateJson('messages'), [{ n: 0, text: 'on main' }], 'main reads its item');
+  reopenedUnwritten.switchBranch('side');
+  assert.equal(reopenedUnwritten.getStateJson('messages'), null,
+    'a branch with no update of its own, without state.bin, should read the state it inherited as null');
+  reopenedUnwritten.close();
+  console.log('ok: without state.bin, this build opens a store whose second branch has no update, and reads its inherited state as null');
 
   // Git keeps no empty directory, so each copy gets back the empty blobs/ that 0.2.1 made.
   const fixture = (to) => {

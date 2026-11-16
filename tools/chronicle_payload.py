@@ -7,9 +7,10 @@ import json, struct, sys
 # StateOperation in src/types.rs. tools/check-tools.mjs fails unless the enum's variants are the kinds these
 # two lists name.
 READ = ('Set', 'Delta', 'Append', 'AppendMany', 'Redact', 'Edit', 'Snapshot', 'DeltaSnapshot',
-        'TreeSet', 'TreeRemove', 'TreeBatch', 'TreeDeltaSnapshot', 'Field')
+        'TreeSet', 'TreeRemove', 'TreeBatch', 'TreeDeltaSnapshot')
 # Kinds that no tool reads, each with its reason. A tool that meets one stops.
-NOT_READ = {}
+NOT_READ = {'Field': "these tools don't replay an operation nested in a field, and chronicle writes Field only in its "
+                     'own tests'}
 
 def decode_update(enc, payload):
     if enc != 1: return json.loads(payload)
@@ -29,7 +30,9 @@ def read_update(enc, payload, offset, tool):
 
 def require_read(kind, offset, tool):
     if kind not in READ:
-        stop(tool, f"records.log holds a state update of kind {kind} at offset {offset}, which this tool doesn't read")
+        reason = f' ({NOT_READ[kind]})' if kind in NOT_READ else ''
+        stop(tool, f"records.log holds a state update of kind {kind} at offset {offset}, which this tool doesn't "
+                   f'read{reason}')
 
 def stop(tool, why):
     print(f'{tool}: {why}, so it stops without a verdict.', file=sys.stderr)

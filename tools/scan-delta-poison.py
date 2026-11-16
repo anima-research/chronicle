@@ -31,7 +31,7 @@ that doesn't decode, or a kind of operation it doesn't read (chronicle_payload.R
 import sys, os, struct, json, datetime
 from chronicle_payload import read_update, require_read
 
-RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta", "Field")
+RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta")
 NON_APPEND_RAW = ("Set", "Edit", "Redact", "Delta")
 TREE_OPS = ("TreeSet", "TreeRemove", "TreeBatch", "TreeDeltaSnapshot")
 
@@ -104,10 +104,6 @@ def apply_raw(state, op):
         arr = state if isinstance(state, list) else ([] if state is None else state)
         arr.extend(json.loads(bytes(item)) for item in op["AppendMany"])
         return arr
-    if name == "Field":
-        obj = state if isinstance(state, dict) else {}
-        obj[op["Field"]["name"]] = apply_raw(obj.get(op["Field"]["name"]), op["Field"]["operation"])
-        return obj
     if name == "Edit":
         idx = op["Edit"]["index"]
         if isinstance(state, list) and idx < len(state):
