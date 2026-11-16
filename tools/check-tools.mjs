@@ -1,0 +1,171 @@
+// Runs the recovery tools in tools/ on a store this build writes, and on a committed store that chronicle 0.2.1
+// wrote. It needs Python 3, as python3, or as python on Windows.
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { JsStore } from '../index.js';
+
+const tools = dirname(fileURLToPath(import.meta.url));
+const scratch = mkdtempSync(join(tmpdir(), 'chronicle-tools-'));
+const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
+const REBUILD_REFUSES = 'this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds state.bin';
+const NOT_WRITTEN_HERE = { Delta: 'no strategy the JS API registers writes it', Field: 'nothing in src writes it' };
+
+function python(args) {
+  const run = spawnSync(PYTHON, args, { encoding: 'utf8', cwd: tools });
+  if (run.error) throw new Error(`${PYTHON} didn't run: ${run.error.message}. This check needs Python 3 as ${PYTHON}.`);
+  return { status: run.status, out: run.stdout, err: run.stderr };
+}
+
+function exitsZero(name, ...args) {
+  const run = python([join(tools, name), ...args]);
+  assert.equal(run.status, 0, `${name} ${args.join(' ')} exited ${run.status}:\n${run.out}${run.err}`);
+  console.log(`ok: ${name} exits 0`);
+  return run;
+}
+
+function scanIsClean(store, label) {
+  const { out } = exitsZero('scan-delta-poison.py', store, '--json');
+  for (const chain of JSON.parse(out).chains) {
+    assert.ok(['CLEAN', 'HEALED_BUT_HAD_WINDOW', 'OPEN_WINDOW', 'SKIPPED_TREE'].includes(chain.status),
+      `scan-delta-poison.py reads ${label}'s ${chain.state_id} chain as ${chain.status}${chain.error ? `: ${chain.error}` : ''}`);
+  }
+}
+
+function updates(store) {
+  const run = python(['-c', `
+import json, struct, sys
+from chronicle_payload import decode_update
+f = open(sys.argv[1], 'rb'); size = f.seek(0, 2); f.seek(0); seen = []
+while f.tell() < size:
+    f.read(6); f.read(32); rtype = f.read(struct.unpack('<H', f.read(2))[0]).decode(); enc = f.read(1)[0]
+    payload = f.read(struct.unpack('<I', f.read(4))[0])
+    for _ in range(2): f.read(8 * struct.unpack('<H', f.read(2))[0])
+    f.read(4)
+    if rtype == 'state_update':
+        u = decode_update(enc, payload); op = u['operation']
+        seen.append([u['state_id'], op if isinstance(op, str) else next(iter(op))])
+print(json.dumps(seen))`, join(store, 'records.log')]);
+  assert.equal(run.status, 0, `reading the updates of ${store}:\n${run.err}`);
+  return JSON.parse(run.out);
+}
+
+function states(store) {
+  return {
+    messages: store.getStateJson('messages'),
+    settings: store.getStateJson('settings'),
+    files: store.treeList('files', null),
+  };
+}
+
+const REGISTRATIONS = [
+  { id: 'messages', strategy: 'append_log', deltaSnapshotEvery: 3, fullSnapshotEvery: 2 },
+  { id: 'settings', strategy: 'snapshot' },
+  { id: 'files', strategy: 'tree', deltaSnapshotEvery: 2, fullSnapshotEvery: 2 },
+];
+
+try {
+  const enumBody = readFileSync(join(tools, '..', 'src', 'types.rs'), 'utf8').match(/pub enum StateOperation \{\n([\s\S]*?)\n\}/);
+  assert.ok(enumBody, 'src/types.rs has no `pub enum StateOperation`');
+  const variants = [...enumBody[1].matchAll(/^ {4}([A-Z]\w*)\b/gm)].map((match) => match[1]);
+  const lists = JSON.parse(python(['-c', 'import json, chronicle_payload as p; print(json.dumps([p.READ, p.NOT_READ]))']).out);
+  const [read, notRead] = [new Set(lists[0]), lists[1]];
+  const unplaced = variants.filter((kind) => !read.has(kind) && !(kind in notRead));
+  assert.deepEqual(unplaced, [], `StateOperation has kinds that tools/chronicle_payload.py neither reads nor names as not read: ${unplaced.join(', ')}`);
+  console.log(`ok: each of StateOperation's ${variants.length} kinds is placed`);
+
+  const built = join(scratch, 'built');
+  const store = JsStore.create({ path: built });
+  for (const registration of REGISTRATIONS) store.registerState(registration);
+  for (let n = 0; n < 14; n++) store.appendToStateJson('messages', { n, text: `message ${n}` });
+  store.appendManyToStateJson('messages', [{ n: 14, text: 'batched' }, { n: 15, text: 'batched' }]);
+  store.editStateItem('messages', 2, Buffer.from(JSON.stringify({ n: 2, text: 'edited' })));
+  store.redactStateItems('messages', 4, 6);
+  store.setStateJson('settings', { theme: 'dark' });
+  store.setStateJson('settings', { theme: 'light', size: 12 });
+  const blob = store.storeBlob(Buffer.from('notes'), 'text/plain');
+  const file = { blobHash: blob, size: 5, mode: 0o644 };
+  store.treeSet('files', 'a.txt', file);
+  store.treeSet('files', 'b.txt', file);
+  store.treeBatch('files', [{ op: 'set', path: 'c.txt', entry: file }, { op: 'remove', path: 'b.txt' }]);
+  store.treeRemove('files', 'a.txt');
+  store.treeSet('files', 'd.txt', file);
+  const written = states(store);
+  store.sync();
+  store.close();
+  const held = updates(built);
+  const kinds = [...new Set(held.map(([, kind]) => kind))].sort();
+  assert.deepEqual(kinds, [...read].filter((kind) => !(kind in NOT_WRITTEN_HERE)).sort(),
+    'the premise: the store holds each kind the tools read, but those the JS API can\'t write');
+  console.log(`ok: the store holds ${kinds.join(', ')}`);
+
+  exitsZero('trim-records-log.py', join(built, 'records.log'));
+  const report = exitsZero('chain-report.py', join(built, 'records.log'));
+  const messageUpdates = held.filter(([state]) => state === 'messages').length;
+  assert.match(report.out, new RegExp(`^chain0: ops=${messageUpdates} appends=16 `, 'm'),
+    `chain-report.py's line for messages should show ${messageUpdates} operations and 16 items:\n${report.out}`);
+  console.log(`ok: chain-report.py's line for messages shows its ${messageUpdates} operations and 16 items`);
+  scanIsClean(built, 'the built store');
+  exitsZero('unchunk-blobs.py', built);
+
+  const rebuild = python([join(tools, 'rebuild-state-index.py'), built]);
+  assert.equal(rebuild.status, 2, `rebuild-state-index.py exited ${rebuild.status}:\n${rebuild.out}${rebuild.err}`);
+  assert.ok(rebuild.err.includes(REBUILD_REFUSES), `rebuild-state-index.py said:\n${rebuild.out}${rebuild.err}`);
+  console.log('ok: rebuild-state-index.py refuses it, exit 2');
+
+  const bare = join(scratch, 'bare');
+  cpSync(built, bare, { recursive: true });
+  rmSync(join(bare, 'state.bin'));
+  const reopened = JsStore.open({ path: bare });
+  for (const registration of REGISTRATIONS) reopened.registerState(registration);
+  assert.deepEqual(states(reopened), written, 'a store opened without state.bin reads other states');
+  reopened.close();
+  console.log('ok: without state.bin, this build reads every state of a one-branch store as written');
+
+  const branched = join(scratch, 'branched');
+  const twoBranches = JsStore.create({ path: branched });
+  twoBranches.registerState(REGISTRATIONS[0]);
+  twoBranches.appendToStateJson('messages', { n: 0, text: 'on main' });
+  twoBranches.createBranch('side', 'main');
+  twoBranches.switchBranch('side');
+  twoBranches.appendToStateJson('messages', { n: 1, text: 'on side' });
+  twoBranches.sync();
+  twoBranches.close();
+  rmSync(join(branched, 'state.bin'));
+  assert.throws(() => JsStore.open({ path: branched }), /cannot replay state 'messages'/,
+    'a store whose second branch holds a state update should be refused without state.bin');
+  console.log('ok: without state.bin, this build refuses a store whose second branch holds a state update');
+
+  // Git keeps no empty directory, so each copy gets back the empty blobs/ that 0.2.1 made.
+  const fixture = (to) => {
+    cpSync(join(tools, 'fixtures', 'json-updates'), to, { recursive: true });
+    mkdirSync(join(to, 'blobs'));
+    return to;
+  };
+  const old = fixture(join(scratch, 'old'));
+  exitsZero('trim-records-log.py', join(old, 'records.log'));
+  exitsZero('chain-report.py', join(old, 'records.log'));
+  scanIsClean(old, 'the 0.2.1 store');
+  exitsZero('unchunk-blobs.py', old);
+  rmSync(join(old, 'state.bin'));
+  exitsZero('rebuild-state-index.py', old);
+  const rebuilt = JsStore.open({ path: old });
+  rebuilt.registerState({ id: 'messages', strategy: 'append_log' });
+  assert.equal(rebuilt.getStateLen('messages'), 50, 'the rebuilt store reads 50 items');
+  rebuilt.close();
+  console.log('ok: the state.bin rebuild-state-index.py writes opens with 50 items');
+
+  const mixed = fixture(join(scratch, 'mixed'));
+  const later = JsStore.open({ path: mixed });
+  for (let n = 50; n < 55; n++) later.appendToStateJson('messages', { n, text: `message ${n}` });
+  later.sync();
+  later.close();
+  exitsZero('chain-report.py', join(mixed, 'records.log'));
+  scanIsClean(mixed, 'the store with both encodings');
+  console.log('ok: a log that holds both encodings reads');
+} finally {
+  rmSync(scratch, { recursive: true, force: true });
+}

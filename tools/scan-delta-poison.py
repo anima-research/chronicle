@@ -23,11 +23,15 @@ even when the head state happens to currently match.
 Usage:
     scan-delta-poison.py <store-dir-or-records.log> [--json] [--verbose]
 
-Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error.
+It needs chronicle_payload.py beside it.
+
+Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, or a kind of
+operation it doesn't read (chronicle_payload.READ).
 """
 import sys, os, struct, json, datetime
+from chronicle_payload import decode_update, operation_kind
 
-RAW_OPS = ("Append", "Set", "Edit", "Redact", "Delta")
+RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta", "Field")
 NON_APPEND_RAW = ("Set", "Edit", "Redact", "Delta")
 TREE_OPS = ("TreeSet", "TreeRemove", "TreeBatch", "TreeDeltaSnapshot")
 
@@ -54,7 +58,7 @@ def parse_log(path):
                 rid, seq, br, ts = struct.unpack("<QQQq", need(32))
                 tlen = struct.unpack("<H", need(2))[0]
                 rtype = need(tlen).decode()
-                need(1)
+                enc = need(1)[0]
                 plen = struct.unpack("<I", need(4))[0]
                 payload = need(plen)
                 cbc = struct.unpack("<H", need(2))[0]
@@ -66,7 +70,8 @@ def parse_log(path):
                 break  # torn tail on a live store - scan what is durable
             if rtype != "state_update":
                 continue
-            upd = json.loads(payload)
+            upd = decode_update(enc, payload)
+            operation_kind(upd, "scan-delta-poison.py")
             upd["_offset"] = start
             upd["_seq"] = seq
             upd["_ts"] = ts
@@ -95,6 +100,14 @@ def apply_raw(state, op):
         arr = state if isinstance(state, list) else ([] if state is None else state)
         arr.append(op_data(op, "Append"))
         return arr
+    if name == "AppendMany":
+        arr = state if isinstance(state, list) else ([] if state is None else state)
+        arr.extend(json.loads(bytes(item)) for item in op["AppendMany"])
+        return arr
+    if name == "Field":
+        obj = state if isinstance(state, dict) else {}
+        obj[op["Field"]["name"]] = apply_raw(obj.get(op["Field"]["name"]), op["Field"]["operation"])
+        return obj
     if name == "Edit":
         idx = op["Edit"]["index"]
         if isinstance(state, list) and idx < len(state):

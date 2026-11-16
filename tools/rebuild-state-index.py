@@ -8,6 +8,12 @@
 # the tiny post-loss chains (a boot timestamp, a time-module tick) lose.
 #
 # strategies map is left EMPTY: apps re-register their states on boot.
+#
+# This tool is for a store whose every state update is JSON, as chronicle wrote them before 0.3.0. On a store with a
+# MessagePack update, written by chronicle 0.3.0 or newer, it stops with exit code 2 and writes nothing. From 0.5.0,
+# open rebuilds state.bin from records.log where every state update is on the store's first branch. Where a second
+# branch holds a state update, open refuses the store, and no tool here rebuilds it. From 0.5.0, open also refuses a
+# store with a broken chain, whatever state.bin holds, so the head this tool keeps doesn't open there either.
 import sys, struct, zlib, json, os
 
 store = sys.argv[1]
@@ -33,7 +39,7 @@ while f.tell() < size:
     need(1); need(1)
     rid, seq, br, ts = struct.unpack('<QQQq', need(32))
     tlen = struct.unpack('<H', need(2))[0]; rtype = need(tlen).decode()
-    need(1)
+    enc = need(1)[0]
     plen = struct.unpack('<I', need(4))[0]; payload = need(plen)
     cbc = struct.unpack('<H', need(2))[0]; need(8*cbc)
     ltc = struct.unpack('<H', need(2))[0]; need(8*ltc)
@@ -41,6 +47,12 @@ while f.tell() < size:
     assert crc == zlib.crc32(payload) & 0xffffffff, f'crc fail at {start}'
     count += 1
     if rtype != 'state_update': continue
+    if enc == 1:
+        print('rebuild-state-index.py: this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds '
+              'state.bin from records.log where every state update is on the store\'s first branch; where a second '
+              'branch holds a state update, open refuses the store, and no tool here rebuilds it; this tool is for a '
+              'store whose every state update is JSON.', file=sys.stderr)
+        sys.exit(2)
     upd = json.loads(payload)
     sid = upd['state_id']; op = upd['operation']
     opname = op if isinstance(op, str) else next(iter(op))
