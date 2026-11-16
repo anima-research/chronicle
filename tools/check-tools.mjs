@@ -75,6 +75,10 @@ try {
   const [read, notRead] = [new Set(lists[0]), lists[1]];
   const unplaced = variants.filter((kind) => !read.has(kind) && !(kind in notRead));
   assert.deepEqual(unplaced, [], `StateOperation has kinds that tools/chronicle_payload.py neither reads nor names as not read: ${unplaced.join(', ')}`);
+  const listed = [...read, ...Object.keys(notRead)];
+  const unknown = listed.filter((kind) => !variants.includes(kind));
+  assert.deepEqual(unknown, [], `tools/chronicle_payload.py lists kinds that StateOperation in src/types.rs doesn't have: ${unknown.join(', ')}`);
+  assert.equal(variants.length, listed.length, 'StateOperation has as many kinds as READ and NOT_READ list');
   console.log(`ok: each of StateOperation's ${variants.length} kinds is placed`);
 
   const built = join(scratch, 'built');
