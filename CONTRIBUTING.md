@@ -165,8 +165,11 @@ never do.
 ## Building and testing
 
 You need Node 22.12 or later, the floor `package.json`'s `engines` declares,
-and a Rust toolchain. `npm test` also runs `tools/unchunk-blobs.py`, so it
-needs Python 3 on the `PATH`, as `python3`, or as `python` on Windows.
+and a Rust toolchain. `npm test` also runs the recovery tools in `tools/` on
+stores the build writes (`tools/check-tools.mjs`), so it needs Python 3 on the
+`PATH`, as `python3`, or as `python` on Windows. A new kind of state operation
+fails that check until `tools/chronicle_payload.py` lists it, in `READ` once
+the tools read it, or in `NOT_READ` with its reason.
 
 ```bash
 npm ci                                          # strict lockfile install
