@@ -22,7 +22,7 @@ def read_update(enc, payload, offset, skipped):
     try:
         update = decode_update(enc, payload)
         op = update['operation']; kind = op if isinstance(op, str) else next(iter(op))
-        update['state_id']
+        for field in ('record_id', 'global_sequence', 'state_id', 'timestamp'): update[field]
     except Exception:
         skipped.append(offset)
         return None, None
@@ -36,8 +36,8 @@ def say_skipped(skipped, tool):
 
 def require_checksum(payload, checksum, offset, tool):
     if zlib.crc32(payload) & 0xffffffff != checksum:
-        stop(tool, f'the record at offset {offset} of records.log fails its checksum; chronicle truncates the log there '
-                   'if no valid record follows it, and otherwise refuses to open the store')
+        stop(tool, f"the record at offset {offset} of records.log fails its checksum, so chronicle won't read past it: "
+                   'open truncates the log there or refuses the store')
 
 def require_read(kind, offset, tool):
     if kind not in READ:

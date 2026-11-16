@@ -22,8 +22,10 @@ while f.tell()<size:
     require_checksum(payload,checksum,start,'chain-report.py')
     if rtype!='state_update': continue
     upd,opname=read_update(enc,payload,start,skipped)
-    if upd is None or upd['state_id']!='messages': continue
-    require_read(opname,start,'chain-report.py'); op=upd['operation']
+    if upd is None: continue
+    require_read(opname,start,'chain-report.py')
+    if upd['state_id']!='messages': continue
+    op=upd['operation']
     prev=upd.get('prev_update_offset')
     ch = headpos.pop(prev,None) if prev is not None else None
     if ch is None:

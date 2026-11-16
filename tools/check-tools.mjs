@@ -2,7 +2,7 @@
 // wrote. It needs Python 3, as python3, or as python on Windows.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { crc32 } from 'node:zlib';
 import { dirname, join } from 'node:path';
@@ -12,9 +12,10 @@ import { JsStore } from '../index.js';
 const tools = dirname(fileURLToPath(import.meta.url));
 const scratch = mkdtempSync(join(tmpdir(), 'chronicle-tools-'));
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
-const REBUILD_REFUSES = 'this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds state.bin from '
-  + 'records.log for a store with one branch; with more branches, open can refuse the store, or leave a branch without '
-  + 'the states it inherited, and no tool here rebuilds it';
+const REBUILD_REFUSES = 'this store was written by chronicle 0.3.0 or newer; from 0.5.0, open without state.bin '
+  + 'replays the state updates in records.log, and the next save writes state.bin; it refuses a broken chain, and with '
+  + 'more than one branch it can refuse the store or leave a branch without the states it inherited; no tool here '
+  + 'rebuilds state.bin for it';
 const FIXTURE_ITEMS = Array.from({ length: 50 }, (_, n) => ({ n, text: `message ${n} says hello` }));
 const NOT_WRITTEN_HERE = { Delta: 'no strategy the JS API registers writes it' };
 
@@ -64,6 +65,20 @@ function copyWithPayload(from, name, update, edit, { checksum = 'rewritten' } = 
   writeFileSync(join(to, 'records.log'), Buffer.concat([log.subarray(0, update.payload - 4), length, payload,
     log.subarray(update.payload + size, crcAt), crc, log.subarray(crcAt + 4)]));
   return to;
+}
+
+function withAppendedRecord(from, name, template, payload) {
+  const to = join(scratch, name);
+  cpSync(from, to, { recursive: true });
+  const log = readFileSync(join(to, 'records.log'));
+  const header = Buffer.from(log.subarray(template.record, template.payload - 4));
+  header.writeBigUInt64LE(1n << 40n, 6);
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(payload.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32LE(crc32(payload));
+  writeFileSync(join(to, 'records.log'), Buffer.concat([log, header, length, payload, Buffer.alloc(4), crc]));
+  return { store: to, offset: log.length };
 }
 
 function bothToolsStop(store, label, says) {
@@ -171,29 +186,32 @@ try {
   };
   const corrupt = copyWithPayload(built, 'corrupt', first, undecodable, { checksum: 'kept' });
   bothToolsStop(corrupt, 'a record that fails its checksum', `the record at offset ${first.record} of records.log fails its checksum`);
-  const damaged = copyWithPayload(built, 'damaged', first, undecodable);
-  const skips = `typed state_update that don't decode as state updates, the first at offset ${first.record},`;
-  const damagedReport = python([join(tools, 'chain-report.py'), join(damaged, 'records.log')]);
-  assert.equal(damagedReport.status, 0, `chain-report.py on a record that doesn't decode exited ${damagedReport.status}:\n${damagedReport.err}`);
-  assert.ok(damagedReport.err.includes(skips), `chain-report.py should say what it skipped:\n${damagedReport.err}`);
-  const damagedScan = python([join(tools, 'scan-delta-poison.py'), damaged, '--json']);
-  assert.equal(damagedScan.status, 0, `scan-delta-poison.py on a record that doesn't decode exited ${damagedScan.status}:\n${damagedScan.err}`);
-  assert.ok(damagedScan.err.includes(skips), `scan-delta-poison.py should say what it skipped:\n${damagedScan.err}`);
-  const statuses = Object.fromEntries(JSON.parse(damagedScan.out).chains.map((chain) => [chain.state_id, chain.status]));
-  assert.deepEqual(statuses, { ...builtStatuses, messages: 'PARTIAL_CHAIN' },
-    'the scan should show the chain that lost its record as partial, and the others as before');
-  console.log('ok: chain-report.py and scan-delta-poison.py skip a record that doesn\'t decode and say so, and the scan shows its chain as partial');
+  const ordinary = withAppendedRecord(built, 'ordinary', first,
+    Buffer.from('\x82\xa8state_id\xa8messages\xa9operation\x81\xa6Append\xc4\x02{}', 'latin1'));
+  const skips = `typed state_update that don't decode as state updates, the first at offset ${ordinary.offset},`;
+  const ordinaryReport = python([join(tools, 'chain-report.py'), join(ordinary.store, 'records.log')]);
+  assert.equal(ordinaryReport.status, 0, `chain-report.py on a record that isn't a state update exited ${ordinaryReport.status}:\n${ordinaryReport.err}`);
+  assert.ok(ordinaryReport.err.includes(skips), `chain-report.py should say what it skipped:\n${ordinaryReport.err}`);
+  const ordinaryScan = python([join(tools, 'scan-delta-poison.py'), ordinary.store, '--json']);
+  assert.equal(ordinaryScan.status, 0, `scan-delta-poison.py on a record that isn't a state update exited ${ordinaryScan.status}:\n${ordinaryScan.err}`);
+  assert.ok(ordinaryScan.err.includes(skips), `scan-delta-poison.py should say what it skipped:\n${ordinaryScan.err}`);
+  const statuses = Object.fromEntries(JSON.parse(ordinaryScan.out).chains.map((chain) => [chain.state_id, chain.status]));
+  assert.deepEqual(statuses, builtStatuses, 'the scan should read each chain as on the store without the record');
+  const keeps = JsStore.open({ path: ordinary.store });
+  assert.deepEqual(states(keeps), written, 'this build should keep the record as an ordinary one and read each state as written');
+  keeps.close();
+  console.log('ok: chain-report.py and scan-delta-poison.py skip a record typed state_update that isn\'t one and say so, as this build keeps it');
   const unread = 'Field';
   assert.ok(unread in notRead, `the premise: tools/chronicle_payload.py names ${unread} as not read`);
-  const renamed = copyWithPayload(built, 'unread', first, (payload) => {
-    const at = payload.indexOf(Buffer.from('\xa6Append', 'latin1'));
-    assert.ok(at >= 0, 'the premise: the first update of messages is an Append');
-    return Buffer.concat([payload.subarray(0, at), Buffer.from(`${String.fromCharCode(0xa0 | unread.length)}${unread}`, 'latin1'),
-      payload.subarray(at + 7)]);
+  const firstSetting = held.find(({ state }) => state === 'settings');
+  const wrapped = copyWithPayload(built, 'unread', firstSetting, (payload) => {
+    const at = payload.indexOf(Buffer.from('\xa9operation', 'latin1')) + 10;
+    return Buffer.concat([payload.subarray(0, at), Buffer.from('\x81\xa5Field\x82\xa4name\xa1x\xa9operation', 'latin1'),
+      payload.subarray(at)]);
   });
-  bothToolsStop(renamed, `a state update of kind ${unread}`, `of kind ${unread} at offset ${first.record}, `);
+  bothToolsStop(wrapped, `a state update of kind ${unread}`, `of kind ${unread} at offset ${firstSetting.record}, `);
 
-  // The three stores below pin what rebuild-state-index.py's refusal says of open without state.bin: change them with it.
+  // The stores below pin what rebuild-state-index.py's refusal says of open without state.bin: change them with it.
   const bare = join(scratch, 'bare');
   cpSync(built, bare, { recursive: true });
   rmSync(join(bare, 'state.bin'));
@@ -201,7 +219,16 @@ try {
   for (const registration of REGISTRATIONS) reopened.registerState(registration);
   assert.deepEqual(states(reopened), written, 'a store opened without state.bin reads other states');
   reopened.close();
+  assert.ok(existsSync(join(bare, 'state.bin')), 'the close after an open without state.bin should write state.bin');
   console.log('ok: without state.bin, this build reads every state of a one-branch store as written');
+
+  const log = readFileSync(join(built, 'records.log'));
+  const secondRoot = withAppendedRecord(built, 'broken', first,
+    log.subarray(first.payload, first.payload + log.readUInt32LE(first.payload - 4)));
+  rmSync(join(secondRoot.store, 'state.bin'));
+  assert.throws(() => JsStore.open({ path: secondRoot.store }), /cannot replay state 'messages'/,
+    'a store whose messages chain has a second root should be refused without state.bin');
+  console.log('ok: without state.bin, this build refuses a store with a broken chain');
 
   const branched = join(scratch, 'branched');
   const twoBranches = JsStore.create({ path: branched });

@@ -11,10 +11,10 @@
 #
 # This tool is for a store whose every state update is JSON, as chronicle wrote them before 0.3.0. On a store with a
 # MessagePack update, written by chronicle 0.3.0 or newer, it stops with exit code 2 and writes nothing. From 0.5.0,
-# open rebuilds state.bin from records.log for a store with one branch. With more branches, open can refuse the
-# store, or leave a branch without the states it inherited, and no tool here rebuilds it. From 0.5.0, open also
-# refuses a store with a broken chain once its state.bin is lost, and after this tool rebuilds state.bin with the
-# longer chain as the head.
+# open without state.bin replays the state updates in records.log, and the next save writes state.bin. It refuses a
+# broken chain, and with more than one branch it can refuse the store or leave a branch without the states it
+# inherited. No tool here rebuilds state.bin for such a store. From 0.5.0, open can refuse a store with a broken chain
+# once its state.bin is lost, even after this tool rebuilds state.bin.
 import sys, struct, zlib, json, os
 
 store = sys.argv[1]
@@ -49,10 +49,11 @@ while f.tell() < size:
     count += 1
     if rtype != 'state_update': continue
     if enc == 1:
-        print('rebuild-state-index.py: this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds '
-              'state.bin from records.log for a store with one branch; with more branches, open can refuse the store, '
-              'or leave a branch without the states it inherited, and no tool here rebuilds it; this tool is for a '
-              'store whose every state update is JSON.', file=sys.stderr)
+        print('rebuild-state-index.py: this store was written by chronicle 0.3.0 or newer; from 0.5.0, open without '
+              'state.bin replays the state updates in records.log, and the next save writes state.bin; it refuses a '
+              'broken chain, and with more than one branch it can refuse the store or leave a branch without the states '
+              'it inherited; no tool here rebuilds state.bin for it; this tool is for a store whose every state update '
+              'is JSON.', file=sys.stderr)
         sys.exit(2)
     upd = json.loads(payload)
     sid = upd['state_id']; op = upd['operation']

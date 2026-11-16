@@ -12,7 +12,7 @@ This scanner is READ-ONLY. For every state chain in records.log it computes:
 
   as-code  — the state exactly as chronicle reconstructs it (base full
              Snapshot + DeltaSnapshots + trailing raw ops), and
-  raw-truth — a replay of raw ops only (Append/Set/Edit/Redact/Delta),
+  raw-truth — a replay of raw ops only (Append/AppendMany/Set/Edit/Redact/Delta),
              ignoring every Snapshot/DeltaSnapshot, which are purely derived.
 
 A mismatch means the chain is poisoned (by a bad delta, or by a full
