@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Reports the chains of the state messages in a records.log. Needs chronicle_payload.py beside it.
 import sys, struct, zlib, json, datetime
-from chronicle_payload import decode_update, operation_kind
+from chronicle_payload import read_update, require_read
 logp = sys.argv[1]
 f = open(logp,'rb'); size=f.seek(0,2); f.seek(0)
 def need(n):
@@ -20,9 +20,9 @@ while f.tell()<size:
         ltc=struct.unpack('<H',need(2))[0]; need(8*ltc); need(4)
     except EOFError: break
     if rtype!='state_update': continue
-    upd=decode_update(enc,payload)
+    upd,opname=read_update(enc,payload,start,'chain-report.py')
     if upd['state_id']!='messages': continue
-    op=upd['operation']; opname=operation_kind(upd,'chain-report.py')
+    require_read(opname,start,'chain-report.py'); op=upd['operation']
     prev=upd.get('prev_update_offset')
     ch = headpos.pop(prev,None) if prev is not None else None
     if ch is None:

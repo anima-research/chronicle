@@ -25,11 +25,11 @@ Usage:
 
 It needs chronicle_payload.py beside it.
 
-Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, or a kind of
-operation it doesn't read (chronicle_payload.READ).
+Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, a state update
+that doesn't decode, or a kind of operation it doesn't read (chronicle_payload.READ).
 """
 import sys, os, struct, json, datetime
-from chronicle_payload import decode_update, operation_kind
+from chronicle_payload import read_update, require_read
 
 RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta", "Field")
 NON_APPEND_RAW = ("Set", "Edit", "Redact", "Delta")
@@ -70,8 +70,8 @@ def parse_log(path):
                 break  # torn tail on a live store - scan what is durable
             if rtype != "state_update":
                 continue
-            upd = decode_update(enc, payload)
-            operation_kind(upd, "scan-delta-poison.py")
+            upd, kind = read_update(enc, payload, start, "scan-delta-poison.py")
+            require_read(kind, start, "scan-delta-poison.py")
             upd["_offset"] = start
             upd["_seq"] = seq
             upd["_ts"] = ts

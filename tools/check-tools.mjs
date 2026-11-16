@@ -2,7 +2,7 @@
 // wrote. It needs Python 3, as python3, or as python on Windows.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ const tools = dirname(fileURLToPath(import.meta.url));
 const scratch = mkdtempSync(join(tmpdir(), 'chronicle-tools-'));
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 const REBUILD_REFUSES = 'this store was written by chronicle 0.3.0 or newer; from 0.5.0, open rebuilds state.bin';
+const FIXTURE_ITEMS = Array.from({ length: 50 }, (_, n) => ({ n, text: `message ${n} says hello` }));
 const NOT_WRITTEN_HERE = { Delta: 'no strategy the JS API registers writes it', Field: 'nothing in src writes it' };
 
 function python(args) {
@@ -27,12 +28,20 @@ function exitsZero(name, ...args) {
   return run;
 }
 
-function scanIsClean(store, label) {
+function scanIsClean(store, label, trees = []) {
   const { out } = exitsZero('scan-delta-poison.py', store, '--json');
-  for (const chain of JSON.parse(out).chains) {
-    assert.ok(['CLEAN', 'HEALED_BUT_HAD_WINDOW', 'OPEN_WINDOW', 'SKIPPED_TREE'].includes(chain.status),
+  const expected = {};
+  for (const { state } of updates(store)) expected[state] = (expected[state] ?? 0) + 1;
+  const chains = JSON.parse(out).chains;
+  assert.deepEqual(chains.map((chain) => chain.state_id).sort(), Object.keys(expected).sort(),
+    `scan-delta-poison.py should read one chain for each state of ${label}:\n${out}`);
+  for (const chain of chains) {
+    const allowed = trees.includes(chain.state_id) ? ['SKIPPED_TREE'] : ['CLEAN', 'HEALED_BUT_HAD_WINDOW', 'OPEN_WINDOW'];
+    assert.ok(allowed.includes(chain.status),
       `scan-delta-poison.py reads ${label}'s ${chain.state_id} chain as ${chain.status}${chain.error ? `: ${chain.error}` : ''}`);
+    assert.equal(chain.ops, expected[chain.state_id], `scan-delta-poison.py's ${chain.state_id} chain of ${label} should hold each of its updates`);
   }
+  console.log(`ok: scan-delta-poison.py reads each chain of ${label}`);
 }
 
 function updates(store) {
@@ -41,13 +50,14 @@ import json, struct, sys
 from chronicle_payload import decode_update
 f = open(sys.argv[1], 'rb'); size = f.seek(0, 2); f.seek(0); seen = []
 while f.tell() < size:
-    f.read(6); f.read(32); rtype = f.read(struct.unpack('<H', f.read(2))[0]).decode(); enc = f.read(1)[0]
-    payload = f.read(struct.unpack('<I', f.read(4))[0])
+    record = f.tell(); f.read(6); f.read(32); rtype = f.read(struct.unpack('<H', f.read(2))[0]).decode(); enc = f.read(1)[0]
+    size_at = f.tell(); payload = f.read(struct.unpack('<I', f.read(4))[0])
     for _ in range(2): f.read(8 * struct.unpack('<H', f.read(2))[0])
     f.read(4)
     if rtype == 'state_update':
         u = decode_update(enc, payload); op = u['operation']
-        seen.append([u['state_id'], op if isinstance(op, str) else next(iter(op))])
+        seen.append({'state': u['state_id'], 'kind': op if isinstance(op, str) else next(iter(op)),
+                     'record': record, 'payload': size_at + 4})
 print(json.dumps(seen))`, join(store, 'records.log')]);
   assert.equal(run.status, 0, `reading the updates of ${store}:\n${run.err}`);
   return JSON.parse(run.out);
@@ -68,9 +78,10 @@ const REGISTRATIONS = [
 ];
 
 try {
-  const enumBody = readFileSync(join(tools, '..', 'src', 'types.rs'), 'utf8').match(/pub enum StateOperation \{\n([\s\S]*?)\n\}/);
+  const enumBody = readFileSync(join(tools, '..', 'src', 'types.rs'), 'utf8').replace(/\r\n/g, '\n')
+    .match(/pub enum StateOperation \{\n([\s\S]*?)\n\}/);
   assert.ok(enumBody, 'src/types.rs has no `pub enum StateOperation`');
-  const variants = [...enumBody[1].matchAll(/^ {4}([A-Z]\w*)\b/gm)].map((match) => match[1]);
+  const variants = [...enumBody[1].matchAll(/^[ \t]+([A-Z]\w*)\b/gm)].map((match) => match[1]);
   const lists = JSON.parse(python(['-c', 'import json, chronicle_payload as p; print(json.dumps([p.READ, p.NOT_READ]))']).out);
   const [read, notRead] = [new Set(lists[0]), lists[1]];
   const unplaced = variants.filter((kind) => !read.has(kind) && !(kind in notRead));
@@ -101,24 +112,39 @@ try {
   store.sync();
   store.close();
   const held = updates(built);
-  const kinds = [...new Set(held.map(([, kind]) => kind))].sort();
+  const kinds = [...new Set(held.map(({ kind }) => kind))].sort();
   assert.deepEqual(kinds, [...read].filter((kind) => !(kind in NOT_WRITTEN_HERE)).sort(),
     'the premise: the store holds each kind the tools read, but those the JS API can\'t write');
   console.log(`ok: the store holds ${kinds.join(', ')}`);
 
   exitsZero('trim-records-log.py', join(built, 'records.log'));
   const report = exitsZero('chain-report.py', join(built, 'records.log'));
-  const messageUpdates = held.filter(([state]) => state === 'messages').length;
+  const messageUpdates = held.filter(({ state }) => state === 'messages').length;
   assert.match(report.out, new RegExp(`^chain0: ops=${messageUpdates} appends=16 `, 'm'),
     `chain-report.py's line for messages should show ${messageUpdates} operations and 16 items:\n${report.out}`);
   console.log(`ok: chain-report.py's line for messages shows its ${messageUpdates} operations and 16 items`);
-  scanIsClean(built, 'the built store');
+  scanIsClean(built, 'the built store', ['files']);
   exitsZero('unchunk-blobs.py', built);
 
+  const index = readFileSync(join(built, 'state.bin'));
   const rebuild = python([join(tools, 'rebuild-state-index.py'), built]);
   assert.equal(rebuild.status, 2, `rebuild-state-index.py exited ${rebuild.status}:\n${rebuild.out}${rebuild.err}`);
   assert.ok(rebuild.err.includes(REBUILD_REFUSES), `rebuild-state-index.py said:\n${rebuild.out}${rebuild.err}`);
-  console.log('ok: rebuild-state-index.py refuses it, exit 2');
+  assert.ok(readFileSync(join(built, 'state.bin')).equals(index), 'rebuild-state-index.py changed state.bin as it refused');
+  console.log('ok: rebuild-state-index.py refuses it, exit 2, and leaves state.bin as it was');
+
+  const damaged = join(scratch, 'damaged');
+  cpSync(built, damaged, { recursive: true });
+  const update = held.find(({ state }) => state === 'messages');
+  const log = readFileSync(join(damaged, 'records.log'));
+  log[update.payload] = 0xc1;
+  writeFileSync(join(damaged, 'records.log'), log);
+  for (const name of ['chain-report.py', 'scan-delta-poison.py']) {
+    const run = python([join(tools, name), name === 'chain-report.py' ? join(damaged, 'records.log') : damaged]);
+    assert.equal(run.status, 2, `${name} on a state update that doesn't decode exited ${run.status}:\n${run.out}${run.err}`);
+    assert.ok(run.err.includes(`at offset ${update.record} `), `${name} should name the record's offset:\n${run.err}`);
+  }
+  console.log('ok: chain-report.py and scan-delta-poison.py stop with exit 2 at a state update that doesn\'t decode');
 
   const bare = join(scratch, 'bare');
   cpSync(built, bare, { recursive: true });
@@ -158,9 +184,10 @@ try {
   exitsZero('rebuild-state-index.py', old);
   const rebuilt = JsStore.open({ path: old });
   rebuilt.registerState({ id: 'messages', strategy: 'append_log' });
-  assert.equal(rebuilt.getStateLen('messages'), 50, 'the rebuilt store reads 50 items');
+  assert.equal(rebuilt.getStateLen('messages'), 50, 'the rebuilt store counts 50 items');
+  assert.deepEqual(rebuilt.getStateJson('messages'), FIXTURE_ITEMS, 'the rebuilt store reads the 50 items 0.2.1 wrote');
   rebuilt.close();
-  console.log('ok: the state.bin rebuild-state-index.py writes opens with 50 items');
+  console.log('ok: the state.bin rebuild-state-index.py writes opens with the 50 items 0.2.1 wrote');
 
   const mixed = fixture(join(scratch, 'mixed'));
   const later = JsStore.open({ path: mixed });
@@ -169,7 +196,14 @@ try {
   later.close();
   exitsZero('chain-report.py', join(mixed, 'records.log'));
   scanIsClean(mixed, 'the store with both encodings');
-  console.log('ok: a log that holds both encodings reads');
+  rmSync(join(mixed, 'state.bin'));
+  const replayed = JsStore.open({ path: mixed });
+  replayed.registerState({ id: 'messages', strategy: 'append_log' });
+  assert.deepEqual(replayed.getStateJson('messages'),
+    [...FIXTURE_ITEMS, ...Array.from({ length: 5 }, (_, i) => ({ n: 50 + i, text: `message ${50 + i}` }))],
+    'the store with both encodings, without state.bin, reads its 55 items');
+  replayed.close();
+  console.log('ok: without state.bin, this build reads the 55 items of the store with both encodings');
 } finally {
   rmSync(scratch, { recursive: true, force: true });
 }

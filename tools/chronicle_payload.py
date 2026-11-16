@@ -4,7 +4,8 @@
 import json, struct, sys
 
 # The kinds of state operation that chain-report.py and scan-delta-poison.py read, by the variant names of
-# StateOperation in src/types.rs. tools/check-tools.mjs fails where that enum has a variant in neither list.
+# StateOperation in src/types.rs. tools/check-tools.mjs fails unless the enum's variants are the kinds these
+# two lists name.
 READ = ('Set', 'Delta', 'Append', 'AppendMany', 'Redact', 'Edit', 'Snapshot', 'DeltaSnapshot',
         'TreeSet', 'TreeRemove', 'TreeBatch', 'TreeDeltaSnapshot', 'Field')
 # Kinds that no tool reads, each with its reason. A tool that meets one stops.
@@ -16,13 +17,23 @@ def decode_update(enc, payload):
     if end != len(payload): raise ValueError(f'MessagePack state update has {len(payload) - end} bytes after its value')
     return value
 
-def operation_kind(update, tool):
-    op = update['operation']; kind = op if isinstance(op, str) else next(iter(op))
+def read_update(enc, payload, offset, tool):
+    try:
+        update = decode_update(enc, payload)
+        op = update['operation']; kind = op if isinstance(op, str) else next(iter(op))
+        update['state_id']
+    except Exception as error:
+        stop(tool, f"the record at offset {offset} of records.log is typed state_update but doesn't decode as one "
+                   f"({type(error).__name__}: {error})")
+    return update, kind
+
+def require_read(kind, offset, tool):
     if kind not in READ:
-        print(f"{tool}: records.log holds a state update of kind {kind}, which this tool doesn't read, so it stops "
-              'without a verdict.', file=sys.stderr)
-        sys.exit(2)
-    return kind
+        stop(tool, f"records.log holds a state update of kind {kind} at offset {offset}, which this tool doesn't read")
+
+def stop(tool, why):
+    print(f'{tool}: {why}, so it stops without a verdict.', file=sys.stderr)
+    sys.exit(2)
 
 _FIXED = {0xc0: None, 0xc2: False, 0xc3: True}
 _SIZED = {0xc4: ('B', 'bin'), 0xc5: ('>H', 'bin'), 0xc6: ('>I', 'bin'), 0xd9: ('B', 'str'), 0xda: ('>H', 'str'),
