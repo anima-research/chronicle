@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { crc32 } from 'node:zlib';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsStore } from '../index.js';
@@ -44,6 +45,7 @@ function scanIsClean(store, label, trees = []) {
     assert.equal(chain.ops, expected[chain.state_id], `scan-delta-poison.py's ${chain.state_id} chain of ${label} should hold each of its updates`);
   }
   console.log(`ok: scan-delta-poison.py reads each chain of ${label}`);
+  return Object.fromEntries(chains.map((chain) => [chain.state_id, chain.status]));
 }
 
 function copyWithPayload(from, name, update, edit) {
@@ -52,10 +54,15 @@ function copyWithPayload(from, name, update, edit) {
   const log = readFileSync(join(to, 'records.log'));
   const size = log.readUInt32LE(update.payload - 4);
   const payload = edit(Buffer.from(log.subarray(update.payload, update.payload + size)));
+  let crcAt = update.payload + size;
+  crcAt += 2 + 8 * log.readUInt16LE(crcAt);
+  crcAt += 2 + 8 * log.readUInt16LE(crcAt);
   const length = Buffer.alloc(4);
   length.writeUInt32LE(payload.length);
-  writeFileSync(join(to, 'records.log'),
-    Buffer.concat([log.subarray(0, update.payload - 4), length, payload, log.subarray(update.payload + size)]));
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32LE(crc32(payload));
+  writeFileSync(join(to, 'records.log'), Buffer.concat([log.subarray(0, update.payload - 4), length, payload,
+    log.subarray(update.payload + size, crcAt), crc, log.subarray(crcAt + 4)]));
   return to;
 }
 
@@ -147,7 +154,7 @@ try {
   assert.match(report.out, new RegExp(`^chain0: ops=${messageUpdates} appends=16 `, 'm'),
     `chain-report.py's line for messages should show ${messageUpdates} operations and 16 items:\n${report.out}`);
   console.log(`ok: chain-report.py's line for messages shows its ${messageUpdates} operations and 16 items`);
-  scanIsClean(built, 'the built store', ['files']);
+  const builtStatuses = scanIsClean(built, 'the built store', ['files']);
   exitsZero('unchunk-blobs.py', built);
 
   const index = readFileSync(join(built, 'state.bin'));
@@ -162,7 +169,17 @@ try {
     payload[0] = 0xc1;
     return payload;
   });
-  bothToolsStop(damaged, 'a state update that doesn\'t decode', `the record at offset ${first.record} `);
+  const skips = `typed state_update that don't decode as state updates, the first at offset ${first.record},`;
+  const damagedReport = python([join(tools, 'chain-report.py'), join(damaged, 'records.log')]);
+  assert.equal(damagedReport.status, 0, `chain-report.py on a record that doesn't decode exited ${damagedReport.status}:\n${damagedReport.err}`);
+  assert.ok(damagedReport.err.includes(skips), `chain-report.py should say what it skipped:\n${damagedReport.err}`);
+  const damagedScan = python([join(tools, 'scan-delta-poison.py'), damaged, '--json']);
+  assert.equal(damagedScan.status, 0, `scan-delta-poison.py on a record that doesn't decode exited ${damagedScan.status}:\n${damagedScan.err}`);
+  assert.ok(damagedScan.err.includes(skips), `scan-delta-poison.py should say what it skipped:\n${damagedScan.err}`);
+  const statuses = Object.fromEntries(JSON.parse(damagedScan.out).chains.map((chain) => [chain.state_id, chain.status]));
+  assert.deepEqual(statuses, { ...builtStatuses, messages: 'PARTIAL_CHAIN' },
+    'the scan should show the chain that lost its record as partial, and the others as before');
+  console.log('ok: chain-report.py and scan-delta-poison.py skip a record that doesn\'t decode and say so, and the scan shows its chain as partial');
   const unread = 'Field';
   assert.ok(unread in notRead, `the premise: tools/chronicle_payload.py names ${unread} as not read`);
   const renamed = copyWithPayload(built, 'unread', first, (payload) => {

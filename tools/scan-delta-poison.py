@@ -25,18 +25,21 @@ Usage:
 
 It needs chronicle_payload.py beside it.
 
-Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, a state update
-that doesn't decode, or a kind of operation it doesn't read (chronicle_payload.READ).
+A record typed state_update that doesn't decode as a state update is skipped, as chronicle
+skips it, and a line on stderr says so.
+
+Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, or a kind of
+operation it doesn't read (chronicle_payload.READ).
 """
 import sys, os, struct, json, datetime
-from chronicle_payload import read_update, require_read
+from chronicle_payload import read_update, require_read, say_skipped
 
 RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta")
 NON_APPEND_RAW = ("Set", "Edit", "Redact", "Delta")
 TREE_OPS = ("TreeSet", "TreeRemove", "TreeBatch", "TreeDeltaSnapshot")
 
 
-def parse_log(path):
+def parse_log(path, skipped):
     """Parse records.log; return {offset: update_dict} for state_update records."""
     records = {}
     with open(path, "rb") as f:
@@ -70,7 +73,9 @@ def parse_log(path):
                 break  # torn tail on a live store - scan what is durable
             if rtype != "state_update":
                 continue
-            upd, kind = read_update(enc, payload, start, "scan-delta-poison.py")
+            upd, kind = read_update(enc, payload, start, skipped)
+            if upd is None:
+                continue
             require_read(kind, start, "scan-delta-poison.py")
             upd["_offset"] = start
             upd["_seq"] = seq
@@ -226,7 +231,9 @@ def main():
         print(f"error: {path} not found", file=sys.stderr)
         return 2
 
-    records = parse_log(path)
+    skipped = []
+    records = parse_log(path, skipped)
+    say_skipped(skipped, "scan-delta-poison.py")
 
     # Heads = state_update records that nothing points back to (per branch fork).
     referenced = {

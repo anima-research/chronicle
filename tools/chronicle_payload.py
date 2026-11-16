@@ -18,15 +18,21 @@ def decode_update(enc, payload):
     if end != len(payload): raise ValueError(f'MessagePack state update has {len(payload) - end} bytes after its value')
     return value
 
-def read_update(enc, payload, offset, tool):
+def read_update(enc, payload, offset, skipped):
     try:
         update = decode_update(enc, payload)
         op = update['operation']; kind = op if isinstance(op, str) else next(iter(op))
         update['state_id']
-    except Exception as error:
-        stop(tool, f"the record at offset {offset} of records.log is typed state_update but doesn't decode as one "
-                   f"({type(error).__name__}: {error})")
+    except Exception:
+        skipped.append(offset)
+        return None, None
     return update, kind
+
+def say_skipped(skipped, tool):
+    if skipped:
+        print(f"{tool}: skipped {len(skipped)} record(s) typed state_update that don't decode as state updates, the "
+              f'first at offset {skipped[0]}, as chronicle skips them; they stay in the log as ordinary records.',
+              file=sys.stderr)
 
 def require_read(kind, offset, tool):
     if kind not in READ:
