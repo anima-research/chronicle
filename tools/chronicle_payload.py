@@ -1,7 +1,7 @@
 # A state update's payload as a dict, from either encoding a store holds. A record's encoding byte is 1 for
 # MessagePack, which chronicle writes for state updates from 0.3.0; anything else is JSON, as earlier releases wrote.
 # The MessagePack reader needs nothing installed.
-import json, struct, sys
+import json, struct, sys, zlib
 
 # The kinds of state operation that chain-report.py and scan-delta-poison.py read, by the variant names of
 # StateOperation in src/types.rs. tools/check-tools.mjs fails unless the enum's variants are the kinds these
@@ -33,6 +33,11 @@ def say_skipped(skipped, tool):
         print(f"{tool}: skipped {len(skipped)} record(s) typed state_update that don't decode as state updates, the "
               f'first at offset {skipped[0]}, as chronicle skips them; they stay in the log as ordinary records.',
               file=sys.stderr)
+
+def require_checksum(payload, checksum, offset, tool):
+    if zlib.crc32(payload) & 0xffffffff != checksum:
+        stop(tool, f'the record at offset {offset} of records.log fails its checksum; chronicle truncates the log there '
+                   'if no valid record follows it, and otherwise refuses to open the store')
 
 def require_read(kind, offset, tool):
     if kind not in READ:

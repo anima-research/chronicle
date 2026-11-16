@@ -48,7 +48,7 @@ function scanIsClean(store, label, trees = []) {
   return Object.fromEntries(chains.map((chain) => [chain.state_id, chain.status]));
 }
 
-function copyWithPayload(from, name, update, edit) {
+function copyWithPayload(from, name, update, edit, { checksum = 'rewritten' } = {}) {
   const to = join(scratch, name);
   cpSync(from, to, { recursive: true });
   const log = readFileSync(join(to, 'records.log'));
@@ -59,8 +59,8 @@ function copyWithPayload(from, name, update, edit) {
   crcAt += 2 + 8 * log.readUInt16LE(crcAt);
   const length = Buffer.alloc(4);
   length.writeUInt32LE(payload.length);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32LE(crc32(payload));
+  const crc = Buffer.from(log.subarray(crcAt, crcAt + 4));
+  if (checksum === 'rewritten') crc.writeUInt32LE(crc32(payload));
   writeFileSync(join(to, 'records.log'), Buffer.concat([log.subarray(0, update.payload - 4), length, payload,
     log.subarray(update.payload + size, crcAt), crc, log.subarray(crcAt + 4)]));
   return to;
@@ -165,10 +165,13 @@ try {
   console.log('ok: rebuild-state-index.py refuses it, exit 2, and leaves state.bin as it was');
 
   const first = held.find(({ state }) => state === 'messages');
-  const damaged = copyWithPayload(built, 'damaged', first, (payload) => {
+  const undecodable = (payload) => {
     payload[0] = 0xc1;
     return payload;
-  });
+  };
+  const corrupt = copyWithPayload(built, 'corrupt', first, undecodable, { checksum: 'kept' });
+  bothToolsStop(corrupt, 'a record that fails its checksum', `the record at offset ${first.record} of records.log fails its checksum`);
+  const damaged = copyWithPayload(built, 'damaged', first, undecodable);
   const skips = `typed state_update that don't decode as state updates, the first at offset ${first.record},`;
   const damagedReport = python([join(tools, 'chain-report.py'), join(damaged, 'records.log')]);
   assert.equal(damagedReport.status, 0, `chain-report.py on a record that doesn't decode exited ${damagedReport.status}:\n${damagedReport.err}`);

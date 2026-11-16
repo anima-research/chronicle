@@ -28,11 +28,11 @@ It needs chronicle_payload.py beside it.
 A record typed state_update that doesn't decode as a state update is skipped, as chronicle
 skips it, and a line on stderr says so.
 
-Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, or a kind of
-operation it doesn't read (chronicle_payload.READ).
+Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, a record that
+fails its checksum, or a kind of operation it doesn't read (chronicle_payload.READ).
 """
 import sys, os, struct, json, datetime
-from chronicle_payload import read_update, require_read, say_skipped
+from chronicle_payload import read_update, require_checksum, require_read, say_skipped
 
 RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta")
 NON_APPEND_RAW = ("Set", "Edit", "Redact", "Delta")
@@ -68,9 +68,10 @@ def parse_log(path, skipped):
                 need(8 * cbc)
                 ltc = struct.unpack("<H", need(2))[0]
                 need(8 * ltc)
-                need(4)
+                checksum = struct.unpack("<I", need(4))[0]
             except EOFError:
                 break  # torn tail on a live store - scan what is durable
+            require_checksum(payload, checksum, start, "scan-delta-poison.py")
             if rtype != "state_update":
                 continue
             upd, kind = read_update(enc, payload, start, skipped)
