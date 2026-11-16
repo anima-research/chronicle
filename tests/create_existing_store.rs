@@ -881,7 +881,9 @@ fn a_blobs_junction_to_nothing_is_refused_naming_the_link() {
     fs::create_dir(&path).unwrap();
     junction(&target, &path.join("blobs"));
     fs::remove_dir(&target).unwrap();
-    let names_it = |msg: &str| msg.contains("leads to nothing");
+    // the link by its own path, not the target's: read_link on a junction may give another form of it
+    let link = path.join("blobs");
+    let names_it = |msg: &str| msg.contains("leads to nothing") && msg.contains(&*link.to_string_lossy());
 
     let msg = invalid_operation(Store::create(config(&path)));
     assert!(names_it(&msg), "create: {msg}");
@@ -930,10 +932,12 @@ fn a_blobs_link_to_a_file_is_refused_naming_it() {
     let path = dir.path().join("store");
     fs::create_dir(&path).unwrap();
     std::os::unix::fs::symlink(&target, path.join("blobs")).unwrap();
+    let blobs = path.join("blobs");
+    let names_it = |msg: &str| msg.contains("isn't a directory") && msg.contains(&*blobs.to_string_lossy());
     let msg = invalid_operation(Store::create(config(&path)));
-    assert!(msg.contains("isn't a directory"), "create: {msg}");
+    assert!(names_it(&msg), "create: {msg}");
     match Store::open_or_create(config(&path)) {
-        Err(StoreError::InvalidFormat(msg)) => assert!(msg.contains("isn't a directory"), "open_or_create: {msg}"),
+        Err(StoreError::InvalidFormat(msg)) => assert!(names_it(&msg), "open_or_create: {msg}"),
         Err(other) => panic!("open_or_create: expected InvalidFormat, got {other:?}"),
         Ok(_) => panic!("open_or_create made a store through a blobs link to a file"),
     }

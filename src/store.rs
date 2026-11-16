@@ -237,7 +237,8 @@ impl Store {
     /// The refusal of a `blobs/` with data in it says to move `blobs/` aside
     /// to start over, which loses nothing: blobs are content-addressed. A
     /// `blobs` link that leads to nothing is refused too, naming it, as a
-    /// store file's is: its target may be on a volume that isn't mounted.
+    /// store file's is: its target may be on a volume that isn't mounted. So
+    /// is a `blobs` that isn't a directory, whatever `create_if_missing` says.
     ///
     /// A store's `blobs/`, or the directory a `blobs` link leads to, belongs
     /// to that store alone: open and create clear blob staging files there
@@ -3751,8 +3752,9 @@ impl Store {
                     Self::link_to_nothing(&manifest_path)
                 )),
                 Ok(Some(found)) if found == Self::BLOBS_NOT_A_DIRECTORY => StoreError::InvalidFormat(format!(
-                    "{} has no MANIFEST, and {} isn't a directory, so it isn't a Chronicle store or a place for one: move it aside to create one here",
+                    "{} has no MANIFEST, and {} isn't a directory, so it isn't a Chronicle store or a place for one: move {} aside to create one here",
                     path.display(),
+                    path.join("blobs").display(),
                     path.join("blobs").display()
                 )),
                 Ok(Some(found)) if found == Self::BLOBS_LINK_TO_NOTHING => StoreError::InvalidFormat(format!(
