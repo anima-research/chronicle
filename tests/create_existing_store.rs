@@ -755,7 +755,10 @@ fn a_blobs_link_to_nothing_is_refused_naming_the_link() {
     let path = dir.path().join("store");
     fs::create_dir(&path).unwrap();
     std::os::unix::fs::symlink(&target, path.join("blobs")).unwrap();
-    let names_it = |msg: &str| msg.contains("leads to nothing") && msg.contains(&*target.to_string_lossy());
+    let link = path.join("blobs");
+    let names_it = |msg: &str| msg.contains("leads to nothing")
+        && msg.contains(&*link.to_string_lossy())
+        && msg.contains(&*target.to_string_lossy());
 
     let msg = invalid_operation(Store::create(config(&path)));
     assert!(names_it(&msg), "create: {msg}");
