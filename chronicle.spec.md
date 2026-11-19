@@ -67,7 +67,7 @@ The package is the Rust crate `chronicle` with its Node binding. Together they a
 
 **F12. Links.** A record names other records in two lists: the records that caused it, and the records that it is related to in another way. A caller can ask what a record caused. The answer holds the ID of each record whose first list names that record. A caller can ask what is related to a record. The answer holds the ID of each record whose second list names that record. Both answers hold records of every branch. Limit today: L2.
 
-**F13. The records of a branch.** A caller can ask for records in a range of sequences. The answer holds the records that were appended on the branch that the caller acts on, and that have a sequence in the range. The first and the last sequence of the range are in the range. A range whose first sequence is after its last sequence holds no records. The answer holds no record of the branch's parent. This is so also for a record of the parent from before the branch point.
+**F13. The records of a branch.** A caller can ask for records in a range of sequences. The answer holds the records that were appended on the branch that the caller acts on, and that have a sequence in the range. The first and the last sequence of the range are in the range. A range whose first sequence is after its last sequence holds no records. The answer holds no record of the branch's parent. This is so also for a record of the parent from before the branch point. Limits today: L1 and L10.
 
 **F14. The order and the limits of that answer.** The answer is in ascending order of sequence. When the caller asks for the newest first, it is in descending order. When the caller names types, the answer holds only records of those types. When the caller gives a limit, the answer holds at most that many records. They are the first matching records in the answer's order. With no limit given, the limit is 10,000. When the caller gives a number of records to skip, the answer starts after that many matching records. Limit today: L1.
 
@@ -105,7 +105,7 @@ The package is the Rust crate `chronicle` with its Node binding. Together they a
 
 **F77. A value without a registration.** A caller can set and read a state that is not registered. Such a state is not in the list of states. When the caller registers the name afterwards, the state keeps its value.
 
-**F28. The list of states.** When a caller asks for the states, the store gives each registered state with its name and its kind. For a list that has a value on the branch that the caller acts on, it also gives the number of items there.
+**F28. The list of states.** When a caller asks for the states, the store gives each registered state with its name and its kind. For a list that has a value on the branch that the caller acts on, it also gives the number of items there. Limit today: L11.
 
 **F29. Each change is a record.** Each change of a state adds one record of the reserved type to the branch that the caller acts on. The record takes the branch's next sequence, as in F7, and the answer to the change is that record. A change of a state on one branch gives the state a value on that branch alone. The store can add records of its own of the reserved type to the branch, so that reads stay fast. Each of them takes a sequence too. So after one change, the branch's head can be more than one above where it was.
 
@@ -125,9 +125,9 @@ The package is the Rust crate `chronicle` with its Node binding. Together they a
 
 **F36. A list: redact.** When a caller redacts a range of indexes, the list loses the items from the first index of the range up to the last index before the range's end. Each later item moves down by the number of items that left. A part of the range that is beyond the end of the list is ignored.
 
-**F79. Replace a whole list.** A caller can replace the whole value of a list with a new list in one change. A read at an earlier sequence gives the old items, and a read at the change's sequence gives the new items. No read gives an empty list or a part of the new list. A later append goes to the end of the new list.
+**F79. Replace a whole list.** A caller can replace the whole value of a list with a new list in one change. A read at an earlier sequence gives the old items, and a read at the change's sequence gives the new items. Each read gives the old list or the new list, and never a part of one. A later append goes to the end of the new list.
 
-**F37. Reads of a list.** A caller can read the whole list, the number of its items, the items in a range of indexes, the last items up to a number that it gives, one item by its index, and several items by their indexes in one request. An index that the list does not have gives "no item". The items of one request are all from one version of the list.
+**F37. Reads of a list.** A caller can read the whole list, the number of its items, the items in a range of indexes, the last items up to a number that it gives, one item by its index, and several items by their indexes in one request. An index that the list does not have gives "no item". The items of one request are all from one version of the list. Limit today: L11.
 
 **F38. A tree.** A value of the kind tree is a map from paths to entries. An entry names a blob by its hash, and has a size and a mode. A caller can set the entry of a path and remove a path. A caller can make several such sets and removes as one change: the tree gets all of them or none, and the change is one record. A caller can read the entry of one path, and it can list the paths, or the paths that start with a text that it gives.
 
@@ -227,7 +227,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 
 **N2. Synchronous calls.** Every method but `storeBlobAsync` runs on the caller's thread and returns its answer directly. A caller uses each handle of a store from the thread that opened the store: this is a rule for the caller, and the package does not check it.
 
-**N3. Failures.** When the store refuses or fails a call, the method throws an `Error`. Its `code` is one of the texts of E1, and its message has the form that E2 gives. Two cases are apart. An argument of a wrong type is refused before the store sees it, with an error of the binding's runtime that has no code of E1. And `storeBlobAsync` reports a failure of its store by rejecting its promise.
+**N3. Failures.** When the store refuses or fails a call, the method throws an `Error`. Its `code` is one of the texts of E1, and its message has the form that E2 gives. Two cases are apart. An argument of a wrong type is refused before the store sees it, with an error of the binding's runtime that has no code of E1. And `storeBlobAsync` reports a failure of its store by rejecting its promise. A failure of its own machinery, such as a thread that cannot start or that panics, has the runtime's code and no code of E1.
 
 **N4. IDs and numbers.** A record's ID, a branch's ID and a subscription's ID are texts, and each is a whole number in decimal digits. One place is apart: in the `data` of an event, the ID of a record and the ID of a branch are JSON numbers. Where a method takes an ID, a text with a plus sign before the digits is taken too. A sequence, an index and a count are numbers. The hash of a blob is a text of 64 hexadecimal digits in lower case. The hash in an entry of a tree is the text that the caller gave, and the store does not check it.
 
@@ -239,7 +239,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 
 **N8. A closed handle, and a deleted branch.** On a closed handle, every method but `isClosed` and `pinnedBranch` throws `StoreClosed`. Three cases are apart. A second `close` does nothing (A4). The two polls do not look whether the handle is closed: a poll first checks the ID, and then gives the events that still wait (A66). A read of an item with an index below zero answers null (L4). Through a view whose branch is deleted, each method that depends on a branch throws `BranchNotFound`.
 
-**N9. The order of keys.** A JSON object that a caller writes comes back with its keys in the order written, at every level, from every method that gives it back. The entries of a tree are apart: they come by path. An object that an earlier release stored keeps the order in which it was stored.
+**N9. The order of keys.** A JSON object that a caller writes comes back with its keys in the order written, at every level, from every method that gives it back as bytes or as a JSON text. A method that gives a JavaScript object gives the object's own order: JavaScript puts each key that is a whole number first, in rising order, and the other keys follow in the order written. The entries of a tree are apart: they come by path. An object that an earlier release stored keeps the order in which it was stored.
 
 #### Methods
 
@@ -344,7 +344,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 - It throws `InvalidSequence` for a sequence above the parent's head, `BranchExists` and `BranchNotFound`.
 
 **A23. `createEmptyBranch`.** `createEmptyBranch(name: string, from?: string | undefined | null): JsBranch`. Functional items: F17, F19, F20.
-- It is `createBranch`, but the new branch takes no state. When `from` is left out on a view, the parent is the view's branch. Limit today: L3.
+- It is `createBranch`, but the new branch takes no state. When `from` is left out on a view, the parent is the view's branch. It looks for a taken name before it looks for the parent, so it throws `BranchExists` first. Limit today: L3.
 
 **A24. `switchBranch`.** `switchBranch(name: string): JsBranch`. Functional items: F23, F64.
 - On the store's own handle it makes the named branch the current branch, and the answer is that branch.
@@ -397,7 +397,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 
 **A37. `appendManyToStateJson`.** `appendManyToStateJson(stateId: string, items: Array<any>): JsAppendedBatch`. Functional items: F32, F33.
 - It adds the items to the end of the list, in the order given, as one change with one record and one sequence.
-- `record` in the answer is that record. `firstOrdinal` is the index of the first item, and item number i of `items` is at `firstOrdinal + i`.
+- `record` in the answer is that record. `firstOrdinal` is the index of the first item, and item number i of `items` is at `firstOrdinal + i`. This holds for a list whose value is a JSON array of JSON items. On another value the batch takes the stored count, and its items do not read by index.
 - It throws `InvalidOperation`, and writes nothing, when `items` is empty.
 
 **A38. `appendManyToStateJsonWithIdentity`.** `appendManyToStateJsonWithIdentity(stateId: string, items: Array<any>, idField: string, sequenceField: string): JsAppendedBatch`. Functional items: F32, F33, F34.
@@ -415,6 +415,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 
 **A41. `getStateLen`.** `getStateLen(stateId: string): number | null`. Functional items: F37.
 - It is the list's number of items on the handle's branch, zero for a list with no items, and null when the state has no value on that branch.
+- Limit today: L11.
 
 **A42. `stateHeadOffset`.** `stateHeadOffset(stateId: string): number | null`. Functional items: F41.
 - It is a number for the state's value on the handle's branch, or null when the state has no value there.
@@ -434,7 +435,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 **A45. `getStateItemsJson`.** `getStateItemsJson(stateId: string, ordinals: Array<number>): Array<any | undefined | null>`. Functional items: F37.
 - The answer has one entry for each entry of `ordinals`, in the same order: the item at that index, as `getStateItemJson` gives it. An index can be there more than one time.
 - Each entry is from one version of the list. With no index of zero or more in `ordinals`, it reads nothing and gives null for each entry.
-- Limit today: L4.
+- Limits today: L4 and L11.
 
 **A46. `getStateTail`.** `getStateTail(stateId: string, count: number): Buffer | null`. Functional items: F37.
 - It is the JSON text of an array of the last `count` items, as bytes, or of every item when the list has fewer. It is null when the state has no value on the handle's branch.
@@ -467,7 +468,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 **A55. `query`.** `query(filter: JsQueryFilter): Array<JsRecord>`. Functional items: F13, F14.
 - It gives records that were appended on the handle's branch, as `JsQueryFilter` says, in rising order of sequence, or in falling order when `reverse` is true.
 - With no `limit`, the answer holds at most 10,000 records. `offset` leaves out that many matching records from the start of the answer.
-- Limit today: L1.
+- Limits today: L1 and L10.
 
 **A56. `listStates`.** `listStates(): Array<JsStateInfo>`. Functional items: F28.
 - It gives one entry for each registered state. `itemCount` and `opsSinceSnapshot` are for the handle's branch. The order of the answer is not specified.
@@ -621,7 +622,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 **T11. `JsStateRegistration`.** `{ id: string; strategy: string; deltaSnapshotEvery?: number; fullSnapshotEvery?: number; initialValue?: Buffer }`.
 - `id`: The state's name.
 - `strategy`: The state's kind: `snapshot`, `append_log` or `tree`.
-- `deltaSnapshotEvery`: For a list: when this many changes have come since the store's last short cut, the store adds a small short cut, which holds the items since then. It adds no small one while the list has had an edit, a redact or a set since its last short cut. 100 for a list and 50 for a tree when left out. For a tree, the source has a rule of the same form.
+- `deltaSnapshotEvery`: For a list: when this many changes have come since the store's last short cut, the store adds a small short cut, which holds the items since then. It adds no small one while the list has had an edit, a redact or a set since its last short cut. When a whole short cut is due at the same change, it takes the small one's place. 100 for a list and 50 for a tree when left out. For a tree, the source has a rule of the same form.
 - `fullSnapshotEvery`: For a list: the store adds a short cut of the whole value when its count of the changes since the last whole one reaches the larger of two numbers. The first is `deltaSnapshotEvery` times `fullSnapshotEvery`. The second is the number of items at the last whole one, which is zero for a new list. The store does not keep that count. It takes the number of small short cuts since the last whole one times today's `deltaSnapshotEvery`, and adds the changes since the last small one. So the count is off after `updateStateStrategy` changes `deltaSnapshotEvery`. 10 when left out.
 - `initialValue`: Taken and not used.
 
@@ -738,7 +739,7 @@ The signatures are in the notation of the package's `index.d.ts`, which the buil
 - `StoreClosed`: `Store has been closed`, or `View has been closed` from a view that was closed.
 - `SubscriptionNotFound`: `Subscription not found`.
 - The binding makes some failures itself, with the code `InvalidOperation`, `BranchNotFound`, `Deserialization` or `Serialization`. Such a message is the binding's own text, such as `Invalid record ID` or `Branch not found`, or the text of the JSON error. It does not always start as the list above says.
-- Release 0.6.0 puts no code of E1 on a failure. So a caller that runs on 0.6.0 tells failures apart by these texts.
+- These are the texts of release 0.7.0. Release 0.6.0 puts no code of E1 on a failure, so a caller that runs on it tells failures apart by its texts. Some of them differ: there a dropped subscription reads `Subscription disconnected`.
 
 ### The store's files
 
@@ -746,7 +747,7 @@ Other programs read a store's files beside the package: an older release of the 
 
 **D1. `MANIFEST`.** The file is the four bytes `RST\0`, then one byte for the format version, which is 1 or 2. In version 2, eight bytes follow: a set of feature bits, as a number of 64 bits with its lowest byte first. Bit 0 says that the store holds a change of several items of a list. A new store has version 1. The store writes version 2, with bit 0 set, just before its first change of several items of a list. The file stays at version 2 when that change then fails. A build opens version 1, and it opens version 2 when it knows each bit that is set. It refuses another version, and a bit that it does not know, with `InvalidFormat`. A release from before such changes refuses version 2. Functional items: F71.
 
-**D2. `records.log`.** The log of records, in the order in which the store accepted them. Each record is these bytes, in this order, and each number has its lowest byte first. Functional items: F7 to F9, F65, F66 and F68.
+**D2. `records.log`.** The log of records, in the order in which the store accepted them. Each record is these bytes, in this order. Each number is unsigned and has its lowest byte first, unless its line says otherwise. Functional items: F7 to F9, F65, F66 and F68.
 - The four bytes `REC\0`, one byte for the version, which is 1, and one byte of flags, which is 0.
 - The record's ID, its sequence and the ID of its branch, each in 8 bytes.
 - The time in microseconds since the start of 1970, UTC, as a signed number in 8 bytes.
@@ -776,7 +777,7 @@ Other programs read a store's files beside the package: an older release of the 
 
 **D9. Other entries in the store's directory.** No functional item needs this item.
 - The store's own names in its directory are `MANIFEST`, `LOCK`, `records.log`, `state.bin`, `state-indexes.bin`, `branches.bin` and `blobs`, and each name that starts with `.chronicle-checkpoint-`. It makes a file of the last kind during a save and removes it.
-- The store reads, changes and removes no entry with another name. It lists its directory in two cases only: to remove the files that an interrupted save left, and before `openOrCreate` creates a store. One case is apart: a file of the store's own name can be a symbolic link. A save then replaces the file that the link leads to, in that file's own directory, and the link stays.
+- The store reads, changes and removes no entry with another name. It lists its directory in two cases only: to remove the files that an interrupted save left, and before `openOrCreate` creates a store. One case is apart: `MANIFEST`, `state.bin`, `state-indexes.bin` or `branches.bin` can be a symbolic link. A save then replaces the file that the link leads to, in that file's own directory, and the link stays. The log is written through a link at `records.log`. A link at `LOCK` is refused (D7).
 - `openOrCreate` creates a store beside these names and beside no other: `lost+found`, `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems`, `System Volume Information`, `$RECYCLE.BIN`, `.DS_Store`, `LOCK`, `blobs`, and a name that starts with `.chronicle-checkpoint-`. The check reads names alone: a regular file with the name `blobs` passes it, and the create then fails with `Io`. So a caller that keeps its own files in the directory puts them there after the store exists.
 
 ### The Rust interface
@@ -787,14 +788,16 @@ Other programs read a store's files beside the package: an older release of the 
 
 ## Where the code differs today
 
-The code at `f4e39ac` does not meet these promises. Each limit has a label, and each item that it touches names the label. The list holds the limits that were read in the code. It is not complete: no one has yet held every functional item against the code by a test. A change that removes a limit removes its entry here, and its label at the items.
+The code at `f4e39ac` does not meet these promises. Each limit has a label, and each item that it touches names the label. The list holds the limits that were read in the code, shown by a run, or shown by a test of this repository. It is not complete: no one has yet held every functional item against the code by a test. A change that removes a limit removes its entry here, and its label at the items.
 
 - **L1. A query with a filter by type can leave out records that match (F13, F14, A55).** The code takes the first records of the range, and then keeps those of the named types. Their number is four times the sum of the limit and the number of records to skip, plus 100. So the answer can hold fewer records than the limit, or none, while later records of the range match. `query_range_on` in `src/store.rs`.
 - **L2. A record with more than 65,535 links in one list, or with a type of more than 65,535 bytes, does not read back (F12, A10, A53).** An append takes a list of any length. The log writes the list's length in 16 bits, and then writes every ID. No code checks the length. The next open takes such a record for a cut-off record, or refuses the store. `write_record` in `src/records/log.rs`.
 - **L3. On the store's own handle, a new branch that takes no states has `main` as its parent when the caller names none (F17, A23).** Every other create takes the branch that the caller acts on. `create_empty_branch` in `src/store.rs`.
-- **L4. Two reads of items answer null for an index below zero before they look for the store or for the branch (F6, F24, N8, A6, A44, A45).** So they answer on a closed handle, and through a view whose branch is deleted. `getStateItemJson` and `getStateItemsJson` in `src/napi.rs`.
+- **L4. Two reads of items answer for an index below zero before they look for the store or for the branch (F6, F24, N8, A6, A44, A45).** So they answer null on a closed handle, and through a view whose branch is deleted. `getStateItemsJson` answers an empty list of indexes in the same way, with an empty list. `getStateItemJson` and `getStateItemsJson` in `src/napi.rs`.
 - **L5. A record that is appended during a catch-up can reach the subscription neither way (F56, A65).** `catch_up_subscription_on` in `src/store.rs` replays from the log and then marks the subscription as caught up, and it takes no write lock between the two. An append takes the write lock, and its event passes over a subscription that is not yet caught up.
 - **L6. A start sequence above the branch's head replays every record of the branch (F54, A65).** `iter_from_on` in `src/store.rs`, and the replay loop of the catch-up, which checks a record's branch and type and not its sequence.
 - **L7. A followed state whose bytes are no JSON, and that is no larger than the size of F58, is sent as no value, with no word that anything is missing (F54, A65).** A larger one comes marked as cut. The catch-up, in `src/store.rs`.
 - **L8. A large state can be sent whole and marked as cut (F58, A65).** The catch-up compares the whole value's size with the limit, and then adds up the sizes of the items without the brackets and commas between them.
 - **L9. A record's checksum covers its payload alone (F68, A2, D2).** So damage to a record's ID, sequence, branch, type or links passes the open's scan. `write_record` in `src/records/log.rs`.
+- **L10. A query of a range whose first sequence is after its last sequence ends the process (F13, A55).** F13 promises an answer with no records. The call panics in the index's search, and the panic ends the Node process.
+- **L11. In a store that a release before 0.5.0 wrote, a list's stored number of items can be wrong (F28, F37, A41, A45).** The store counts the items again at the list's first change of several items after an open, and at a request to compact. Until then `getStateLen` gives the stored number, and a read of several items by their indexes can disagree with the list. `tests/review7_fixes.rs` shows both.
