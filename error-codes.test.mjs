@@ -32,7 +32,7 @@ function throwsCoded(call, code, message) {
   });
 }
 
-test('ErrorCode lists every code, each named as its value', () => {
+test('E1 ErrorCode lists every code, each named as its value', () => {
   assert.deepEqual(Object.keys(ErrorCode).sort(), [
     'BlobNotFound', 'BranchExists', 'BranchNotFound', 'ChecksumMismatch', 'Corruption',
     'Deserialization', 'DurabilityLost', 'HashMismatch', 'InvalidFormat', 'InvalidOperation',
@@ -424,7 +424,7 @@ function thrownBy(call) {
   assert.fail('expected a throw');
 }
 
-test('storeBlobAsync rejects with the code and message storeBlob throws for the same failure', async () => {
+test('N3 A17 storeBlobAsync rejects with the code and message storeBlob throws for the same failure', async () => {
   const { store, dir } = freshStore();
   const longType = 'x'.repeat(65_536);
   const refused = thrownBy(() => store.storeBlob(Buffer.from('x'), longType));
@@ -522,7 +522,7 @@ test('opening a store under a path that is a file is an Io error', { skip: proce
   throwsCoded(() => JsStore.open({ path: join(file, 'store') }), ErrorCode.Io, /^IO error: /);
 });
 
-test("an error napi raises converting a call's arguments keeps napi's code, or has none", () => {
+test("N3 an error napi raises converting a call's arguments keeps napi's code, or has none", () => {
   const { store } = freshStore();
   const napiCode = (call) => {
     try {
