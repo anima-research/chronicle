@@ -297,8 +297,8 @@ test('D9 the store leaves no .chronicle-checkpoint- file after its saves, and ch
   mkdirSync(join(dir, 'mine'));
   writeFileSync(join(dir, 'mine', 'inside'), 'kept too');
   const marks = () => ['mine.txt', 'mine', join('mine', 'inside')].map((name) => {
-    const { ino, mtimeMs } = statSync(join(dir, name));
-    return [name, ino, mtimeMs];
+    const { ino, mtimeNs } = statSync(join(dir, name), { bigint: true });
+    return [name, ino, mtimeNs];
   });
   const before = marks();
   store.registerState({ id: 'list', strategy: 'append_log' });
@@ -330,21 +330,26 @@ test('D9 openOrCreate creates a store beside LOCK, blobs and a name that starts 
   }
 });
 
-test("D9 a save replaces the file that a link of the store's own name leads to, in that file's own directory, and the link stays", { skip: process.platform === 'win32' && 'makes a symbolic link' }, () => {
+test("D9 a save replaces the file that a link at state.bin leads to, in that file's own directory, the store writes the log through a link at records.log, and both links stay", { skip: process.platform === 'win32' && 'makes a symbolic link' }, () => {
   const { store, dir } = freshStore();
   store.registerState({ id: 'list', strategy: 'append_log' });
   store.close();
   const elsewhere = `${dir}-elsewhere`;
   mkdirSync(elsewhere);
-  renameSync(join(dir, 'state.bin'), join(elsewhere, 'state.bin'));
-  symlinkSync(join(elsewhere, 'state.bin'), join(dir, 'state.bin'));
+  for (const name of ['state.bin', 'records.log']) {
+    renameSync(join(dir, name), join(elsewhere, name));
+    symlinkSync(join(elsewhere, name), join(dir, name));
+  }
   const reopened = JsStore.open({ path: dir });
-  const target = statSync(join(elsewhere, 'state.bin')).ino;
+  const before = (name) => statSync(join(elsewhere, name), { bigint: true });
+  const [states, log] = [before('state.bin'), before('records.log')];
   reopened.appendToStateJson('list', 1);
   reopened.sync();
   reopened.close();
-  assert.ok(lstatSync(join(dir, 'state.bin')).isSymbolicLink());
-  assert.notEqual(statSync(join(elsewhere, 'state.bin')).ino, target);
+  for (const name of ['state.bin', 'records.log']) assert.ok(lstatSync(join(dir, name)).isSymbolicLink(), name);
+  assert.notEqual(before('state.bin').ino, states.ino);
+  assert.equal(before('records.log').ino, log.ino);
+  assert.ok(before('records.log').size > log.size);
   assert.deepEqual(readdirSync(elsewhere).filter((name) => name.startsWith('.chronicle-checkpoint-')), []);
   const again = JsStore.open({ path: dir });
   assert.deepEqual(again.getStateJson('list'), [1]);
@@ -358,31 +363,64 @@ test('D9 E2 openOrCreate takes a regular file named blobs by its name, and the c
   refuses(() => JsStore.openOrCreate({ path: dir }), ErrorCode.Io, /^IO error: /);
 });
 
-test('N5 each method and each type that chronicle.spec.md gives has its name and its signature in the built index.d.ts, and the file has no other', () => {
-  const spec = readFileSync(new URL('../chronicle.spec.md', import.meta.url), 'utf8');
-  const declarations = readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
-  const members = (text) => {
-    const out = [];
-    let open = '';
-    for (const line of text.split('\n')) {
-      open = `${open} ${line}`;
-      if ((open.match(/\(/g) ?? []).length === (open.match(/\)/g) ?? []).length) {
-        const member = open.replace(/\s+/g, ' ').replace(/\( /g, '(').replace(/ \)/g, ')').replace(/;$/, '').trim();
-        if (member) out.push(member);
-        open = '';
-      }
+function exportsOf(source) {
+  const text = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const found = [];
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if ('{(['.includes(c)) depth++;
+    else if ('})]'.includes(c)) depth--;
+    else if (depth === 0 && /^export\b/.test(text.slice(i, i + 7)) && (i === 0 || /\s/.test(text[i - 1]))) {
+      const header = text.slice(i).match(/^export\s+(?:declare\s+)?(?:const\s+)?(\w+)\s+(\w+)/);
+      const open = text.indexOf('{', i);
+      const close = (() => {
+        let d = 0;
+        for (let k = open; k < text.length; k++) {
+          if (text[k] === '{') d++;
+          else if (text[k] === '}' && --d === 0) return k;
+        }
+        return -1;
+      })();
+      assert.ok(header && close > open, `a whole declaration at ${i}`);
+      found.push({ kind: header[1], name: header[2], body: text.slice(open + 1, close) });
+      i = close;
     }
-    return out.sort();
-  };
-  const methods = [...spec.matchAll(/^\*\*A\d+\. `\w+`\.\*\* `([^`]+)`/gm)].map(([, signature]) => signature);
-  assert.equal(methods.length, 79);
-  assert.deepEqual(members(declarations.match(/export declare class JsStore \{([\s\S]*?)\n\}/)[1]), [...methods].sort());
+  }
+  return found;
+}
+
+function membersOf(body) {
+  const out = [];
+  let depth = 0;
+  let member = '';
+  for (const c of `${body}\n`) {
+    if ('{(['.includes(c)) depth++;
+    if ('})]'.includes(c)) depth--;
+    if (depth === 0 && (c === '\n' || c === ';')) {
+      const text = member.replace(/\s+/g, ' ').replace(/([({[]) /g, '$1').replace(/ ([)}\]])/g, '$1').trim();
+      if (text) out.push(text);
+      member = '';
+    } else member += c;
+  }
+  assert.equal(depth, 0, 'every bracket of the body closes');
+  return out.sort();
+}
+
+test('N5 the built index.d.ts exports JsStore, ErrorCode and the types of chronicle.spec.md, each method and each type with the name and the signature that the spec gives', () => {
+  const spec = readFileSync(new URL('../chronicle.spec.md', import.meta.url), 'utf8');
+  const declared = exportsOf(readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8'));
   const types = [...spec.matchAll(/^\*\*T\d+\. `(\w+)`\.\*\* `\{ (.*) \}`/gm)];
   assert.equal(types.length, 27);
-  const interfaces = [...declarations.matchAll(/^export interface (\w+) \{([\s\S]*?)\n\}/gm)];
-  assert.deepEqual(interfaces.map(([, name]) => name).sort(), types.map(([, name]) => name).sort());
+  assert.deepEqual(
+    declared.map(({ kind, name }) => `${kind} ${name}`).sort(),
+    ['class JsStore', 'enum ErrorCode', ...types.map(([, name]) => `interface ${name}`)].sort(),
+  );
+  const methods = [...spec.matchAll(/^\*\*A\d+\. `(\w+)`\.\*\* `([^`]+)`/gm)];
+  assert.equal(methods.length, 79);
+  for (const [, name, signature] of methods) assert.equal(signature.match(/^(?:static )?(\w+)\(/)?.[1], name, signature);
+  assert.deepEqual(membersOf(declared.find(({ name }) => name === 'JsStore').body), methods.map(([, , signature]) => signature).sort());
   for (const [, name, body] of types) {
-    const [, , declared] = interfaces.find(([, other]) => other === name);
-    assert.deepEqual(members(declared), body.split('; ').sort(), name);
+    assert.deepEqual(membersOf(declared.find((entry) => entry.name === name).body), body.split('; ').sort(), name);
   }
 });

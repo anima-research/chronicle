@@ -109,7 +109,9 @@ test('A74 T26 treeDiff gives one entry for each path that differs between two se
   store.treeRemove('files', 'removed');
   store.treeSet('files', 'added', entry(5));
   const to = store.currentSequence();
-  const byPath = Object.fromEntries(store.treeDiff('files', from, to).map((change) => [change.path, change]));
+  const changes = store.treeDiff('files', from, to);
+  assert.equal(changes.length, 3);
+  const byPath = Object.fromEntries(changes.map((change) => [change.path, change]));
   assert.deepEqual(Object.keys(byPath).sort(), ['added', 'changed', 'removed']);
   assert.deepEqual(byPath.added, { changeType: 'added', path: 'added', newEntry: entry(5) });
   assert.deepEqual(byPath.changed, { changeType: 'modified', path: 'changed', oldEntry: entry(2), newEntry: entry(4) });

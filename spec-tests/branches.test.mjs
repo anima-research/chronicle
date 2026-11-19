@@ -42,6 +42,14 @@ test('A22 E2 createBranchAt throws BranchExists for a name that a branch has, an
   store.close();
 });
 
+test('A23 E2 createEmptyBranch looks for a taken name before the parent, and throws BranchExists first', () => {
+  const { store } = freshStore();
+  store.createBranch('side');
+  refuses(() => store.createEmptyBranch('side', 'missing'), ErrorCode.BranchExists, 'Branch already exists: side');
+  refuses(() => store.createEmptyBranch('new', 'missing'), ErrorCode.BranchNotFound, /^Branch not found: /);
+  store.close();
+});
+
 test.todo("A23 L3 on the store's own handle with from left out, the new branch's parent is the current branch", () => {
   const { store } = freshStore();
   const side = store.createBranch('side');

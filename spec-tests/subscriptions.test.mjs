@@ -126,6 +126,16 @@ test('T21 T23 for another value larger than maxSnapshotBytes, a catch-up sends n
   store.close();
 });
 
+test("T21 maxSnapshotBytes counts the stored state's bytes, not its characters or a respaced copy of it", () => {
+  for (const [value, limit] of [[JSON.stringify('é'.repeat(10)), 15], ['{ "k" :  1 }', 10]]) {
+    const { store } = freshStore();
+    const snapshot = snapshotsOf(store, value, limit);
+    assert.equal(snapshot.truncated, true, value);
+    assert.equal(snapshot.total_bytes, Buffer.byteLength(value));
+    store.close();
+  }
+});
+
 test.todo('A65 T21 L8 a catch-up does not send whole a list larger than maxSnapshotBytes', () => {
   const { store } = freshStore();
   const snapshot = snapshotsOf(store, '[1,1,1]', 5);
@@ -273,7 +283,10 @@ test("T23 a record event has the record's id as a number, sequence, branch, reco
     payload_size: record.payload.length,
     payload,
   });
-  assert.deepEqual(records, [expected(fits, { s: 'x'.repeat(4096 - 8) }), expected(large, null), expected(raw, null)]);
+  const want = [expected(fits, { s: 'x'.repeat(4096 - 8) }), expected(large, null), expected(raw, null)];
+  assert.deepEqual(records, want);
+  const replayed = drain(store, caughtUp(store, { fromSequence: fits.sequence, filter: { includeRecords: true } }));
+  assert.deepEqual(replayed.filter((event) => event.eventType === 'record').map((event) => event.record), want);
   store.close();
 });
 

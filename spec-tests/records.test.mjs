@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -213,6 +214,21 @@ test('A55 T16 with no limit, query answers at most 10,000 records', () => {
   assert.equal(store.query({}).length, 10_000);
   assert.equal(store.query({ limit: 10_001 }).length, 10_001);
   store.close();
+});
+
+test.todo('A55 L10 a query whose fromSequence is after its toSequence answers no records', () => {
+  const script = `
+    import { mkdtempSync } from 'node:fs';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    import { JsStore } from ${JSON.stringify(new URL('../index.js', import.meta.url).href)};
+    const store = JsStore.openOrCreate({ path: join(mkdtempSync(join(tmpdir(), 'chronicle-spec-')), 'store') });
+    for (const n of [1, 2, 3]) store.appendJson('note', { n });
+    process.stdout.write(JSON.stringify(store.query({ fromSequence: 2, toSequence: 1 })));
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, '[]');
 });
 
 test.todo('A55 T16 L1 a filter by type answers each matching record up to the limit, however few of the records match', () => {

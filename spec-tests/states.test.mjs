@@ -50,14 +50,20 @@ test('T11 a whole short cut comes when the changes since the last whole one reac
   store.close();
 });
 
-test('T11 the store adds no small short cut while the list has had an edit since its last short cut', () => {
-  for (const edited of [false, true]) {
+test('T11 the store adds no small short cut while the list has had an edit, a redact or a set since its last short cut', () => {
+  const changes = {
+    none: () => {},
+    edit: (store) => store.editStateItem('list', 0, Buffer.from('1')),
+    redact: (store) => store.redactStateItems('list', 0, 1),
+    set: (store) => store.setStateJson('list', [9]),
+  };
+  for (const [name, change] of Object.entries(changes)) {
     const { store } = freshStore();
     store.registerState({ id: 'list', strategy: 'append_log', deltaSnapshotEvery: 2, fullSnapshotEvery: 100 });
     store.appendToStateJson('list', 0);
-    if (edited) store.editStateItem('list', 0, Buffer.from('1'));
+    change(store);
     for (let n = 0; n < 5; n++) store.appendToStateJson('list', n);
-    assert.equal(shortCutKinds(store).includes('DeltaSnapshot'), !edited, `edited: ${edited}`);
+    assert.equal(shortCutKinds(store).includes('DeltaSnapshot'), name === 'none', name);
     store.close();
   }
 });

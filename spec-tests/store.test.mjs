@@ -123,18 +123,27 @@ test('N1 the package gives one class, JsStore, whose three static methods make a
   store.close();
 });
 
-test('N2 each method answers directly or throws at the call, and storeBlobAsync alone answers with a promise', async () => {
+test('N2 each method answers directly, and storeBlobAsync alone answers with a promise', async () => {
   const { store } = populated();
-  const id = store.subscribe();
-  const calls = { ...ARGS, isClosed: [], pinnedBranch: [], pollSubscription: [id], pollSubscriptionTimeout: [id, 0], close: [] };
+  const spare = store.subscribe();
+  const live = store.subscribe();
+  const calls = {
+    ...ARGS,
+    createBranchWithStates: ['other-2', null, {}],
+    createBranchAtWithStates: ['other-3', 'main', 0, {}],
+    createBranchAt: ['other-4', 'main', 0],
+    createEmptyBranch: ['other-5'],
+    unsubscribe: [spare],
+    catchUpSubscription: [live],
+    isClosed: [],
+    pinnedBranch: [],
+    pollSubscription: [live],
+    pollSubscriptionTimeout: [live, 0],
+    close: [],
+  };
   let pending;
   for (const [name, args] of Object.entries(calls)) {
-    let answer;
-    try {
-      answer = store[name](...args);
-    } catch {
-      continue;
-    }
+    const answer = store[name](...args);
     if (name === 'storeBlobAsync') pending = answer;
     else assert.equal(typeof answer?.then, 'undefined', name);
   }
@@ -243,13 +252,14 @@ test('N8 on a closed handle a second close does nothing, and a poll, with or wit
   refuses(() => store.pollSubscriptionTimeout(ids[1], 1), ErrorCode.StoreClosed, 'Store has been closed');
 });
 
-test.todo('N8 L4 on a closed handle, a read of an item with an index below zero throws StoreClosed', () => {
+test.todo('N8 L4 on a closed handle, a read of items with an index below zero, or with no index, throws StoreClosed', () => {
   const { store } = populated();
   const view = store.view('main');
   store.close();
   for (const handle of [store, view]) {
     refuses(() => handle.getStateItemJson('list', -1), ErrorCode.StoreClosed, 'Store has been closed');
     refuses(() => handle.getStateItemsJson('list', [-1]), ErrorCode.StoreClosed, 'Store has been closed');
+    refuses(() => handle.getStateItemsJson('list', []), ErrorCode.StoreClosed, 'Store has been closed');
   }
 });
 
@@ -316,6 +326,70 @@ test.todo('A2 L9 open throws Corruption for a record whose type is damaged, with
   bytes[bytes.indexOf(Buffer.from('marked-type'))] = 'M'.charCodeAt(0);
   writeFileSync(log, bytes);
   refuses(() => JsStore.open({ path: dir }), ErrorCode.Corruption, /^Corruption detected: /);
+});
+
+function blobCacheCase(dir, open, others) {
+  const blobs = join(dir, 'blobs');
+  const fileOf = (hash) => join(blobs, hash.slice(0, 2), hash);
+  return (target, extra) => {
+    const store = open();
+    const good = readFileSync(fileOf(target));
+    assert.equal(store.getBlob(target).length, 1000);
+    const damaged = Buffer.from(good);
+    damaged[damaged.length - 5] ^= 0xff;
+    writeFileSync(fileOf(target), damaged);
+    for (const hash of others.slice(0, extra)) store.getBlob(hash);
+    let kept;
+    try {
+      kept = store.getBlob(target).length === 1000;
+    } catch (error) {
+      assert.equal(error.code, ErrorCode.ChecksumMismatch);
+      kept = false;
+    }
+    store.close();
+    writeFileSync(fileOf(target), good);
+    return kept;
+  };
+}
+
+test('A1 A2 A3 T10 with blobCacheSize left out, the open store keeps the last 1,000 blobs that it read in its memory', () => {
+  const { store, dir } = freshStore();
+  const target = store.storeBlob(Buffer.alloc(1000, 1), 'application/octet-stream');
+  const others = Array.from({ length: 1000 }, (_, n) => store.storeBlob(Buffer.from(`other ${n}`), 'text/plain'));
+  store.close();
+  const read = blobCacheCase(dir, () => JsStore.open({ path: dir }), others);
+  assert.equal(read(target, 999), true);
+  assert.equal(read(target, 1000), false);
+});
+
+test('A1 A2 A3 T10 with blobCacheSize 0, each way to open a store keeps one blob in its memory', () => {
+  for (const [name, open] of [
+    ['create', (dir) => JsStore.create({ path: dir, blobCacheSize: 0 })],
+    ['open', (dir) => JsStore.open({ path: dir, blobCacheSize: 0 })],
+    ['openOrCreate', (dir) => JsStore.openOrCreate({ path: dir, blobCacheSize: 0 })],
+  ]) {
+    const dir = freshDir();
+    const store = name === 'create' ? open(dir) : JsStore.create({ path: dir });
+    const target = store.storeBlob(Buffer.alloc(1000, 2), 'application/octet-stream');
+    const other = store.storeBlob(Buffer.from('other'), 'text/plain');
+    if (name === 'create') {
+      store.getBlob(target);
+      const file = join(dir, 'blobs', target.slice(0, 2), target);
+      const good = readFileSync(file);
+      const damaged = Buffer.from(good);
+      damaged[damaged.length - 5] ^= 0xff;
+      writeFileSync(file, damaged);
+      assert.equal(store.getBlob(target).length, 1000, name);
+      store.getBlob(other);
+      refuses(() => store.getBlob(target), ErrorCode.ChecksumMismatch, /^Checksum mismatch: /);
+      store.close();
+      continue;
+    }
+    store.close();
+    const read = blobCacheCase(dir, () => open(dir), [other]);
+    assert.equal(read(target, 0), true, name);
+    assert.equal(read(target, 1), false, name);
+  }
 });
 
 test("A1 T10 create makes a store in config.path and returns the store's own handle, which follows the current branch", () => {
@@ -398,13 +472,14 @@ test('A6 E2 view throws BranchNotFound, "Branch not found: …", for a name that
   store.close();
 });
 
-test.todo('A6 L4 through a view whose branch is deleted, a read of an item with an index below zero throws BranchNotFound', () => {
+test.todo('A6 L4 through a view whose branch is deleted, a read of items with an index below zero, or with no index, throws BranchNotFound', () => {
   const { store } = populated();
   store.createBranch('gone');
   const view = store.view('gone');
   store.deleteBranch('gone');
   refuses(() => view.getStateItemJson('list', -1), ErrorCode.BranchNotFound, /^Branch not found: 'gone'/);
   refuses(() => view.getStateItemsJson('list', [-1, -2]), ErrorCode.BranchNotFound, /^Branch not found: 'gone'/);
+  refuses(() => view.getStateItemsJson('list', []), ErrorCode.BranchNotFound, /^Branch not found: 'gone'/);
   store.close();
 });
 
@@ -504,7 +579,7 @@ test('A52 T6 stats reports the whole store, the same from a view', () => {
 
 test('A62 D3 D5 sync saves the tables of states and branches that changed, each as a new file in place of the old, and replaces neither when nothing changed', () => {
   const { store, dir } = freshStore();
-  const files = () => ({ states: statSync(join(dir, 'state.bin')).ino, branches: statSync(join(dir, 'branches.bin')).ino });
+  const files = () => ({ states: statSync(join(dir, 'state.bin'), { bigint: true }).ino, branches: statSync(join(dir, 'branches.bin'), { bigint: true }).ino });
   store.registerState({ id: 'list', strategy: 'append_log' });
   const registered = files();
   store.appendToStateJson('list', { n: 1 });

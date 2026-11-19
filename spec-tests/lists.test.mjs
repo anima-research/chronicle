@@ -120,6 +120,10 @@ test('A45 with no index of zero or more, getStateItemsJson reads nothing and giv
   store.close();
 });
 
+test.todo('A41 L11 in a store that a release before 0.5.0 wrote, getStateLen gives the number of items that the list holds');
+
+test.todo('A45 L11 in a store that a release before 0.5.0 wrote, getStateItemsJson gives each item as getStateItemJson does');
+
 test('A46 getStateTail gives every item when the list has fewer than count', () => {
   const store = listStore(1, 2);
   assert.deepEqual(JSON.parse(store.getStateTail('list', 5).toString()), [1, 2]);
@@ -186,6 +190,16 @@ test('A79 T19 getStateIndexValueCounts gives each text of the field with how man
   assert.deepEqual(Object.fromEntries(counts.map(({ value, count }) => [value, count])), { a: 2, b: 3, c: 1 });
   assert.equal(store.getStateIndexValueCounts('list', '/t'), null);
   assert.equal(store.getStateIndexValueCounts('list', '/none'), null);
+  store.close();
+});
+
+test("N9 a method that gives bytes keeps the order of keys as written, and a method that gives a JavaScript object gives JavaScript's own order", () => {
+  const { store } = freshStore();
+  store.registerState({ id: 'value', strategy: 'snapshot' });
+  const written = '{"z":1,"10":"a","a":2,"2":"b"}';
+  store.setState('value', Buffer.from(written));
+  assert.equal(store.getState('value').toString(), written);
+  assert.deepEqual(Object.keys(store.getStateJson('value')), ['2', '10', 'z', 'a']);
   store.close();
 });
 
