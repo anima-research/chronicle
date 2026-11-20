@@ -59,6 +59,8 @@ test('Toggling automatic snapshots acts immediately without losing disabled-peri
     if (exit === 'append') {
       addMessages(store, id, messages, 1);
       assert.deepEqual(operationKinds(store, id, endOfSetup).slice(-2), ['Append', 'DeltaSnapshot']);
+      store.close();
+      assert.deepEqual(reopen().getStateJson(id), messages);
     } else if (exit === 'compact') {
       const beforeCompaction = mark(store);
       const headBefore = store.stateHeadOffset(id);

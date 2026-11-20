@@ -98,6 +98,10 @@ function readBack(read, whileFaulted) {
 
 function checkIdentity(side, { kind, rows, ids }, whileFaulted) {
   assert.deepEqual(updateIds(side), ids, 'the torn write published no update record');
+  const length = readBack(() => side.getStateLen('index'), whileFaulted);
+  if (!length.unavailable) {
+    assert.equal(length.value, rows.length);
+  }
   if (kind === 'single') {
     const next = readBack(() => side.getStateItemJson('index', rows.length), whileFaulted);
     if (!next.unavailable) {

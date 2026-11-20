@@ -1112,6 +1112,19 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
             )
             .unwrap();
         }
+        "torn-layouts" => {
+            let ids: Vec<u64> = ["compile-intact", "compile-torn"]
+                .iter()
+                .map(|compile| {
+                    store
+                        .append(RecordInput::json("layout", &json!({ "compileId": compile })).unwrap())
+                        .unwrap()
+                        .id
+                        .0
+                })
+                .collect();
+            std::fs::write(path.join("tail-ids.json"), serde_json::to_vec(&ids).unwrap()).unwrap();
+        }
         other => panic!("unknown checkpoint crash point {other}"),
     }
     std::process::exit(73);
@@ -1345,6 +1358,61 @@ fn a_torn_shard_redaction_never_recovers_part_of_the_selected_group() {
             "{point}"
         );
     }
+}
+
+#[test]
+fn a_torn_layout_after_writer_death_leaves_the_one_before_it_and_its_id_is_issued_again() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    let prefix: Vec<_> = (0..4)
+        .map(|i| {
+            let kind = if i % 2 == 0 { "layout" } else { "message" };
+            store
+                .append(RecordInput::raw(kind, format!("{kind} {i}").into_bytes()))
+                .unwrap()
+        })
+        .collect();
+    drop(store);
+    crash(dir.path(), "checkpoint/torn-layouts");
+    let ids: Vec<u64> =
+        serde_json::from_slice(&std::fs::read(dir.path().join("tail-ids.json")).unwrap()).unwrap();
+    let (intact, torn) = (RecordId(ids[0]), RecordId(ids[1]));
+    let log = dir.path().join("records.log");
+    let len = std::fs::metadata(&log).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+
+    let store = Store::open(config(dir.path())).unwrap();
+    let kept = store.get_record(intact).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&kept.payload).unwrap(),
+        json!({ "compileId": "compile-intact" })
+    );
+    assert!(store.get_record(torn).unwrap().is_none());
+    let mut layouts: Vec<_> = prefix
+        .iter()
+        .filter(|record| record.record_type == "layout")
+        .map(|record| record.id)
+        .collect();
+    layouts.push(intact);
+    assert_eq!(store.get_records_by_type("layout"), layouts);
+    assert_eq!(store.current_branch().head, kept.sequence);
+    let next = store
+        .append(RecordInput::raw("message", b"after the crash".to_vec()))
+        .unwrap();
+    assert_eq!((next.id, next.sequence), (torn, kept.sequence.next()));
+    assert_eq!(store.get_records_by_type("layout"), layouts);
+    let messages: Vec<_> = prefix
+        .iter()
+        .filter(|record| record.record_type == "message")
+        .map(|record| record.id)
+        .chain([next.id])
+        .collect();
+    assert_eq!(store.get_records_by_type("message"), messages);
 }
 
 #[test]

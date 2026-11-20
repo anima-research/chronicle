@@ -64,6 +64,8 @@ function journalWriter(path) {
   const sibling = store.view('main');
   store.registerState({ id: 'mode', strategy: 'snapshot' });
   store.registerState({ id: 'queue', strategy: 'snapshot' });
+  store.registerState({ id: 'acceptances', strategy: 'append_log' });
+  store.appendToStateJson('acceptances', { id: 'accept-17' });
   store.setStateJson('mode', { mode: 'active' });
   store.setStateJson('queue', [{ retry: 'accept-17' }]);
   const old = [appendEntry(store, layout, { fold: 1 }), appendEntry(store, layout, { fold: 2 })];
@@ -88,6 +90,7 @@ function journalWriter(path) {
   const start = appendEntry(store, 'push.render-start', { request: 'render-17' });
   store.setStateJson('mode', newMode);
   store.setStateJson('queue', newQueue);
+  store.registerStateFieldIndex('acceptances', '/id', 'string');
   withBlockedCheckpoint(path, 'state.bin', () => {
     assert.throws(() => store.sync());
     assert.deepEqual(readEntry(store, accepted.id), accepted);
@@ -216,6 +219,7 @@ test('Failing a barrier leaves exactly the landed journal suffix and state reada
   assert.equal(child.signal, 'SIGKILL', child.stderr);
   const entries = JSON.parse(child.stdout);
   const recovered = f.open();
+  assert.deepEqual(recovered.queryStateIndexEq('acceptances', '/id', 'accept-17', {}), [0]);
   for (const type of new Set(entries.map(entry => entry.type))) {
     assert.deepEqual(recovered.getRecordIdsByType(type).map(id => readEntry(recovered, id)),
       entries.filter(entry => entry.type === type));
@@ -248,6 +252,20 @@ test('Close consumes the root even when its final barrier throws', t => {
   assert.equal(reopened.isClosed(), false);
   assert.throws(() => store.currentBranch());
   assert.throws(() => view.currentBranch());
+});
+
+test('Close runs its own barrier after an earlier sync failed, and succeeds once the fault clears', t => {
+  const f = fixture(t);
+  const store = f.create();
+  store.registerState({ id: 'work', strategy: 'snapshot' });
+  store.setStateJson('work', 'dirty state head');
+  withBlockedCheckpoint(f.path, 'state.bin', () => {
+    assert.throws(() => store.sync());
+  });
+  assert.doesNotThrow(() => store.close());
+  assert.equal(store.isClosed(), true);
+  const reopened = f.open();
+  assert.equal(reopened.getStateJson('work'), 'dirty state head');
 });
 
 test('Close reports the failure of its own barrier when no sync failed before it', t => {

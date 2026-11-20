@@ -24,19 +24,21 @@ fn create_store(dir: &TempDir) -> Store {
     .unwrap()
 }
 
-fn bytes_written<T>(op: impl FnOnce() -> T) -> (T, Option<u64>) {
-    let written = || -> Option<u64> {
-        let io = fs::read_to_string("/proc/thread-self/io").ok()?;
+#[cfg(target_os = "linux")]
+fn bytes_written<T>(op: impl FnOnce() -> T) -> (T, u64) {
+    let written = || -> u64 {
+        let io = fs::read_to_string("/proc/thread-self/io").expect("/proc/thread-self/io");
         io.lines()
-            .find_map(|line| line.strip_prefix("wchar:"))?
+            .find_map(|line| line.strip_prefix("wchar:"))
+            .expect("a wchar line")
             .trim()
             .parse()
-            .ok()
+            .expect("a byte count")
     };
     let before = written();
     let result = op();
     let after = written();
-    (result, before.zip(after).map(|(before, after)| after - before))
+    (result, after - before)
 }
 
 fn dir_bytes(path: &Path) -> u64 {
@@ -279,6 +281,7 @@ fn tree_overwrite_churn_disk_linear() {
     assert_linear("tree_overwrite_churn", &SIZES, &bytes, 5.0);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows() {
     const TARGET: &str = "agent-00000000";
@@ -316,18 +319,14 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         let (set, set_written) = bytes_written(|| store.tree_set("tree", TARGET, &replacement));
         set.unwrap();
         let after_set = store.stats().unwrap();
-        if let Some(bytes) = set_written {
-            assert!(bytes <= TREE_BUDGET, "set in {n}-key tree wrote {bytes} bytes");
-        }
+        assert!(set_written <= TREE_BUDGET, "set in {n}-key tree wrote {set_written} bytes");
         assert_eq!(after_set.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(replacement));
 
         let (removed, remove_written) = bytes_written(|| store.tree_remove("tree", TARGET));
         removed.unwrap();
         let after_remove = store.stats().unwrap();
-        if let Some(bytes) = remove_written {
-            assert!(bytes <= TREE_BUDGET, "remove in {n}-key tree wrote {bytes} bytes");
-        }
+        assert!(remove_written <= TREE_BUDGET, "remove in {n}-key tree wrote {remove_written} bytes");
         assert_eq!(after_remove.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), None);
         assert_eq!(store.tree_list("tree", None).unwrap().len(), n - 1);
@@ -360,12 +359,10 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
             )
         });
         edit.unwrap();
-        if let Some(bytes) = edit_written {
-            assert!(
-                bytes <= 4 * edited.len() as u64 + 1024,
-                "edit in {n}-item log wrote {bytes} bytes"
-            );
-        }
+        assert!(
+            edit_written <= 4 * edited.len() as u64 + 1024,
+            "edit in {n}-item log wrote {edit_written} bytes"
+        );
         assert_eq!(store.get_state_item("log", 0).unwrap(), Some(edited));
         assert_eq!(store.get_state_len("log").unwrap(), Some(n));
     }

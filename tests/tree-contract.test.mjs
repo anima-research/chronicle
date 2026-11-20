@@ -148,6 +148,32 @@ test('A saved tree hit can restore an undecodable intent without touching its bl
   assert.deepEqual([before, store.treeGet(INTENTS, 'new')], [null, null]);
 });
 
+test('An intent whose blob is unreadable can be saved, replaced, restored and removed', t => {
+  const f = fresh(t, INTENTS);
+  const path = 'draft';
+  const unreadable = intent(f.store, { origin: 'about to be damaged' });
+  f.store.treeSet(INTENTS, path, unreadable);
+  f.store.close();
+  const file = join(f.dir, 'blobs', unreadable.blobHash.slice(0, 2), unreadable.blobHash);
+  const bytes = readFileSync(file);
+  bytes[bytes.length - 2] ^= 0xff;
+  writeFileSync(file, bytes);
+  f.store = JsStore.open({ path: f.dir });
+  const { store } = f;
+  assert.throws(() => store.getBlob(unreadable.blobHash));
+  assert.deepEqual(point(store, INTENTS, path), unreadable);
+  const saved = store.treeGet(INTENTS, path);
+  const replacement = intent(store, { origin: 'store' });
+  store.treeSet(INTENTS, path, replacement);
+  assert.deepEqual(point(store, INTENTS, path), replacement);
+  store.treeRemove(INTENTS, path);
+  assert.equal(store.treeGet(INTENTS, path), null);
+  store.treeSet(INTENTS, path, saved);
+  assert.deepEqual(point(store, INTENTS, path), unreadable);
+  store.treeRemove(INTENTS, path);
+  assert.deepEqual([store.treeGet(INTENTS, path), store.treeList(INTENTS)], [null, []]);
+});
+
 test('Listing uses exact literal prefixes and ordered original path spellings', t => {
   const { store } = fresh(t, FILES);
   const base = stage(store, 'first version', 0o644);

@@ -22,7 +22,11 @@ function measure(prefix) {
     reader = JsStore.openOrCreate({ path: join(dir, 'store') });
     writer = reader.view('main');
     writer.registerState({ id: 'log', strategy: 'append_log', deltaSnapshotEvery: 1000, fullSnapshotEvery: 1000 });
-    writer.appendManyToStateJson('log', Array.from({ length: prefix }, (_, i) => item(i - prefix)));
+    const before = writer.currentSequence();
+    for (let start = 0; start < prefix; start += 16) {
+      writer.appendManyToStateJson('log', Array.from({ length: 16 }, (_, i) => item(start + i - prefix)));
+    }
+    assert.ok(writer.currentSequence() - before >= prefix / 16);
 
     assert.equal(JSON.parse(reader.getStateSlice('log', 0, prefix).toString('utf8')).length, prefix);
     assert.deepEqual(reader.getStateItemJson('log', prefix - 2), item(-2));
@@ -83,12 +87,15 @@ function branchIdTime({ messages, branches }) {
   try {
     store = JsStore.openOrCreate({ path: join(dir, 'store') });
     store.registerState({ id: 'log', strategy: 'append_log', deltaSnapshotEvery: 1000, fullSnapshotEvery: 1000 });
-    store.appendManyToStateJson('log', Array.from({ length: messages }, (_, i) => item(i)));
     let parent = 'main';
     for (let i = 0; i < branches; ++i) parent = store.createEmptyBranch(`other-${i}`, parent).name;
+    store.switchBranch(parent);
     const active = store.createBranch('active');
     store.switchBranch('active');
     assert.equal(store.currentBranch().id, active.id);
+    const before = store.currentSequence();
+    for (let i = 0; i < messages; ++i) store.appendToStateJson('log', item(i));
+    assert.ok(store.currentSequence() - before >= messages);
     const times = [];
     for (let sample = 0; sample < 5; ++sample) {
       const start = process.cpuUsage();

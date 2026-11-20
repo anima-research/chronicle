@@ -972,14 +972,6 @@ fn check_identity_ordinals(
     }
 }
 
-/// n single identity appends and one identity batch of the same items: each
-/// item is stamped with the record that holds it, which for the batch is its
-/// one record for every item. Apart from the stamps the stored bytes are the
-/// same, and with the single record's stamps swapped for the batch's they are
-/// the batch's bytes exactly. A field index on the items' own ids answers
-/// each item's ordinal in both, and a cut by an item's stamped sequence
-/// keeps it, and the one before drops it: for a single append that is the
-/// item alone, for the batch the whole batch.
 #[test]
 fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
     identity_batch_case(false);

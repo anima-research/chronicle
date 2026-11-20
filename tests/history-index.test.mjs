@@ -326,6 +326,10 @@ test("Switching and reusing a branch name cannot revive another identity's index
   store.deleteBranch('side');
   store.createBranch('side');
   const replacement = store.view('side');
+  for (const [s, id] of slots.entries()) {
+    assert.deepEqual([eq(replacement, id, TOP, `deleted-${id}`), range(replacement, id, at(30 + s)),
+      replacement.getStateIndexValueCounts(id, TOP)], [null, null, null]);
+  }
   for (const id of slots) {
     registerHistory(replacement, id);
     assert.deepEqual(eq(replacement, id, TOP, 'common'), expectedEq(mainRows[id], TOP, 'common'));
@@ -408,7 +412,7 @@ test('Missing, wrong-kind and poisoned indexes differ from successful empty quer
   assert.equal(time(), null);
   assert.equal(counts(), null);
   for (const [field, kind] of [[TIME, 'number'], [TOP, 'string']]) {
-    try { view.registerStateFieldIndex(SHARED, field, kind); } catch { /* still unusable */ }
+    assert.throws(() => view.registerStateFieldIndex(SHARED, field, kind));
   }
   assert.equal(time(), null);
   assert.equal(rooms(), null);

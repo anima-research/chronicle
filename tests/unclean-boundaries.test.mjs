@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, cpSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,10 +64,13 @@ function pendingWriter(_root, view) {
   return { generationId, pendingId, sequence };
 }
 
-function compactChecked(root, view, checkpoint) {
+const beforeCompaction = path => `${path}-before-compaction`;
+
+function compactChecked(path, root, view, checkpoint) {
   const mainHead = root.stateHeadOffset(ledger);
   const oldHead = view.stateHeadOffset(ledger);
   const before = view.currentSequence();
+  cpSync(path, beforeCompaction(path), { recursive: true, verbatimSymlinks: true });
   view.compactState(ledger);
   assert.notEqual(view.stateHeadOffset(ledger), oldHead);
   const updates = view.query({ fromSequence: before + 1, types: ['state_update'] })
@@ -83,7 +86,7 @@ function compactChecked(root, view, checkpoint) {
   return { compactedFrom: oldHead };
 }
 
-function checkpointWriter(root, view, options) {
+function checkpointWriter(path, root, view, options) {
   if (options.empty) appendEvent(view, {
     kind: 'clear', key: record.key, targetClaimId: options.generationId, created: 15,
   });
@@ -94,7 +97,7 @@ function checkpointWriter(root, view, options) {
   assert.deepEqual(view.getStateItemJson(ledger, oldCount), checkpoint);
   view.redactStateItems(ledger, 0, oldCount);
   assert.deepEqual(view.getStateJson(ledger), [checkpoint]);
-  const compacted = options.compact ? compactChecked(root, view, checkpoint) : {};
+  const compacted = options.compact ? compactChecked(path, root, view, checkpoint) : {};
   return { stamp: { eventId, sequence }, ...compacted };
 }
 
@@ -110,11 +113,14 @@ function checkRecoveredCheckpoint(path, checkpoint) {
 }
 
 function checkTornCompaction(path, checkpoint, compactedFrom) {
-  const torn = `${path}-torn`;
-  cpSync(path, torn, { recursive: true, verbatimSymlinks: true });
+  const torn = beforeCompaction(path);
   try {
     const log = join(torn, 'records.log');
-    truncateSync(log, statSync(log).size - 1);
+    const prefix = readFileSync(log);
+    const finished = readFileSync(join(path, 'records.log'));
+    assert.deepEqual(finished.subarray(0, prefix.length), prefix);
+    assert.ok(finished.length > prefix.length + 1, 'the compaction wrote to the log');
+    appendFileSync(log, finished.subarray(prefix.length, finished.length - 1));
     reopen(torn, root => {
       assert.ok(root.recovery()?.droppedBytes > 0, 'the cut tore the last record');
       const view = root.view(branch);
@@ -165,6 +171,7 @@ function mixedWriter(root, view) {
   for (const [i, id] of [first.id, last.id].entries()) {
     assert.deepEqual(JSON.parse(root.getRecord(id).payload.toString()), receipts[i].data);
   }
+  view.registerStateFieldIndex(messages, '/id', 'string');
   assert.equal(root.sync(), undefined);
   return coordinates;
 }
@@ -203,8 +210,8 @@ if (process.argv[2] === '--crash-writer') {
   const root = JsStore.open({ path });
   const view = action === 'progress' ? undefined : root.view(branch);
   globalThis.liveWriterHandles = [root, view];
-  const writers = { pending: pendingWriter, checkpoint: checkpointWriter,
-    compact: compactChecked,
+  const writers = { pending: pendingWriter, checkpoint: (r, v, o) => checkpointWriter(path, r, v, o),
+    compact: (r, v, checkpoint) => compactChecked(path, r, v, checkpoint),
     mixed: mixedWriter, progress: progressWriter };
   const coordinates = writers[action](root, view, JSON.parse(options));
   writeSync(1, JSON.stringify(coordinates));
@@ -258,6 +265,7 @@ if (process.argv[2] === '--crash-writer') {
       }), receipts.map((r, i) => ({ id: saved.ids[i], ...r, links: i ? [saved.ids[0]] : [] })));
 
       const view = root.view(saved.branch);
+      assert.deepEqual(view.queryStateIndexEq(messages, '/id', 'mail-row', {}), [1]);
       const delivered = view.getStateJson(messages);
       assert.deepEqual(delivered, rows);
       const events = view.getStateJson(audit);

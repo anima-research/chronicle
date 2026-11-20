@@ -131,7 +131,7 @@ test('No record, stored null and other falsy JSON values are different states', 
   assert.equal(store.getStateJson(emptyId), null);
   store.registerState(log(windowId));
   assert.equal(store.getStateJson(windowId), null);
-  assert.equal(store.getStateLen(windowId) ?? 0, 0);
+  assert.equal(store.getStateLen(windowId), null);
   for (const id of [emptyId, windowId]) assert.equal(store.stateHeadOffset(id), null);
 
   const scalars = { 'value/null': null, 'value/off': false, 'value/zero': 0, 'value/text': '',

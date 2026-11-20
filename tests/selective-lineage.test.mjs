@@ -127,6 +127,24 @@ test('A sampled non-main parent name works for all three named-parent forks', as
   assert.deepEqual([values(plain, slots), values(live, slots), values(hist, slots)], [atCut, liveSeed, atCut]);
 });
 
+test('A selective fork of a selectively derived parent leaves out what that parent left out', t => {
+  const { store } = fresh(t);
+  logs(store, MSG, AUX);
+  const row = stamped(store, MSG, { text: 'primary' });
+  stamped(store, AUX, { text: 'ledger on main' });
+  const parentName = store.createBranchWithStates('dendrite/selective', 'main', { stateIds: [MSG] }).name;
+  const parent = store.view(parentName);
+  const later = stamped(parent, MSG, { text: 'on the parent' });
+  assert.deepEqual([store.getStateJson(AUX).length, parent.getStateJson(AUX), parent.getStateJson(MSG)], [1, null, [row, later]]);
+  const cut = parent.currentSequence();
+  const filter = { stateIds: [MSG, AUX] };
+  const live = store.view(store.createBranchWithStates('grandchild/live', parentName, filter).name);
+  const past = store.view(store.createBranchAtWithStates('grandchild/past', parentName, cut, filter).name);
+  for (const child of [live, past]) {
+    assert.deepEqual([child.getStateJson(AUX), child.getStateJson(MSG)], [null, [row, later]]);
+  }
+});
+
 test('A selective head fork shares the seed records but subsequent writes diverge', t => {
   const { store: parent } = fresh(t);
   logs(parent, MSG, AUX, WIN);
@@ -286,42 +304,56 @@ function withStoreDirectoryHidden(path, run) {
   }
 }
 
-test('A selective fork whose own checkpoint fails throws, and the store keeps the child',
-  { skip: process.platform === 'win32' && 'renames the open store directory' }, t => {
-    const fixture = fresh(t);
-    const { store } = fixture;
-    logs(store, MSG);
-    const row = stamped(store, MSG, { text: 'parent row' });
-    const from = store.currentBranch().name;
-    const cut = store.currentSequence();
-    const filter = { stateIds: [MSG] };
-    const names = (handle = store) => handle.listBranches().map(({ name }) => name).sort();
-    const original = names();
-    const ioError = error => error?.code === ErrorCode.Io;
-    const exists = error => error?.code === ErrorCode.BranchExists;
-    const live = 'derived/live';
-    const past = 'derived/past';
-
-    store.sync();
-    withStoreDirectoryHidden(fixture.path, () => {
-      assert.throws(() => store.createBranchWithStates(live, from, filter), ioError);
-      assert.deepEqual(names(), [...original, live].sort());
-    });
-    assert.throws(() => store.createBranchWithStates(live, from, filter), exists);
-    assert.deepEqual(store.view(live).getStateJson(MSG), [row]);
-
-    store.sync();
-    withStoreDirectoryHidden(fixture.path, () => {
-      assert.throws(() => store.createBranchAtWithStates(past, from, cut, filter), ioError);
-      assert.deepEqual(names(), [...original, live, past].sort());
-    });
-    assert.throws(() => store.createBranchAtWithStates(past, from, cut, filter), exists);
-    assert.deepEqual(store.view(past).getStateJson(MSG), [row]);
-
-    const reopened = fixture.reopen();
-    assert.deepEqual([names(reopened), reopened.view(live).getStateJson(MSG), reopened.view(past).getStateJson(MSG)],
-      [[...original, live, past].sort(), [row], [row]]);
+function forkUnderFailedCheckpoint(t, fork) {
+  const fixture = fresh(t);
+  const { store } = fixture;
+  logs(store, MSG);
+  const row = stamped(store, MSG, { text: 'parent row' });
+  const from = store.currentBranch().name;
+  const cut = store.currentSequence();
+  const names = (handle = store) => handle.listBranches().map(({ name }) => name).sort();
+  const original = names();
+  store.sync();
+  let thrown = null;
+  let during;
+  withStoreDirectoryHidden(fixture.path, () => {
+    try { fork(store, from, cut); } catch (error) { thrown = error; }
+    during = names();
   });
+  return { fixture, store, row, names, original, thrown, during, retry: () => fork(store, from, cut) };
+}
+
+const forks = {
+  live: (store, from) => store.createBranchWithStates('derived/live', from, { stateIds: [MSG] }),
+  past: (store, from, cut) => store.createBranchAtWithStates('derived/past', from, cut, { stateIds: [MSG] }),
+};
+
+test('A selective fork whose own checkpoint fails throws', {
+  skip: process.platform === 'win32' && 'renames the open store directory',
+}, t => {
+  for (const fork of Object.values(forks)) {
+    const { thrown } = forkUnderFailedCheckpoint(t, fork);
+    assert.equal(thrown?.code, ErrorCode.Io);
+  }
+});
+
+for (const [kind, method] of [['live', 'createBranchWithStates'], ['past', 'createBranchAtWithStates']]) {
+  test(`${method} whose own checkpoint fails leaves the name free, and a retry makes the child`, {
+    skip: process.platform === 'win32' && 'renames the open store directory',
+    todo: `${method} keeps the child it allocated when its own checkpoint fails: the name stays taken, and a retry throws BranchExists.`,
+  }, t => {
+    const { fixture, row, names, original, thrown, during, retry } = forkUnderFailedCheckpoint(t, forks[kind]);
+    assert.equal(thrown?.code, ErrorCode.Io);
+    assert.deepEqual(during, original);
+    assert.deepEqual(names(), original);
+    const child = retry();
+    assert.equal(child.name, `derived/${kind}`);
+    assert.deepEqual(names(), [...original, `derived/${kind}`].sort());
+    const reopened = fixture.reopen();
+    assert.deepEqual([names(reopened), reopened.view(`derived/${kind}`).getStateJson(MSG)],
+      [[...original, `derived/${kind}`].sort(), [row]]);
+  });
+}
 
 test('Storage, presentation and later writes have distinct inclusive cutoffs', t => {
   const { store } = fresh(t);

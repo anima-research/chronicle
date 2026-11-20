@@ -185,6 +185,23 @@ test('An explicit branch name selects the live records of that branch', {
   assert.deepEqual(drain(store, named).map(recordId), [onWork.id]);
 });
 
+test('An explicit branch name selects the replayed and live states of that branch', {
+  todo: "A state subscription ignores the branch name: a catch-up replays the value on the handle's branch, and live changes come from every branch.",
+}, t => {
+  const store = freshStore(t);
+  setSnapshot(store, 'mood', 'base');
+  store.createBranch('work');
+  const work = store.view('work');
+  work.setStateJson('mood', 'on work');
+  store.setStateJson('mood', 'on main');
+  const named = watchSnapshots(store, { filter: { includeStateChanges: true, stateIds: ['mood'], branch: 'work' } });
+  assert.deepEqual(replaySnapshots(store, named).map(snapshot => snapshot.data), ['on work']);
+  work.setStateJson('mood', 'work again');
+  store.setStateJson('mood', 'main again');
+  work.close();
+  assert.deepEqual(drain(store, named).map(event => JSON.parse(event.data).operation), [{ Set: [...Buffer.from('"work again"')] }]);
+});
+
 test('An explicit branch name selects the replayed records of that branch', {
   todo: "A catch-up replays the branch of the handle that catches up, and ignores the subscription's branch name.",
 }, t => {
@@ -241,13 +258,13 @@ test('Replay honors selected state IDs and explicit and default snapshot byte li
   const selected = replaySnapshots(store, smallId);
   assert.deepEqual(selected.map(snapshotId).sort(), selectedIds);
   const small = selected.find(s => snapshotId(s) === 'fits'), over = selected.find(s => snapshotId(s) === 'over');
-  assert.deepEqual([small.truncated, small.data, over.truncated, jsonBytes(over.data) <= limit], [false, fits, true, true]);
+  assert.deepEqual([small.truncated, small.data, over.truncated, over.data], [false, fits, true, null]);
   assert.deepEqual(selected.map(s => [snapshotId(s), s.truncated, jsonBytes(s.data) <= limit]).sort(), [['fits', false, true], ['over', true, true]]);
 
   const all = replaySnapshots(store, defaultId);
   assert.deepEqual(all.map(snapshotId).sort(), ['at-default', 'fits', 'over', 'over-default', 'unselected']);
   const at = all.find(s => snapshotId(s) === 'at-default'), above = all.find(s => snapshotId(s) === 'over-default');
-  assert.deepEqual([at.truncated, at.data === atDefault, above.truncated, jsonBytes(above.data) <= defaultLimit], [false, true, true, true]);
+  assert.deepEqual([at.truncated, at.data === atDefault, above.truncated, above.data], [false, true, true, null]);
 
   store.setStateJson('fits', 'é');
   store.setStateJson('over', 'é');
@@ -260,22 +277,26 @@ test('Replay honors selected state IDs and explicit and default snapshot byte li
   assert.deepEqual(changed(defaultId), ['fits', 'over', 'unselected']);
 });
 
-function cutArray(t) {
+function cutArray(t, items, cap) {
   const store = freshStore(t);
-  setSnapshot(store, 'items', ['é', 'é']);
-  const id = watchSnapshots(store, { maxSnapshotBytes: 9, filter: { includeStateChanges: true, stateIds: ['items'] } });
+  setSnapshot(store, 'items', items);
+  const id = watchSnapshots(store, { maxSnapshotBytes: cap, filter: { includeStateChanges: true, stateIds: ['items'] } });
   const [snapshot] = replaySnapshots(store, id);
   return snapshot;
 }
 
-test('A replayed JSON array over the snapshot byte cap is marked truncated', t => {
-  assert.equal(cutArray(t).truncated, true);
+test('A replayed JSON array over the snapshot byte cap keeps its newest items and says where they start', t => {
+  const snapshot = cutArray(t, ['aa', 'bb', 'cc'], 7);
+  assert.deepEqual(
+    [snapshot.truncated, snapshot.data, snapshot.from_index, snapshot.total_length, snapshot.total_bytes],
+    [true, ['cc'], 2, 3, jsonBytes(['aa', 'bb', 'cc'])],
+  );
 });
 
 test('The snapshot byte cap includes the delimiters of a replayed JSON array', {
   todo: 'Array truncation budgets the elements but not the brackets and commas in the delivered snapshot.',
 }, t => {
-  const snapshot = cutArray(t);
+  const snapshot = cutArray(t, ['é', 'é'], 9);
   assert.ok(jsonBytes(snapshot.data) <= 9, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of 9`);
 });
 
