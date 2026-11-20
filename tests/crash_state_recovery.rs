@@ -959,13 +959,10 @@ fn chunk(id: usize, marked: bool) -> Value {
     row
 }
 
-/// The blobs of the adoption's three tree entries, of three lengths.
 const MAIN_BLOB: &[u8] = &[b'm'; 9];
 const OLD_BLOB: &[u8] = &[b'o'; 20];
 const ADOPTED_BLOB: &[u8] = &[b'a'; 300];
 
-/// The tree entry of a file holding `content`, as a workspace writes one: the
-/// hash a store gives the content, and its length.
 fn entry(content: &[u8], mode: u32) -> TreeEntry {
     TreeEntry {
         blob_hash: Hash::from_bytes(content).to_hex(),
@@ -982,8 +979,6 @@ fn adopted_entry() -> TreeEntry {
     entry(ADOPTED_BLOB, 0o755)
 }
 
-// Only in crash_writer, never in the process running the tests: let the
-// log grow by a byte, then have the kernel refuse the rest of the write.
 #[cfg(unix)]
 fn interrupt_next_append(path: &Path) {
     let limit = (std::fs::metadata(path.join("records.log")).unwrap().len() + 1) as libc::rlim_t;
@@ -991,8 +986,6 @@ fn interrupt_next_append(path: &Path) {
         rlim_cur: limit,
         rlim_max: limit,
     };
-    // SAFETY: ignore the size-limit signal in this disposable writer; the
-    // initialized rlimit lives through the system call.
     unsafe {
         libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
         assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit), 0);
@@ -1061,7 +1054,6 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                 }
                 let got = store.tree_get("files", "tool").unwrap();
                 if op == "set" {
-                    // pins treeSet.10: immediate readback is a complete old or new tuple.
                     assert_eq!(
                         got,
                         Some(if boundary == "failed" {
@@ -1071,7 +1063,6 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                         })
                     );
                 } else {
-                    // pins treeRemove.8: a refused removal still reads present; a landed one absent.
                     assert_eq!(
                         got,
                         if boundary == "failed" {
@@ -1082,7 +1073,6 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                     );
                 }
             }
-            // No separate completion append on any path.
         }
         "redact" | "redact-refused" => {
             let mut rows = value(&store, "messages");
@@ -1098,7 +1088,6 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                 result.unwrap();
                 rows.as_array_mut().unwrap().drain(1..4);
             }
-            // pins redactStateItems.8: immediate readback exposes the whole splice or the untouched group.
             assert_eq!(value(&store, "messages"), rows);
         }
         "typed-tail" => {
@@ -1111,8 +1100,6 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                         .id,
                 );
             }
-            // The last record lands once this writer is dead (see the test),
-            // at the branch and sequence its next append would take.
             let branch = store.current_branch();
             std::fs::write(
                 path.join("tail-ids.json"),
@@ -1134,8 +1121,6 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
 fn a_switch_back_to_source_survives_a_barrier_without_drop() {
     let dir = TempDir::new().unwrap();
     let store = Store::create(config(dir.path())).unwrap();
-    // Don't use the default branch as the source: resetting the cursor
-    // to the default at open is not a successful restoration.
     let source = store.create_branch("source", None).unwrap().id;
     store.switch_branch("source").unwrap();
     let child = store.create_branch("child", None).unwrap().id;
@@ -1143,19 +1128,16 @@ fn a_switch_back_to_source_survives_a_barrier_without_drop() {
     drop(store);
 
     let store = open_store(dir.path()).unwrap();
-    // pins switchBranch.12: a clean reopen preserves the selected child.
     assert_eq!(store.current_branch().id, child);
     store.switch_branch("source").unwrap();
     drop(store);
     let store = open_store(dir.path()).unwrap();
-    // pins switchBranch.12: after switching back, a clean reopen starts at the source.
     assert_eq!(store.current_branch().id, source);
 
     store.switch_branch("child").unwrap();
     drop(store);
     crash(dir.path(), "checkpoint/restore-source");
     let store = open_store(dir.path()).unwrap();
-    // pins switchBranch.13: after a switch back and a sync, a crash without Drop keeps the restoration and the original child.
     assert_eq!(
         (
             store.current_branch().id,
@@ -1183,11 +1165,8 @@ fn interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix
         let store = open_store(dir.path()).unwrap();
         let journal = value(&store, JOURNAL);
         if point == "watermark" {
-            // pins appendToStateJson.15: the core keeps each item's own seq, in log order, through an interrupted prefix.
-            // The items reach the core as bytes here: what JsStore.appendToStateJson makes of a supplied seq has no test in this file.
             assert_eq!(journal, json!(journal_items()));
         }
-        // pins setStateJson.12: the published watermark coexists with the old journal until the clear lands.
         assert_eq!(
             (value(&store, TABLE), journal),
             (
@@ -1215,7 +1194,6 @@ fn interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix
         crash(dir.path(), &format!("checkpoint/mark-{marks}"));
 
         let store = open_store(dir.path()).unwrap();
-        // pins editStateItem.12: the summary survives with exactly the completed prefix of source marks.
         assert_eq!(
             (value(&store, "summaries"), value(&store, "chunks")),
             (
@@ -1232,7 +1210,7 @@ fn an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence
     for op in ["set", "remove"] {
         for boundary in ["before", "failed", "after"] {
             if boundary == "failed" && !cfg!(unix) {
-                continue; // The partial-write fault uses a Unix file-size limit.
+                continue;
             }
             let dir = TempDir::new().unwrap();
             let store = Store::create(config(dir.path())).unwrap();
@@ -1245,8 +1223,6 @@ fn an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence
                     full_snapshot_every: 2,
                 },
             );
-            // Each entry's blob is stored before the fault, as a workspace
-            // stores the file before it adopts it.
             for content in [MAIN_BLOB, OLD_BLOB, ADOPTED_BLOB] {
                 let hash = store.store_blob(content, "application/octet-stream").unwrap();
                 assert_eq!(hash.to_hex(), entry(content, 0).blob_hash);
@@ -1273,12 +1249,9 @@ fn an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence
                 ("remove", true) => None,
                 _ => unreachable!(),
             };
-            // First recovery, then the next open after that reader checkpoints:
-            // no work is deferred to another session.
             for _ in 0..2 {
                 let store = open_store(dir.path()).unwrap();
                 let got = store.tree_get_on(workspace, "files", "tool").unwrap();
-                // pins treeGet.11: with only the pending intent, the hash/absence is evidence on its branch alone.
                 assert_eq!(
                     (
                         store.get_records_by_type("agreement"),
@@ -1299,24 +1272,18 @@ fn an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence
                     intent.sequence
                 };
                 if op == "set" {
-                    // pins treeSet.10: readback agrees with the committed prefix, including size and mode.
                     assert_eq!((got, head), (expected.clone(), expected_head), "{boundary}");
                 } else {
-                    // pins treeRemove.8: only a committed removal reads as absence.
                     assert_eq!((got, head), (expected.clone(), expected_head), "{boundary}");
                 }
             }
             if op == "remove" && boundary == "before" {
-                // The target is still present. Take its backing records away
-                // after open but before this reader has looked up the tree.
                 let store = open_store(dir.path()).unwrap();
                 let log = dir.path().join("records.log");
                 let intact = std::fs::read(&log).unwrap();
                 std::fs::write(&log, []).unwrap();
                 let read = store.tree_get_on(workspace, "files", "tool");
                 std::fs::write(&log, intact).unwrap();
-                // pins treeRemove.8: surface an unreadable tree, never report it as a landed removal.
-                // A store with the full entry already cached need not read the damaged log.
                 assert!(match read {
                     Err(_) => true,
                     Ok(entry) => entry == Some(old_entry()),
@@ -1357,7 +1324,6 @@ fn a_torn_shard_redaction_never_recovers_part_of_the_selected_group() {
             },
         );
         if point == "torn" {
-            // Model loss of the end of the last append, without decoding its framing.
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(dir.path().join("records.log"))
@@ -1370,7 +1336,6 @@ fn a_torn_shard_redaction_never_recovers_part_of_the_selected_group() {
         } else {
             json!(rows)
         };
-        // pins redactStateItems.8: one complete update removes all shards; its torn tail removes none.
         assert_eq!(
             (
                 value(&store, "messages"),
@@ -1396,9 +1361,6 @@ fn open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death() {
         serde_json::from_slice(&std::fs::read(dir.path().join("tail-ids.json")).unwrap()).unwrap();
     let mut ids = vec![prefix.id];
     ids.extend(serde_json::from_value::<Vec<RecordId>>(written["ids"].clone()).unwrap());
-    // A record in the log that no store indexed, as a writer that dies
-    // between its log append and its index entry leaves it. The writer is
-    // dead, so no store has the log open while this appends.
     let (kind, text) = TYPED_RECORDS[4];
     let log = RecordLog::open(dir.path().join("records.log")).unwrap();
     let (last, _) = log
@@ -1420,12 +1382,10 @@ fn open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death() {
             .filter(|((ty, _), _)| *ty == kind)
             .map(|(_, id)| *id)
             .collect();
-        // pins openOrCreate.16: recovered by-type IDs include each complete record once, in append order.
         assert_eq!(store.get_records_by_type(kind), expected, "{kind}");
     }
     for (id, (kind, text)) in ids.into_iter().zip(TYPED_RECORDS) {
         let record = store.get_record(id).unwrap().unwrap();
-        // pins openOrCreate.16: even the previously unindexed ID resolves to the right typed payload.
         assert_eq!(
             (
                 record.id,

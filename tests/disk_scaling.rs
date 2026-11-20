@@ -1,13 +1,11 @@
 //! Disk-growth scaling gates.
 //!
 //! Deterministic CI gates for the superlinear-scaling campaign: total on-disk
-//! bytes must grow (near-)linearly in operation count. The bulk tests run the same
-//! workload at N and 4N ops and assert the byte ratio stays well below the
+//! bytes must grow (near-)linearly in operation count. Each test runs the same
+//! workload at N and 4N ops and asserts the byte ratio stays well below the
 //! quadratic signature (~16x); the ratio for linear growth is ~4x plus
 //! snapshot-cadence overhead. Tables are printed for slope inspection with
-//! `cargo test --test disk_scaling -- --nocapture`. The point-update test
-//! counts the bytes that one ordinary operation passes to the system's write
-//! calls, outside snapshot boundaries; only Linux reports them.
+//! `cargo test --test disk_scaling -- --nocapture`.
 
 use chronicle::{
     RecordInput, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, TreeEntry,
@@ -26,9 +24,6 @@ fn create_store(dir: &TempDir) -> Store {
     .unwrap()
 }
 
-/// The bytes that `op` passes to write calls on this thread, which holds every
-/// write of an ordinary operation. Linux reports them in `/proc/thread-self/io`;
-/// elsewhere the count is `None`.
 fn bytes_written<T>(op: impl FnOnce() -> T) -> (T, Option<u64>) {
     let written = || -> Option<u64> {
         let io = fs::read_to_string("/proc/thread-self/io").ok()?;
@@ -287,10 +282,7 @@ fn tree_overwrite_churn_disk_linear() {
 #[test]
 fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows() {
     const TARGET: &str = "agent-00000000";
-    // Beyond all operations on either state, so no automatic snapshot falls in a measurement.
     const SNAPSHOT_EVERY: u64 = 10_000;
-    // Allow a few KiB of framing for a key and a 64-byte hex hash, but not a
-    // copy of the large tree (even just its hashes are >100 KiB).
     const TREE_BUDGET: u64 = 4 * 1024;
     let hash = |i: usize| chronicle::Hash::from_bytes(&i.to_le_bytes()).to_hex();
     let entry = |i| TreeEntry {
@@ -325,10 +317,8 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         set.unwrap();
         let after_set = store.stats().unwrap();
         if let Some(bytes) = set_written {
-            // pins treeSet.14: replacing one existing checkpoint writes only entry-sized data.
             assert!(bytes <= TREE_BUDGET, "set in {n}-key tree wrote {bytes} bytes");
         }
-        // pins treeSet.14: all keys and their replacements use just the one registered tree.
         assert_eq!(after_set.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(replacement));
 
@@ -336,10 +326,8 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         removed.unwrap();
         let after_remove = store.stats().unwrap();
         if let Some(bytes) = remove_written {
-            // pins treeRemove.11: one eviction does not write the fleet-wide map.
             assert!(bytes <= TREE_BUDGET, "remove in {n}-key tree wrote {bytes} bytes");
         }
-        // pins treeRemove.11: the eviction leaves just the checkpoint tree registered.
         assert_eq!(after_remove.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), None);
         assert_eq!(store.tree_list("tree", None).unwrap().len(), n - 1);
@@ -373,7 +361,6 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         });
         edit.unwrap();
         if let Some(bytes) = edit_written {
-            // pins editStateItem.14: an edit writes in proportion to the one replacement, not log length.
             assert!(
                 bytes <= 4 * edited.len() as u64 + 1024,
                 "edit in {n}-item log wrote {bytes} bytes"

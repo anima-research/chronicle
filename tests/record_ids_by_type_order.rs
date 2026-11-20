@@ -91,15 +91,13 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         store.sync().unwrap();
         let synced_records = store.stats().unwrap().record_count;
         // Two more layouts; the second is torn below, as a crash mid-append
-        // would leave it. Each write is one record at the next sequence, so
-        // no other record, of any type, holds a part of the pair.
+        // would leave it.
         let write_layout = |pair: &Value| {
             let records = store.stats().unwrap().record_count;
             let head = store.current_branch().head;
             let record = store
                 .append(RecordInput::json("layout", pair).unwrap())
                 .unwrap();
-            // pins appendJson.11: the layout and its receipt are written as one record, with no other beside it.
             assert_eq!(
                 (
                     store.stats().unwrap().record_count,
@@ -114,7 +112,6 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         let newest = write_layout(&torn_pair);
         for (id, expected) in [(intact.id, &intact_pair), (newest.id, &torn_pair)] {
             let record = store.get_record(id).unwrap().unwrap();
-            // pins appendJson.11: live lookup returns the layout and its own receipt together.
             assert_eq!(
                 serde_json::from_slice::<Value>(&record.payload).unwrap(),
                 *expected
@@ -135,11 +132,8 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         !store.get_records_by_type("layout").contains(&newest_layout),
         "the torn record is gone"
     );
-    // pins getRecord.13: the saved compile mark resolves to nothing before its ID is reused.
-    // pins appendJson.11: recovery publishes neither part of the torn pair.
     assert!(store.get_record(newest_layout).unwrap().is_none());
     let intact = store.get_record(intact_layout).unwrap().unwrap();
-    // pins appendJson.11: recovery still exposes the complete preceding layout and receipt.
     assert_eq!(
         serde_json::from_slice::<Value>(&intact.payload).unwrap(),
         intact_pair
@@ -151,7 +145,6 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
             (record.id, record.record_type)
         })
         .collect();
-    // pins appendJson.11: past the synced records, the recovered log holds the intact pair's one record and nothing of the torn one.
     assert_eq!(
         (
             tail,
@@ -176,7 +169,6 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         "the torn record's ID is issued again"
     );
     let found = store.get_record(newest_layout).unwrap().unwrap();
-    // pins getRecord.13: the saved ID now names the replacement, not the old compile's payload.
     assert_eq!(
         (
             found.id,

@@ -4167,11 +4167,6 @@ mod tests {
         assert_eq!(store.get_state_len("log").unwrap(), Some(40));
     }
 
-    /// The first length lookup on a reopened store, whose head this session
-    /// hasn't checked, takes the count the head holds: it reads no record of
-    /// the state's chain and rebuilds nothing. A count that read the chain,
-    /// as a batch's check of an unchecked head does, would show in both
-    /// counters, as the read of the value after it does.
     #[test]
     fn a_reopened_store_answers_a_length_without_reading_a_record() {
         use crate::records::RECORD_DECODES;
@@ -4181,7 +4176,6 @@ mod tests {
         let rebuilds = store.state_reconstruction_count();
         RECORD_DECODES.with(|decodes| decodes.set(0));
         let len = store.get_state_len("s").unwrap();
-        // pins getStateLen.5: the first count after a reopen reads no record and rebuilds nothing.
         assert_eq!(
             (len, decodes(), store.state_reconstruction_count()),
             (Some(64), 0, rebuilds)
@@ -4194,12 +4188,6 @@ mod tests {
         );
     }
 
-    /// A field index registered again while the index the store holds for
-    /// it is fresh is taken as it is, in the session that built it and on a
-    /// reopened store that loaded it: the call reads no record of the slot,
-    /// so it builds nothing from the slot's content, whether through a
-    /// rebuilt value or record by record. Registering a field not indexed
-    /// yet does read the slot, which shows the counter would see that.
     #[test]
     fn registering_a_fresh_field_index_again_reads_no_record() {
         use crate::records::RECORD_DECODES;
@@ -4235,7 +4223,6 @@ mod tests {
             store
                 .register_state_field_index("messages", "/v", FieldIndexKind::Number)
                 .unwrap();
-            // pins registerStateFieldIndex.8: registering a fresh index again in its session reads none of the slot.
             assert_eq!((decodes(), store.state_reconstruction_count()), (0, rebuilds));
             store.sync().unwrap();
         }
@@ -4246,7 +4233,6 @@ mod tests {
         store
             .register_state_field_index("messages", "/v", FieldIndexKind::Number)
             .unwrap();
-        // pins registerStateFieldIndex.8: on a reopened store the duplicate reads none of the slot either.
         assert_eq!((decodes(), store.state_reconstruction_count()), (0, rebuilds));
         assert_eq!(
             store.query_state_index_range("messages", "/v", Some(7.0), Some(9.0), None, None, false),
@@ -5782,7 +5768,6 @@ mod tests {
         let items: Vec<u64> =
             serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
         assert_eq!(items, (0..150).collect::<Vec<u64>>());
-        // pins registerState.16: the earlier slot is still registered when initialization resumes.
         assert!(matches!(
             store.register_state(registration("items")),
             Err(StoreError::StateExists(_))

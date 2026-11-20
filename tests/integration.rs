@@ -1973,7 +1973,6 @@ fn test_register_field_index_idempotent_reregistration_skips_materialization() {
     store
         .register_state_field_index("messages", "/v", FieldIndexKind::Number)
         .unwrap();
-    // pins registerStateFieldIndex.8: a fresh index is cheap to register again in this session.
     assert_eq!(
         store.state_reconstruction_count(),
         rebuilds,
@@ -1989,14 +1988,11 @@ fn test_register_field_index_idempotent_reregistration_skips_materialization() {
     })
     .unwrap();
 
-    // No state or index read before the first duplicate registration on this handle.
     let rebuilds = store.state_reconstruction_count();
     store
         .register_state_field_index("messages", "/v", FieldIndexKind::Number)
         .unwrap();
-    // pins registerStateFieldIndex.8: the cold duplicate must not reconstruct the slot.
     assert_eq!(store.state_reconstruction_count(), rebuilds);
-    // pins registerStateFieldIndex.8: the duplicate leaves the populated index's ordinals intact.
     assert_eq!(
         store.query_state_index_range("messages", "/v", Some(7.0), Some(9.0), None, None, false),
         Some(vec![7, 8, 9])

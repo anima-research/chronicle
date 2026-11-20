@@ -27,12 +27,11 @@ test('Dead handles throw instead of reporting empty inventories, records or revi
   root.appendToStateJson('messages', { text: 'remove me' });
   root.appendToStateJson('messages', message);
   root.redactStateItems('messages', 0, 1);
-  // pins redactStateItems.4 normal return already made the redaction visible
   assert.deepEqual(root.getStateJson('messages'), [message]);
   const receiptType = 'context-manager/accepted-layout';
   const receipt = root.appendJson(receiptType, { receipt: { note: 'accepted' } });
   const subId = root.subscribe({});
-  root.catchUpSubscription(subId); // the ID to be passed after close is a live subscription
+  root.catchUpSubscription(subId);
   root.unsubscribe(root.subscribe({}));
 
   const detached = root.view('main');
@@ -50,35 +49,23 @@ test('Dead handles throw instead of reporting empty inventories, records or revi
   }
 
   function assertDead(handle, which) {
-    // pins currentBranch.7 unavailable selection throws, not a default branch
     assert.throws(() => handle.currentBranch(), which);
-    // pins currentSequence.5 unreadable head throws on the calling stack
     assert.throws(() => handle.currentSequence(), which);
-    // pins listStates.4 an unreadable registration inventory is not a successful list
     assert.throws(() => handle.listStates(), which);
-    // pins listBranches.3 failure to list branches synchronously signals unknown
     assert.throws(() => handle.listBranches(), which);
-    // pins close.9 a retained closed handle no longer reads its messages
     assert.throws(() => handle.getStateJson('messages'), which);
-    // pins close.9 receipt inspection on that same handle no longer works
     assert.throws(() => handle.getRecord(receipt.id), which);
-    // pins getStateLen.2 an existing branch's unreadable count throws
     assert.throws(() => handle.getStateLen('messages'), which);
-    // pins stateHeadOffset.7 an unreadable revision is neither stale nor absent
     assert.throws(() => handle.stateHeadOffset('messages'), which);
-    // pins getRecordIdsByType.7 unreadable type history throws rather than listing IDs
     assert.throws(() => handle.getRecordIdsByType(receiptType), which);
-    // pins redactStateItems.4 a failed, well-formed redaction throws at the call
     assert.throws(() => handle.redactStateItems('messages', 0, 1), which);
-    // pins subscribe.14 failed creation throws rather than returning an ID
     assert.throws(() => handle.subscribe({}), which);
-    // pins unsubscribe.4 removal of a valid ID on a dead handle throws at the call
     assert.throws(() => handle.unsubscribe(subId), which);
   }
 
   detached.close();
   assertDead(detached, 'individually detached view');
-  assert.equal(root.getStateLen('messages'), 1); // the branch itself is still live
+  assert.equal(root.getStateLen('messages'), 1);
   root.close();
   assertDead(root, 'retained closed root');
   assertDead(held, 'view closed by its root');
@@ -93,12 +80,9 @@ test('Liveness is sampled on the handle that is about to read', async (t) => {
   const record = detached.appendJson(type, { v: 1, storeId });
   const countBefore = root.stats().recordCount;
   detached.close();
-  // pins isClosed.6 the detached handle reports that it cannot serve an identity lookup
   assert.equal(detached.isClosed(), true);
-  // pins isClosed.6 closing a sibling does not direct the open handle to a cache-only lookup
   assert.equal(root.isClosed(), false);
   const ids = root.getRecordIdsByType(type);
-  // pins isClosed.6 the surviving handle still resolves the existing identity, without a mint
   assert.deepEqual(ids, [record.id]);
   assert.equal(JSON.parse(root.getRecord(ids[0]).payload.toString()).storeId, storeId);
   assert.equal(root.stats().recordCount, countBefore);
@@ -106,40 +90,31 @@ test('Liveness is sampled on the handle that is about to read', async (t) => {
   const held = root.view('main');
   assert.equal(held.isClosed(), false);
   const probe = nextTurn().then(() => {
-    // pins isClosed.7 the scheduled callback gets true (not a throw or a promise) when it runs
     assert.equal(held.isClosed(), true);
   });
   root.close();
   await probe;
-  // pins isClosed.6 the retained root now reports closed to the identity reader
   assert.equal(root.isClosed(), true);
 });
 
 test('Fresh factory handles advertise capabilities before state setup', (t) => {
   const { dir, keep } = workspace(t);
   function checkReadAndIndexCapabilities(handle) {
-    // pins stateHeadOffset.8 revision support is detected without a trial call
     assert.equal(typeof handle.stateHeadOffset, 'function');
-    // pins registerStateFieldIndex.1 index registration is function-detectable
     assert.equal(typeof handle.registerStateFieldIndex, 'function');
-    // pins queryStateIndexRange.1 the range query is exposed under this name
     assert.equal(typeof handle.queryStateIndexRange, 'function');
-    // pins getStateIndexValueCounts.1 the indexed history count capability is callable
     assert.equal(typeof handle.getStateIndexValueCounts, 'function');
-    // pins getStateSlice.1 slice support is detected without a state to slice
     assert.equal(typeof handle.getStateSlice, 'function');
   }
 
   const path = join(dir, 'created');
   for (const factory of ['create', 'open']) {
     const handle = keep(JsStore[factory]({ path }));
-    // pins appendManyToStateJsonWithIdentity.1 both creation and cold open advertise the batch before a write
     assert.equal(typeof handle.appendManyToStateJsonWithIdentity, 'function', factory);
     checkReadAndIndexCapabilities(handle);
     handle.close();
   }
   const fresh = keep(JsStore.openOrCreate({ path: join(dir, 'absent') }));
-  // pins openOrCreate.5 the just-returned session handle supports batches before registration
   assert.equal(typeof fresh.appendManyToStateJsonWithIdentity, 'function');
   checkReadAndIndexCapabilities(fresh);
 });
@@ -155,7 +130,6 @@ test('Session directories isolate stores and preserve application-owned neighbor
   const hash = first.storeBlob(bytes, 'text/plain');
 
   const second = keep(JsStore.openOrCreate({ path: join(dir, 'second-session') }));
-  // pins openOrCreate.10 the absent sibling starts with no records or registrations and no access to the first blob
   assert.deepEqual([second.stats().recordCount, second.listStates(), second.getBlob(hash)], [0, [], null]);
 
   const ledgerDir = join(path, 'recovery');
@@ -166,11 +140,9 @@ test('Session directories isolate stores and preserve application-owned neighbor
   const caches = new Map([[first, state]]);
   first.close();
   const reopened = keep(JsStore.openOrCreate({ path }));
-  // pins openOrCreate.13 a valid store reopens without disturbing the application's ledger bytes
   assert.deepEqual(readFileSync(ledger), ledgerBytes);
   assert.deepEqual(reopened.getStateJson('session'), state);
   assert.deepEqual(reopened.getBlob(hash), bytes);
-  // pins openOrCreate.14 the next open is a distinct key, not the cached closed object
   assert.equal(caches.has(reopened), false);
 });
 
@@ -194,38 +166,30 @@ test('Repair on a stopped copy preserves historical coordinates and leaves the o
   const originalHead = resident.currentSequence();
   resident.close();
 
-  // Copy as an operator's `cp -R` does: a link inside the store stays the link it was.
   cpSync(residentPath, repairPath, { recursive: true, verbatimSymlinks: true });
   const repair = keep(JsStore.open({ path: repairPath }));
   const report = { branch: repair.currentBranch().name, stateId: slot, sequenceBefore: repair.currentSequence() };
   assert.equal(report.branch, 'work');
   repair.setStateJson(slot, repaired);
   assert.deepEqual(repair.getStateJson(slot), repaired);
-  // pins currentSequence.12 the captured head includes the other slot's write and still addresses the old summaries
   assert.deepEqual([report.sequenceBefore, repair.getStateJsonAt(slot, report.sequenceBefore)], [lastWrite.sequence, old]);
   repair.redactStateItems('messages', 0, 1);
-  // pins getStateJsonAt.3 both slots as of the last append: the newly added message and the not-yet-repaired summaries
   assert.deepEqual(repair.getStateJsonAt('messages', report.sequenceBefore), [message]);
   assert.deepEqual(repair.getStateJsonAt(report.stateId, report.sequenceBefore), old);
-  // pins getStateJsonAt.7 an absent historical slot returns strictly null
   assert.equal(repair.getStateJsonAt('no-such-slot', report.sequenceBefore), null);
 
   repair.switchBranch('main');
   repair.switchBranch(report.branch);
-  // pins open.12 reselecting the reopened root's reported branch recovers the dropped text at the saved head
   assert.deepEqual(repair.getStateJsonAt(report.stateId, report.sequenceBefore), old);
-  repair.switchBranch('main'); // cold readback must select the branch named in the report
+  repair.switchBranch('main');
   repair.close();
   cpSync(repairPath, readbackPath, { recursive: true, verbatimSymlinks: true });
   const readback = keep(JsStore.open({ path: readbackPath }));
   readback.switchBranch(report.branch);
-  // pins getStateJsonAt.8 the report's coordinates on a stopped copy recover the persisted pre-repair text
   assert.deepEqual(readback.getStateJsonAt(report.stateId, report.sequenceBefore), old);
   assert.deepEqual(readback.getStateJson(report.stateId), repaired);
-  // pins getStateJsonAt.7 cold readback also distinguishes an absent slot from a failure
   assert.equal(readback.getStateJsonAt('no-such-slot', report.sequenceBefore), null);
 
   const original = keep(JsStore.open({ path: residentPath }));
-  // pins open.4 repairing the copy left the resident's selection, head and summaries alone
   assert.deepEqual([original.currentBranch().name, original.currentSequence(), original.getStateJson(slot)], ['work', originalHead, old]);
 });

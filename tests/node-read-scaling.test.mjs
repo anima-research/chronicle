@@ -6,9 +6,6 @@ import { join } from 'node:path';
 import { JsStore } from '../index.js';
 
 const body = 'a message '.repeat(8);
-// Number relative to the start of the suffix, so the suffix reads at the two
-// sizes receive exactly the same queries and return exactly the same JSON,
-// even at -1. Every item has the same size, in the prefix too.
 function item(n) {
   return { by: String(n).padStart(7, '0'), body };
 }
@@ -27,7 +24,6 @@ function measure(prefix) {
     writer.registerState({ id: 'log', strategy: 'append_log', deltaSnapshotEvery: 1000, fullSnapshotEvery: 1000 });
     writer.appendManyToStateJson('log', Array.from({ length: prefix }, (_, i) => item(i - prefix)));
 
-    // Don't charge either lookup for its first (possibly cold) build.
     assert.equal(JSON.parse(reader.getStateSlice('log', 0, prefix).toString('utf8')).length, prefix);
     assert.deepEqual(reader.getStateItemJson('log', prefix - 2), item(-2));
 
@@ -36,8 +32,6 @@ function measure(prefix) {
     for (let sample = 0; sample < 5; ++sample) {
       let sliceTime = 0;
       for (let i = 0; i < 16; ++i) {
-        // Every slice is the FIRST read of a new head. Re-reading a single
-        // unchanged window could hide one full conversion per sibling append.
         const more = [item(added), item(added + 1)];
         const boundary = prefix + added - 1;
         writer.appendManyToStateJson('log', more);
@@ -49,9 +43,6 @@ function measure(prefix) {
       }
       sliceTimes.push(sliceTime);
 
-      // Spread the ordinals over the whole log, so that most lie far from both
-      // ends: a lookup that walks from either end, or a fast path for the last
-      // item, costs more as the prefix grows.
       const total = prefix + added;
       const positions = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.6180339887498949) % 1) * total));
       const found = new Array(positions.length);
@@ -60,9 +51,6 @@ function measure(prefix) {
       pointTimes.push(cpuMicrosSince(start));
       assert.deepEqual(found, positions.map((position) => item(position - prefix)));
 
-      // Pages of three items, spread over the whole log at other places than
-      // the points, as a caller paging through history reads them: a fast path
-      // for the suffix alone doesn't make them cheap.
       const width = 3;
       const offsets = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.7548776662466927 + 0.5) % 1) * (total - width)));
       const pages = new Array(offsets.length);
@@ -72,8 +60,6 @@ function measure(prefix) {
       assert.deepEqual(pages.map((page) => JSON.parse(page.toString('utf8'))),
         offsets.map((offset) => Array.from({ length: width }, (_, k) => item(offset + k - prefix))));
     }
-    // As in reconstruction_scaling.rs, take the best batch CPU time so a
-    // single GC pause or a busy host doesn't determine the scaling result.
     return { point: Math.min(...pointTimes), slice: Math.min(...sliceTimes), window: Math.min(...windowTimes) };
   } finally {
     writer?.close();
@@ -85,16 +71,9 @@ function measure(prefix) {
 test('Warm point, page and suffix conversion do not scale with the untouched prefix', () => {
   const small = measure(256);
   const large = measure(32768);
-  // The prefix grows 128x (>78x even counting all of the new suffixes).
-  // Allow considerable noise, but not the work of parsing or copying it.
-  // A floor of 20 ms absorbs the noise of a tiny baseline, and the coarse CPU
-  // clock of some systems; a conversion of the whole prefix costs far more.
   const floor = 20_000;
-  // pins getStateItemJson.7: warm Node lookups convert only the requested item.
   assert.ok(large.point < 6 * small.point + floor, `point batch grew from ${small.point} to ${large.point} µs CPU`);
-  // pins getStateSlice.5: reading the old boundary plus new items costs the window, not the accumulated log.
   assert.ok(large.slice < 6 * small.slice + floor, `suffix batch grew from ${small.slice} to ${large.slice} µs CPU`);
-  // pins getStateSlice.5: pages spread over the log cost the page, not the log around them.
   assert.ok(large.window < 6 * small.window + floor, `page batch grew from ${small.window} to ${large.window} µs CPU`);
 });
 
@@ -128,7 +107,6 @@ test("The current branch's ID costs the same with a long history or many branche
   const deep = branchIdTime({ messages: 8192, branches: 2 });
   const wide = branchIdTime({ messages: 128, branches: 256 });
   const floor = 20_000;
-  // pins currentBranch.17: repeated ID reads through the binding traverse neither history nor the branch list.
   assert.ok(deep < 3 * small + floor && wide < 3 * small + floor,
     `2,000 reads took ${small} µs CPU, ${deep} with a long history, ${wide} with many branches`);
 });

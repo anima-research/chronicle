@@ -209,8 +209,6 @@ fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
     let path = dir.path().join("store");
     populated(&path);
 
-    // Leave the valid MANIFEST and lock alone. Open takes the lock before
-    // opening the log; a directory there obstructs that open even as root.
     let log = path.join("records.log");
     let saved = dir.path().join("saved-log");
     fs::rename(&log, &saved).unwrap();
@@ -220,7 +218,6 @@ fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
 
     fs::remove_dir(&log).unwrap();
     fs::rename(saved, log).unwrap();
-    // pins openOrCreate.15: the failed factory leaves no lock for the caller to close.
     let store = Store::open_or_create(config(&path)).expect("immediate reopen after repairing the log");
     let messages = store.get_state("messages").unwrap().unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&messages).unwrap(), serde_json::json!([{"n": 1}]));
@@ -228,16 +225,11 @@ fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
 
 #[test]
 fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
-    // A fresh directory, where the factory creates rather than opens: a
-    // regular file named blobs is one of the entries a new store may sit
-    // beside, so create takes its own lock, and only then fails to make its
-    // blobs directory there.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     fs::create_dir(&path).unwrap();
     fs::write(path.join("blobs"), b"").unwrap();
     let failed = Store::open_or_create(config(&path));
-    // An I/O error, not a refusal of the directory before the lock.
     assert!(
         matches!(failed, Err(StoreError::Io(_))),
         "got {:?}",
@@ -245,7 +237,6 @@ fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
     );
 
     fs::remove_file(path.join("blobs")).unwrap();
-    // pins openOrCreate.15: the failed create leaves no lock for the caller to close.
     let store = Store::open_or_create(config(&path)).expect("immediate create after removing the file");
     store
         .register_state(StateRegistration {

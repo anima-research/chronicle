@@ -80,16 +80,11 @@ test("the store's errors carry their kind", () => {
   );
   const foreign = Buffer.from([0xff, 0, 0x61]);
   store.setState('notes', foreign);
-  // pins getStateJson.19: foreign snapshot bytes fail the JSON read before the raw probe.
   assert.throws(() => store.getStateJson('notes'));
-  // The store's code and wording for that failure, which WindowIndex doesn't read.
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
   const raw = store.getState('notes');
-  // pins getState.3: the raw read of even a non-JSON snapshot returns a Buffer.
   assert.ok(Buffer.isBuffer(raw));
-  // pins getState.3: preserve all its bytes, including invalid UTF-8.
   assert.deepEqual(raw, foreign);
-  // pins getStateJson.19: the probe of the same ID identifies unparseable content, not an empty index.
   assert.throws(() => JSON.parse(raw.toString('utf8')), SyntaxError);
   throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
   store.setState('notes', Buffer.from('not json'));
@@ -97,16 +92,11 @@ test("the store's errors carry their kind", () => {
   throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
   store.registerState({ id: 'items', strategy: 'append_log' });
   store.appendToState('items', Buffer.from('not json'));
-  // pins getStateJson.6: a failure reconstructing the full log throws synchronously, not a miss.
   assert.throws(() => store.getStateJson('items'));
-  // pins getState.2: the raw probe's own failure reaches the caller before getState returns.
   assert.throws(() => store.getState('items'), (error) => {
-    // pins getStateJson.19: the raw probe after the failed JSON read identifies an unreadable chain.
-    // pins getState.5: WindowIndex recognizes the raw failure by its prefix, space included.
     assert.match(error.message, /^Deserialization error: /);
     return true;
   });
-  // pins getStateTail.8: the unreadable tail isn't reported as an empty history.
   assert.throws(() => store.getStateTail('items', 1));
   throwsCoded(() => store.getStateItemJson('items', 0), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.getStateItemsJson('items', [0]), ErrorCode.Deserialization, /at line 1 column \d+$/);
@@ -219,14 +209,11 @@ test('a second open of a store in use is Locked', () => {
     import assert from 'node:assert/strict';
     import { ErrorCode, JsStore } from './index.js';
     const [held, independent] = process.argv.slice(1);
-    // pins open.7: an inspection open cannot share the live parent's lock.
     assert.throws(() => JsStore.open({ path: held }), { code: ErrorCode.Locked });
-    // pins openOrCreate.4: no independent writer on the held path, even in another process.
     assert.throws(() => JsStore.openOrCreate({ path: held }), { code: ErrorCode.Locked });
     const other = JsStore.openOrCreate({ path: independent });
     const payload = Buffer.from('independent write');
     const record = other.append('note', payload);
-    // pins openOrCreate.4: another store remains writable while the parent holds its lock.
     assert.deepEqual(other.getRecord(record.id).payload, payload);
     other.close();
   `, dir, join(dir, '..', 'other')], { cwd: import.meta.dirname, timeout: 30_000 });
@@ -236,7 +223,6 @@ test('a second open of a store in use is Locked', () => {
   } finally {
     store.close();
   }
-  // Releasing the writer admits an inspector, which must take the lock too.
   const inspector = JsStore.open({ path: dir });
   try {
     probeFromChild();
@@ -495,16 +481,12 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
   const shard = join(dir, 'blobs', hash.slice(0, 2));
   const destination = join(shard, hash);
 
-  // A file in place of the shard obstructs the path at the OS level, with the
-  // POSIX error for a path through a regular file. The directory at the
-  // destination below is refused by Chronicle itself.
   if (process.platform !== 'win32') {
     writeFileSync(shard, 'not a directory');
     const osError = thrownBy(() => writeFileSync(destination, content));
     const systemFailure = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
     const posixMessage = new RegExp(`^IO error: .*\\(os error ${Math.abs(osError.errno)}\\)$`, 's');
     const hasErrnoCode = typeof systemFailure.code === 'string' && /^E[A-Z0-9]+$/.test(systemFailure.code);
-    // pins storeBlob.9: workspace uses a conventional errno code first, else the full POSIX diagnostic.
     assert.ok(
       hasErrnoCode ? systemFailure.code === osError.code : systemFailure instanceof Error && posixMessage.test(systemFailure.message),
       `expected ${osError.code} or ${posixMessage}, got ${systemFailure.code}: ${systemFailure.message}`,
@@ -525,9 +507,6 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
   store.close();
 });
 
-// As agent-framework's workspace reads a system error (errnoCode, in
-// src/modules/workspace/answers.ts): a conventional errno code first, else on
-// POSIX the number that ends an "IO error: " message, named as Node names it.
 const errnoNames = new Map();
 for (const [name, number] of Object.entries(constants.errno)) if (!errnoNames.has(number)) errnoNames.set(number, name);
 function workspaceErrno({ code, message }) {
@@ -541,9 +520,6 @@ test('a blob write that the system refuses carries its errno as workspace reads 
 }, () => {
   const { store, dir } = freshStore();
   store.close();
-  // The child may write files of up to 64 blocks, of 512 or 1,024 bytes as its
-  // shell counts them: room for the store's own files, not for this blob. Node
-  // ignores SIGXFSZ, so the write past the limit fails with EFBIG.
   const outcome = JSON.parse(execFileSync('/bin/sh', ['-c', 'ulimit -f 64 && exec "$0" "$@"', process.execPath, '--input-type=module', '-e', `
     import { JsStore } from './index.js';
     const store = JsStore.open({ path: process.argv[1] });
@@ -557,7 +533,6 @@ test('a blob write that the system refuses carries its errno as workspace reads 
     process.stdout.write(JSON.stringify(outcome));
   `, dir], { cwd: import.meta.dirname, encoding: 'utf8', timeout: 30_000 }));
   assert.notEqual(outcome, null, 'the blob was stored past the limit on the size of files');
-  // pins storeBlob.9: a failure writing the blob's bytes, not only one looking at its path, gives workspace the errno.
   assert.equal(workspaceErrno(outcome), 'EFBIG', `${outcome.code}: ${outcome.message}`);
 });
 
@@ -613,7 +588,6 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
   throwsCoded(() => reopened.getBlob(hashes[2]), ErrorCode.InvalidFormat, /names the chunk [0-9a-f]{64}, which isn't stored/);
   throwsCoded(() => reopened.getBlob(hashes[3]), ErrorCode.ChecksumMismatch, /.+/);
   writeFileSync(blobFile(hashes[3]), otherWholeFile);
-  // pins getBlob.14: repair after a read error needs no intervening store call or reopen.
   assert.deepEqual(reopened.getBlob(hashes[3]), contents[3]);
 
   for (const { kind, content, hash, damage } of coldCases) {
@@ -621,28 +595,21 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
     const good = readFileSync(path);
     damage(path, good);
     if (kind === 'missing') {
-      // pins getBlob.14: start the retry from an observed miss on this handle.
       assert.equal(reopened.getBlob(hash), null);
     } else {
-      // pins getBlob.12: a cold read of each damaged whole file throws, never a partial hit or miss.
       assert.throws(() => reopened.getBlob(hash), (error) => {
-        // pins isClosed.5: the catch-path probe doesn't replace the read error and reports an open store.
         assert.equal(reopened.isClosed(), false, kind);
         const reason = error instanceof Error ? error.message : String(error);
-        // pins getBlob.12: workspace has a printable reason for the unreadable copy.
         assert.match(reason, /[^\s\p{C}]/u, kind);
         return true;
       }, kind);
     }
     writeFileSync(path, good);
-    // pins getBlob.14: external restoration suffices on the same handle, after a miss or an error.
     assert.deepEqual(reopened.getBlob(hash), content, kind);
   }
 
   reopened.close();
-  // pins getBlob.13: read the same valid hash after close and catch the synchronous refusal.
   assert.throws(() => reopened.getBlob(coldCases.at(-1).hash), () => {
-    // pins isClosed.5: the same catch-path probe now reports closure, without throwing instead.
     assert.equal(reopened.isClosed(), true);
     return true;
   });

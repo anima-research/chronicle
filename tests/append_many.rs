@@ -900,7 +900,6 @@ fn an_identity_batch_stores_its_items_stamped_with_its_one_record() {
     }
 }
 
-/// Run the same ordinal and record lookups on the live store and on its cold reopen.
 fn check_identity_ordinals(
     store: &Store,
     items: &[Value],
@@ -915,7 +914,6 @@ fn check_identity_ordinals(
     for (i, item) in items.iter().enumerate() {
         let (single_bytes, single) = read("single", 1 + i);
         let (batched_bytes, batched) = read("batched", batch.first_ordinal + i);
-        // pins appendToStateJsonWithIdentity.17: at the same ordinal, only the writing record differs.
         assert_eq!(single, stamped(item, "by", "at", &singles[i]), "item {i}: the single stamp");
         assert_eq!(batched, stamped(item, "by", "at", &batch.record), "item {i}: the batch stamp");
         assert_eq!(
@@ -925,7 +923,6 @@ fn check_identity_ordinals(
         );
         assert_ne!(single_bytes, batched_bytes, "item {i}: the stamps differ");
 
-        // pins appendToStateJsonWithIdentity.17: each stamp names the record holding the item.
         for (value, holder) in [(&single, &singles[i]), (&batched, &batch.record)] {
             let by: u64 = value["by"].as_str().unwrap().parse().unwrap();
             let record = store.get_record(chronicle::RecordId(by)).unwrap().unwrap();
@@ -943,7 +940,6 @@ fn check_identity_ordinals(
         }
     }
 
-    // pins appendToStateJsonWithIdentity.17: both indexes give the same ordinal for each row id.
     for (i, item) in items.iter().enumerate() {
         if let Some(own) = item.get("id").and_then(Value::as_str) {
             for id in ["single", "batched"] {
@@ -1003,7 +999,6 @@ fn identity_batch_case(presented: bool) {
     });
     let mut items: Vec<Value> = (0..6).map(identity_item).collect();
     if presented {
-        // Present the row the tombstone retracts and finish with a window-format header.
         items[1]["id"] = json!("m1");
         items[5]["v"] = json!(1);
     }
@@ -1063,7 +1058,6 @@ fn identity_batch_case(presented: bool) {
             expected.push(stamped(item, "by", "at", owner));
         }
         expected.push(stamped(&last, "by", "at", &last_records[leg]));
-        // pins appendToStateJsonWithIdentity.17: the entire reopened stream, with its own stamps.
         assert_eq!(stream, &expected, "{id}: reopened window");
 
         let mut presented = Vec::new();
@@ -1074,16 +1068,10 @@ fn identity_batch_case(presented: bool) {
                 presented.retain(|(_, id)| *id != row);
             }
         }
-        // pins appendToStateJsonWithIdentity.17: replay leaves the same presented rows at their original ordinals.
         assert_eq!(presented, [(0, "first"), (1, "m0"), (3, "m2"), (5, "m4"), (7, "last")], "{id}");
     }
 }
 
-/// Identity writers race each other and two ordinary record writers, which
-/// take record IDs by another path: one on the same branch, which takes
-/// sequences there too, and one on another branch, which takes IDs only.
-/// A writer that could take the ID an identity append reserved would leave
-/// a stamp naming another record, or two records at one ID or sequence.
 #[test]
 fn contending_single_identity_writers_each_stamp_their_own_one_record() {
     use std::collections::BTreeSet;
@@ -1105,7 +1093,6 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
     let records_before = store.stats().unwrap().record_count;
     let side_before = store.get_branch_by_id(side.id).unwrap().head;
 
-    // Line up a fresh wave for every race, without depending on which writer wins.
     let ready = Arc::new(Barrier::new(WRITERS + 2));
     let mut writes = Vec::new();
     for round in 0..ROUNDS {
@@ -1140,7 +1127,6 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
         writes.extend(threads.into_iter().map(|h| h.join().unwrap()));
     }
 
-    // pins appendToStateJsonWithIdentity.5: one record per append, with no intermediate write.
     assert_eq!(
         store.stats().unwrap().record_count,
         records_before + (ROUNDS * (WRITERS + 2)) as u64
@@ -1160,7 +1146,6 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
         taken.sort_unstable();
         taken
     };
-    // pins appendToStateJsonWithIdentity.5: each writer took a separate sequence for its one write.
     assert_eq!(
         sequences(main.id),
         ((main.head.0 + 1)..=(main.head.0 + (ROUNDS * (WRITERS + 1)) as u64)).collect::<Vec<_>>()
@@ -1198,11 +1183,9 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
             other => panic!("expected a stamped append, got {other:?}"),
         };
         let own = stamped(input, "by", "at", returned);
-        // pins appendToStateJsonWithIdentity.5: the record at this ID already holds this writer's stamped payload.
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), own, "record {:?}", returned.id);
         expected.push(own);
     }
-    // pins appendToStateJsonWithIdentity.5: the final log holds exactly those stamped items, once each.
     assert_eq!(value(&store, "log"), json!(expected));
 }
 

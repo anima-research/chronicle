@@ -17,9 +17,6 @@ function freshPath(t) {
 }
 
 function withPendingCheckpoint(store, path, tryWrites) {
-  // Obstruct pathname lookups, not the contents of any particular store file.
-  // Registration needs a checkpoint; while it is pending, the other writes
-  // should fail before their records are admitted. Restore before close().
   const saved = `${path}-saved`;
   renameSync(path, saved);
   try {
@@ -32,12 +29,6 @@ function withPendingCheckpoint(store, path, tryWrites) {
   }
 }
 
-// Run this file again in a child whose files may grow to `blocks` of the
-// shell's blocks (512 or 1024 bytes) and no further. A limit of 0 lets no file
-// of the store grow, whichever file a write would extend; 32 admits small seed
-// records but not a 64 KiB payload, so such a write starts and is torn. Only
-// this child is limited; the test can open the store again with no limit. The
-// pipe keeps fixtures, including large attempted payloads, out of argv and off disk.
 function runLimited(fixture, blocks) {
   execFileSync('sh', ['-c', `ulimit -f ${blocks} && exec "$@"`, 'limited-store',
     process.execPath, fileURLToPath(import.meta.url), '--limited'], {
@@ -74,46 +65,30 @@ function tryTreeWrites(side, fixture) {
   let cause;
   const caught = error => { cause = error; return true; };
 
-  // pins treeSet.5: failure replacing a real file throws in the call.
   assert.throws(() => side.treeSet(tree, file, revised), caught);
-  // pins treeSet.9: report the file-size limit's errno to workspace callers.
   assert.equal(errnoCode(cause), 'EFBIG', String(cause));
-  // pins treeSet.10: read the complete previous tuple, consistent with no new record.
   assert.deepEqual([side.treeGet(tree, file), updateIds(side)], [original, ids]);
 
   assert.throws(() => side.treeSet(tree, checkpoint, replacement), caught);
   assert.equal(errnoCode(cause), 'EFBIG', String(cause));
-  // pins treeSet.13: a refused checkpoint save leaves the old entry AND its list available to undo.
   assert.deepEqual(savedCheckpoint(side), saved);
 
-  // pins treeRemove.2: a failure evicting an existing key throws synchronously.
   assert.throws(() => side.treeRemove(tree, checkpoint), caught);
-  // pins treeRemove.6: the removal failure retains the OS cause.
   assert.equal(errnoCode(cause), 'EFBIG', String(cause));
-  // pins treeRemove.12: eviction did not discard the checkpoint entry before throwing.
   assert.deepEqual(side.treeGet(tree, checkpoint), saved.entry);
 
-  // pins treeBatch.4: the well-formed mixed batch fails in the core and throws in JS.
   assert.throws(() => side.treeBatch(tree, treeOps(fixture)), caught);
-  // pins treeBatch.7: the workspace can report the batch's specific OS failure.
   assert.equal(errnoCode(cause), 'EFBIG', String(cause));
-  // pins treeGet.12: check each attempted set and removal, including the absent key.
   assert.deepEqual(tuples(side), [original, saved.entry, null]);
-  // pins treeBatch.3: no batch record (or first few edit records) landed.
   assert.deepEqual(updateIds(side), ids);
 
-  // pins appendJson.7: a journal append refusal throws before the caller can cache success.
   assert.throws(() => side.appendJson(journal, { event: 'not published' }), caught);
-  // pins appendJson.17: expose the actual size-limit errno for the journal failure.
   assert.equal(errnoCode(cause), 'EFBIG', String(cause));
   assert.deepEqual(side.getRecordIdsByType(journal), journalIds);
 }
 
 const stamp = (item, record) => ({ ...item, by: record.id, at: record.sequence });
 
-// A read error while the write fault is in force leaves the outcome unknown.
-// Catch only the read itself, never an assertion or a mismatching result. The
-// cold pass requires a successful read, so this can't vacuously prove recovery.
 function readBack(read, whileFaulted) {
   try { return { value: read() }; } catch (error) {
     if (!whileFaulted) throw error;
@@ -121,36 +96,21 @@ function readBack(read, whileFaulted) {
   }
 }
 
-// The fault tears the write before its record is published: no file of the
-// child may hold more than 32 blocks (16 or 32 KiB), and the item's body alone
-// is over 64 KiB, so the whole record cannot land. Every successful read, in
-// the child while the fault is in force and cold in the parent, must then show
-// the rows from before the write. No fault here throws after a whole record
-// landed: that half of the requirements has no test.
 function checkIdentity(side, { kind, rows, ids }, whileFaulted) {
   assert.deepEqual(updateIds(side), ids, 'the torn write published no update record');
   if (kind === 'single') {
     const next = readBack(() => side.getStateItemJson('index', rows.length), whileFaulted);
     if (!next.unavailable) {
-      // pins appendToStateJsonWithIdentity.11: after a write torn by its fault, the pre-append ordinal holds no new item.
       assert.equal(next.value, null);
     }
   }
   const full = readBack(() => side.getStateJson('index'), whileFaulted);
   if (!full.unavailable) {
-    // pins getStateJson.15: a successful reread after the torn write reports what landed: the old rows, never a partial batch.
     assert.deepEqual(full.value, rows);
   }
 }
 
-// Re-enter just this file as an ordinary Node process, not another test runner.
-// Don't close the limited writer: the parent checks what a cold reader finds
-// without a graceful shutdown checkpoint covering up a partial publication.
 if (process.argv[2] === '--limited') {
-  // Suppress the signal's default termination. Observing it distinguishes an
-  // actual limit hit from a validation throw, without requiring the identity
-  // methods to expose any particular error code or message. The callback runs
-  // only when JS yields, AFTER the synchronous throw and immediate rereads.
   const hitLimit = new Promise(resolve => process.on('SIGXFSZ', resolve));
   const fixture = JSON.parse(readFileSync(0, 'utf8'));
   const store = JsStore.open({ path: fixture.path });
@@ -162,7 +122,6 @@ if (process.argv[2] === '--limited') {
     if (fixture.kind === 'single') {
       assert.throws(() => side.appendToStateJsonWithIdentity('index', fixture.items[0], 'by', 'at'));
     } else {
-      // pins appendManyToStateJsonWithIdentity.15: a mid-write error, not just validation, throws before returning.
       assert.throws(() => side.appendManyToStateJsonWithIdentity('index', fixture.items, 'by', 'at'));
     }
     checkIdentity(side, fixture, true);
@@ -171,7 +130,6 @@ if (process.argv[2] === '--limited') {
   await hitLimit;
   clearTimeout(deadline);
   if (fixture.kind === 'tree') {
-    // No deferred branch edit became visible after the synchronous checks.
     assert.deepEqual(tuples(side), [fixture.original, fixture.saved.entry, null]);
     assert.deepEqual(updateIds(side), fixture.ids);
   }
@@ -194,7 +152,6 @@ test('Pre-record I/O refusals preserve whole branch-local JSON values', posix, t
     const side = root.view('side');
     side.setState(binding, Buffer.from('not JSON'));
     assert.throws(() => side.getStateJson(binding));
-    // pins currentBranch.12: a failing binding-record read does not mask the branch name.
     assert.equal(side.currentBranch().name, 'side');
     side.setStateJson(binding, before);
     side.setStateJson('unfold', saved);
@@ -205,20 +162,13 @@ test('Pre-record I/O refusals preserve whole branch-local JSON values', posix, t
     const revision = side.stateHeadOffset('unfold');
     const sequence = side.currentSequence();
     withPendingCheckpoint(root, path, () => {
-      // pins setStateJson.4: a valid replacement on an open branch throws in the calling stack.
       assert.throws(() => side.setStateJson(binding, after));
-      // pins currentBranch.12: a failing binding write leaves its branch identifiable too.
       assert.equal(side.currentBranch().name, 'side');
       assert.throws(() => side.setStateJson('unfold', unfolded));
-      // pins setState.8: an I/O refusal of a valid byte write throws during setState itself.
       assert.throws(() => side.setState('receipt', Buffer.from('replacement')));
-      // pins appendToStateJson.3: core refusal throws, not a successful or asynchronous return.
       assert.throws(() => side.appendToStateJson('log', { message: 'three' }));
     });
-    // Path restored for reads, but no compensating write (or sync) yet.
-    // pins setStateJson.13: the previously stored whole branch-local snapshot remains in force.
     assert.deepEqual(root.view('side').getStateJson(binding), before);
-    // pins setStateJson.16: known pre-record failure; reread the whole prior unfold snapshot at its prior revision.
     assert.deepEqual([side.getStateJson('unfold'), side.stateHeadOffset('unfold'), side.currentSequence()],
       [saved, revision, sequence]);
     assert.deepEqual(side.getState('receipt'), receipt);
@@ -256,8 +206,6 @@ test('Tree and journal mutations preserve the OS cause and do not publish a refu
     fixture = { path, kind: 'tree', original, revised, saved, replacement,
       ids: updateIds(side), journalIds: side.getRecordIdsByType(journal) };
   } finally { root.close(); }
-  // No file may grow in the child, so even a small treeRemove fails before its
-  // record lands, whichever file would hold it. The child's open still succeeds.
   runLimited(fixture, 0);
 
   const reopened = JsStore.open({ path });
@@ -270,9 +218,7 @@ test('Tree and journal mutations preserve the OS cause and do not publish a refu
     assert.deepEqual(side.getRecordIdsByType(journal), fixture.journalIds);
     side.treeBatch(tree, treeOps(fixture));
     const ids = updateIds(side);
-    // pins treeBatch.3: successful mixed edits add exactly one update for this tree, not separate records per path.
     assert.deepEqual([ids.slice(0, -1), JSON.parse(side.getStateUpdateJson(ids.at(-1))).state_id], [fixture.ids, tree]);
-    // pins treeBatch.4: the entire batch is visible on return, without awaiting it.
     assert.deepEqual(tuples(side), [fixture.revised, null, fixture.revised]);
   } finally { reopened.close(); }
 });
@@ -280,8 +226,6 @@ test('Tree and journal mutations preserve the OS cause and do not publish a refu
 test('Interrupted identity writes expose no partial stamped row or batch', posix, t => {
   for (const kind of ['single', 'batch']) {
     const path = freshPath(t);
-    // Incompressible body, with small distinct rows on either side in the
-    // batch: a mistaken publication of just the first row is observable.
     const large = { group: 'reply', body: { chunk: randomBytes(64 * 1024).toString('base64') }, by: 'stale', at: -1 };
     const items = kind === 'single' ? [large] : [{ group: 'open' }, large, { group: 'end' }];
     const root = JsStore.openOrCreate({ path });

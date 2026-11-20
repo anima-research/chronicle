@@ -30,27 +30,20 @@ try {
     const expectedKey = digest(bytes);
     const key = store.storeBlob(bytes, 'application/vnd.rookery.media');
     const retained = store.getBlob(key);
-    // pins storeBlob.1: fresh Buffer bytes round-trip with a caller-defined media type.
     assert.deepEqual(retained, bytes);
-    // pins storeBlob.7: both synchronous writes return the independently hashed bytes alone.
     assert.deepEqual([key, store.storeBlob(bytes, 'image/jpeg')], [expectedKey, expectedKey]);
-    // pins getBlob.6: binary bytes encode with the standard base64 alphabet and padding.
     assert.equal(retained.toString('base64'), '+/8=');
 
     const emptyKey = store.storeBlob(Buffer.alloc(0), 'application/octet-stream');
-    // pins getBlob.2: zero bytes are still a complete Buffer hit.
     assert.deepEqual(store.getBlob(emptyKey), Buffer.alloc(0));
-    // pins getBlob.3: an ordinary miss is exactly null.
     assert.equal(store.getBlob(digest('never stored')), null);
 
     const json = '{\n  "bird": "Mésange 🪶",\n  "count": 3\n}\n';
     const saved = store.getBlob(store.storeBlob(Buffer.from(json), 'application/json'));
-    // pins getBlob.5: default and explicit UTF-8 decodings preserve the authored JSON text.
     assert.deepEqual([saved.toString(), saved.toString('utf8'), saved.toString('utf-8')], [json, json, json]);
 
     const nextKey = store.storeBlob(Buffer.from([0x12, 0x34]), 'application/octet-stream');
     writeFileSync(join(dir, 'materialized'), store.getBlob(nextKey));
-    // pins getBlob.11: a retained read survives another same-size read and intervening I/O.
     assert.deepEqual(retained, Buffer.from([0xfb, 0xff]));
 
     const request = { prompt: 'draft' };
@@ -58,14 +51,12 @@ try {
     request.prompt = 'revised';
     const preimage = Buffer.from(JSON.stringify(request));
     const actualKey = digest(preimage);
-    store.storeBlob(preimage, 'application/json'); // No reference published, return value discarded.
+    store.storeBlob(preimage, 'application/json');
     store.close();
     store = JsStore.open({ path: syncPath });
-    // pins storeBlob.12: cold external lookup finds the actual request bytes, not the stale preimage.
     assert.deepEqual([store.getBlob(actualKey), store.getBlob(provenanceKey)], [preimage, null]);
 
     for (const invalidType of [undefined, null, 42]) {
-      // pins storeBlob.13: the synchronous API must refuse a non-string media type.
       assert.throws(() => store.storeBlob(Buffer.from('untyped media'), invalidType));
     }
   });
@@ -79,11 +70,9 @@ try {
       source.createBranch('child', 'main');
       const child = source.view('child');
       key = source.storeBlob(original, 'text/plain');
-      // pins view.8: a non-main view can read bytes newly stored by its source.
       assert.deepEqual(child.getBlob(key), original);
       const other = Buffer.from('child-only write');
       const otherKey = child.storeBlob(other, 'text/plain');
-      // pins getBlob.10: source resolves a different branch's write by hash alone.
       assert.deepEqual(source.getBlob(otherKey), other);
 
       sourceId = source.appendJson('file-version', { path: 'first.txt', blobHash: key }).id;
@@ -97,12 +86,10 @@ try {
     const reopened = JsStore.open({ path: branchPath });
     try {
       const rebound = reopened.view('child');
-      // pins view.8: even the first read through a fresh view resolves the original source key.
       assert.deepEqual(rebound.getBlob(key), original);
       for (const [handle, id] of [[reopened, sourceId], [rebound, childId]]) {
         const { blobHash } = JSON.parse(handle.getRecord(id).payload.toString());
         assert.equal(blobHash, key);
-        // pins getBlob.8: each distinct persisted reference still resolves to the same bytes.
         assert.deepEqual(handle.getBlob(blobHash), original);
       }
       rebound.close();
@@ -113,23 +100,16 @@ try {
 
   await test('openOrCreate honors the supplied blob read-cache capacity, for a new store and an existing one', () => {
     const contents = ['oldest', 'middle', 'newest'].map((s) => Buffer.from(s));
-    // Read in another order than the writes, so that a cache filled by the
-    // writes rather than the reads can't pass.
     const readOrder = [2, 0, 1];
     for (const capacity of [1, 2]) {
-      // ContextManager passes blobCacheSize to openOrCreate whether or not the
-      // store exists yet, and the two cases open the store differently.
       for (const existing of [false, true]) {
         const at = join(dir, `cache-${capacity}-${existing ? 'existing' : 'new'}`);
         const offline = `${at}-offline`;
         if (process.platform === 'win32') {
-          // Move a junction rather than a directory with open files on Windows.
           symlinkSync(mkdtempSync(join(dir, 'backing-')), at, 'junction');
         }
         let keys;
         if (existing) {
-          // Written and closed by a handle with the default capacity: the
-          // tested handle has written nothing and read nothing before.
           const seed = JsStore.openOrCreate({ path: at });
           try { keys = contents.map((b) => seed.storeBlob(b, 'text/plain')); } finally { seed.close(); }
         }
@@ -138,15 +118,13 @@ try {
           keys ??= contents.map((b) => handle.storeBlob(b, 'text/plain'));
           for (const i of readOrder) assert.deepEqual(handle.getBlob(keys[i]), contents[i]);
 
-          // Take the configured path offline, without depending on any files inside it.
           renameSync(at, offline);
           try {
             const reads = keys.map((key) => {
               try { return handle.getBlob(key); }
-              catch { return null; } // An uncached read may fail while storage is unavailable.
+              catch { return null; }
             });
-            const kept = new Set(readOrder.slice(-capacity)); // the last `capacity` blobs read
-            // pins openOrCreate.17: exactly the configured number of recent reads remain available.
+            const kept = new Set(readOrder.slice(-capacity));
             assert.deepEqual(reads, contents.map((b, i) => kept.has(i) ? b : null),
               `${existing ? 'an existing' : 'a new'} store opened with blobCacheSize ${capacity}`);
           } finally {
