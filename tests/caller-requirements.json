@@ -1,0 +1,3233 @@
+{
+ "about": "What chronicle's three callers require of the store, for each requirement that had no test or only part of a test on main at 5db2d5f. A test names a requirement in a comment `pins LABEL`. `differs from LABEL` marks a place where the store does something other than the caller relies on. A requirement that is pinned in part, or that differs, has a note that says what has no test or what the store gives. The requirements that a test on main already pinned have no entry.",
+ "requirements": {
+  "currentBranch.2": {
+   "sentence": "It reports, without moving it, the selection used by the receiving handle's branch-local reads and writes: shared-store callers follow that cursor, and a branch-bound view reports its own branch. A read is not a reservation: a fresh check after disk I/O, an await or a synchronous listener must see a move that has taken effect, so callers can retry a scan, refuse a write, stop appending shards or discard stale strategy work.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "currentBranch.4": {
+   "sentence": "`id` is the native string identity of the branch, stable across writes, returns to that branch and saved pins read on restart. Distinct branches must compare unequal even if their contents, head sequence or name match; in particular, deleting a branch and creating another under its name must not validate old message indexes, token caches, write stamps or disk pins.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "currentBranch.10": {
+   "sentence": "A previously returned object's `id` and `name` must still describe the branch that was selected at that call. Two operations keep the object itself across hooks: if it were a live cursor that changed in place, their old-versus-new comparison and their account of where rows landed would be wrong.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "currentBranch.14": {
+   "sentence": "`parentId` supplies the parent branch's ID when there is one, and a nullish or absent value when there is none. The wrapper forwards the ID, not the parent's name, and normalizes absence to `undefined`.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "currentBranch.15": {
+   "sentence": "`branchPoint` supplies the numeric sequence of the fork when present. The wrapper preserves the sequence, including zero, and normalizes a nullish or absent value to `undefined`.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "currentBranch.11": {
+   "sentence": "`created` supplies the branch's stable numeric creation timestamp in JavaScript Date milliseconds. ContextManager converts it to a Date; the fold journal keeps the original number and keys compile provenance and durable receipts by `(id, created)`, so later selection or name reuse must not change what that pair identifies.",
+   "status": "differs",
+   "note": "The store gives `created` in microseconds since the epoch, and context-manager passes it to `new Date(...)`, which takes milliseconds. The stability of the `(id, created)` pair is pinned.",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "currentBranch.8": {
+   "sentence": "The current branch must match its live entry in `listBranches()`: callers mark it current by name or ID, look up its ancestry starting at that ID or name, and match receipt provenance against the listed ID and creation time. Workspace ancestry comes from the list; it does not require walking parents in the object returned by `currentBranch()`.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "currentBranch.9": {
+   "sentence": "The returned `name` is a usable parent argument to `createBranchAt`, `createBranchWithStates` and `createBranchAtWithStates`. Passing it back must fork from the very branch on which the caller read the message boundary, state selection or current head, not from a different branch with matching data.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentBranch.6": {
+   "sentence": "On an open store the selection must remain inspectable after a failed switch, fork, restore or later initialization/materialization step. The read must distinguish a refusal that never moved the cursor from a move that landed despite the error; callers compare against the saved source or requested target to restore by name, retire or preserve prepared work, and update clients or checkpoints.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs",
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "currentBranch.7": {
+   "sentence": "If the branch itself cannot be determined, callers that handle that condition need a synchronous throw, not a plausible default branch, incomplete object or rejected Promise. They can then leave a write outcome unknown, defer or refuse window settlement, use last-known transition status, keep the old direct-write position, omit a repair report or skip a TUI branch-change inference; the removal hook deliberately retains its previous behavior when the branch is unknown.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "currentBranch.12": {
+   "sentence": "Failure to read or write a thinking-binding record must not itself prevent reading the branch name. Those handlers read `currentBranch()` unguarded to identify the failing branch before returning `null` or `false`; a second exception there would replace the intended fallback.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs",
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "currentBranch.17": {
+   "sentence": "Reading the branch ID for an already-current message-ID index must not require a traversal of history or all branches. That check is on the documented constant-time same-instance, same-branch lookup path, not just on the rebuild path.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-read-scaling.test.mjs"
+   ]
+  },
+  "getStateJson.2": {
+   "sentence": "Read the current logical value on this handle's branch, including changes already made by another caller sharing the store. Reopening a store or switching branches must not return the previous in-memory mirror: callers use the read to restore settings, detect changed or removed records, and merge counters without reusing IDs.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateJson.12": {
+   "sentence": "No stored value is a successful read yielding null, including immediately after registration. In particular, three presence tests require exactly null, not undefined or another falsy value: registration alone is not data, and false, zero, an empty string or an empty array is not a miss.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateJson.3": {
+   "sentence": "Give the decoded JSON value itself, not serialized bytes, a JSON document string, or a store envelope. Preserve the stored type and contents even when they are not the application's expected schema: inspection, validation, repair and version handling belong to the reader.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateJson.13": {
+   "sentence": "A numeric snapshot comes back as a JS number, not text, a one-element list or an object with a counter field. Otherwise the summary-ID readers treat an existing counter as zero or ignore it.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateJson.9": {
+   "sentence": "The zero-based positions in a full read are the positions used by editStateItem and range redaction. A caller that finds an ID in the persisted array must be able to update that exact slot, including every matching copy, without editing its neighbor.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateJson.10": {
+   "sentence": "A whole-array read agrees with getStateLen and, where used, getStateItemJson or the decoded getStateSlice on the same state. The full read is both a fallback for those methods and the baseline to which incremental reads are added.",
+   "status": "no test",
+   "note": "Ordinary full/length/point/slice agreement already has tests and has further cross-handle cases in this mapping. Extending it unconditionally to stale legacy counts contradicts a_batch_counts_a_legacy_states_items_before_it_takes_its_ordinals, which intentionally sees length zero for three readable items before reconciliation."
+  },
+  "getStateJson.8": {
+   "sentence": "Leave blob references in the returned JSON in their stored form. Readers distinguish inline content from references, sometimes count or show the references without resolution, and fetch the identified blob themselves when full content is wanted.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateJson.7": {
+   "sentence": "Return mutable materialized objects and arrays whose local mutation is not a store write. Callers assign or delete fields, replace array elements, or extend their cached array; stored state changes through an explicit store operation, not through those JS references.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateJson.6": {
+   "sentence": "When a read cannot determine the value, throw synchronously rather than returning null, an empty collection or an error-shaped JSON value. This lets a restore or update refuse before overwriting unread state; best-effort readers can instead log, skip, mark the outcome unknown or retry, without caching a fabricated absence.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getStateJson.19": {
+   "sentence": "Invalid JSON or a state chain that cannot be reconstructed as one JSON value must not masquerade as a successful empty index. After getStateJson throws, WindowIndex probes getState for the same ID: non-JSON bytes or a raw-read error starting with 'Deserialization error: ' indicate persistent foreign content, whereas null bytes, parseable bytes or another raw-read failure cause the original read error to propagate.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getStateJson.20": {
+   "sentence": "A stored JSON null must also be returned as null. When the slot has a non-null revision, WindowIndex uses that fact to distinguish a stored null (a foreign, non-list value, which it will not overwrite) from a slot with no records.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateJson.15": {
+   "sentence": "After a write throws, a successful reread reports what actually landed, not what the caller attempted or an assumed rollback. Unfold uses structural equality to decide which state to keep in memory; the window index must see the whole identity-stamped batch or none of it, or be able to report that read-back also failed.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "getStateJson.16": {
+   "sentence": "Use the same JSON round-trip representation as the write and point-read paths. In particular undefined object fields are omitted and lone surrogate halves in string values come back as U+FFFD; differences between the full read and the point read in stringification, including key order, break request hashes, and differences from storedCanonicalJson make a landed write look absent.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "getStateJson.17": {
+   "sentence": "The value must correspond to the state's observed revision on this handle, and reading it must not itself change that revision. Callers retain the materialized value or a comparison result under stateHeadOffset or a branch-aware fallback; reusing that result while the revision is unchanged must be sound.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "setStateJson.1": {
+   "sentence": "Set the whole value of the named state, including its first value. `getStateJson` must subsequently see the supplied JSON snapshot: fields the caller kept remain, fields it deleted disappear, and arrays retain their items and order rather than being merged with the old array.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setStateJson.4": {
+   "sentence": "Report a write error by throwing in the calling stack, not by returning an error record, false, or a promise that rejects later. That is how callers stop an operation, preserve a pending retry, wrap the cause, log and continue, or deliberately ignore a best-effort failure.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "setStateJson.6": {
+   "sentence": "A full-array set also works on an `append_log` state: the supplied array becomes the entire current list, even if empty. Later appends extend that list and indexed edits address its new positions, not those of the pre-set log.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "setStateJson.10": {
+   "sentence": "Accept a top-level JSON `null` as a replacement value. Clearing a receipt or all-except hold this way leaves no live receipt or hold to restore; it does not require deleting or re-registering the slot.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "setStateJson.11": {
+   "sentence": "When the store supplies `stateHeadOffset`, a set of the summaries or chunks changes that slot’s revision on that branch by the time the caller checks it. Instances sharing the branch must observe the change even for a replacement of the same length; unrelated slot writes are not changes to this revision.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "setStateJson.5": {
+   "sentence": "A completed set participates in a subsequent `store.sync()` durability barrier: a successful sync must cover it before the caller acknowledges the change, consumes retry work, or writes a repair receipt. Success of the set alone need not mean fsync, and failure of the later sync does not undo the logged write.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "setStateJson.12": {
+   "sentence": "Coalescing compaction needs independently ordered slot replacements: the table contains the caller’s journal watermark before the marked journal is emptied. An interruption between these writes may leave the new table and the old journal together; replay skips entries already covered by the watermark.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "setStateJson.13": {
+   "sentence": "The agent registry rollback and the coordinator’s scope/disposition cache assume that a refused snapshot replacement leaves the previous stored value in force. Neither compensates by rewriting the old branch-local slot after the setter throws.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "setStateJson.16": {
+   "sentence": "Unfold recovery does not assume a throw means the write missed. If read-back succeeds after an exception, it must reflect the whole snapshot that actually landed or the prior state; the caller uses that comparison to update its mirror and rethrows the original error without issuing the remaining writes.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "setStateJson.17": {
+   "sentence": "A lone UTF-16 surrogate half in summary text must read back as U+FFFD. The unfold error check compares against that normalized string to decide whether its replacement landed.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setStateJson.9": {
+   "sentence": "Preserve caller-supplied own object keys even when a channel or agent name is also an `Object.prototype` member, such as `constructor`. The readers distinguish an actual stored override, generation or destination from an inherited property.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setStateJson.14": {
+   "sentence": "Accept records constructed with missing optional members. In particular, an undefined optional checkpoint `data` member must not become a real snapshot that hides the node’s `patch` on reconstruction; unnamed pins likewise must be writable.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setStateJson.15": {
+   "sentence": "Stored numeric fields stay within JSON’s finite-number domain. The load-repair reporter relies on that when accepting any number it reads; the host’s lessons loader converts overflowing numbers to JSON null before passing its snapshot to the module writer.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setStateJson.18": {
+   "sentence": "As the fallback for the byte setter, `setStateJson` must leave the same parsed resolutions or presentation-receipt value that the byte path intends to store. The receipt can be about 5 MB with 75,000 leaves; this path passes a JS object, not pre-encoded bytes.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "close.5": {
+   "sentence": "Closing after inspection or a dry run must not itself change the logical application data merely read, or apply changes that the caller only planned. This is not a requirement to preserve the backing files byte for byte.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "close.11": {
+   "sentence": "The inspector accounts for close writing back store metadata even without application edits: state.bin, state-indexes.bin (including a rebuilt history index) and branches.bin (including branch heads corrected at open). Its forensic warning expressly allows the bytes to change.",
+   "status": "no test",
+   "note": "Not a requirement of the store. Permission for close to rewrite derived metadata is not a requirement to replace particular files. Public reopen reads cannot distinguish close publication from another repair at open, and file identity/layout is not a caller contract to freeze here."
+  },
+  "close.9": {
+   "sentence": "Closing an owned handle ends its use for live store reads, even though the manager still holds the JavaScript object. In particular, inspection of messages, branches and receipts through that manager is no longer available on that handle.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "close.7": {
+   "sentence": "isClosed() must remain callable and accurately report whether close consumed the handle, including immediately after a throw. That lets callers skip a duplicate close or a read on a closed store, and lets framework shutdown distinguish retryable cleanup from a terminal failure.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "close.3": {
+   "sentence": "A close failure is a synchronous throw carrying the store's error, not a false result or a later promise rejection. Callers can propagate or aggregate that error, log it without undoing a completed write, fold it into an audit verdict, or deliberately suppress it in favor of the original open error.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "close.8": {
+   "sentence": "For failure of close's own final sync specifically, ContextManager promises that the store is closed all the same, whether close runs directly or at the end of an interrupted write. Framework shutdown also handles that consumed-on-error outcome; the throw is not evidence that the original handle can be retried.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "close.12": {
+   "sentence": "Close remains a distinct operation after an explicit sync attempt: framework shutdown still calls it if that sync threw, and must be able to retain a close error alongside the earlier sync error.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "close.10": {
+   "sentence": "The verification reread and the Claude import need a thrown failure with a useful .message for their operator-facing diagnostics. Neither matches a particular close-error code or literal message.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "treeGet.1": {
+   "sentence": "`treeGet` answers synchronously. Callers inspect the result immediately, including between a branch check and a mutation where yielding could move the tree.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.2": {
+   "sentence": "The two string arguments select one exact key in one named tree: a mount-relative path in a file or intent tree, an agent name in the checkpoint tree, or a request hash in the envelope index. A different spelling, an entry in another tree, or a descendant with the given prefix is not a match.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.3": {
+   "sentence": "A present key returns a truthy entry; an ordinary missing key returns `null` without throwing. Membership is in the tree, not on disk or in the blob store: even a key whose blob is gone still returns its entry.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.13": {
+   "sentence": "The envelope-index lookup also returns `null` when that tree has never been created. Reading an old summary or a mint for which no preimage was persisted does not require registering an empty index first.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.4": {
+   "sentence": "The lookup uses the branch selected on this store at the time of the call. After a switch, rewind or derivation it sees the entries that branch has, including inherited entries; workspace file and intent lookups must describe the same branch as its tree listing and `currentBranch()`.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.7": {
+   "sentence": "On a hit, `blobHash` is the unchanged string reference stored in the entry. Callers can compare or save it, or pass it directly to `getBlob` on the same store; for example, the request hash used to look up an envelope is not the blob hash used to read the envelope.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.9": {
+   "sentence": "For workspace files the returned `blobHash` also identifies the bytes by their full SHA-256 hex digest, in the same spelling as the caller's disk hash. Reconciliation, deletion tombstones, disk status and recovery of lost content compare these independently obtained hashes; an opaque blob locator would not suffice.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.8": {
+   "sentence": "`size` is the numeric byte count recorded for that version, not a character count, compressed size, or size of the current disk file. It is used without fetching the blob for reporting, edit budgets, exact write verification, disk recovery bounds, and recognizing an already-empty checkpoint list.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.10": {
+   "sentence": "`mode` preserves the numeric mode as written, including the regular-file type bits when present and their absence in legacy placeholders such as `0o644`. Overwrites and edits carry the old value forward, readback compares it exactly, and reconciliation extracts permission bits only from a recorded file mode.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.14": {
+   "sentence": "Object spread of a returned entry must copy at least `blobHash` and `mode`. `diskOf` adds the path with a spread, and the evidence comparison reads those two fields from the resulting object.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.15": {
+   "sentence": "A saved result remains the entry as it was before a subsequent update and is valid input to `treeSet` unchanged. Failed deletion rollback uses it to restore the original intent reference and metadata, even for a damaged intent; if the saved result was null, rollback restores absence instead.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeGet.12": {
+   "sentence": "After `treeSet`, `treeRemove` or `treeBatch` throws, successful readback still reports what actually landed, not what was attempted or what the exception suggests. The caller compares previously differing keys: a set must match hash, size and mode, and a removal must read as null; keys already equal before the write prove nothing.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeGet.11": {
+   "sentence": "A lookup on the branch of an interrupted disk-to-tree adoption must reveal its recorded outcome even if the separate completion record was lost. Until the next mutation, the expected hash or expected absence is evidence that the adoption landed; different tree contents leave the caller with its prior evidence.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "treeGet.6": {
+   "sentence": "If the tree lookup itself cannot determine the answer, it must signal failure by throwing, not return a guessed entry or `null` as if absence had been established. In particular, failed commit readback preserves both errors and leaves the outcome unknown; checkpoint eviction instead catches the error, logs it and allows teardown to finish.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "sync.1": {
+   "sentence": "Callers invoke `sync()` with no arguments and continue synchronously. They need no success value: returning normally, not resolving a promise or returning a receipt, is the signal they use.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "sync.2": {
+   "sentence": "Normal return means the writes made to this store up to the call are on stable storage and recoverable after an unclean stop. The barrier covers the whole batch, including writes made through other components sharing the store, not just the last record or the state of the component calling `sync`.",
+   "status": "no test",
+   "note": "Recovery of a mixed batch after process death is allocated, but that cannot distinguish stable storage from dirty OS cache. The stronger whole-store power-loss barrier needs a storage crash model not provided by these tests."
+  },
+  "sync.3": {
+   "sentence": "If durability cannot be established, `sync` must throw in the calling stack. A returned error, `false`, or a later rejection would be mistaken for success; callers themselves decide whether to propagate the failure, log it, refuse an action, or retry.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "sync.7": {
+   "sentence": "Before code writes a journal entry, ledger update, repair receipt, or fleet child listing that asserts a Chronicle state change, `sync` must make the state itself recoverable, including its head or branch selection, not just bytes in a record log. This keeps a workspace completion, accepted layout, Discord surgery ledger, repair receipt, or child listing from surviving the change it attests to.",
+   "status": "no test",
+   "note": "A surviving later receipt implies the exact earlier state was on stable media even under lost or reordered dirty writes. A normal exit, kill, directory copy or checkpoint inode comparison cannot establish that ordering."
+  },
+  "sync.6": {
+   "sentence": "After a typed record is appended, or found by reading the store, `sync` must make it and the earlier records stable under their existing IDs. Callers use that guarantee before acting on journal entries or workspace intents, caching a store identity, using a compile mark whose ID must not be reissued after a crash, or returning, querying, or announcing a fold receipt.",
+   "status": "partly",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "sync.5": {
+   "sentence": "A failed pre-append `sync` does not create the proposed journal entry; a failed `sync` after `appendJson` has returned does not undo that append or hide the record from the live store. The record's durability is uncertain, so callers can read and reconcile it, or retry the barrier on the same data, rather than blindly append it again.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "sync.9": {
+   "sentence": "After `setStateJson` changes the host mode or prose lock, success must preserve the new choice across a crash; a throw is not a rollback and does not rule out the write reaching disk. Store-only quiesce/resume fails on that throw, whereas the recovery-file host-mode path and the prose-lock path log the failure.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs",
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "sync.8": {
+   "sentence": "Delivered or imported messages and notices must be durable before the framework forgets its obligation to deliver them: pruning a deferred queue, settling interrupted agents, releasing held mail, or ending a tune-out. On a throw the recovery obligation stays; finding a copy in memory is not a substitute for syncing it.",
+   "status": "partly",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "sync.11": {
+   "sentence": "When the deferred-write queue itself is a store slot, `sync` after `setStateJson` must persist the replacement queue, including an empty queue. In particular, newly assigned queue IDs must survive before the importer stores messages under them, so a restart between import and acknowledgement can recognize duplicates.",
+   "status": "partly",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "sync.12": {
+   "sentence": "Before originals go to a provider, the guard's single `sync` must cover its staged and linked audit log state, the archived originals (including referenced blobs), and the message row and its presentation. If the audit cannot be certified durable, the caller keeps the batch unsubmitted and sends placeholders instead.",
+   "status": "partly",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "sync.13": {
+   "sentence": "Coalescing needs the receipt and accepted work durable before acknowledgement, and the render-start durable before issuing a render. A failed commit must be retryable by syncing the already-written work, without admitting the occurrence or performing its effects again.",
+   "status": "partly",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ],
+   "note": "A retry of a failed sync on the same work is pinned. The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "sync.10": {
+   "sentence": "Compression and merge retries need their progress in named state to survive before proceeding: the next provider call must not repay a recorded answer after a crash, and reopening must not undo a counted attempt, the end of a failure run, or a quarantine.",
+   "status": "partly",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "currentSequence.2": {
+   "sentence": "The number is the head of the branch this handle is reading, consistent with its `currentBranch()` even for a branch-bound view. It covers the whole record across states and namespaces, not just the newest message, a filtered view, or a position in a presentation window.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "currentSequence.10": {
+   "sentence": "Reading the head does not write a record, advance the head or select another branch. In particular a topology dry run and the strategy’s read-only reload of branch state can inspect it without modifying the store.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "currentSequence.3": {
+   "sentence": "For a stored-row cutoff, every row already on the branch has `row.sequence <= head`, including hidden rows; rows stored later have strictly larger sequences. Read marks, pre-turn checkpoints, thinking-binding records, direct-write notices, and tune-out run and last-look bounds use this ordering; it does not tell them which rows were presented.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentSequence.13": {
+   "sentence": "Equality with a requested `atSequence` identifies exactly the live checkpoint that `createBranchWithStates` inherits. Derivation records this head and can seed the child with the parent’s live caches there; a different historical checkpoint goes through `createBranchAtWithStates` and is loaded cold.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentSequence.14": {
+   "sentence": "A head read after `presentRows` is at or past the write that presented the rows. An `atSequence` snapshot there includes that presentation, whereas cutting at the rows’ own storage sequences can leave them outside the child’s window.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentSequence.7": {
+   "sentence": "A saved head uses the same coordinates as Chronicle’s `branchPoint` on the shared parent history. A materialization pins the head its push planned from (a fork there or later retains the planned state); a direct disk write follows the captured head (only a fork strictly past it retains the write), and an awaited unlink can use its pre-unlink position if the branch moved.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentSequence.8": {
+   "sentence": "A cutoff inherited across a fork remains meaningful for the common prefix: an inherited thinking-binding start is at most the branch point, a legacy read mark can cover through the smaller of head and branch point, and a run start can be carried onto a child forked strictly past it. A head on an unrelated branch is not interchangeable with this one.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentSequence.12": {
+   "sentence": "The sequence read before a repair rewrites a state remains a historical address afterwards. With the reported branch selected, `getStateJsonAt(stateId, sequenceBefore)` must recover the old summaries, not the repaired ones.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "currentSequence.9": {
+   "sentence": "The head can be persisted as a finite, nonnegative sequence anchor, including when no window row exists at or beyond a chosen ordinal. Tune-outs use it for the epoch start in record coordinates; on reload an anchor equal to the branch head remains valid, while one greater than the head is rejected.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "currentSequence.5": {
+   "sentence": "An unreadable head is distinguishable from a valid position by a synchronous throw. Best-effort callers can then return no mark or position, keep a prior direct-write position without denying the disk write landed, omit a boot or branch-move bound, or log and omit a load-repair report while proceeding with the repair.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "currentSequence.15": {
+   "sentence": "`storeHeadOf` distinguishes absence from failure: it feature-detects the method for context doubles and falls back to the last message’s sequence or zero only when the head is undefined. A throw yields `null`, not that fallback.",
+   "status": "no test",
+   "note": "Not a requirement of the store. This describes storeHeadOf's treatment of doubles with a missing, zero-returning or throwing method. Chronicle cannot test the fallback chosen by a caller."
+  },
+  "currentSequence.6": {
+   "sentence": "Where a head is required to make a branch or persist a new ordinal anchor, failure must be observable before that operation proceeds, not converted into a plausible cutoff. In offline recovery this is a failure of the recovery body: the caller checks or restores the source branch and settles the prepared batch accordingly.",
+   "status": "no test",
+   "note": "Not a requirement of the store. The native failure signal is already pinned for a deleted view and is further checked for closure. Preventing a dependent fork, restoring the source and settling offline recovery work after the read throws are decisions of the recovery program."
+  },
+  "open.4": {
+   "sentence": "A copy of the store directory can be opened at the copy's path. Its lock, recovery and any applied repairs concern that copy, not the resident's original directory.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "open.3": {
+   "sentence": "The raw handle exposes the current persisted named state through `getStateJson`, as stored. Opening alone does not register missing application states, settle or deduplicate summaries, or turn malformed values into empty ones; the callers inspect, validate or repair those values themselves.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "open.8": {
+   "sentence": "The opened handle retains the store's state registrations and can enumerate their IDs with `listStates()`. The inspector chooses among registered message slots, and the scanner discovers summaries without being given their namespaces.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "open.7": {
+   "sentence": "Opening takes the store's exclusive lock, even for inspection. If another process holds the store open, a second open on that directory is refused rather than returning a concurrent reader or writer.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "open.14": {
+   "sentence": "Torn-tail recovery is observable as a shrink of `<path>/records.log` back to the last whole record during the call, even if a later open step throws. The inspector infers the number of dropped bytes and the new end offset from the before/after sizes; it cannot rely on a returned recovery report on failure or a later open to report the lost bytes.",
+   "status": "no test",
+   "note": "The requested evidence after *failed* open is the physical size of a particular log at a particular frame boundary; there is no handle or public recovery report on failure. Do not introduce a new store-format test for the inspector's filesystem inference."
+  },
+  "open.15": {
+   "sentence": "After an unclean shutdown the opened store may have corrected branch heads, which closing the handle can persist to `branches.bin`. The inspector's forensic instructions therefore promise logical inspection, not preservation of the original files byte for byte.",
+   "status": "no test",
+   "note": "Not a requirement of the store. The logical reconciliation is already observable/tested on reopen. Proving that close and not the next open specifically wrote corrected bytes to branches.bin requires inspecting persisted internals; the forensic warning allows such writes, it does not require them."
+  },
+  "open.16": {
+   "sentence": "The positions in a list read from the opened handle correspond to the positions edited on that handle. Backfill records matches by persisted slot index, including duplicate entry IDs, and updates just those slots with `editStateItem`.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "open.17": {
+   "sentence": "A caller can persist a repair through the handle's synchronous `sync()` without first closing it. The L4 repair syncs the changed state before writing its repair receipt and telling the operator to restart.",
+   "status": "partly",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "open.18": {
+   "sentence": "The inspector can lend the returned handle to `MessageStore` and to `ContextManager.open({ store, … })` without opening the path a second time. It retains responsibility for cleanup and uses `isClosed()` on that handle before calling `close()` in `finally`.",
+   "status": "no test",
+   "note": "Not a requirement of the store. Whether MessageStore and ContextManager accept a lent root and decline ownership of it is an integration test for those libraries. The store only supplies an open shareable object, exclusive path locking and a live/closed flag."
+  },
+  "open.12": {
+   "sentence": "Opening for repair preserves access to pre-repair history rather than flattening it into the latest state. In particular, topology repair treats the handle's `currentSequence()` and branch name before the write as coordinates at which the old summary text remains readable afterwards.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "listBranches.1": {
+   "sentence": "A zero-argument call returns the rows synchronously as a JavaScript array. Callers use `map`, `some`, or `find` immediately; a Promise, cursor, or bare iterable is not interchangeable.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.2": {
+   "sentence": "A successful list gives the live branches of this store without changing the selected branch. It includes the selected branch and branches made elsewhere or in earlier processes, reflects intervening creates and deletes, and does not list deleted branches merely because their journal records survive.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.10": {
+   "sentence": "The listing surfaces need one row per live branch: they map rows without deduplicating, and the mapped array's length is reported as the branch count.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.6": {
+   "sentence": "Membership by exact name agrees with the branch-creation operations’ notion of an occupied name. Callers use a miss to choose an unused default and a hit to refuse a collision before preparing a recovery, rollback, or suppression; the list is a check, not a reservation.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.5": {
+   "sentence": "`id` is the branch’s native string identifier, unique among the live rows and consistent with the ID from other store calls. In particular, an ID saved in a workspace pin or direct-write position must still identify that same branch if it exists, not a replacement with its name.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.12": {
+   "sentence": "After a failed derivation, a row with both the requested name and the ID returned by `createBranchWithStates` or `createBranchAtWithStates` must mean that `deleteBranch(name)` still targets the child this derivation created. A child already removed or replaced under that name must not pass the check.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.13": {
+   "sentence": "`head` is the numeric current head sequence of the row’s own branch, including for branches other than the selected one. ContextManager passes it through unchanged for display.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.9": {
+   "sentence": "`created` is the native numeric creation timestamp. It is directly comparable to a captured store timestamp, and is in epoch milliseconds so `new Date(b.created)` produces the creation date without parsing or rescaling.",
+   "status": "differs",
+   "note": "The store gives `created` in microseconds since the epoch, on the same clock as currentBranch's `created`.",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.11": {
+   "sentence": "The pair `(id, created)` must match the branch reference captured by `currentBranch()` at compile time and distinguish that branch from a foreign or replacement branch, independently of name or later selection. A live match can authorize acceptance or resolve a receipt query; on a live miss the journal alone supplies evidence of a deleted branch, and a name query prefers its live owner.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.7": {
+   "sentence": "A fork’s `parentId` identifies its immediate parent by native ID in the same list when that parent is live; following those links describes actual, acyclic ancestry. A root, missing intermediate branch, or missing fork metadata must not manufacture a common ancestor: the workspace treats unprovable continuation as unsafe and the tune-out hook can return no origin.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.8": {
+   "sentence": "When present, `branchPoint` is the numeric last parent sequence inherited at the same sequence numbers, not the branch’s current head; zero is a value, distinct from missing metadata. Exact boundaries matter: common-history walks take minima, materialization permits a fork at the pinned sequence, a direct write requires every fork strictly after its saved head, and tune-out inherits a start only from a direct parent cut strictly past that start.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "listBranches.3": {
+   "sentence": "If the list cannot be read reliably, signal that by a synchronous throw rather than by returning an empty or partial successful list. An ordinary miss is actionable; in particular, the two failed-suppression diagnostics treat a throw as “unknown, possibly kept,” not as confirmation that the target branch is gone.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "storeBlob.1": {
+   "sentence": "Accept a Node Buffer and a content-type string for the complete payload. Callers pass UTF-8 JSON and text, decoded media bytes and arbitrary binary file contents; the type can be supplied by the caller rather than chosen from fixed store constants.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "storeBlob.4": {
+   "sentence": "Keep the bytes available for the lifetime of their persisted references, including after reopening the store or returning to a branch that holds a reference. When a caller syncs the referencing state as a durability barrier, the blob it names must survive with it; this does not require a separate fsync on every blob call.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "storeBlob.7": {
+   "sentence": "For media references, plain mint preimages and workspace file versions, the key must equal the full lowercase 64-hex SHA-256 of the supplied bytes alone, independent of MIME type. Callers share that identity with existing media blobs, independently hashed request JSON, disk observations, write receipts and recovery reads.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "storeBlob.12": {
+   "sentence": "A whole-request preimage must remain findable by its independently computed digest without a blob index entry or any use of the return value. If the request changed after provenance was computed, the write is under the digest of the bytes actually passed, not the stale provenance key.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "storeBlob.8": {
+   "sentence": "The returned identifier must be a usable `blobHash` for a subsequent `treeSet` or `treeBatch` entry carrying the input's byte length and the caller's mode. Staging bytes is distinct from publishing a path: an edit can stage several blobs, and a failure before the tree commit must not expose any of the planned edits.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "storeBlob.13": {
+   "sentence": "Refuse a non-string media type if a direct `extractBlobs` call reaches the store without a declared or sniffed string type. The normal message-write boundary checks this itself; the direct path deliberately leaves the refusal to Chronicle.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "storeBlob.9": {
+   "sentence": "For workspace tools to give errno-specific diagnoses and remedies, a system write error must expose a Node-style errno code or, on POSIX, an Error message of the form `IO error: … (os error N)`. Unrecognized errors still propagate with their own text; the workspace does not treat every message ending in an OS number as an I/O error.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "storeBlob.14": {
+   "sentence": "After a repair attempt, readback under the old hash must reveal whether the blob is actually readable, even if `storeBlob` threw after writing or returned without replacing a damaged file. The caller tolerates either repair outcome: it reports restored or unstored based on readback and can serve the independently verified disk bytes in either case.",
+   "status": "pinned",
+   "tests": [
+    "src/blobs/storage.rs"
+   ]
+  },
+  "appendToStateJson.1": {
+   "sentence": "Accept a string state ID and a caller-built JavaScript item directly, including nested objects, arrays and optional properties; callers do not encode the item as bytes. A freshly registered `append_log` must accept its first item without a separate write of `[]`.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "appendToStateJson.3": {
+   "sentence": "Finish the state update synchronously on success and signal a write failure by throwing in the call. A delayed rejection, error return or silent no-op cannot drive the callers' retry, rollback or reporting paths; no caller examines the successful return value.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "appendToStateJson.7": {
+   "sentence": "Preserve inline JSON and caller-supplied blob references as distinct forms of the item. The context log resolves its stored `blob_ref` blocks, and inference, process and guard-audit readers recognize `{ blobId }` and fetch that exact blob later; append itself need not store or expand a blob.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "appendToStateJson.9": {
+   "sentence": "The context and autobiographical logs need readable JSON when a JavaScript string value contains a lone UTF-16 surrogate: it reads back as U+FFFD. Their byte-based edits deliberately match the object append for string values, and the strategy compares its in-memory mirror against that normalized stored form.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "appendToStateJson.15": {
+   "sentence": "Keep the coalescer's own `seq` on each journal item unchanged. The next table stores the last such number, and restore applies only items above it, in log order; the record's store-assigned sequence is no substitute for this watermark.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "appendToStateJson.13": {
+   "sentence": "A successful later `sync()` must cover the preceding appends and make them recoverable after a crash. The guard does not submit original results before that barrier, and the coalescer does not acknowledge acceptance or start a render before its commit barrier.",
+   "status": "no test",
+   "note": "The remaining gap explicitly requires discarding unflushed appends. Child exit without destructors still recovers from the OS page cache."
+  },
+  "treeList.1": {
+   "sentence": "The state ID selects exactly one registered tree. A mount’s workspace entries and its branch-intent records are separate inventories, even when they use the same path.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.2": {
+   "sentence": "The list reflects the tree on the branch selected at the time of the call, including after a switch, rollback or suppression. A reconciliation pass and a materialization label their selected paths with `currentBranch().id`; paths from a different branch under that label would lead to wrong decisions or disk writes.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.3": {
+   "sentence": "Membership is the live set of stored entries, consistent with `treeGet`, `treeSet` and `treeRemove`: an updated entry replaces the old one, a removed entry is gone, and an implied parent directory is not a file entry. Drafts and other stored paths still count when absent from disk; disk walks, include rules, nesting and evidence are applied by the callers, not used to preselect the inventory.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.4": {
+   "sentence": "The result is an array available synchronously, usable with `for…of`, `.map`, `.filter`, `.some` and `.length` without an `await` or conversion. An empty tree or unmatched prefix yields an empty array, not `null` or an error: callers use zero versus nonzero length to decide whether a directory exists in history.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.9": {
+   "sentence": "A root listing covers every entry at every depth in the named tree. Status, evidence and whole-mount materialization omit the prefix; intent listing, directory listing and reconciliation pass `undefined`; the path-spelling helper passes the literal empty string.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.8": {
+   "sentence": "For a directory prefix such as `src/`, the selection is by the literal stored prefix, at arbitrary depth. It includes `src/sub/f`, not the exact key `src` or a sibling such as `src2/f`; callers that need the exact key as well look it up separately.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.7": {
+   "sentence": "Each consumed `path` is the full string key from the mount root, with the prefix still attached and the stored spelling intact. Callers split at `/`, compare case and apply path rules themselves; normalizing an old key such as `a//b.txt` into a valid path would make them act on a different name.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.10": {
+   "sentence": "A stored key appears only once. Status counts filtered file entries by length, intent enumeration feeds conflict and deletion counts, and evidence classification counts agreement per entry; none of these counts deduplicates its input.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.11": {
+   "sentence": "The path-spelling caller relies on path order to break ties. When disk lacks a name and several stored spellings match under simple case folding, an exact spelling wins; otherwise the first matching spelling in the list wins, without a caller-side sort.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.12": {
+   "sentence": "An intent entry carries the `blobHash` stored at that path, usable unchanged with `getBlob` to read the intent JSON. Listing the reference does not require readable blob contents: the caller reports a missing or unreadable intent as damaged, not as an absent path.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.13": {
+   "sentence": "For a workspace file, `blobHash` is the content hash of the currently stored bytes in the same representation as disk-agreement evidence (full SHA-256 hex). Evidence classification compares the strings directly to decide whether disk is owed a change.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.14": {
+   "sentence": "The numeric `mode` preserves the stored file-type and permission bits, including the distinction between a recorded regular-file mode and a legacy placeholder without type bits. Otherwise evidence classification can miss a mode owed to disk or invent one where no mode was recorded.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.5": {
+   "sentence": "An actual failure to read the tree throws with a reportable cause rather than returning an empty or partial inventory. Tool calls report failure, a failed programmatic materialization rejects, and a failed inventory read while choosing mount backends leaves the existing choices in place.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeList.6": {
+   "sentence": "On tool-call paths, an OS I/O failure needs to retain a recognizable errno for the caller to give errno-specific advice: either an `E…` code or, on POSIX, an `Error` message of the form `IO error: … (os error N)`. For other failures the caller reports the bounded diagnostic rather than requiring an errno.",
+   "status": "no test",
+   "note": "Cold malformed tree data can produce a real read error, but it has no OS errno. The open store reads through an already-open descriptor/cache; the existing checkpoint obstruction and write-size limit do not inject a named OS read errno into this live Node listing."
+  },
+  "getBlob.2": {
+   "sentence": "On a hit, the result is a Node Buffer containing the complete original payload stored by storeBlob under that key, not a preview, decoded object, base64 string or blob descriptor. A stored zero-byte payload is still a hit.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.3": {
+   "sentence": "An ordinary lookup of a valid hash with no blob returns null rather than throwing or returning placeholder bytes. Six functions test truthiness; the three mint-preimage functions specifically distinguish null, so undefined is not an interchangeable miss.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.5": {
+   "sentence": "For stored JSON, the Buffer decodes to the original UTF-8 text with toString() or with the explicit utf8 or utf-8 encoding. Parsing and schema checks belong to the caller: this is how logs, checkpoints, audit content, workspace intent, envelopes and plain mint requests are read.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.6": {
+   "sentence": "For binary media, toString('base64') on the result gives the canonical base64 encoding of the stored bytes. Workspace images and message media use that encoding directly; mint reconstruction reapplies the saved alphabet, padding and whitespace to reproduce the exact authoring request.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.8": {
+   "sentence": "Successful resolutions can be reused by hash alone: the bytes a hash denotes do not change between reads or depend on which record refers to it. BlobManager caches the encoded string on that basis, and workspace shares one resolution among multiple file versions with the same hash.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.10": {
+   "sentence": "Blob resolution is shared across branch-bound views of the same store. A derived MessageStore uses the parent's BlobManager, including its handle and resolve cache, rather than requiring a branch-specific blob reader.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.4": {
+   "sentence": "Reopening an intact store with durably saved references must not invalidate their blob keys. The readers resolve history, tree entries, media and provenance from persisted identifiers; in particular, boot recovers original tool results from an audit blob synced before a crash.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "getBlob.11": {
+   "sentence": "A successful workspace read yields bytes that remain usable while the caller fetches other blobs and performs later I/O. Materialization retains a Buffer per planned write; a single scratch buffer overwritten by successive reads would write the wrong files.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "getBlob.12": {
+   "sentence": "On an open store, an existing blob file that cannot be read whole or fails its format, checksum or content-hash check throws with a printable reason; it is neither a normal miss nor usable partial data. Workspace uses the reason to report the copy as unreadable and can skip a write or seek a verified disk copy.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getBlob.13": {
+   "sentence": "A read on a closed store throws, with isClosed() reporting closure in the catch path. Workspace rethrows the store's error instead of diagnosing a missing or damaged blob.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getBlob.9": {
+   "sentence": "An immediate read after storeBlob reports what actually became readable, without a sync, reopen or tree update. Mint verifies newly written media before indexing an envelope; workspace decides whether repair took by rereading the old hash, not by whether storeBlob returned or threw.",
+   "status": "pinned",
+   "tests": [
+    "src/blobs/storage.rs"
+   ]
+  },
+  "getBlob.14": {
+   "sentence": "A missing or unreadable lookup is not a permanent negative result on that handle. Workspace promises that restoring the blob file from backup makes it readable again, and that removing a damaged file left in place allows a later read to retry storage from matching disk bytes.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getStateItemJson.2": {
+   "sentence": "Read the append log named by the supplied state ID. The callers distinguish `messages` and `context` from their namespace-prefixed variants, and the ended-agent lookup names a separate `framework/dendrite/ended` log.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateItemJson.5": {
+   "sentence": "Resolve the item on the receiving handle’s branch, including on a newly forked view and after a branch switch. The same state ID, length and ordinal can denote different data on different branches; using the parent’s tail on a child, or the old branch’s record during registry reindexing, gives a false match.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateItemJson.8": {
+   "sentence": "Reflect completed writes visible on that branch without requiring a reopen or sync. In particular, read back a just-appended tail, an edited item at its existing position, and suffix records appended through a sibling MessageStore; do not serve the pre-write item from a point-read cache.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateItemJson.9": {
+   "sentence": "Return the full stored message or context entry, including its stored content blocks and blob references, not a projected or already blob-resolved view. The readers resolve blobs themselves, use participant, metadata, timestamp, shard, source and cache fields where present, and carry the other stored fields through when editing only `content`.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateItemJson.10": {
+   "sentence": "Preserve a message’s stored `id` and numeric `sequence` as stamped by `appendToStateJsonWithIdentity`; the sequence is the append record’s sequence, not the slot index or the sequence of a later edit. The derived-store seed check and the message-cache tail check compare both fields by strict equality, and a message read can supply the sequence for a later branch cut.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "getStateItemJson.11": {
+   "sentence": "A point-read message used to populate the warm cache must stringify the same way as that item from a fresh `getStateJson` rebuild. This includes omitted undefined fields, lone-surrogate normalization and the store version’s key order; a merely similar hand-built object changes content hashes.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "getStateItemJson.12": {
+   "sentence": "A returned message object must remain a snapshot when the caller retains it: a later read or edit must not repurpose or mutate that object in place. MessageStore retains point-read objects in arrays shared across derived stores and memoizes their caller-facing views by object identity.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "getStateItemJson.13": {
+   "sentence": "Return the stored ended-agent record, including its string `name`, `incarnation`, `ended.at`, and, when present, `namespace` and `inherit.mode`. The framework uses these fields to recognize a changed tail, index the latest named end, exclude shared forks from namespace ownership, and return the matching record itself.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateItemJson.14": {
+   "sentence": "Distinguish a store read failure from an absent ended record: throw on an unreadable ended log so that the lookup and its namespace-ownership check fail, rather than allowing the name or namespace to appear unused.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "getStateItemJson.7": {
+   "sentence": "Make repeated lookups point reads: fetch and convert the requested item without materializing the entire log for each index. The context and message readers explicitly budget O(item size); cheap tail and suffix reads also make derived-store seeding, cache write-through and incremental ended-log indexing worthwhile.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-read-scaling.test.mjs"
+   ]
+  },
+  "listStates.1": {
+   "sentence": "With no arguments, `listStates()` returns a JavaScript array synchronously, including an empty array when there are no states. Callers use `map`, `filter`, `slice`, `find`, `some`, or `for…of` without awaiting or unwrapping a result.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.2": {
+   "sentence": "Each entry exposes the exact registered name as a string in `.id`. Callers compare whole names, test namespace prefixes and summary suffixes, and strip suffixes to recover namespace names; a shortened name or opaque handle does not work.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.3": {
+   "sentence": "Membership reflects the registrations in the opened store: existing IDs are discoverable across namespaces and after reopening, and unregistered IDs have no match. The list is not a page, a list of nonempty values, or a selection based on the current configuration: callers apply those distinctions themselves.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.7": {
+   "sentence": "A state ID occurs at most once. The API lists and counts rows without deduplicating them, and the corruption scanner scans each matching row; duplicates would repeat states, inflate search totals, or double-count findings.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.9": {
+   "sentence": "Each entry supplies the state's strategy name as a string in `.strategy`. The `store.states` response forwards it directly rather than looking it up or deriving it from the state value.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.8": {
+   "sentence": "The listing order is observable: `store.states` takes the last entries in that order, and `store.search` pages the matches in that order. For successive offsets to partition unchanged search results, the matches must retain their relative order; neither caller specifies a sort key.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.5": {
+   "sentence": "A listed or matched ID names the same state for subsequent reads on that store; membership alone does not promise a non-null payload. Seven callers use `getStateJson` to read by that ID, while the workspace uses the matched tree and intent IDs to check for changes held on the selected branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.6": {
+   "sentence": "Listing supports inspection without changing the store: it neither registers a missing state nor rewrites existing data as a side effect. The diagnostic scripts inspect persisted registrations, direct mounts need not create workspace trees, and probing for a previous presentation must leave its receipt alone.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.10": {
+   "sentence": "A receipt registration found while loading a non-kv-unified strategy identifies a valid target for a later `setStateJson(id, null)` without registering it again. The caller arms that write only for a listed receipt with non-null data and performs it only after a successful non-dry-run adaptive presentation.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "listStates.4": {
+   "sentence": "If enumeration fails, it must signal failure by throwing rather than returning an empty or partial inventory: callers interpret missing IDs as real negatives. No caller checks a listing-specific error code or message; for example, the inspector distinguishes a missing or ambiguous registration (exit 2) from a read failure (exit 1).",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "redactStateItems.1": {
+   "sentence": "Redaction targets only the named append-log state on the receiving handle’s branch. The names can be shared or namespaced message/context slots, or a namespaced quarantine ledger; the same name on a different branch is not a second target.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "redactStateItems.4": {
+   "sentence": "Normal return means the change is already visible: callers immediately rebuild indexes, emit removal events, append replacements or compact. They discard the returned record, so failure must be signaled by throwing synchronously, not by returning a failure value or a promise.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "redactStateItems.9": {
+   "sentence": "Clearing the entire context log leaves the same state ready for `appendToStateJson`, without re-registration. The first replacement gets index zero from the cleared length; an empty replacement leaves no entries.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "redactStateItems.8": {
+   "sentence": "A range that removes a sharded message cannot leave only some shards removed. `removeBodyGroup` relies on one all-or-none write for the selected ingestion, even when cleanup throws; `removeRange` likewise passes body-aligned bounds so it does not break a body.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "redactStateItems.6": {
+   "sentence": "Where `stateHeadOffset` is available, a successful message redaction changes the revision of that slot on that branch, and every handle on the branch sees the new revision. MessageStore records it immediately; a sibling must not treat its pre-redaction cache or ID-to-position map as current.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "redactStateItems.10": {
+   "sentence": "Quarantine checkpointing measures the ledger length before appending its checkpoint. Redacting that old prefix must leave the newly appended checkpoint intact as the complete replayable projection, including after a crash between redaction and `compactState`; compaction must operate on that surviving state.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "getStateLen.3": {
+   "sentence": "For seven callers, a never-written state is a successful empty count, not a read error. They accept `null` and convert it to zero; none of these seven needs to distinguish it from numeric zero.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateLen.10": {
+   "sentence": "The window-index fallback needs `null` specifically when the branch has no record for the index, without creating the index by inspecting it. A written state must not masquerade as absent: a null revision skips the value read, including the check for a foreign window format.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "getStateLen.8": {
+   "sentence": "A saved count is the exclusive end accepted by `redactStateItems(id, 0, count)`. Context replacement clears exactly the old log; quarantine checkpointing uses the event count to test its 256-event threshold, then removes exactly those old events after appending the checkpoint, leaving the checkpoint intact.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs",
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "getStateLen.11": {
+   "sentence": "When `stateHeadOffset` is unavailable, the window index uses the length as its append-only revision: it stays stable for an unchanged list and reflects new items, including writes through another handle on the branch. The caller pairs it with `currentBranch().id`; equal lengths need not identify equal indexes across branches.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateLen.2": {
+   "sentence": "An inability to determine the count is signaled by throwing synchronously, not by returning `null`, zero, or a stale length. The callers have no separate error-result channel; in particular, an unreadable ended log must fail the lookup rather than let a namespace ownership check pass.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getStateLen.9": {
+   "sentence": "After an append throws, a successful reread reflects what actually landed on that branch, not what the write reported. Message recovery checks the row at the pre-write length, and the no-offset window index rereads its revision; if the reread fails too, the caller reports an unknown write outcome rather than treating the write as absent.",
+   "status": "no test",
+   "note": "The ordinary pre-write-refusal and cross-handle length cases are observable. For the remaining case there is no surfaced, injectable post-publication identity append failure, and length on a live valid branch comes from head metadata rather than reading that failed record."
+  },
+  "getStateLen.5": {
+   "sentence": "Counting must not require reading or materializing the whole log on paths designed to avoid that work: the message-count API specifically promises O(1). The same cost distinction matters when seeding a derived store, checking the append-only window cache, and looking up an ended agent without rescanning old entries.",
+   "status": "pinned",
+   "tests": [
+    "tests/reconstruction_scaling.rs"
+   ]
+  },
+  "isClosed.3": {
+   "sentence": "After `close()` throws, the answer must reflect whether the handle was consumed, not whether `close()` returned successfully: true even if its internal sync threw after consumption, false if the handle remains open. This lets `stop()` retain the original terminal failure rather than retry a consumed handle, and lets failed-create cleanup close a handle that a failed stop left open.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "isClosed.4": {
+   "sentence": "False must leave `currentBranch()` available for the API’s immediate live read, so a branch move outside the API is not hidden by its cache. True makes the API return the last known branch without reading the closed store.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "isClosed.5": {
+   "sentence": "After `getBlob()` throws, the probe must distinguish a closed handle from a blob read failure on an open handle without replacing the exception. On true the workspace rethrows that same error; on false it reports the blob as unreadable.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "isClosed.6": {
+   "sentence": "After the manager closes, false must still permit lookup of an existing identity record if the store remains open; true must select the in-memory identity cache alone. `getStoreId()` can then return a known ID or refuse by name, without reading a closed store or minting a new ID.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "isClosed.7": {
+   "sentence": "A scheduled compression drain needs the handle’s state when its timer fires, not when the previous tick scheduled it. If the host closed the store in between, true must stop the timer quietly before a branch read or another tick; a thrown probe error would instead be logged as a drain failure.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "openOrCreate.17": {
+   "sentence": "The path configuration accepts and applies a numeric `blobCacheSize`. ContextManager supplies the configured value, or supplies 1000 itself; it does not rely on 1000 being Chronicle’s default.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "openOrCreate.10": {
+   "sentence": "An absent store directory is sufficient to create a fresh, empty store there. New sessions create the parent but deliberately do not create or initialize the store directory; different session paths must yield isolated stores.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "openOrCreate.13": {
+   "sentence": "The directory named by `path` remains usable for application files alongside Chronicle’s own files. Framework start and offline recovery must be able to reopen that directory without rejecting or clearing the awareness ledger stored under it.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "openOrCreate.4": {
+   "sentence": "The open is exclusive per store: there cannot be an independent live writer to the same store outside the returned object, even in another process. Managers can share that object; the lock is not a lock on all stores, since the trial audit opens other stores while the host holds its active one.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "openOrCreate.14": {
+   "sentence": "Reopening a closed store for framework or context-manager work yields a new JavaScript object. Per-object journal indexes and identity caches must not be carried from a closed handle into the next open.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "openOrCreate.5": {
+   "sentence": "The returned handle includes a callable `appendManyToStateJsonWithIdentity`. Both framework startup and ContextManager initialization check it before registering any states, so even importers or auditors that never perform a batch themselves need it to get past initialization.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "openOrCreate.15": {
+   "sentence": "A failed factory call must not leave a newly acquired lock that needs a caller to close it. Framework and ContextManager promise release on failed startup, but their cleanup blocks start only after `openOrCreate` returns a handle.",
+   "status": "pinned",
+   "tests": [
+    "tests/create_existing_store.rs"
+   ]
+  },
+  "openOrCreate.16": {
+   "sentence": "After an unclean stop or an ambiguous append, reopening must expose the complete typed records that actually landed, in replay order, even when the old handle never indexed a landed record. Framework journal replay and ContextManager’s accepted-round retry use the reopened record history to avoid losing or repeating an action.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "treeSet.1": {
+   "sentence": "In the registered tree named by `stateId`, insert or replace just the entry at the supplied string key, leaving other keys and trees alone. The key can be a mount-relative path, an agent name, or the digest of an authoring request, which is not the digest of its envelope blob.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeSet.3": {
+   "sentence": "Accept the entry's byte size and numeric mode along with its hash, and retain the supplied values for readback. Inputs include mode `0` for intent and envelope records, `0o644` for checkpoints or a workspace placeholder, and workspace modes with regular-file type and permission bits; stripping those bits or substituting a default changes the meaning of the entry.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeSet.5": {
+   "sentence": "Report a failed operation by throwing in the call, not by returning a sentinel or later rejecting a promise. That lets reconciliation stop before asserting success, checkpoint callers report a failed save, intent rollback warn without masking the original error, and mint persistence log an indexing refusal without losing the summary.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeSet.11": {
+   "sentence": "Allow a mode-only replacement using an existing entry's hash and size, without another `storeBlob`. An unchanged content hash is not grounds to discard the set: reconciliation uses it both to fill a previously unrecorded mode and to adopt a changed disk mode.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeSet.12": {
+   "sentence": "Accept a previously saved `treeGet` entry verbatim as the value of a compensating set. This restores the old intent reference and metadata without requiring the caller to decode or recreate a possibly damaged blob; the restoration itself is best effort.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeSet.8": {
+   "sentence": "Make prior tree sets durable by the time a subsequent `store.sync()` barrier succeeds; `treeSet` need not itself be a disk barrier. Reconciliation orders durable adoption intents before tree changes, then syncs this pass's file and intent changes and any earlier tool write on which a disk-agreement record relies, so that record cannot survive without the state it asserts.",
+   "status": "no test",
+   "note": "The stronger sync-before-evidence contract concerns stable media, not whether an ordinary reader can recover the tree after process exit. There is no public loss-of-unflushed-writes fixture."
+  },
+  "treeSet.10": {
+   "sentence": "After a workspace set throws or an adoption stops partway, readback on that branch must reflect whether the whole single-path change landed, not a torn entry or a write still scheduled to happen later. Tool commits compare hash, size and mode with the previously different entry and skip the disk push if the set landed then threw; a failed readback leaves the outcome unknown, and an entry already equal beforehand is not proof of a new commit.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs",
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeSet.13": {
+   "sentence": "For the checkpoint save during window undo, the retry logic assumes a failure leaves the old checkpoint list in place. Unlike the workspace tool writer, it does not check for a set that committed and then threw before telling the operator that another undo can finish the save.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeSet.14": {
+   "sentence": "Checkpoint updates must have per-entry write cost, with one tree registration independent of how many agents ever had checkpoints. Rewriting every agent's list or creating a permanent state registration per key defeats the stated reason for using `treeSet` here.",
+   "status": "pinned",
+   "tests": [
+    "tests/disk_scaling.rs"
+   ]
+  },
+  "treeSet.15": {
+   "sentence": "Setting a checkpoint entry that points to the two-byte JSON list `[]` must leave a present entry of size two, not an absent key. Its presence shadows the legacy checkpoint map, and its size tells eviction not to rewrite the tombstone.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeSet.9": {
+   "sentence": "To preserve errno-specific workspace diagnostics for a set failure, expose a conventional `E…` error code or, on POSIX, an `Error` message in the recognized `IO error: … (os error N)` form. Other throws still signal failure, but callers fall back to generic error text and advice.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.1": {
+   "sentence": "A call with one record-type string returns a JavaScript array of ID strings synchronously. Callers use `for…of`, `.map()`, `.length`, `.join()` or numeric indexing directly on the answer, without awaiting it or fetching another page.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.2": {
+   "sentence": "Match the exact type string supplied, including caller-chosen names containing `/`. In particular, an entry lookup must not also match its `/checkpoint` family, and identity IDs must not be mixed with layout IDs.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.3": {
+   "sentence": "No matching record is a successful empty array; a present record makes the array nonempty. Provider waits use this distinction to tell a checkpoint containing a null snapshot from no checkpoint at all.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.4": {
+   "sentence": "Enumerate by stored type independently of whether the caller understands the payload. A malformed checkpoint, an identity without a usable `storeId`, or a layout with an unreadable envelope must not pass for a record that was never there.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.5": {
+   "sentence": "Scope enumeration to the store, not the selected branch, its ancestry, or its current sequence. Switching or rolling back a branch must not rewind the list, and deleting a branch must not hide the records appended on it.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.10": {
+   "sentence": "A listed ID is the key for `getRecord(id)` on the same store, not a branch sequence, an array position, or an ID extracted from the payload. For an intact record that lookup must return the corresponding record; a missing listed record aborts RecordJournal replay, whereas the fold code can skip an unusable identity or report a missing layout.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.12": {
+   "sentence": "Journal and layout IDs are decimal integer strings, with real entry and receipt IDs above the `0` cursor for “nothing covered yet.” RecordJournal validates digits and parses with `BigInt`; fold cursors and comparisons parse with `Number`.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.13": {
+   "sentence": "Numeric ID order must agree with append order across branches. RecordJournal takes the greatest checkpoint ID as the newest and uses IDs strictly above its `through` ID as the tail; fold lookups likewise use IDs as chronological cursors.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.14": {
+   "sentence": "Keep the identity of a surviving record consistent between `appendJson`, enumeration and reopen. RecordJournal persists an appended entry's ID as a checkpoint boundary, and the fold index inserts the returned layout ID directly and uses persisted IDs as links and marks; it checks for reuse if recovery dropped the old tail record.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.18": {
+   "sentence": "The layout ID array must be a caller-owned, growable snapshot, not frozen or live-linked to the store's index. The fold index retains the returned array and pushes each later successful append's ID itself; neither the store append nor a fresh listing may mutate that retained array behind its back.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.19": {
+   "sentence": "On the same open store object, re-listing layouts must preserve the previously accounted-for list as an unchanged prefix and put new IDs in the suffix. After an ambiguous write the fold index reads only that suffix: a visible acceptance that landed must be there so a retry finds it, and a write that left nothing must add no ID.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs",
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.11": {
+   "sentence": "Once an append returns, its record must be discoverable on the open store even if the following sync or caller-side processing fails. Being listed is not proof of durability: journal replay reconciles the record, and identity and layout readers use a separate sync before relying on it as durable.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.20": {
+   "sentence": "If the store append itself throws after writing a record to the log but before indexing it, a same-object listing is not evidence that nothing landed. RecordJournal allows the current list to lack that record, blocks further writes, and relies on enumeration on the reopened store to include it if the log retained it.",
+   "status": "no test",
+   "note": "Not a requirement of the store. The old handle is expressly allowed to lack the ID; that is not an invariant requiring a miss. There is no injection between a successful complete log write and the in-memory type-index add to produce this specific failing append."
+  },
+  "getRecordIdsByType.15": {
+   "sentence": "Callers carrying a listing forward across writes rely on there being no unaccounted-for same-type writer. RecordJournal assumes one writer per type so a later checkpoint cannot cover an unreduced entry; the fold journal supports multiple writers only because they share the index on the one open store object.",
+   "status": "no test",
+   "note": "Not a requirement of the store. Independent open exclusion is testable and allocated. Per-type writer ownership and sharing a retained JS index among clients of the same object are journal-protocol requirements, not properties of type enumeration."
+  },
+  "getRecordIdsByType.7": {
+   "sentence": "Signal failure to enumerate by throwing synchronously, not by returning an empty or partial success. That lets replay abort, provider waits fail closed and retry, identity lookup avoid minting on a failed read, and fold indexing retry rather than cache an incomplete history (a compile then carries no mark).",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getRecordIdsByType.16": {
+   "sentence": "Looking up identity IDs must not mint an identity record. The read-only lookup may run after the manager closes if the store itself is still open; the minting path separately decides whether to append and sync a new identity.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "editStateItem.1": {
+   "sentence": "The edit addresses an existing item of the named append-log state by its zero-based position in the stored array. The index is not a record sequence, a payload ID, or a position in a filtered in-memory list; the same ID can occur at several independently editable positions.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "editStateItem.2": {
+   "sentence": "The Buffer contains UTF-8 JSON for the whole replacement item, not a patch or a record envelope. Reads must recover the supplied value, including existing fields the caller carries forward: for example, editing message content must not replace the message’s ID or original append sequence with those of the edit record.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "editStateItem.13": {
+   "sentence": "The backfill requires a per-slot edit rather than a whole-array Set: even the bytes of unrelated slots stay intact, and the edit does not resurrect entries that a whole-array Set on an append log could bring back.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "editStateItem.14": {
+   "sentence": "For a module’s accumulating log, the edit record is proportional to the replacement item’s size, not to the size of the accumulated log. Snapshot consolidation is separate from the point edit.",
+   "status": "pinned",
+   "tests": [
+    "tests/disk_scaling.rs"
+   ]
+  },
+  "editStateItem.7": {
+   "sentence": "The five context-manager writers need the JSON prepared by `storedJson` to round-trip on read and replay. In particular, its replacement escape for a lone surrogate reads as U+FFFD, while a literal backslash escape in the original text stays literal; the callers do the sanitizing, not `editStateItem`.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "editStateItem.11": {
+   "sentence": "The edit leaves its input Buffer usable with the same bytes for another edit. The chunk and merge writers serialize once, outside their loops, then pass that same Buffer for every matching copy.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "editStateItem.15": {
+   "sentence": "For a changed message, the post-edit point lookup supplies the canonical value a fresh materialization would produce, without mutating the previously materialized message object in place. The message store caches the re-read object and memoizes views by object identity.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "editStateItem.12": {
+   "sentence": "Chunk compression and summary merging rely on separately persisted writes in program order. A crash between the summary append and the chunk mark, or partway through the source-marking loop, can leave the new summary and only the marks already written; restart repairs from that prefix.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "editStateItem.16": {
+   "sentence": "Where native history indexes are available, editing message content must not silently lose the message from timestamp or channel searches or map a match to a different row. The caller fetches the edited content at the ordinal returned by the index; it tolerates an unavailable index by re-registering and retrying, not by accepting incorrect hits.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "stateHeadOffset.1": {
+   "sentence": "When available, `stateHeadOffset` is a synchronous function on the store handle. It takes the exact string state ID—`messages` or a namespaced message, window, summary or chunk slot—and answers for the branch that handle sees, without a separate branch argument.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "stateHeadOffset.2": {
+   "sentence": "`null` means the state has no chain record on this branch, including before its first write; an existing head has a numeric offset even if its stored value is JSON null or is not a readable window index. MessageStore reserves `-1` for the no-head case, and the strategy can remember `null` as a known revision.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "stateHeadOffset.3": {
+   "sentence": "The offset identifies the state's newest chain record. Every write to the state on that branch changes the revision, including count-preserving edits, redactions, replacements and store-generated snapshots; neither item count nor equality of the materialized values suffices.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "stateHeadOffset.10": {
+   "sentence": "For the window state, offsets are comparable across branches of the same store: an inherited head keeps its offset, and divergent heads must not alias even if both indexes have the same length. WindowIndex omits the branch ID from its cache key and uses offset equality both after branch switches and when seeding a derived index from its parent.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "stateHeadOffset.6": {
+   "sentence": "A revision check immediately before a write sees any intervening write; a check immediately after sees the head the store actually kept, not the pre-write head or a predicted revision. This lets MessageStore detect gaps between counted writes, WindowIndex stamp its in-place update after a single or batched append, and the strategy certify a mirror only if it was current going into its own write.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs",
+    "test-views.mjs"
+   ]
+  },
+  "stateHeadOffset.7": {
+   "sentence": "If the method is present but cannot determine the head, it must not return `null` or a stale offset as though the check succeeded; a synchronous throw is distinguishable. MessageStore propagates it, WindowIndex drops a reading whose post-write stamp failed and retries from the store (a failed recovery read leaves the write outcome unknown), and the strategy converts the throw to `undefined` and reads and compares the state instead.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "stateHeadOffset.8": {
+   "sentence": "Support is detected by `typeof ... === 'function'`, not by a trial call. An absent method is supported differently from a failing callable: MessageStore uses its per-handle write version, WindowIndex uses state length plus branch ID, and the strategy forgoes revision-based skipping.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "stateHeadOffset.9": {
+   "sentence": "Looking up a head must be cheap enough to check freshness without materializing the state on every read. It is on the message ID lookup path, on every window-view read, and is used specifically to avoid rereading unchanged summaries and chunk records.",
+   "status": "pinned",
+   "tests": [
+    "tests/reconstruction_scaling.rs"
+   ]
+  },
+  "appendManyToStateJsonWithIdentity.1": {
+   "sentence": "The store handle exposes a function named `appendManyToStateJsonWithIdentity` even before the first window write. Context-manager and agent-framework check the handle at open or creation; context-manager checks again before registering the state for a multi-item write, with no per-item fallback.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "appendManyToStateJsonWithIdentity.11": {
+   "sentence": "The answer's numeric `firstOrdinal` is the actual zero-based position the first item took in the target state: its item length immediately before this append, including intervening writes by another handle. The writer compares it with its cached length to decide whether it can extend that cache or must discard it.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendManyToStateJsonWithIdentity.6": {
+   "sentence": "The append completes synchronously on the handle's current branch. By normal return the state's revision reflects the write: the writer immediately reads `stateHeadOffset`, or branch-local `getStateLen` on a handle without offsets, and another reader uses the changed revision to detect the append.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendManyToStateJsonWithIdentity.7": {
+   "sentence": "A retained append is readable as the same stamped items at the same positions through `getStateJson` and, when supported, `getStateSlice`. This lets another manager see the write and lets a reopened manager reconstruct the writer's window without its in-memory cache.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendManyToStateJsonWithIdentity.12": {
+   "sentence": "The record ID is stable and unique to the write across branches: an inherited record keeps its ID, but an independent presentation does not reuse it even at the same ordinal and sequence. The index compares `by` to recognize a shared prefix and to distinguish which presentation a removal concerns.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendManyToStateJsonWithIdentity.15": {
+   "sentence": "Failure is signaled by a synchronous throw, not a normal error-valued answer; the caller needs no particular error code or message. A throw is not proof the write was refused: the index discards its cache and uses the next successful read on that branch to settle whether the batch landed, treating the outcome as unknown while the read also fails.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.1": {
+   "sentence": "Registration is an optional, function-detectable capability on `JsStore`. Both callers silently skip it if it is absent; neither catches an exception from a function that is present.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.3": {
+   "sentence": "The first argument selects the exact message append-log slot. Registration works for both the shared `messages` slot and an isolated `${namespace}/messages` slot, without indexing a different namespace’s messages.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.4": {
+   "sentence": "The JSON-pointer field `/timestamp` with kind `number` establishes the numeric index used by `queryStateIndexRange`. The caller needs matching message-slot ordinals for millisecond bounds, without scanning the entire history.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.5": {
+   "sentence": "The two `string` indexes at `/metadata/channelId` and `/metadata/external/channelId` coexist independently with each other and the timestamp index. Each channel path supports exact-value ordinal lookup and value counts, even when one message carries both paths; the caller merges the results.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.6": {
+   "sentence": "A missing or non-string channel ID contributes no entry to that field’s string index. It neither prevents indexing other messages nor introduces a coerced value such as the string `\"undefined\"` into searches or counts.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.7": {
+   "sentence": "Registration works before the first append and on an already populated slot. In the latter case it indexes the messages already there, including history written before field indexes were introduced.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.8": {
+   "sentence": "Repeating the same `(stateId, field, kind)` is idempotent and cheap when the persisted index is fresh. A sibling `MessageStore` or a reopened store does not have to detect prior registration, handle a duplicate error, or pay for a full rebuild every time.",
+   "status": "pinned",
+   "tests": [
+    "tests/integration.rs"
+   ]
+  },
+  "registerStateFieldIndex.10": {
+   "sentence": "If registration returns normally but the index is not queryable, the associated native query distinguishes that failure (`null`) from a sound index with no matches (empty result). Only `null` triggers re-registration; a second `null` produces the caller’s unavailable-index error rather than an empty history or a full scan.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.11": {
+   "sentence": "A usable index belongs to the branch identified by the store handle, not merely to a state ID or a reusable branch name. After a fork, switch, or branch recreation, registration and recovery must not expose another branch’s ordinals as matches.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.12": {
+   "sentence": "Once registered, a queryable index reflects subsequent writes to the slot, including appends, length-preserving edits through another handle, and redactions that shift ordinals. If it cannot be kept current, it must become unqueryable rather than return stale positions that the caller will use for point reads.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "registerStateFieldIndex.13": {
+   "sentence": "Construction-time registration may rebuild and persist index data, but does not change the logical contents of the inspected store. The inspection tool constructs a `MessageStore` to read history under precisely that guarantee; it does not require byte-for-byte disk immutability.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "view.2": {
+   "sentence": "`view` resolves an existing branch by its string name on the same store, from any handle on that store, including a derived handle. Callers pass the name they forked or saved, not a branch ID, sequence, or filesystem path; names can include slashes.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "view.13": {
+   "sentence": "For a fork at the head, the view exposes the same inherited records without copying or renumbering them. The message seed checks the slot length and last item's ID and sequence; the window seed checks the inherited chain-head offset, and the helpers read cold when they cannot verify a match.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "view.7": {
+   "sentence": "Different handles on the same branch see each other's slot updates, including edits that preserve item count. Where `stateHeadOffset` is exposed, the view reports the same slot revision as other handles reading that chain head, and a write to the slot changes that revision for all handles on the branch.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "view.8": {
+   "sentence": "Content-addressed blobs remain accessible by the same hashes across the source and branch handles. A head-derived message store reuses the parent's blob manager and cache; a cold or reopened message store must resolve those references through the view itself.",
+   "status": "pinned",
+   "tests": [
+    "tests/blob-async.mjs"
+   ]
+  },
+  "view.9": {
+   "sentence": "A later view of the saved branch name, including after a restart, opens the branch as the child left it, with its subsequent writes and namespaced window intact. It does not create a branch or reconstruct a new child from the original parent checkpoint.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "getStateSlice.1": {
+   "sentence": "`getStateSlice` is an optional capability, detected with `typeof ... === 'function'`. If it is absent, MessageStore slices its fully materialized state, and WindowIndex reads the index whole.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getStateSlice.2": {
+   "sentence": "The method takes the state ID, offset and limit as positional arguments and returns synchronously. A non-null success is a Buffer containing one UTF-8 JSON array, even for a one-item slice; neither caller awaits a result or accepts an already-decoded array.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateSlice.3": {
+   "sentence": "The slice is of the named slot on the receiving handle’s current branch, consistent with that slot’s length and whole-state read. In particular, when the window index revision changes, the slice reflects writes by another handle on that branch or the state of the branch just switched to, not the reader’s old cached tail.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateSlice.6": {
+   "sentence": "WindowIndex passes `2 ** 31 - 1` as the limit to get the entire available suffix in one call, without padding or a smaller implicit page size. It expects its previous last item first, followed by everything appended since; a snapshot that only moves the revision leaves the boundary item alone in that slice.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateSlice.5": {
+   "sentence": "The fast path reads and converts the requested window rather than materializing the whole slot. MessageStore relies on O(window) JSON conversion, and WindowIndex expects a read after another handle’s append to cost the boundary item plus the appended items, not the accumulated index.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-read-scaling.test.mjs"
+   ]
+  },
+  "getStateSlice.7": {
+   "sentence": "For a message slot the elements are the stored message objects, including the `id` and actual record `sequence` stamped by the append, not the slot ordinal. Content (including stored blob references), metadata, timestamps and shard fields remain available for MessageStore’s own conversion and optional blob resolution.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateSlice.8": {
+   "sentence": "For the append-only window index, each stamped item retains the writing record’s string ID in `by` and numeric sequence in `at`, including items that share a batch record. The first returned item’s `by` must identify the same record at that ordinal across branches with a shared prefix, and must not match for a different record: that equality is the caller’s prefix check.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "getStateSlice.9": {
+   "sentence": "MessageStore treats a null result as an empty message window, not as a request to retry the whole read. Once the method is present, a thrown store error or invalid JSON propagates; null therefore cannot stand for a successful nonempty window.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateSlice.10": {
+   "sentence": "An unusable window-index slice must be detectable, not returned as a plausible suffix with bad items silently omitted. WindowIndex falls back to a whole read on a throw, parse failure, null, non-array, empty array, boundary mismatch, or appended item it cannot interpret as a presentation, tombstone or supported header; it applies nothing incrementally until all appended items pass.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "treeRemove.1": {
+   "sentence": "Remove the entry at the exact `(stateId, path)` pair, leaving other keys and other trees alone. A subsequent `treeGet` for the removed entry returns `null`, not an entry with empty contents: the key can be a mount-relative path in either of two trees, or an agent name in the checkpoint tree.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeRemove.3": {
+   "sentence": "The removed workspace file or intent is also absent from `treeList`, both for the whole tree and for a matching path prefix. Otherwise scans and listings still treat it as a tracked path.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeRemove.2": {
+   "sentence": "Normal return means the removal has taken effect synchronously; signal failure by throwing in that call, not by returning a status or rejecting a promise later. All five calls discard the answer, so none needs any field of the returned `JsRecord`.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeRemove.4": {
+   "sentence": "Workspace removals belong to the selected branch's tree history, not to global disk evidence. Selecting a history before a removal must recover the file or intent as it stood there; the file tree and its intent tree rewind together.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeRemove.7": {
+   "sentence": "Removing a workspace file from the tree does not unlink the mounted disk file. Reconciliation can drop a store copy and report the path as disk-only; tool deletion can leave the disk copy in place until a separate, permitted materialization.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeRemove.9": {
+   "sentence": "A tool's file removal respects the order of separate intent-tree writes. Where deletion needs a tombstone, the removal must not land ahead of that tombstone; where deletion clears an origin or conflict instead, that guard remains until the removal lands.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeRemove.5": {
+   "sentence": "Workspace removals participate in the store's durability ordering: a later successful `store.sync()` covers earlier file and intent removals. Reconciliation can thus sync them before appending agreement evidence that asserts their outcome, including evidence about an earlier tool change.",
+   "status": "no test",
+   "note": "The ordering of stable removal versus a later agreement record requires a power-loss/storage-barrier model. Normal tree history and interruption between calls have separate tests."
+  },
+  "treeRemove.8": {
+   "sentence": "After a removal throws or an adoption is interrupted, a successful read of the affected branch's tree distinguishes the two outcomes for a previously present file: `null` means removal landed, the old entry means it did not. The tool commit uses this to keep or put back the tombstone and report what was stored; if read-back itself throws, it reports an unknown outcome and leaves the tombstone alone.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "treeRemove.10": {
+   "sentence": "An empty replacement intent can remove a tree reference even when the blob it points to is missing or unreadable. Clearing the intent must not require successfully decoding the old record.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeRemove.6": {
+   "sentence": "For workspace tool diagnostics to retain their errno-specific explanation and remedy, a propagated removal I/O error must expose a recognizable errno. The helper accepts a Node-style errno code or, on non-Windows hosts, an `Error` with Chronicle's `IO error: … (os error N)` message; other failures get generic handling.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeRemove.11": {
+   "sentence": "Checkpoint eviction costs a per-key O(entry) write in the one registered checkpoint tree. It cannot rewrite a fleet-wide checkpoint map or leave a permanent state registration per evicted agent without defeating the caller's scaling requirement.",
+   "status": "pinned",
+   "tests": [
+    "tests/disk_scaling.rs"
+   ]
+  },
+  "treeRemove.12": {
+   "sentence": "Checkpoint eviction assumes, for its failure diagnostic, that a throwing removal leaves the agent's checkpoint key in the store. Unlike the workspace tool commit, eviction does no read-back: it logs the failure and lets teardown finish.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "registerState.2": {
+   "sentence": "The complete string in `registration.id` identifies the slot. Bare IDs such as `messages` and `context`, slash-prefixed namespace paths such as `agents/Ada/messages`, and names containing a colon such as `default/autobio:summaries` must work without conflating distinct names.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.13": {
+   "sentence": "A `tree` registration makes the named state usable for keyed tree reads and writes. The envelope index and turn-checkpoint tree omit snapshot settings; workspace trees supply configurable `deltaSnapshotEvery` and `fullSnapshotEvery`.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "registerState.14": {
+   "sentence": "Both cadence fields must accept `Number.MAX_SAFE_INTEGER` and treat it as a very long interval. The coalescing journal relies on not taking its own snapshots before the framework clears it.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "registerState.5": {
+   "sentence": "A registration survives closing and reopening the store. Startup can register the same IDs again and then load the state already held there.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.6": {
+   "sentence": "A repeated registration is a duplicate by ID alone, even if it requests a different strategy or cadence. It leaves the existing data and registration intact; changing the message slot's cadence on an existing store is a separate `updateStateStrategy` call, not an effect of re-registration.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.11": {
+   "sentence": "For the three context-manager paths, the duplicate signal is a thrown JavaScript `Error` whose entire message is `State already exists: ${stateId}` for the attempted ID. A silent success would skip the message-slot retune and make `registerStateIfAbsent` report a new registration; a code alone, wrong ID, or extra message text does not match.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.15": {
+   "sentence": "The framework uses a weaker duplicate test: if registration throws for an existing slot, it must throw an `Error` whose message contains the case-sensitive text `State already exists`. This caller does not inspect an error code or match the ID.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.7": {
+   "sentence": "Failures other than a duplicate, such as I/O, a closed store, or a malformed ID, must throw at registration and not match the caller's duplicate test. Context-manager propagates the thrown value; the framework wraps it with the attempted ID and the original cause, rather than marking the slot ready or waiting for a later write to fail.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "registerState.16": {
+   "sentence": "Successful registrations are durable independently of later registrations. If strategy initialization fails partway through a list, the earlier slots remain registered and a later start can finish the list.",
+   "status": "pinned",
+   "tests": [
+    "src/store.rs"
+   ]
+  },
+  "registerState.8": {
+   "sentence": "Registering an unwritten slot supplies no application data. In particular an unwritten module snapshot reads as `null` (otherwise first start looks like a restart), and an unwritten message or context log contributes no rows.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.9": {
+   "sentence": "Registration must work across branch switches and on branch-bound handles without replacing a branch's values with another branch's. It identifies a slot in the store; what a fork or derivation inherits at a cut is the slot's written history, not data manufactured by its registration.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "registerState.10": {
+   "sentence": "The registration is discoverable through `listStates()` by its exact ID and strategy, independently of whether data has been written. Callers use that distinction to list states, select message slots, and recognize previously store-backed workspace mounts.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.1": {
+   "sentence": "The write goes to the named append-log state on the receiver’s branch and survives a reopen. The state name is not fixed: callers use a shared or namespaced message slot, a namespaced window, and a namespaced quarantine ledger.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.3": {
+   "sentence": "The method accepts the item as a JavaScript object and preserves its JSON data alongside the stamps. That includes message content with blob references and optional shard metadata, a window item’s row id, tombstone or header, and a quarantine event’s nested records, outcomes or checkpoint entries.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs",
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.4": {
+   "sentence": "The third and fourth arguments name the top-level fields to fill in the stored item, respectively with the writing record’s id and sequence. Messages use `id`/`sequence`, window writes use `by`/`at` so a presentation’s existing `id` still names the row, and quarantine writes use `eventId`/`sequence`.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.5": {
+   "sentence": "Assigning the identity and appending the stamped item is one atomic record write. Another writer cannot take the reserved identity, and there is no intermediate record containing an unstamped item or a second record needed to complete it.",
+   "status": "pinned",
+   "tests": [
+    "tests/append_many.rs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.6": {
+   "sentence": "Success synchronously returns the writing record itself, with a string `.id` and numeric `.sequence` equal to the two stored stamps. Callers use those properties without a reread or `await`; the benchmark forwards the last such record as the `record` of its simulated batch.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.7": {
+   "sentence": "A record id is stable and distinct from other append records’ ids. In particular, inherited window records keep their `by` stamp on a fork, but independent writes on divergent branches do not acquire the same stamp even at the same ordinal or sequence.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.13": {
+   "sentence": "The newly appended message is readable at the tail in the same stored JSON form by point lookup and by full reconstruction. Optional `undefined` properties and lone surrogate halves must not make the message unreadable or give the warm cache a different serialized shape from a cold read.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.10": {
+   "sentence": "Where `stateHeadOffset` is available, a landed append changes the target state’s revision on that branch, as seen by every handle reading that branch. Message and window caches use the post-write revision to distinguish the new state from the old one.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.14": {
+   "sentence": "On a message slot with native history indexes, an append must not leave a queryable but stale index. A subsequent timestamp or channel query must find a matching appended ordinal, or the index must report that it is unavailable so MessageStore can re-register and retry.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.8": {
+   "sentence": "A refused append throws synchronously and writes nothing; it does not return a success-looking record or an error sentinel. The callers propagate the failure rather than applying a fictitious window item, announcing a message, marking an exhaustion written, or continuing the benchmark loop as if the write succeeded.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.11": {
+   "sentence": "A throw during or after a write is not proof that nothing landed. Once the same branch can be read, its state must reveal either no new item or the complete stamped item: message recovery checks the pre-append ordinal and body group, and window recovery discards its cache and reloads the index.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.15": {
+   "sentence": "A quarantine event’s `eventId` is a nonempty string usable as an exact reference in a later ledger append. An alert or clear must match the intended exhaustion generation, and an `alert_sent` must still be able to name the pending event it acknowledges after replay.",
+   "status": "pinned",
+   "tests": [
+    "test-batches.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.16": {
+   "sentence": "A successful ledger append precedes the side effect that relies on it. The pending-alert event must be persisted before external delivery, and the appended checkpoint at the old ledger length must survive redaction of the preceding items and subsequent compaction.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "appendToStateJsonWithIdentity.17": {
+   "sentence": "For the benchmark’s per-row replacement for `appendManyToStateJsonWithIdentity`, successive single appends must leave the same window items, ordinals and presented rows as the batch, including after reopen. The deliberate difference is that each item names its own writing record instead of all items naming one record.",
+   "status": "pinned",
+   "tests": [
+    "tests/append_many.rs"
+   ]
+  },
+  "setAutoSnapshot.1": {
+   "sentence": "`setAutoSnapshot(false)` on the store returned by `getStore()` disables automatic snapshots for the manager’s message writes, starting with the very next `addMessage` and lasting throughout the setup loop. Neither caller waits for the change.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "setAutoSnapshot.2": {
+   "sentence": "`setAutoSnapshot(true)` on the same handle restores automatic snapshotting after setup. The caller can proceed directly to `compactState('messages')` or `close()` without awaiting or checking a result.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "setAutoSnapshot.3": {
+   "sentence": "Turning snapshotting off and back on must leave the messages written while it was off intact. The derive benchmark expects a child to inherit all of them after compaction; the window benchmark expects all of them to be presented after close and reopen.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "createBranchAt.1": {
+   "sentence": "Create a new branch with the caller’s exact target name, from the branch identified by `currentBranch().name`. The target can be supplied by an operator or generated, including names such as `recovery/<agent>/<timestamp>`; success must not mean reuse of an existing branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAt.2": {
+   "sentence": "On success, return synchronously an object whose `.name` is the new branch’s string name. That name must already work with `switchBranch`; callers neither await the store method nor use a branch ID to select the result.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAt.9": {
+   "sentence": "Accept `currentSequence()` as the cut for a full head fork. The child starts with all current branch state, including messages, context log, window index and strategy state; a removal or summary written after the last message must not be lost.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAt.4": {
+   "sentence": "Inherited rows retain their IDs and sequence numbers. The child’s sequence numbering continues from its cut, not from the source’s later head: recovery removes inherited rows by source IDs, and cross-branch readers compare sequence numbers as shared positions only through the cut.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAt.5": {
+   "sentence": "Register the child in the store’s branch listing with its own identity, the source branch’s ID as `parentId`, and the requested sequence as `branchPoint`. Later readers use that lineage to distinguish an inherited history from a divergent one, including after offline repair.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "createBranchAt.13": {
+   "sentence": "A historical fork rewinds named snapshot, tree and log state, not the store-wide typed-record journal. Switching to the fork must not hide or duplicate later journal entries in `getRecordIdsByType`.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "createBranchAt.7": {
+   "sentence": "Once creation succeeds, the branch exists independently of the later selection, strategy initialization or redaction. A failure at one of those later steps must not implicitly undo creation: the branch can be inspected or kept for diagnosis even if the source is selected again.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "appendJson.11": {
+   "sentence": "An accepted layout and its optional receipt must land as one commit: a crash or failed append must not publish one part without the other.",
+   "status": "pinned",
+   "tests": [
+    "tests/record_ids_by_type_order.rs"
+   ]
+  },
+  "appendJson.3": {
+   "sentence": "On normal return, the append has taken effect synchronously: the record is listed by `getRecordIdsByType(type)` and readable by ID on the current store object. Even if handling the result or a subsequent `sync()` fails, replay can find the record without reopening; this also lets an identity retry reuse the UUID it already wrote.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "appendJson.4": {
+   "sentence": "Typed records remain discoverable store-wide across historical rollback, branch switches, branch deletion and reopen. In particular, a fold receipt can name the branch it was compiled on without switching back to that branch to append it.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "appendJson.8": {
+   "sentence": "The synchronous result must expose `.id`, the same ID used by type enumeration and `getRecord`. That ID must continue to name the retained record: later checkpoint boundaries, delta and receipt links, compile marks and receipt cursors use it; the fold journal explicitly tolerates reissue if open drops a rotten last record.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "appendJson.9": {
+   "sentence": "IDs must be positive decimal strings, unique and strictly increasing in store-wide append order, not branch-local sequences or per-type counters. The journals compare them numerically and use zero as the boundary before the first entry.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "appendJson.12": {
+   "sentence": "Appending an accepted-layout record must extend that type's ID list at the end, preserving its previous prefix in ascending order. The fold index pushes successful IDs itself, refreshes from its previous length after failure, and needs the IDs it compares to remain distinguishable in order when converted to JavaScript `Number`.",
+   "status": "partly",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ],
+   "note": "The ascending prefix is pinned. No test reaches the boundary at 2 ** 53, where two IDs compare equal as Numbers: no call makes a record ID that large."
+  },
+  "appendJson.5": {
+   "sentence": "A typed append takes the next record sequence on the branch selected at write time, in the same sequence space as that branch's messages. This is separate from both the global ID and any branch named inside the payload.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "appendJson.13": {
+   "sentence": "`RecordJournal.write` also requires the result's `.sequence` to be the numeric branch sequence of the appended record, consistent with the sequence later read during replay.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "appendJson.10": {
+   "sentence": "A successful `store.sync()` before the append must order the referenced state onto stable storage first. An entry asserting that state, or a layout naming messages and summaries, must not survive without it.",
+   "status": "no test",
+   "note": "Testing that a later layout can never survive power loss without the previously synced state needs control of persistence ordering, not merely killing the process between calls."
+  },
+  "appendJson.6": {
+   "sentence": "A successful `store.sync()` after the append must make that record and preceding appends durable; the append result alone need not establish this. The callers use this barrier before acting on a durable journal entry, caching or returning a minted identity, or announcing acceptance.",
+   "status": "no test",
+   "note": "Discarding all non-stable writes at the last successful barrier is not an available fault model; process-death ID and payload recovery is separately allocated. Sync also does not promise that *only* pre-barrier appends can survive."
+  },
+  "appendJson.7": {
+   "sentence": "An append failure must throw during the call, not silently return a sentinel or reject a promise later. The identity writer then exits before caching the mint, and the two journal writers distinguish failure from a successful write before they report it.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "appendJson.15": {
+   "sentence": "If the append itself throws, `RecordJournal` does not require rollback or trust the current index to show whether the write landed. It stops further writes, and requires a reopened store to expose any intact record left in the log so it is reduced before later checkpoints.",
+   "status": "no test",
+   "note": "There is no exposed failure point that reports an append error after a complete typed frame but before indexing. Periodic fsync failure is deliberately not an append failure; substituting it tests the wrong recovery path."
+  },
+  "appendJson.16": {
+   "sentence": "For a fold acceptance retried on the same store after an append throws, any acceptance that actually landed must be discoverable on the next type-list refresh with its original compile ID and receipt. Otherwise the caller's retry can write a second acceptance instead of returning the first.",
+   "status": "no test",
+   "note": "A failed barrier after a returned append can and should be tested, but the requested same-handle throw from the typed append *after a published acceptance* has no externally triggerable phase. A wrapper throwing after a successful call would test the wrapper."
+  },
+  "appendJson.17": {
+   "sentence": "For workspace callers to identify the OS cause of a journal append failure, the thrown value must expose a recognizable errno code, or on POSIX be an `Error` whose message matches `IO error: … (os error N)`. A particular generic error code is not required; other forms lose the errno-specific explanation.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "getRecord.10": {
+   "sentence": "For RecordJournal, the returned object must expose `payload` in a form `Buffer.from(record.payload)` can turn into the record's bytes.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecord.11": {
+   "sentence": "A replayed entry's `sequence` must be the numeric sequence assigned to that record on the branch selected at append, matching the sequence in the append reference. It is not the global record ID or the branch's sequence at read time.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecord.4": {
+   "sentence": "An ID for which there is no record yields `null`, including a stale link or a formerly listed ID. RecordJournal turns a listed-but-missing record into an error rather than replaying a partial tail; fold-journal can skip a missing identity, omit a receipt or start from a baseline instead of diffing against unknown history.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecord.5": {
+   "sentence": "An operational read failure can surface as a synchronous throw, distinct from an ordinary miss or a payload parse failure. RecordJournal propagates it; the fold-journal parser does not catch the store call itself, so, for example, a failed mark lookup can be retried without keeping a half-built index, and a thrown predecessor lookup can be reported as a failed layout reconstruction.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "getRecord.6": {
+   "sentence": "Typed records remain readable by ID from any selected branch, even after a historical rollback or deletion of the branch on which they were written. Neither journal can use a lookup restricted to the current branch's history.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "getRecord.7": {
+   "sentence": "Once an append has returned, journals sharing the open store must be able to read that record, even if a subsequent `sync()` failed; readability is not a durability receipt. This lets RecordJournal reconcile before another write and lets fold-journal find and sync a landed identity or acceptance instead of writing a duplicate.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "getRecord.8": {
+   "sentence": "A reopened store must resolve the IDs of intact journal records recovered from its log, including after a killed process. If an append threw inside the store after writing the log but before indexing the record, RecordJournal need not find it on the old handle; it relies on being able to replay it on reopen.",
+   "status": "no test",
+   "note": "Cold lookup of complete records after process death is testable and covered elsewhere. The remaining complete-frame/before-index append exception cannot be placed by the store's fault fixtures."
+  },
+  "getRecord.13": {
+   "sentence": "A lookup of a saved compile mark must reflect what its ID names now. If opening the store dropped a rotten last record, the caller accepts either a miss or the replacement record at the reissued ID; it checks the payload's `compileId` before using the mark to skip history.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs",
+    "tests/record_ids_by_type_order.rs"
+   ]
+  },
+  "queryStateIndexEq.2": {
+   "sentence": "The query is scoped to the supplied message state ID (`messages` or `<namespace>/messages`) on the receiver’s branch. A branch switch or a write on another branch must not cause ordinals from that other branch to be returned for the same state ID.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.3": {
+   "sentence": "Each call matches the supplied channel ID by exact string equality on the specified registered JSON-pointer field. `/metadata/channelId` and `/metadata/external/channelId` are independently queryable; neither schema replaces the other.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.5": {
+   "sentence": "Missing or non-string values at the queried path do not match. They are skipped rather than coerced into channel IDs such as `\"undefined\"`.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.6": {
+   "sentence": "Passing `{}` as the options returns every match for that field, with no implicit cap or offset. The caller needs the complete sets to merge channels, intersect with time results, compute total counts and only then select a page.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.8": {
+   "sentence": "The same message has the same numeric ordinal across both channel indexes and `queryStateIndexRange`. The caller uses ordinal equality, without fetching content, to count a dual-schema message once and to intersect channel and time results.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.9": {
+   "sentence": "Channel strings enumerated by `getStateIndexValueCounts` can be passed unchanged as equality-query values. Their merged equality results must identify the messages for those values: the caller derives per-channel counts from the unique ordinals, not by summing the two indexes’ counts.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.10": {
+   "sentence": "A usable index with no matching messages returns `[]`. An unregistered, wrong-kind or poisoned index instead returns exactly `null` for that field, not an empty result, `undefined` or a thrown error; only `null` triggers recovery.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.11": {
+   "sentence": "After `null`, the identical query can be retried immediately after `registerStateFieldIndex(stateId, field, 'string')` and sees the repaired index if registration succeeded. Recovery is per field, including first use on a seeded branch view; a second `null` makes the caller report “unavailable”, not “unsupported” or zero matches.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexEq.12": {
+   "sentence": "A query on a usable index is a native indexed lookup with cost tied to the matches (documented as O(1) lookup plus O(k) output), not a scan or materialization of all stored messages.",
+   "status": "pinned",
+   "tests": [
+    "tests/reconstruction_scaling.rs"
+   ]
+  },
+  "getStateIndexValueCounts.1": {
+   "sentence": "The indexed history feature detects support by checking that `getStateIndexValueCounts` is a function on the store. If it is absent or not callable, `getChannelCounts` reports history indexes as unsupported rather than falling back to a scan.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.2": {
+   "sentence": "The method accepts the message state ID (`messages` or `{namespace}/messages`) and the exact JSON-pointer path used with `registerStateFieldIndex`. The caller queries two independent string indexes this way: `/metadata/channelId` and `/metadata/external/channelId`.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.3": {
+   "sentence": "A successful call returns its entries synchronously, in a collection the caller can iterate immediately. Each entry exposes the channel ID as a string in `.value`; only that property is read.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.4": {
+   "sentence": "The values enumerate all channel IDs present in the indexed history, including pre-existing messages, and are usable unchanged as keys for `queryStateIndexEq` on that state. The caller unions the IDs from both fields and counts the union of matching ordinals per ID; it does not need the numeric counts to resolve overlap.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.5": {
+   "sentence": "A missing or non-string channel ID contributes no value for that field. In particular, the answer must not include a synthetic `\"undefined\"` channel for messages lacking an ID.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.6": {
+   "sentence": "A queryable field index with no values returns an empty array. An absent, wrong-kind or unusable index instead returns exactly `null`; an exception, `undefined`, or a false empty result does not trigger the caller's recovery path.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.7": {
+   "sentence": "After `null`, the same query can run again immediately and see a `registerStateFieldIndex(stateId, field, 'string')` for that field, including first-time registration on a derived store. Recovery is attempted once per field; a second `null` makes the caller report the index as unavailable, distinct from an unsupported method.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.8": {
+   "sentence": "A successful enumeration reflects the branch the store handle reads, including after a branch switch. It must not serve stale or mixed channel IDs from another branch merely because the state ID or branch name is the same.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "getStateIndexValueCounts.9": {
+   "sentence": "With a usable index, enumeration is an index-sized read, not a scan and decode of the message slot. The public channel-count API explicitly relies on that distinction.",
+   "status": "pinned",
+   "tests": [
+    "tests/reconstruction_scaling.rs"
+   ]
+  },
+  "unsubscribe.1": {
+   "sentence": "The string ID returned by `subscribe` must be enough to cancel that subscription in the store without disturbing other subscriptions. Callers pass the ID unchanged, either from a client's request or from the server's set of tracked IDs.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "unsubscribe.4": {
+   "sentence": "For the explicit WebSocket command to report an unsubscribe failure, the store must throw at the call. The command handler reports the thrown error's message or string form; a returned failure status would be ignored.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "unsubscribe.3": {
+   "sentence": "Server shutdown and client disconnect cleanup need each tracked ID to be removable without throwing. Neither loop catches failures: a throw skips the remaining IDs and the subsequent clearing of tracking.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "compactState.1": {
+   "sentence": "A single string state ID suffices to compact an existing `append_log` state. The IDs used are `messages` and the strategy’s namespaced quarantine-event ledger ID.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "compactState.2": {
+   "sentence": "Compaction takes effect by the time the call returns, without an `await` or any action on a returned record. The benchmark ends its build timer on the next line; the strategy exits its branch-scoped mutation lock without waiting for further work.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "compactState.4": {
+   "sentence": "Explicit compaction works on messages already appended while automatic snapshots were disabled. Re-enabling snapshots does not have to be followed by another append before compaction can run.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "compactState.6": {
+   "sentence": "The strategy’s compaction acts on the ledger of the branch current on its store handle, not on a same-named state on another branch. It supplies no branch argument and checks the captured branch name and generation immediately before the call.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "compactState.7": {
+   "sentence": "After the caller appends a checkpoint and redacts the preceding event range, compaction leaves a short logical ledger: the redacted prefix no longer counts toward `getStateLen` or reappears in the event array. The caller uses that length to decide when another checkpoint is due.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "compactState.8": {
+   "sentence": "Compaction preserves the surviving checkpoint as the complete replayable quarantine projection, including generation IDs and alert bookkeeping. Interruption at compaction must not leave a reader without that checkpoint: even an empty checkpoint supersedes records in the legacy snapshot.",
+   "status": "pinned",
+   "tests": [
+    "tests/unclean-boundaries.test.mjs"
+   ]
+  },
+  "setState.1": {
+   "sentence": "The byte setter accepts a namespaced string state ID and a Buffer from `storedJson`. The Buffer contains the already-serialized UTF-8 JSON value; it is not a JS object to serialize again.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setState.2": {
+   "sentence": "A write replaces the whole value of the named snapshot slot, rather than merging keys or appending an item. An empty resolutions object clears old levels, and a later `setStateJson` of null supersedes a receipt written by `setState`.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "setState.3": {
+   "sentence": "The snapshot persists across reinitialization and reopening. `getStateJson` on the same slot must yield the decoded value, with the resolution map's numeric levels or the receipt's nested fields and arrays intact.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setState.4": {
+   "sentence": "Reading the written JSON must respect the caller's escape handling: `storedJson` substitutes U+FFFD for lone surrogate halves in strings and keys but leaves literal backslash text alone. If the substitution makes keys equal, the last value wins; `setState` itself need not repair invalid surrogate escapes.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setState.5": {
+   "sentence": "The write belongs to the branch selected on the supplied store or branch view. A change to a resolution or receipt on one branch must not overwrite the other branch's value when the strategy switches back.",
+   "status": "pinned",
+   "tests": [
+    "test-key-order.mjs"
+   ]
+  },
+  "setState.8": {
+   "sentence": "A failed write must throw through the synchronous caller, not return a failure value or a later Promise rejection. The receipt callback catches a persistence error and attempts to close the flight; it does not inspect the error type or message.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "setState.9": {
+   "sentence": "The byte path must handle large receipt snapshots without making the native binding walk the JS object graph. The caller cites a 75k-leaf workload as the reason to prefer bytes, not as a hard latency limit.",
+   "status": "pinned",
+   "tests": [
+    "tests/state-catalog.test.mjs"
+   ]
+  },
+  "switchBranch.2": {
+   "sentence": "Selection takes effect on the existing store handle before the native call returns. The very next `currentBranch().name` must identify the requested branch; neither caller awaits the native call or installs a handle from its return value.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "switchBranch.3": {
+   "sentence": "`currentBranch().id` after the switch identifies the actual selected branch. It remains the same on a return to that branch and distinguishes a different branch even if a deleted branch’s name has been reused; initialization checks and message caches rely on that distinction.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "switchBranch.4": {
+   "sentence": "One switch moves the cursor for every manager, agent and module sharing that store handle; they do not each have to switch. This is distinct from a derived manager’s explicitly branch-bound `view`, which must keep reading and writing its own branch.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "switchBranch.5": {
+   "sentence": "Checkout exposes the destination’s current head, not an earlier checkpoint position. `currentSequence()` and reads of branch-local state must agree with that head: strategies reload its messages, summaries and window, and the workspace materializes its `_config` tree rather than the source tree.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "switchBranch.6": {
+   "sentence": "Branch-relative indexes and cache validation reads must follow the selected state as well. Native history-index queries must not mix ordinals from different branches, and `stateHeadOffset` must identify the selected state’s chain head so a held window view cannot serve a diverged branch’s cached contents.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs",
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "switchBranch.7": {
+   "sentence": "Subsequent branch-local writes land on the selected branch without changing the branch left behind. This applies to initialization writes, writes replayed after checkout, and removals on a recovery fork; switching back must expose the source with those fork-only changes absent.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "switchBranch.8": {
+   "sentence": "A switch must not rewind or filter store-wide typed records along with branch-local state. Journals still need records from branches other than the selected one, including fold receipts and evidence of what was written to disk.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "switchBranch.10": {
+   "sentence": "If native selection cannot be made, including for an unknown name, it throws synchronously and leaves the previous branch selected and usable. Returning a failure value, rejecting later, or throwing after moving would make the callers mark or report the wrong outcome.",
+   "status": "differs",
+   "note": "When the publication of a switch fails after the selection moved, the store throws and the target stays selected. A refusal before the selection, such as for an unknown name, throws and leaves the previous branch selected, and that part is pinned.",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "switchBranch.11": {
+   "sentence": "Once native selection succeeds, a later strategy-initialization or mount failure does not undo it. The destination and any writes already made there remain inspectable until another explicit branch move, even if the enclosing async operation rejects.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "switchBranch.12": {
+   "sentence": "The selected branch is part of the store state kept across a normal close and reopen. Offline recovery must be able to leave the host on a child branch, or restore the source through the host API and have a later offline run start there.",
+   "status": "pinned",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ]
+  },
+  "switchBranch.13": {
+   "sentence": "A later `store.sync()` must cover the successful selection, including a switch back to the source. Recovery uses that barrier before recording an activation or retirement, so the durable ledger cannot describe a branch change that the reopened store lost.",
+   "status": "partly",
+   "tests": [
+    "tests/crash_state_recovery.rs"
+   ],
+   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+  },
+  "createBranchWithStates.2": {
+   "sentence": "The second argument identifies the parent by name, and the child starts at that parent's current head. This also works when the caller is on a branch-bound view of a previously derived child, not the store's main branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchWithStates.3": {
+   "sentence": "Creation finishes synchronously under the exact requested name: `source.view(branch)` can open the child immediately, including names such as `dendrite/inspect/<name>/<n>`. The exported strategy state, forked states, and parent message lists used to seed the child must describe one checkpoint, with no intervening turn.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchWithStates.6": {
+   "sentence": "The filter remains usable as the description of what was selected after the call. `derive` records that same object's ID and prefix lists, not a separately saved copy.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchWithStates.7": {
+   "sentence": "Inherited history shares the parent's existing records rather than copying them into a new log. The selected window chain initially ends at the same record, and the child message slots expose the same lengths, message IDs, sequences and contents, so the manager can reuse the parent's readings.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchWithStates.8": {
+   "sentence": "The child continues sequence numbering from the fork head. Its inherited rows keep their sequences at or below the recorded checkpoint, and newly stored child rows are above it; the framework uses that boundary to distinguish inheritance from an arrival.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchWithStates.10": {
+   "sentence": "After creation, writes diverge in both directions. Appending to or editing inherited state on the child does not change the parent, and later parent writes do not change what the child inherited.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchWithStates.12": {
+   "sentence": "The result is an object with a string `id` matching the entry for this creation in `listBranches()`, and a replacement under the same name has a different ID. If child setup later fails, the caller uses that comparison before deleting by name so it removes only its own branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "createBranchWithStates.13": {
+   "sentence": "Creation failure is signaled by throwing, with no new branch left for the caller to clean up: the call is outside the child-setup `try`. In particular, an already-used name fails rather than returning or replacing the branch that owns it.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.2": {
+   "sentence": "Creation completes synchronously under the requested child name, including names containing `/`. On return, `source.view(branch)` can open that exact name and read its initial state without waiting or switching branches.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.3": {
+   "sentence": "The `from` argument identifies the parent by name. Creation works from the invoking manager's branch even when that manager holds a branch-bound view of a previous derivation rather than the root handle.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.8": {
+   "sentence": "Registration alone does not give a selected state contents at the checkpoint. If the parent had not written its window index by then, the child sees no written index and remains in legacy window mode.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.9": {
+   "sentence": "The child shares the inherited log records rather than copying or re-identifying them. Message IDs and sequences therefore still identify the same rows in the child's cold read and in its inherited window index.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.10": {
+   "sentence": "Selected tree entries remain usable from the child, not just JSON log contents. In particular, the child can look up a request hash in the inherited preimage index and read the blob that the entry names.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.12": {
+   "sentence": "After creation, writes on either branch do not change what is read on the other. This applies to changes to inherited state as well as new records, including writes made by strategy initialization or background compression.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.13": {
+   "sentence": "The child's branch continues sequence numbering from the requested checkpoint: inherited rows keep their numbers and new child writes are above the cut. The framework compares row sequences with the saved derivation sequence to distinguish inherited rows from new arrivals.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.14": {
+   "sentence": "The branch later reported by `listBranches()` identifies its parent by ID and its fork point by sequence. The framework walks those links to determine which history a watermark on another branch covers for a released fork.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.15": {
+   "sentence": "The branch and its state persist independently of the creating manager. After restarting the store, `reopenDerived` can read the child cold by the saved branch name without recreating it or reading the live parent.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.16": {
+   "sentence": "A creation failure throws before returning a child and leaves no newly created branch for `derive` to clean up. In particular, a name already in use must fail without adopting, overwriting or deleting the existing branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/selective-lineage.test.mjs"
+   ]
+  },
+  "createBranchAtWithStates.17": {
+   "sentence": "The synchronous result supplies a string `id` equal to the new branch's `listBranches()` ID and distinct from a later branch created under the same name. If child setup fails, `derive` uses that identity to delete only the branch it created.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "deleteBranch.6": {
+   "sentence": "Derivation cleanup can delete the child through the parent’s store handle, including when the parent is itself a derived manager. Cleanup does not require releasing every view of the target first: the child may already hold one, and closing the child manager does not close its store.",
+   "status": "pinned",
+   "tests": [
+    "tests/branch-catalog.test.mjs"
+   ]
+  },
+  "deleteBranch.5": {
+   "sentence": "Deletion preserves typed records appended on the deleted branch: their IDs remain enumerable by type across branches, in store-wide order, and their contents remain readable by ID, including after reopen. RecordJournal needs this for entries and checkpoints; FoldJournal needs it to answer queries about deleted branches.",
+   "status": "pinned",
+   "tests": [
+    "tests/journal-replay.test.mjs"
+   ]
+  },
+  "deleteBranch.8": {
+   "sentence": "For API clients subscribed to matching store branch events, deletion is exposed through `pollSubscription` as `branch_deleted`, with JSON event data naming the branch. This is separate from the `branch:deleted` broadcast that the delete command constructs itself.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.1": {
+   "sentence": "Expose the capability as a callable `queryStateIndexRange` property on the store. If it is absent on an older build, the caller reports “unsupported”; it does not fall back to scanning messages.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.2": {
+   "sentence": "Query the numeric `/timestamp` index registered for the supplied state ID. That ID can be `messages` or `<namespace>/messages`; the query and registration must refer to the same slot and JSON field path.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.3": {
+   "sentence": "Return the result synchronously. On success it is an array of integer slot positions, not messages, timestamps, IDs or log sequences: each position addresses the matching item in `getStateItemJson(stateId, position)`. A later lookup that loses a race with a redact may miss; the caller skips it.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.5": {
+   "sentence": "Scope successful results to the branch the handle is reading, including after a branch switch or reuse of a branch name. Two branches can have different messages at the same ordinal; never answer with ordinals from the other branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.6": {
+   "sentence": "Successful results must reflect the current message slot, including appends, changes to indexed timestamps, and removals that shift ordinals. A same-length edit or a write through another handle to the same branch is not a reason to keep serving the old index.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.7": {
+   "sentence": "Interpret numeric `gte` and `lte` as inclusive Unix-millisecond bounds. Equal bounds select that exact millisecond; an omitted or `undefined` bound leaves that end open, and both can be open.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.8": {
+   "sentence": "Order the hits by timestamp value, oldest first by default and newest first with `reverse: true`, even when append order differs. The time-only path preserves native order; a limited newest-first query needs the newest matches, not a reversal of the oldest page.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.9": {
+   "sentence": "Within an equal-timestamp group, keep a consistent append-sequence order in the requested direction. History search treats the sequence interval it has seen at the boundary as fully scanned, and the semantic indexer resumes partway through a tied group by offset.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.10": {
+   "sentence": "Apply `offset` and `limit` inside the native query to the ordered matches: skip the offset (zero by default), then return the requested page, or the remaining hits if fewer. Its array length is the page size, not the total before pagination.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.11": {
+   "sentence": "With no pagination return every matching ordinal exactly once, with no implicit cap. This includes separate messages sharing a timestamp and messages with no channel: the combined query needs the full set before intersection, and token stats counts each returned ordinal.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.12": {
+   "sentence": "Use an indexed range lookup, not full-slot materialization or a content scan. The public time-query API promises O(log n + k) ordinal lookup and fetches content separately only for selected ordinals.",
+   "status": "pinned",
+   "tests": [
+    "tests/reconstruction_scaling.rs"
+   ]
+  },
+  "queryStateIndexRange.13": {
+   "sentence": "Distinguish a successful empty page (`[]`) from an unqueryable index (`null`). An unregistered, wrong-kind or poisoned index must signal literal `null`, not `undefined`, an empty result or an exception: only `null` triggers recovery.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "queryStateIndexRange.14": {
+   "sentence": "An immediate retry of the same query after `registerStateFieldIndex(stateId, '/timestamp', 'number')` must see the repaired or newly registered index if registration succeeded in making it queryable. If it remains unusable, a second `null` makes the caller report “unavailable”; there is no further retry or scan.",
+   "status": "pinned",
+   "tests": [
+    "tests/history-index.test.mjs"
+   ]
+  },
+  "catchUpSubscription.3": {
+   "sentence": "Replay must respect the subscription’s configured filter and limits on buffered events and snapshot size. The server supplies those settings to `subscribe`, not to `catchUpSubscription`, and forwards polled events without applying them again.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "catchUpSubscription.5": {
+   "sentence": "The store must signal completion with a pollable `caught_up` event, even for live-only subscriptions. Like replay events, it needs JSON-parseable `data` and an unprefixed `eventType`: the server adds `store:` and the subscription ID itself.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.1": {
+   "sentence": "pollSubscription accepts the ID returned by subscribe and reads that subscription’s own filtered stream. The server routes each result to the socket that owns the ID without checking the filter or the event’s origin again.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.2": {
+   "sentence": "Each poll returns synchronously without waiting for a future event. One timer callback polls all open clients, and it uses the result directly rather than awaiting it.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.3": {
+   "sentence": "An empty active subscription returns null rather than throwing or returning a truthy placeholder. This ends the drain for this tick, not the subscription; neither poll call has an exception handler.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.4": {
+   "sentence": "A non-null result is one event, not a batch or a peek. Repeated polls on the same ID advance through pending events in delivery order without a separate acknowledgement.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.5": {
+   "sentence": "The eventType field supplies the bare API event name, such as record, state_snapshot or caught_up. The server prepends store: verbatim; it does not translate spelling or strip an existing prefix.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.6": {
+   "sentence": "The data field contains valid JSON text. A parse failure is logged, that event is not sent, and polling moves on without retrying it.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "pollSubscription.7": {
+   "sentence": "For events with payload fields, the decoded data exposes the API’s event-specific fields at the top level. It must not supply a conflicting subscriptionId, because its properties are spread after the ID supplied by the server.",
+   "status": "differs",
+   "note": "The store's events carry snake_case fields, such as `record_type`, `payload_size`, `state_id` and `total_bytes`, and agent-framework declares camelCase names for them. The fields at the top level, and the absence of a conflicting subscriptionId, are pinned.",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "updateStateStrategy.1": {
+   "sentence": "When available, the method is callable with the `JsStore` as its receiver and one registration object, the same shape passed to `registerState`. Its absence is supported: the manager skips the retune and leaves the old cadence in effect.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "updateStateStrategy.2": {
+   "sentence": "It retunes the persisted registration identified by `id`: `messages` for the shared slot or `${namespace}/messages` for an isolated slot. The slot already exists, and reapplying the same settings on a later open must work without creating or replacing the slot.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "updateStateStrategy.3": {
+   "sentence": "For the `append_log` slot, subsequent appends use both supplied intervals: `deltaSnapshotEvery` counts appends and `fullSnapshotEvery` counts delta snapshots, not appends. The caller supplies 50 and 100, respectively, for a full snapshot every 5,000 appends.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "updateStateStrategy.4": {
+   "sentence": "Only scheduling changes. The selected slot remains an append log with its message history intact, usable by the `MessageStore` constructed immediately afterward.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "updateStateStrategy.5": {
+   "sentence": "A normal return means the retune has already applied. The caller neither awaits the call nor inspects a return value; it immediately logs success using the registration it passed in.",
+   "status": "pinned",
+   "tests": [
+    "tests/cadence.test.mjs"
+   ]
+  },
+  "updateStateStrategy.6": {
+   "sentence": "A refused retune, such as a strategy-kind mismatch or transient store error, is signaled by a synchronous throw, not a returned status or rejected promise. The caller logs the thrown value without matching any particular code or message and continues opening on the same store.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "getState.2": {
+   "sentence": "The read completes synchronously: it returns its result directly or throws into the surrounding `catch`. The caller neither awaits a result nor handles a rejected promise.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getState.3": {
+   "sentence": "When the state can be read as one value, `getState` supplies its bytes as a Buffer even if the value is not JSON. Parsing `raw.toString('utf8')` must distinguish stored non-JSON bytes from valid JSON bytes: the former mark the window as foreign and block writes, while the latter cause the original JSON-read error to propagate.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getState.5": {
+   "sentence": "When the stored records cannot be reconstructed as one value, `getState` throws with text beginning exactly `Deserialization error: ` (including the trailing space). A code alone is insufficient: the caller matches the text and includes it in the warning and write refusal.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "getState.6": {
+   "sentence": "Other read failures, including temporary inability to read the store, must not carry the deserialization prefix or masquerade as non-JSON content. The caller rethrows the original `getStateJson` error and tries again on the next read rather than treating the state as permanently foreign.",
+   "status": "pinned",
+   "tests": [
+    "tests/checkpoint-errors.test.mjs"
+   ]
+  },
+  "getStateJsonAt.2": {
+   "sentence": "Read the history of the receiving handle’s branch. The same state ID and sequence on a different branch must give that branch’s version, not the version from the branch that last wrote the state.",
+   "status": "pinned",
+   "tests": [
+    "test-views.mjs"
+   ]
+  },
+  "getStateJsonAt.3": {
+   "sentence": "Return the state in effect at the requested Chronicle sequence, inclusive: a message exists at its own append sequence, and later appends, edits or removals do not change what an earlier lookup sees. Likewise, `currentSequence()` captured just before a repair’s `setStateJson` must still address the pre-repair summaries afterward, even if the last write at that sequence was to another slot.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getStateJsonAt.6": {
+   "sentence": "Return message entries with their stored IDs and payload fields intact. The caller matches `id` and uses the matching entry’s append-time `sequence`, participant, stored content (including blob references), numeric timestamp and any stored metadata, causality or shard/resolution fields to construct the message.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateJsonAt.7": {
+   "sentence": "Ordinary absence must allow the lookup to return `null`, not raise an exception. The caller accepts `null` for a missing slot, treats any non-array as no message, and also returns `null` when no entry in the historical array matches the requested ID; it does not catch store errors.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getStateJsonAt.8": {
+   "sentence": "The documented repair readback must work after reopening a copy of the stopped store. The report contains no dropped text, so the reported branch, state ID and pre-write sequence must recover that text from persisted history, not just from the original handle’s memory.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "getStateTail.2": {
+   "sentence": "Count records, not bytes: boot requests the newest 256 ended records, or all of them if there are fewer.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateTail.5": {
+   "sentence": "The decoded document must itself be an array, even for a single record. A recovery-file-style object with an `ended` property is not accepted from the store.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateTail.6": {
+   "sentence": "Each element must round-trip the `AgentRecord` written by `appendToStateJson`, including its `ended` marker, name and incarnation. Restore uses those fields to recognize bounded work that already ended, even if the previous snapshot still lists it as live.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateTail.7": {
+   "sentence": "No ended history is a successful empty read. The caller treats `null` as an empty list; a buffer decoding to `[]` works too.",
+   "status": "pinned",
+   "tests": [
+    "tests/log-readback.test.mjs"
+   ]
+  },
+  "getStateTail.8": {
+   "sentence": "A read failure must be distinguishable from no history: throw rather than silently return `null` or an empty list. The caller catches read and parse errors and refuses startup, naming the ended log and retaining the cause.",
+   "status": "pinned",
+   "tests": [
+    "error-codes.test.mjs"
+   ]
+  },
+  "subscribe.2": {
+   "sentence": "`bufferSize` sets the maximum number of buffered events before dropping. When the caller omits it, the API promises a default of 1000 events.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.3": {
+   "sentence": "`maxSnapshotBytes` limits the size of state snapshots in bytes. When the caller omits it, the API promises a default of 10 MB.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.5": {
+   "sentence": "Within `filter`, `recordTypes` limits record events by an array of type names. An `undefined` value imposes no record-type restriction.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.6": {
+   "sentence": "The filter accepts an optional `branch` selector by name, not numeric branch ID. The caller passes `undefined` when no name is specified.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.7": {
+   "sentence": "The filter accepts an optional `stateIds` array of strings to select specific states. The caller can pass `undefined` rather than an array.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.8": {
+   "sentence": "A supplied filter independently enables or disables record, state-change, and branch events. The server passes an explicit `false` for each inclusion flag the client leaves unspecified.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.9": {
+   "sentence": "On success, `subscribe` returns the subscription ID synchronously as a nonempty string. The handler uses it without `await`, returns it unchanged in the WebSocket response, and rejects an empty ID on a later unsubscribe request.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.10": {
+   "sentence": "IDs distinguish concurrently active subscriptions on the same store, including multiple subscriptions for one WebSocket. Otherwise the per-client set merges subscriptions or the server polls one client's events for another.",
+   "status": "pinned",
+   "tests": [
+    "tests/subscription-stream.test.mjs"
+   ]
+  },
+  "subscribe.14": {
+   "sentence": "If creation fails, `subscribe` signals failure by throwing rather than returning a sentinel or a rejected promise as the ID. The command handler otherwise tracks the return value as a success; the outer request handler turns a throw into an error response without requiring a particular error class or code.",
+   "status": "pinned",
+   "tests": [
+    "tests/node-lifecycle.test.mjs"
+   ]
+  },
+  "treeBatch.1": {
+   "sentence": "Accept the mount’s tree state ID and an array of operations keyed by mount-relative path: `{ op: 'set', path, entry }` or `{ op: 'remove', path }`. The caller sends the full list, including paths that already hold the requested value; it filters those paths only for failure diagnosis.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeBatch.2": {
+   "sentence": "A set stores the exact blob hash, byte size and mode supplied: the edit path uses the hash from `storeBlob`, and the commit helper supplies `0o644` if the change has no mode. A removal leaves no entry: `treeGet` of that path returns `null`.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeBatch.3": {
+   "sentence": "Record the batch as one all-or-none tree update. A failure before that record lands leaves every target as it was, not a prefix of the edits stored.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs",
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeBatch.4": {
+   "sentence": "Complete the tree update synchronously on normal return and signal failure by throwing in that call, not by returning a failure value or rejecting later. The workspace does not await or inspect the return value before marking paths committed and updating their intents.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  },
+  "treeBatch.5": {
+   "sentence": "Apply the batch to the branch current at commit time. A later branch switch during materialization does not transfer the edits to the newly active branch.",
+   "status": "pinned",
+   "tests": [
+    "tests/tree-contract.test.mjs"
+   ]
+  },
+  "treeBatch.6": {
+   "sentence": "A throw need not mean rollback. If the record landed before the throw, it stays committed and successful immediate `treeGet` calls must reflect it: the caller checks every previously differing path to decide whether to finish the intents and report the edits stored without pushing them to disk.",
+   "status": "no test",
+   "note": "There is no supported post-publication throw point on this path. Admission failures, mid-write errors and a later sync failure do not constitute a committed treeBatch that itself threw."
+  },
+  "treeBatch.7": {
+   "sentence": "Expose a reportable failure reason (`Error.message` or a stringifiable thrown value). For errno-specific diagnostics the workspace recognizes a string system error code, or on non-Windows hosts an `Error` message of the form `IO error: … (os error N)`; other failures get generic reporting.",
+   "status": "pinned",
+   "tests": [
+    "tests/write-refusals.test.mjs"
+   ]
+  }
+ }
+}
