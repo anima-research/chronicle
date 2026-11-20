@@ -202,40 +202,46 @@ function cpuMicrosSince(start) {
   return user + system;
 }
 
-function narrowRangeTime(messages) {
+function narrowRangeFixture(messages) {
   const dir = mkdtempSync(join(tmpdir(), 'chronicle-history-cost-'));
-  let store;
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  const close = () => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  };
+  const firsts = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.6180339887498949) % 1) * (messages - 1)));
+  const window = first => ({ gte: MS + first, lte: MS + first + 1 });
+  const expected = firsts.map(first => [first, first + 1]);
   try {
-    store = JsStore.openOrCreate({ path: join(dir, 'store') });
     registerLog(store, SHARED);
     registerHistory(store, SHARED);
     for (let i = 0; i < messages; i += 4096) {
       store.appendManyToStateJson(SHARED, Array.from({ length: Math.min(4096, messages - i) },
         (_, k) => message(`item ${i + k}`, i + k, 'room', 'room')));
     }
-    const firsts = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.6180339887498949) % 1) * (messages - 1)));
-    const window = first => ({ gte: MS + first, lte: MS + first + 1 });
-    const expected = firsts.map(first => [first, first + 1]);
     assert.deepEqual(firsts.map(first => range(store, SHARED, window(first))), expected);
-    const times = [];
-    for (let sample = 0; sample < 5; ++sample) {
-      const found = new Array(firsts.length);
-      const start = process.cpuUsage();
-      for (let i = 0; i < firsts.length; ++i) found[i] = range(store, SHARED, window(firsts[i]));
-      times.push(cpuMicrosSince(start));
-      assert.deepEqual(found, expected);
-    }
-    return Math.min(...times);
-  } finally {
-    store?.close();
-    rmSync(dir, { recursive: true, force: true });
+  } catch (error) {
+    close();
+    throw error;
   }
+  const sample = () => {
+    const found = new Array(firsts.length);
+    const start = process.cpuUsage();
+    for (let i = 0; i < firsts.length; ++i) found[i] = range(store, SHARED, window(firsts[i]));
+    const time = cpuMicrosSince(start);
+    assert.deepEqual(found, expected);
+    return time;
+  };
+  return { sample, close };
 }
 
-test('A narrow time query through the binding costs the same over a long history', () => {
-  const small = narrowRangeTime(256);
-  const large = narrowRangeTime(32768);
-  const floor = 20_000;
+test('A narrow time query through the binding costs the same over a long history', t => {
+  const fixtures = [narrowRangeFixture(256), narrowRangeFixture(32768)];
+  t.after(() => fixtures.forEach(fixture => fixture.close()));
+  const times = fixtures.map(() => []);
+  for (let round = 0; round < 5; ++round) fixtures.forEach((fixture, i) => times[i].push(fixture.sample()));
+  const [small, large] = times.map(samples => Math.min(...samples));
+  const floor = 3_000;
   assert.ok(large < 3 * small + floor, `96 narrow queries took ${small} µs CPU over 256 messages, ${large} over 32,768`);
 });
 

@@ -207,7 +207,8 @@ test('An explicit branch name selects the live state changes of that branch', {
   todo: 'A state subscription ignores the branch name for live changes: they come from every branch.',
 }, t => {
   const { store, work, filter } = stateBranches(t);
-  const named = store.subscribe({ filter });
+  const named = watchSnapshots(store, { filter });
+  replaySnapshots(store, named);
   work.setStateJson('mood', 'work again');
   store.setStateJson('mood', 'main again');
   work.close();

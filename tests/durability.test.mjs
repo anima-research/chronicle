@@ -16,7 +16,8 @@ const inside = (paths, dir) => paths.filter(path => path === dir || path.startsW
 const relative = (paths, dir) => paths.map(path => posix.relative(dir, path)).sort();
 
 function straceProblem() {
-  const probe = spawnSync('strace', ['--kill-on-exit', '-o', '/dev/null', 'true'], { encoding: 'utf8' });
+  const probe = spawnSync('strace', ['--kill-on-exit', '-o', '/dev/null', 'true'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  if (probe.error?.code === 'ETIMEDOUT') return 'strace did not trace true within 10 s';
   if (probe.error) return `strace is not on the path (${probe.error.code})`;
   if (probe.status !== 0) return `strace may not trace here: ${probe.stderr.trim().split('\n')[0]}`;
   return null;
@@ -26,6 +27,9 @@ function traceWriter() {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'chronicle-durability-')));
   after(() => rmSync(base, { recursive: true, force: true }));
   const root = join(base, 'root');
+  if (/[\x00-\x1f\x7f-\uffff"\\<>]/.test(root)) {
+    return { labels: null, failure: `the path ${JSON.stringify(root)} has characters that strace escapes in its record, and the check reads paths unescaped` };
+  }
   const control = join(root, 'control');
   mkdirSync(control, { recursive: true });
   const record = join(base, 'record');
