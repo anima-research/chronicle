@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
@@ -192,7 +192,9 @@ test('A typed journal outlives historical cuts and deletion of a contributing br
   }
 });
 
-test('Journal lists are growable snapshots with append-only visible suffixes', (t) => {
+test('Journal lists are growable snapshots with append-only visible suffixes', {
+  skip: process.platform === 'win32' && 'renames the directory of an open store, which Windows refuses',
+}, (t) => {
   const { store, path } = fixture(t);
   const position = () => [store.stats().recordCount, store.currentSequence()];
   const beforeReads = position();
@@ -213,7 +215,9 @@ test('Journal lists are growable snapshots with append-only visible suffixes', (
     const now = list();
     // pins appendJson.12: the accepted layout extends exactly the accounted-for prefix by its returned ID.
     assert.deepEqual(now, [...prefix, id]);
-    // pins appendJson.12: layout cursors compare the IDs as JS Numbers (including across a decimal digit change).
+    // The IDs ascend as Numbers too, across a change in their count of digits. The
+    // part of appendJson.12 at 2 ** 53, where two IDs compare equal as Numbers,
+    // has no test: no call makes a record ID that large.
     assert.ok(increasing(now.map(Number)));
     return id;
   }
@@ -243,10 +247,9 @@ test('Journal lists are growable snapshots with append-only visible suffixes', (
       renameSync(moved, path);
     }
   }
-  expectBarrierFailure(() => {
-    store.sync();
-    store.appendJson(layout, { compileId: 'never-written' });
-  });
+  // The caller appends only after the first barrier succeeds, so a refused
+  // barrier means no append.
+  expectBarrierFailure(() => store.sync());
   // pins getRecordIdsByType.19: acceptance refused at the first barrier leaves the exact accounted prefix alone.
   assert.deepEqual(list(), accounted);
   store.sync();
@@ -256,31 +259,17 @@ test('Journal lists are growable snapshots with append-only visible suffixes', (
   assert.deepEqual(list(), [...accounted, landed.id]);
 });
 
-// Find the tail by observing growth during the last append, not by a filename
-// or knowledge of how the record is encoded. Only the fixture uses the FS;
-// the evidence of recovery and the ID lookups come from the reopened handle.
-function sizes(dir) {
-  const files = new Map();
-  for (const relative of readdirSync(dir, { recursive: true })) {
-    const path = join(dir, relative);
-    const stat = statSync(path);
-    if (stat.isFile()) files.set(path, stat.size);
-  }
-  return files;
-}
-
 test('A repaired-away ID has the ordinary JS null miss until reissued', (t) => {
   const f = fixture(t);
   const first = f.store.appendJson(layout, { compileId: 'intact' });
   f.store.sync();
-  const before = sizes(f.path);
   const last = f.store.appendJson(layout, { compileId: 'old-mark', text: 'tail'.repeat(2048) });
   const listedMark = f.store.getRecordIdsByType(layout).at(-1);
   assert.equal(listedMark, last.id);
-  const growth = [...sizes(f.path)].map(([path, size]) => ({ path, size, added: size - (before.get(path) ?? 0) }));
-  const tail = growth.sort((a, b) => b.added - a.added)[0];
-  if (!(tail?.added > 0)) throw new Error('Could not induce a torn tail: no file grew during append');
-  const store = f.reopen(() => truncateSync(tail.path, tail.size - 1));
+  // The fixture tears the last byte of the record log, as a crash in the middle
+  // of the append would. The evidence comes from the reopened handle.
+  const log = join(f.path, 'records.log');
+  const store = f.reopen(() => truncateSync(log, statSync(log).size - 1));
   assert.ok(store.recovery()?.droppedBytes > 0, 'fixture tore the trailing record');
   assert.deepEqual(store.getRecordIdsByType(layout), [first.id]);
   // pins getRecord.4: a single lookup of the formerly listed mark is strictly null before any ID can be reissued.

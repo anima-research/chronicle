@@ -207,7 +207,13 @@ if (process.argv[2] === '--crash-writer') {
   writeSync(1, JSON.stringify(coordinates));
   process.kill(process.pid, 'SIGKILL');
 } else {
-  test('The one surviving ledger checkpoint outlives prefix redaction and compaction', t => {
+  // The writer ends itself with SIGKILL. The system keeps what the process
+  // wrote, so these tests show what survives the death of the process after a
+  // sync, not what survives a loss of power. One test also renames the
+  // directory of an open store. Windows reports neither as these tests need.
+  const posix = { skip: process.platform === 'win32' && 'needs a POSIX signal and a rename of an open directory' };
+
+  test('The one surviving ledger checkpoint outlives prefix redaction and compaction', posix, t => {
     for (const [compact, empty] of [[false, false], [true, false], [true, true]]) {
       const path = setup(t, root => {
         root.registerState({ id: legacy, strategy: 'snapshot' });
@@ -236,7 +242,7 @@ if (process.argv[2] === '--crash-writer') {
     }
   });
 
-  test('An unawaited repair barrier is complete before close and mixed references recover after process death', t => {
+  test('An unawaited repair barrier is complete before close and mixed references recover after process death', posix, t => {
     const path = setup(t, root => {
       for (const id of [messages, presentations, audit]) root.registerState({ id, strategy: 'append_log' });
       for (const id of [framework, summaries]) root.registerState({ id, strategy: 'snapshot' });
@@ -246,11 +252,11 @@ if (process.argv[2] === '--crash-writer') {
     });
     const saved = runWriter(path, 'mixed');
     reopen(path, root => {
-      // pins open.17 repair survives a sync through the open handle, before close could flush it
+      // pins open.17 after a sync through the open handle, the repair survives the death of the process, before close could flush it
       assert.deepEqual(root.getStateJson(summaries), repaired);
       // pins sync.9 a synced JSON replacement preserves the chosen host mode across process death
       assert.deepEqual(root.getStateJson(framework), hostMode);
-      // pins sync.6 every pre-barrier typed ID still names its original type, data and links after a read then sync
+      // pins sync.6 after a read then sync and the death of the process, every pre-barrier typed ID still names its original type, data and links
       assert.deepEqual(saved.ids.map(id => {
         const r = root.getRecord(id);
         return { id: r.id, type: r.recordType, data: JSON.parse(r.payload.toString()), links: r.linkedTo };
@@ -258,14 +264,14 @@ if (process.argv[2] === '--crash-writer') {
 
       const view = root.view(saved.branch);
       const delivered = view.getStateJson(messages);
-      // pins sync.8 every delivered row, including mail and the distinct notice, is present after the delivery barrier
+      // pins sync.8 after the delivery barrier and the death of the process, every delivered row, including mail and the distinct notice, is present
       assert.deepEqual(delivered, rows);
       const events = view.getStateJson(audit);
       const staged = events.find(e => e.type === 'staged');
       const linked = events.find(e => e.type === 'linked' && e.batchId === staged.batchId);
       const originals = view.getBlob(staged.originals.blobId);
       const presentation = view.getStateJson(presentations);
-      // pins sync.12 one barrier covers the audit links, referenced bytes, guarded row and its presentation together
+      // pins sync.12 after one barrier and the death of the process, the audit links, referenced bytes, guarded row and its presentation survive together
       assert.deepEqual({ events, originals, rendering: view.getBlob(staged.content.blobId),
         row: delivered.find(r => r.id === linked.messageId), presentation }, {
         events: [stagedEntry(saved.originalId, saved.contentId), linkedEntry], originals: original, rendering: content,
@@ -301,7 +307,7 @@ if (process.argv[2] === '--crash-writer') {
     });
   });
 
-  test('Synced progress and queue replacements recover without another flush', t => {
+  test('Synced progress and queue replacements recover without another flush', posix, t => {
     for (const empty of [false, true]) {
       const path = setup(t, root => {
         const older = { ...oldProgress, [queue]: empty ? assigned : { version: 1, pending: oldEntries } };
@@ -313,9 +319,9 @@ if (process.argv[2] === '--crash-writer') {
       // No importer message write between the newly assigned IDs and the crash.
       runWriter(path, 'progress', { empty });
       reopen(path, root => {
-        // pins sync.11 exact replacement with assigned IDs, or a stored [] distinct from absence
+        // pins sync.11 after a sync and the death of the process: the exact replacement with assigned IDs, or a stored [] distinct from absence
         assert.deepEqual(root.getStateJson(queue), empty ? [] : assigned);
-        // pins sync.10 paid answer, counted attempt with its new outcome, and newly quarantined merge survive sync
+        // pins sync.10 paid answer, counted attempt with its new outcome, and newly quarantined merge survive a sync and the death of the process
         assert.deepEqual(Object.fromEntries(Object.keys(newestProgress).map(id => [id, root.getStateJson(id)])),
           newestProgress);
       });

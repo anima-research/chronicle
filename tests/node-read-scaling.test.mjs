@@ -48,14 +48,16 @@ function measure(prefix) {
       }
       sliceTimes.push(sliceTime);
 
-      // Vary the ordinals: a fast path only for the head's last item (or
-      // memoizing the last lookup) doesn't make general point reads cheap.
-      const offsets = Array.from({ length: 96 }, (_, i) => added - 1 - ((37 * i) % 128));
-      const found = new Array(offsets.length);
+      // Spread the ordinals over the whole log, so that most lie far from both
+      // ends: a lookup that walks from either end, or a fast path for the last
+      // item, costs more as the prefix grows.
+      const total = prefix + added;
+      const positions = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.6180339887498949) % 1) * total));
+      const found = new Array(positions.length);
       const start = process.cpuUsage();
-      for (let i = 0; i < offsets.length; ++i) found[i] = reader.getStateItemJson('log', prefix + offsets[i]);
+      for (let i = 0; i < positions.length; ++i) found[i] = reader.getStateItemJson('log', positions[i]);
       pointTimes.push(cpuMicrosSince(start));
-      assert.deepEqual(found, offsets.map(item));
+      assert.deepEqual(found, positions.map((position) => item(position - prefix)));
     }
     // As in reconstruction_scaling.rs, take the best batch CPU time so a
     // single GC pause or a busy host doesn't determine the scaling result.
@@ -72,8 +74,46 @@ test('Warm point and suffix conversion do not scale with the untouched prefix', 
   const large = measure(32768);
   // The prefix grows 128x (>78x even counting all of the new suffixes).
   // Allow considerable noise, but not the work of parsing or copying it.
+  // A floor of 20 ms absorbs the noise of a tiny baseline, and the coarse CPU
+  // clock of some systems; a conversion of the whole prefix costs far more.
+  const floor = 20_000;
   // pins getStateItemJson.7: warm Node lookups convert only the requested item.
-  assert.ok(large.point < 6 * small.point, `point batch grew from ${small.point} to ${large.point} µs CPU`);
+  assert.ok(large.point < 6 * small.point + floor, `point batch grew from ${small.point} to ${large.point} µs CPU`);
   // pins getStateSlice.5: reading the old boundary plus new items costs the window, not the accumulated log.
-  assert.ok(large.slice < 6 * small.slice, `suffix batch grew from ${small.slice} to ${large.slice} µs CPU`);
+  assert.ok(large.slice < 6 * small.slice + floor, `suffix batch grew from ${small.slice} to ${large.slice} µs CPU`);
+});
+
+function branchIdTime({ messages, branches }) {
+  const dir = mkdtempSync(join(tmpdir(), 'chronicle-branch-id-'));
+  let store;
+  try {
+    store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    store.registerState({ id: 'log', strategy: 'append_log', deltaSnapshotEvery: 1000, fullSnapshotEvery: 1000 });
+    store.appendManyToStateJson('log', Array.from({ length: messages }, (_, i) => item(i)));
+    let parent = 'main';
+    for (let i = 0; i < branches; ++i) parent = store.createEmptyBranch(`other-${i}`, parent).name;
+    const active = store.createBranch('active');
+    store.switchBranch('active');
+    assert.equal(store.currentBranch().id, active.id);
+    const times = [];
+    for (let sample = 0; sample < 5; ++sample) {
+      const start = process.cpuUsage();
+      for (let i = 0; i < 2000; ++i) store.currentBranch().id;
+      times.push(cpuMicrosSince(start));
+    }
+    return Math.min(...times);
+  } finally {
+    store?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("The current branch's ID costs the same with a long history or many branches", () => {
+  const small = branchIdTime({ messages: 128, branches: 2 });
+  const deep = branchIdTime({ messages: 8192, branches: 2 });
+  const wide = branchIdTime({ messages: 128, branches: 256 });
+  const floor = 20_000;
+  // pins currentBranch.17: repeated ID reads through the binding traverse neither history nor the branch list.
+  assert.ok(deep < 3 * small + floor && wide < 3 * small + floor,
+    `2,000 reads took ${small} µs CPU, ${deep} with a long history, ${wide} with many branches`);
 });

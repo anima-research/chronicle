@@ -90,6 +90,9 @@ test("the store's errors carry their kind", () => {
   // pins getStateJson.19: the probe of the same ID identifies unparseable content, not an empty index.
   assert.throws(() => JSON.parse(raw.toString('utf8')), SyntaxError);
   throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  store.setState('notes', Buffer.from('not json'));
+  throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
   store.registerState({ id: 'items', strategy: 'append_log' });
   store.appendToState('items', Buffer.from('not json'));
   // pins getStateJson.6: a failure reconstructing the full log throws synchronously, not a miss.
@@ -490,20 +493,22 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
   const shard = join(dir, 'blobs', hash.slice(0, 2));
   const destination = join(shard, hash);
 
-  // A file in place of the shard obstructs the path at the OS level. The
-  // directory at the destination below is refused by Chronicle itself.
-  writeFileSync(shard, 'not a directory');
-  const osError = thrownBy(() => writeFileSync(destination, content));
-  const systemFailure = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
-  const posixMessage = new RegExp(`^IO error: .*\\(os error ${Math.abs(osError.errno)}\\)$`, 's');
-  const hasErrnoCode = typeof systemFailure.code === 'string' && /^E[A-Z0-9]+$/.test(systemFailure.code);
-  // pins storeBlob.9: workspace uses a conventional errno code first, else the full POSIX diagnostic.
-  assert.ok(
-    hasErrnoCode ? systemFailure.code === osError.code :
-      process.platform !== 'win32' && systemFailure instanceof Error && posixMessage.test(systemFailure.message),
-    `expected ${osError.code} or ${posixMessage}, got ${systemFailure.code}: ${systemFailure.message}`,
-  );
-  rmSync(shard);
+  // A file in place of the shard obstructs the path at the OS level, with the
+  // POSIX error for a path through a regular file. The directory at the
+  // destination below is refused by Chronicle itself.
+  if (process.platform !== 'win32') {
+    writeFileSync(shard, 'not a directory');
+    const osError = thrownBy(() => writeFileSync(destination, content));
+    const systemFailure = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
+    const posixMessage = new RegExp(`^IO error: .*\\(os error ${Math.abs(osError.errno)}\\)$`, 's');
+    const hasErrnoCode = typeof systemFailure.code === 'string' && /^E[A-Z0-9]+$/.test(systemFailure.code);
+    // pins storeBlob.9: workspace uses a conventional errno code first, else the full POSIX diagnostic.
+    assert.ok(
+      hasErrnoCode ? systemFailure.code === osError.code : systemFailure instanceof Error && posixMessage.test(systemFailure.message),
+      `expected ${osError.code} or ${posixMessage}, got ${systemFailure.code}: ${systemFailure.message}`,
+    );
+    rmSync(shard);
+  }
 
   mkdirSync(destination, { recursive: true });
   const failed = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));

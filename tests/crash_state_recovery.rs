@@ -1153,7 +1153,7 @@ fn a_switch_back_to_source_survives_a_barrier_without_drop() {
     drop(store);
     crash(dir.path(), "checkpoint/restore-source");
     let store = open_store(dir.path()).unwrap();
-    // pins switchBranch.13: sync covers restoration without Drop and keeps the original child.
+    // pins switchBranch.13: after a switch back and a sync, a crash without Drop keeps the restoration and the original child.
     assert_eq!(
         (
             store.current_branch().id,

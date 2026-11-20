@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, r
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { JsStore } from '../index.js';
+import { ErrorCode, JsStore } from '../index.js';
 
 function fixture(t) {
   const path = mkdtempSync(join(tmpdir(), 'chronicle-checkpoint-'));
@@ -164,6 +164,7 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
 
   withBlockedCheckpoint(f.path, 'branches.bin', () => {
     // No retry pending this time: selection succeeds and *its* publication fails.
+    // differs from switchBranch.10, which takes a throw as no move: the store throws after it has moved.
     assert.throws(() => store.switchBranch('target'));
     // pins currentBranch.6: the target is inspectable even though the call threw.
     assert.deepEqual(selected(), [target.name, target.id]);
@@ -246,7 +247,9 @@ test('Temporary damage to a cold record causes real read errors, not absent data
   });
 });
 
-test('Failing a barrier leaves exactly the landed journal suffix and state readable', t => {
+test('Failing a barrier leaves exactly the landed journal suffix and state readable', {
+  skip: process.platform === 'win32' && 'the writer ends itself with SIGKILL, which Windows does not report as a signal',
+}, t => {
   const f = fixture(t);
   const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--journal-writer', f.path], {
     encoding: 'utf8', timeout: 30_000,
@@ -256,7 +259,7 @@ test('Failing a barrier leaves exactly the landed journal suffix and state reada
   const entries = JSON.parse(child.stdout);
   const recovered = f.open();
   for (const type of new Set(entries.map(entry => entry.type))) {
-    // pins sync.13: the repaired barrier recovers receipts, acceptances and starts exactly once.
+    // pins sync.13: after the retried barrier and the death of the process, receipts, acceptances and starts are each there once.
     assert.deepEqual(recovered.getRecordIdsByType(type).map(id => readEntry(recovered, id)),
       entries.filter(entry => entry.type === type));
   }
@@ -283,10 +286,13 @@ test('Close consumes the root even when its final barrier throws', t => {
     assert.equal(store.isClosed(), true);
     // pins close.7: both live references accurately report consumption immediately after the throw.
     assert.deepEqual([store.isClosed(), view.isClosed()], [true, true]);
+    // pins close.3: the close error is the store's error for the failed barrier, of the same kind as the explicit sync's.
+    assert.ok(Object.values(ErrorCode).includes(syncError.code), `sync threw ${syncError.code}`);
+    assert.equal(closeError.code, syncError.code);
     // pins close.10: the close error has an operator-facing message, with no literal required.
     assert.ok(typeof closeError.message === 'string' && closeError.message.trim().length > 0);
     // pins close.12: both attempts yielded separately catchable store errors, neither lost.
-    assert.ok(syncError != null && closeError != null);
+    assert.ok(syncError instanceof Error && closeError instanceof Error && closeError !== syncError);
     // pins close.8: failure of the final barrier leaves neither handle usable.
     assert.throws(() => store.getStateJson('work'));
     assert.throws(() => view.getStateJson('work'));

@@ -986,6 +986,11 @@ fn check_identity_ordinals(
 /// item alone, for the batch the whole batch.
 #[test]
 fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
+    identity_batch_case(false);
+    identity_batch_case(true);
+}
+
+fn identity_batch_case(presented: bool) {
     let dir = TempDir::new().unwrap();
     let store = Store::create(config(dir.path())).unwrap();
     let first = json!({ "id": "first" });
@@ -997,9 +1002,11 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
             .unwrap()
     });
     let mut items: Vec<Value> = (0..6).map(identity_item).collect();
-    // Present the row the tombstone retracts and finish with a window-format header.
-    items[1]["id"] = json!("m1");
-    items[5]["v"] = json!(1);
+    if presented {
+        // Present the row the tombstone retracts and finish with a window-format header.
+        items[1]["id"] = json!("m1");
+        items[5]["v"] = json!(1);
+    }
     let singles: Vec<chronicle::Record> = items
         .iter()
         .map(|item| {

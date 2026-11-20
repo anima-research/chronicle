@@ -171,15 +171,18 @@ test('Creation metadata is in epoch microseconds and stays with the identity', (
   // pins currentBranch.11: it is the pair, not the clock alone, that must distinguish replacements
   assert.notDeepEqual(pair(store.currentBranch()), pair(selected));
 
-  // Date.now() samples whole milliseconds; compare at that precision, including the final millisecond.
+  // A window of ten minutes either side tolerates a step of the wall clock, and
+  // still tells microseconds from milliseconds or seconds by far.
+  const slack = 10 * 60 * 1000;
   const selectedMs = Math.floor(selected.created / 1000);
-  // pins currentBranch.11: native creation time in microseconds since the epoch
-  assert.ok(before <= selectedMs && selectedMs <= after,
+  // differs from currentBranch.11, which asks for milliseconds: the store gives microseconds since the epoch.
+  assert.ok(before - slack <= selectedMs && selectedMs <= after + slack,
     `currentBranch.created = ${selected.created} µs, expected [${before}, ${after}] ms`);
   const listedMs = Math.floor(listed.created / 1000);
-  // pins listBranches.9: the listed timestamp uses the same epoch-microsecond clock
-  assert.ok(before <= listedMs && listedMs <= after,
+  // differs from listBranches.9, which asks for milliseconds: the store gives the same epoch-microsecond clock.
+  assert.ok(before - slack <= listedMs && listedMs <= after + slack,
     `listBranches.created = ${listed.created} µs, expected [${before}, ${after}] ms`);
+  assert.equal(listed.created, selected.created);
 });
 
 test('Listed ancestry describes immediate parents and inclusive cuts, not current heads', (t) => {

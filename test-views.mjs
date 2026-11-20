@@ -457,7 +457,7 @@ try {
     assert.deepEqual(texts(observer), ['inherited', 'source-1', 'source-2', 'through-source-view']);
     root.close();
     const closed = observer.isClosed();
-    // pins isClosed.4: true is the signal to use only the caller's last known name
+    // pins isClosed.4: true is the signal to fall back on a name the caller cached earlier
     assert.equal(closed, true);
     assert.equal(closed ? cachedName : observer.currentBranch().name, 'recovery');
     ok('A checkout changes the shared cursor, not saved branch objects or pinned views');

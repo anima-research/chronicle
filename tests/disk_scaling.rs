@@ -6,7 +6,8 @@
 //! quadratic signature (~16x); the ratio for linear growth is ~4x plus
 //! snapshot-cadence overhead. Tables are printed for slope inspection with
 //! `cargo test --test disk_scaling -- --nocapture`. The point-update test
-//! measures one ordinary operation at a time, outside snapshot boundaries.
+//! counts the bytes that one ordinary operation passes to the system's write
+//! calls, outside snapshot boundaries; only Linux reports them.
 
 use chronicle::{
     RecordInput, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, TreeEntry,
@@ -23,6 +24,24 @@ fn create_store(dir: &TempDir) -> Store {
         create_if_missing: true,
     })
     .unwrap()
+}
+
+/// The bytes that `op` passes to write calls on this thread, which holds every
+/// write of an ordinary operation. Linux reports them in `/proc/thread-self/io`;
+/// elsewhere the count is `None`.
+fn bytes_written<T>(op: impl FnOnce() -> T) -> (T, Option<u64>) {
+    let written = || -> Option<u64> {
+        let io = fs::read_to_string("/proc/thread-self/io").ok()?;
+        io.lines()
+            .find_map(|line| line.strip_prefix("wchar:"))?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let before = written();
+    let result = op();
+    let after = written();
+    (result, before.zip(after).map(|(before, after)| after - before))
 }
 
 fn dir_bytes(path: &Path) -> u64 {
@@ -301,29 +320,25 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         assert_eq!(store.tree_list("tree", None).unwrap().len(), n);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(entry(0)));
 
-        let before_set = store.stats().unwrap().total_size_bytes;
         let replacement = entry(10_000);
-        store.tree_set("tree", TARGET, &replacement).unwrap();
+        let (set, set_written) = bytes_written(|| store.tree_set("tree", TARGET, &replacement));
+        set.unwrap();
         let after_set = store.stats().unwrap();
-        let set_growth = after_set.total_size_bytes.saturating_sub(before_set);
-        // pins treeSet.14: replacing one existing checkpoint writes only entry-sized data.
-        assert!(
-            set_growth <= TREE_BUDGET,
-            "set in {n}-key tree grew by {set_growth} bytes"
-        );
+        if let Some(bytes) = set_written {
+            // pins treeSet.14: replacing one existing checkpoint writes only entry-sized data.
+            assert!(bytes <= TREE_BUDGET, "set in {n}-key tree wrote {bytes} bytes");
+        }
         // pins treeSet.14: all keys and their replacements use just the one registered tree.
         assert_eq!(after_set.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(replacement));
 
-        let before_remove = store.stats().unwrap().total_size_bytes;
-        store.tree_remove("tree", TARGET).unwrap();
+        let (removed, remove_written) = bytes_written(|| store.tree_remove("tree", TARGET));
+        removed.unwrap();
         let after_remove = store.stats().unwrap();
-        let remove_growth = after_remove.total_size_bytes.saturating_sub(before_remove);
-        // pins treeRemove.11: one eviction does not write the fleet-wide map.
-        assert!(
-            remove_growth <= TREE_BUDGET,
-            "remove in {n}-key tree grew by {remove_growth} bytes"
-        );
+        if let Some(bytes) = remove_written {
+            // pins treeRemove.11: one eviction does not write the fleet-wide map.
+            assert!(bytes <= TREE_BUDGET, "remove in {n}-key tree wrote {bytes} bytes");
+        }
         // pins treeRemove.11: the eviction leaves just the checkpoint tree registered.
         assert_eq!(after_remove.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), None);
@@ -347,23 +362,23 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         }
         assert_eq!(store.get_state_len("log").unwrap(), Some(n));
         let edited = serde_json::to_vec(&json!({"body": hash(10_000)})).unwrap();
-        let edit_record = store
-            .update_state(
+        let (edit, edit_written) = bytes_written(|| {
+            store.update_state(
                 "log",
                 StateOperation::Edit {
                     index: 0,
                     new_value: edited.clone(),
                 },
             )
-            .unwrap();
-        // Measure the returned record itself (all fields), not total bytes for
-        // appends, edits and snapshot consolidation together.
-        let record_bytes = rmp_serde::to_vec(&edit_record).unwrap().len();
-        // pins editStateItem.14: the edit record scales with the one replacement, not log length.
-        assert!(
-            record_bytes <= 4 * edited.len() + 1024,
-            "edit in {n}-item log returned a {record_bytes}-byte record"
-        );
+        });
+        edit.unwrap();
+        if let Some(bytes) = edit_written {
+            // pins editStateItem.14: an edit writes in proportion to the one replacement, not log length.
+            assert!(
+                bytes <= 4 * edited.len() as u64 + 1024,
+                "edit in {n}-item log wrote {bytes} bytes"
+            );
+        }
         assert_eq!(store.get_state_item("log", 0).unwrap(), Some(edited));
         assert_eq!(store.get_state_len("log").unwrap(), Some(n));
     }

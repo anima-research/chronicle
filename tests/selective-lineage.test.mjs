@@ -69,6 +69,9 @@ test('A sampled non-main parent name works for all three named-parent forks', as
   const parent = source.currentBranch();
   const head = source.currentSequence();
   const liveSeed = values(source, slots);
+  // The seeds come from reads, so check first that the writes above are in them.
+  assert.ok(atCut.every((value) => value !== null) && liveSeed.every((value) => value !== null));
+  assert.deepEqual([atCut.at(-1), liveSeed.at(-1)], [{ phase: 'initial' }, { phase: 'live' }]);
   assert.deepEqual(values(twin, slots), liveSeed);
   assert.notEqual(twin.currentBranch().id, parent.id);
   assert.notDeepEqual(values(store, slots), liveSeed);
@@ -369,8 +372,10 @@ test('Storage, presentation and later writes have distinct inclusive cutoffs', t
   const allSlots = [MSG, AUX, WIN, CTX, STRATEGY, BIND, PLAN, DIRECT];
   const fullName = 'full';
   const full = fork(fullName, since.name, parent.currentSequence());
+  const parentSlots = values(parent, allSlots);
+  assert.ok(parentSlots.every((value) => value !== null), 'every slot of the parent is populated');
   // pins createBranchAt.9: the full head includes every populated slot, even retraction, context and strategy after the last row.
-  assert.deepEqual(values(full, allSlots), values(parent, allSlots));
+  assert.deepEqual(values(full, allSlots), parentSlots);
   // The following cuts are in `full`'s inherited history. The caller's mark and run start are
   // saved numbers; Chronicle supplies the fork points and rows that make them meaningful.
   for (const [name, cut, expected, covered] of [

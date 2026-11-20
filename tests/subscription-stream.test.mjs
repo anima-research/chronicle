@@ -52,14 +52,15 @@ before(() => {
       const id = store.subscribe();
       store.catchUpSubscription(id);
       assert.equal(store.pollSubscription(id)?.eventType, 'caught_up');
-      for (let i = 0; i < 40000; i++) assert.notEqual(typeof store.pollSubscription(id)?.then, 'function');
+      for (let i = 0; i < 200000; i++) assert.equal(store.pollSubscription(id), null);
     } finally { store.close(); }
   `;
   try {
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', code, join(dir, 'store')], {
-      timeout: 15000, killSignal: 'SIGKILL', encoding: 'utf8',
+      timeout: 60000, killSignal: 'SIGKILL', encoding: 'utf8',
     });
-    // pins pollSubscription.2: empty active polls neither return promises nor wait on a receive timeout.
+    // pins pollSubscription.2: an empty active poll answers null at once, not a promise; 200,000 of them in under
+    // 60 s rule out a wait of 0.3 ms or more on each.
     assert.equal(probe.status, 0, probe.error?.message ?? probe.stderr);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -170,7 +171,8 @@ test('Event inclusion flags select replay and live classes with bare names and J
   }
   const summaries = [replay[0][0], live[0][0]].map(e => JSON.parse(e.data).record);
   const snap = JSON.parse(replay[1][0].data), change = JSON.parse(live[1][0].data);
-  // pins pollSubscription.7: the store's JSON has a top-level record summary and snake_case record and state fields.
+  // differs from pollSubscription.7, whose caller declares camelCase names: the store gives a top-level record
+  // summary and snake_case record and state fields.
   assert.deepEqual({
     records: summaries.map(r => [r.id, r.sequence, r.branch, r.record_type, r.timestamp, r.payload_size]),
     snapshot: [snap.state_id, snap.data, snap.sequence, snap.truncated, snap.total_bytes],
@@ -182,25 +184,51 @@ test('Event inclusion flags select replay and live classes with bare names and J
   });
 });
 
-test('An explicit branch name selects records rather than behaving like no selector', {
-  todo: 'The live record filter ignores the branch name: a subscription to work receives records written to both main and work.',
-}, t => {
+test('A branch selector left undefined selects what an omitted one does', t => {
   const store = freshStore(t);
   store.createBranch('work');
   const base = { includeRecords: true };
-  const named = startLive(store, { ...base, branch: 'work' });
   const unspecified = startLive(store, { ...base, branch: undefined });
   const omitted = startLive(store, base);
   const main = store.appendJson('note', 'on main');
   const work = store.view('work');
-  const onWork = work.appendJson('note', 'on work');
+  work.appendJson('note', 'on work');
   work.close();
   const control = drain(store, omitted).map(recordId);
   // pins subscribe.6: explicit undefined behaves like omitting the selector (and includes the current branch).
   assert.ok(control.includes(main.id));
   assert.deepEqual(drain(store, unspecified).map(recordId), control);
+});
+
+test('An explicit branch name selects the live records of that branch', {
+  todo: 'The live record filter ignores the branch name: a subscription to work receives records written to both main and work.',
+}, t => {
+  const store = freshStore(t);
+  store.createBranch('work');
+  const named = startLive(store, { includeRecords: true, branch: 'work' });
+  store.appendJson('note', 'on main');
+  const work = store.view('work');
+  const onWork = work.appendJson('note', 'on work');
+  work.close();
   // pins subscribe.6: a non-current branch selected by name gets its write and excludes the current branch's.
   assert.deepEqual(drain(store, named).map(recordId), [onWork.id]);
+});
+
+test('An explicit branch name selects the replayed records of that branch', {
+  todo: "A catch-up replays the branch of the handle that catches up, and ignores the subscription's branch name.",
+}, t => {
+  const store = freshStore(t);
+  store.createBranch('work');
+  store.appendJson('note', 'on main');
+  const work = store.view('work');
+  const onWork = work.appendJson('note', 'on work');
+  work.close();
+  const named = store.subscribe({ fromSequence: 0, filter: { includeRecords: true, branch: 'work' } });
+  store.catchUpSubscription(named);
+  const events = drain(store, named);
+  assert.equal(events.pop()?.eventType, 'caught_up');
+  // pins subscribe.6: a catch-up through a handle on main replays the named branch's records, not main's.
+  assert.deepEqual(events.map(recordId), [onWork.id]);
 });
 
 function setSnapshot(store, id, data) {
@@ -257,19 +285,38 @@ test('Replay honors selected state IDs and explicit and default snapshot byte li
   const at = all.find(s => snapshotId(s) === 'at-default'), above = all.find(s => snapshotId(s) === 'over-default');
   // pins subscribe.3: omitting maxSnapshotBytes preserves all 10 MiB but limits a value one byte larger.
   assert.deepEqual([at.truncated, at.data === atDefault, above.truncated, jsonBytes(above.data) <= defaultLimit], [false, true, true, true]);
+
+  // Live changes follow the same selection as the replay did.
+  store.setStateJson('fits', 'é');
+  store.setStateJson('unselected', 'still out');
+  const changed = id => drain(store, id).map(event => {
+    assert.equal(event.eventType, 'state_delta');
+    return JSON.parse(event.data).state_id;
+  });
+  // pins subscribe.7: a live change of an unselected state does not reach a subscription that lists other states.
+  assert.deepEqual(changed(smallId), ['fits']);
+  assert.deepEqual(changed(defaultId), ['fits', 'unselected']);
+});
+
+function cutArray(t) {
+  const store = freshStore(t);
+  setSnapshot(store, 'items', ['é', 'é']); // 8 bytes of elements, 11 bytes of array
+  const id = watchSnapshots(store, { maxSnapshotBytes: 9, filter: { includeStateChanges: true, stateIds: ['items'] } });
+  const [snapshot] = replaySnapshots(store, id);
+  return snapshot;
+}
+
+test('A replayed JSON array over the snapshot byte cap is marked truncated', t => {
+  // pins subscribe.3: an array over the cap is marked truncated.
+  assert.equal(cutArray(t).truncated, true);
 });
 
 test('The snapshot byte cap includes the delimiters of a replayed JSON array', {
   todo: 'Array truncation budgets the elements but not the brackets and commas in the delivered snapshot.',
 }, t => {
-  const store = freshStore(t);
-  setSnapshot(store, 'items', ['é', 'é']); // 8 bytes of elements, 11 bytes of array
-  const limit = 9;
-  const id = watchSnapshots(store, { maxSnapshotBytes: limit, filter: { includeStateChanges: true, stateIds: ['items'] } });
-  const [snapshot] = replaySnapshots(store, id);
+  const snapshot = cutArray(t);
   // pins subscribe.3: marking an array truncated isn't enough if its delivered data still exceeds the byte cap.
-  assert.equal(snapshot.truncated, true);
-  assert.ok(jsonBytes(snapshot.data) <= limit, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of ${limit}`);
+  assert.ok(jsonBytes(snapshot.data) <= 9, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of 9`);
 });
 
 test('The default queue holds a thousand events and cleanup also removes overflowed IDs', t => {
