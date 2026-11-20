@@ -11,6 +11,7 @@ jobs:
   changelog-entry:
     name: Changelog entry present
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: "!contains(github.event.pull_request.labels.*.name, 'no-changelog')"
 
     steps:

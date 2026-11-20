@@ -4,21 +4,23 @@
 //! eliminating the need to keep all updates in memory. An LRU cache
 //! stores recently reconstructed states for fast repeated access.
 
+use super::cache::{SharedCache, StateBytes, StateItems};
 use super::{FieldIndexKind, FieldIndexManager};
+use crate::atomic_file::Checkpoint;
 use crate::error::{Result, StoreError};
 use crate::records::RecordLog;
 use crate::types::{
     BranchId, StateOperation, StateRegistration, StateStrategy, StateUpdateRecord, TreeOp,
     TreeState,
 };
-use lru::LruCache;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Magic bytes for state index file.
@@ -29,6 +31,49 @@ const STATE_INDEX_VERSION: u8 = 2; // Bumped for new format
 
 /// Default cache size (number of states).
 const DEFAULT_CACHE_SIZE: usize = 1000;
+
+pub(crate) fn is_non_append_change(op: &StateOperation) -> bool {
+    matches!(
+        op,
+        StateOperation::Redact { .. }
+            | StateOperation::Edit { .. }
+            | StateOperation::Set(_)
+            | StateOperation::Delta { .. }
+    )
+}
+
+fn replaced_item_count(data: &[u8]) -> Option<usize> {
+    if data.is_empty() {
+        Some(0)
+    } else {
+        super::operations::json_array_len(data)
+    }
+}
+
+/// What `StateManager::lookup_state_items` found for a state.
+enum ItemsLookup {
+    /// The state has no value on the branch.
+    NoValue,
+    /// The state's value isn't a JSON array; the deserialization error.
+    NotArray(String),
+    /// The state's items.
+    Items(Arc<StateItems>),
+}
+
+/// What a session knows of one chain head's `item_count`. See
+/// `StateManager::counts`.
+#[derive(Clone, Copy, Debug)]
+struct CountCheck {
+    /// The head offset this holds for. A head that has moved past it is
+    /// unchecked again.
+    at: u64,
+    /// Whether the count is the number of items the state's value holds.
+    /// False where the session read the value to count it and the value
+    /// didn't materialize as a JSON array (an item that isn't JSON, a value
+    /// of another type, an Edit past the end): there is nothing to count,
+    /// and the value isn't read for a count again while this holds.
+    exact: bool,
+}
 
 /// What type of snapshot is needed for a state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,19 +138,34 @@ pub struct StateChainHead {
     /// File offset of most recent full snapshot.
     pub last_full_snapshot_offset: Option<u64>,
 
-    /// Whether there are non-Append operations (Edit, Redact, Set) since the last snapshot.
-    /// When true, a full snapshot should be created instead of a delta snapshot,
-    /// because delta snapshots can only track Append operations.
+    /// Whether a Redact, an Edit, a Set or a Delta lies in this state's chain
+    /// since its last full snapshot. While true, an `append_log` state takes no delta
+    /// snapshot. Any full snapshot clears it. A head an earlier release saved
+    /// may hold false with such a change in its chain. When a delta snapshot
+    /// comes due across such a change, the store takes a full one instead;
+    /// where the change already lies behind a delta snapshot that release
+    /// took, the store goes on taking delta snapshots, which keep the reading
+    /// that delta gives.
     #[serde(default)]
     pub has_non_append_since_snapshot: bool,
 
     /// Current number of items in the state (for O(1) length queries via
-    /// `get_state_len`). Updated on each Append (+1), Redact (-(end-start)),
-    /// and Set/Snapshot (=value.len). Exact for AppendLog; for Tree states it
-    /// is an upper-bound estimate between full snapshots (overwrites count as
-    /// inserts) and is corrected from the snapshot bytes at each full.
-    /// Snapshot spacing does NOT read this field — it reads
-    /// `item_count_at_last_full`, which is always stamped from parsed
+    /// `get_state_len`). Updated on each Append (+1), Redact (minus the items of
+    /// `[start, end)` that exist: both ends clamped to the count), a full
+    /// Snapshot or a Set or Delta of an array (=its length), and a Set or Delta
+    /// with no bytes (=0). Exact for an AppendLog written with its own operations
+    /// (Appends, Edits, Redacts, and Sets, Deltas and Snapshots of arrays),
+    /// except a count an older build stored before Redacts were clamped or before
+    /// Deltas and empty replaces were counted: loading keeps a stored count as it
+    /// is, so that one can stay wrong until a full Snapshot or an array Set or
+    /// Delta counts the items again, or a batched append counts them (see
+    /// `StateManager::checked_item_count`). A `DeltaSnapshot` leaves the count
+    /// as it is: the store's own restate items already counted, and one a
+    /// caller writes may hold others. For Tree states it is an estimate between
+    /// full snapshots (an overwrite counts as an insert, and a remove as a
+    /// removal whether or not the path existed) and is corrected from the
+    /// snapshot bytes at each full. Snapshot spacing does NOT read this field —
+    /// it reads `item_count_at_last_full`, which is always stamped from parsed
     /// snapshot bytes and therefore exact.
     #[serde(default)]
     pub item_count: usize,
@@ -122,41 +182,146 @@ pub struct StateChainHead {
     pub item_count_at_last_full: usize,
 }
 
+/// Chain heads for every `(branch, state)` pair, grouped by branch.
+///
+/// Grouping by branch is what keeps branch operations proportional to the
+/// branch involved rather than to the whole store: forking copies one
+/// branch's map (or just the selected entries of it), dropping a branch
+/// removes one entry, and neither scans the heads of any other branch. The
+/// per-branch map is ordered so that a state-id prefix selects a contiguous
+/// range.
+///
+/// **On-disk format:** unchanged. This serializes as the flat
+/// `(branch_id, state_id) -> head` map that `state.bin` has always held
+/// (the format a `HashMap<(BranchId, String), StateChainHead>` produces), and
+/// deserializes from it — see `test_state_index_wire_format_is_flat_map`.
+#[derive(Clone, Debug, Default)]
+pub struct BranchHeads {
+    by_branch: HashMap<BranchId, BTreeMap<String, StateChainHead>>,
+}
+
+impl BranchHeads {
+    /// Head of `state_id` on `branch`, if it has one.
+    pub fn get(&self, branch: BranchId, state_id: &str) -> Option<&StateChainHead> {
+        self.by_branch.get(&branch)?.get(state_id)
+    }
+
+    /// Mutable head of `state_id` on `branch`, if it has one.
+    pub fn get_mut(&mut self, branch: BranchId, state_id: &str) -> Option<&mut StateChainHead> {
+        self.by_branch.get_mut(&branch)?.get_mut(state_id)
+    }
+
+    /// Insert or replace the head for `(branch, state_id)`.
+    pub fn insert(
+        &mut self,
+        (branch, state_id): (BranchId, String),
+        head: StateChainHead,
+    ) -> Option<StateChainHead> {
+        self.by_branch.entry(branch).or_default().insert(state_id, head)
+    }
+
+    /// All heads of one branch, ordered by state id.
+    pub fn branch(&self, branch: BranchId) -> Option<&BTreeMap<String, StateChainHead>> {
+        self.by_branch.get(&branch)
+    }
+
+    /// Remove every head of `branch`, returning them.
+    pub fn remove_branch(&mut self, branch: BranchId) -> Option<BTreeMap<String, StateChainHead>> {
+        self.by_branch.remove(&branch)
+    }
+
+    /// Every head in the index.
+    pub fn iter(&self) -> impl Iterator<Item = ((BranchId, &String), &StateChainHead)> {
+        self.by_branch.iter().flat_map(|(branch, heads)| {
+            heads.iter().map(move |(state_id, head)| ((*branch, state_id), head))
+        })
+    }
+
+    /// Total number of heads across all branches.
+    pub fn len(&self) -> usize {
+        self.by_branch.values().map(|heads| heads.len()).sum()
+    }
+
+    /// Whether the index holds no heads at all.
+    pub fn is_empty(&self) -> bool {
+        self.by_branch.values().all(|heads| heads.is_empty())
+    }
+}
+
+impl Serialize for BranchHeads {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        // Entry-by-entry this makes the same serializer calls as
+        // `HashMap<(BranchId, String), StateChainHead>`. The entry count is
+        // passed explicitly: the nested iterator has no exact size hint, and
+        // MessagePack needs the map length up front.
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (key, head) in self.iter() {
+            map.serialize_entry(&key, head)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BranchHeads {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct HeadsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeadsVisitor {
+            type Value = BranchHeads;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of (branch_id, state_id) to chain head")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<BranchHeads, A::Error> {
+                let mut heads = BranchHeads::default();
+                while let Some((key, head)) =
+                    map.next_entry::<(BranchId, String), StateChainHead>()?
+                {
+                    heads.insert(key, head);
+                }
+                Ok(heads)
+            }
+        }
+
+        deserializer.deserialize_map(HeadsVisitor)
+    }
+}
+
+/// Which of a parent branch's states a new branch inherits.
+///
+/// A state is selected if its id equals one of `state_ids` or starts with one
+/// of `state_prefixes`. An empty selection selects nothing. Ids that name no
+/// state, or a state with no value on the parent, are ignored: there is
+/// nothing to inherit and the state reads as empty on the child either way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateSelection {
+    /// Exact state ids to inherit.
+    pub state_ids: Vec<String>,
+    /// State-id prefixes to inherit.
+    pub state_prefixes: Vec<String>,
+}
+
+impl StateSelection {
+    /// Whether `state_id` is covered by this selection.
+    pub fn matches(&self, state_id: &str) -> bool {
+        self.state_ids.iter().any(|id| id == state_id)
+            || self.state_prefixes.iter().any(|p| state_id.starts_with(p.as_str()))
+    }
+}
+
 /// In-memory state index (small - just heads and strategies).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StateIndex {
     /// Chain heads per (branch_id, state_id).
-    pub heads: HashMap<(BranchId, String), StateChainHead>,
+    pub heads: BranchHeads,
 
     /// Registered state strategies.
     pub strategies: HashMap<String, StateStrategy>,
-}
-
-/// Cached state value.
-#[derive(Clone)]
-struct CachedState {
-    value: Vec<u8>,
-    head_offset: u64, // To detect staleness
-}
-
-/// Cached per-item byte spans of an array-shaped (AppendLog) state.
-///
-/// Items are the raw JSON bytes of each array element, split once per
-/// materialization via `serde_json::value::RawValue` (boundary scan only —
-/// no `Value` tree is built). Shared out as `Arc` so repeated item/slice
-/// reads never re-copy the whole state.
-#[derive(Clone)]
-struct CachedItems {
-    items: Arc<Vec<Vec<u8>>>,
-    head_offset: u64, // To detect staleness (same discipline as CachedState)
-}
-
-/// Cached decoded form of a Tree state (path → entry map), so point reads
-/// (`tree_get`) and prefix lists stop paying a full-map JSON parse per call.
-#[derive(Clone)]
-struct CachedTree {
-    tree: Arc<TreeState>,
-    head_offset: u64, // To detect staleness (same discipline as CachedState)
 }
 
 /// State manager handles per-state chains and reconstruction.
@@ -167,20 +332,28 @@ pub struct StateManager {
     /// Path to state index file.
     path: PathBuf,
 
+    /// Last successfully published checkpoint, never seeded just by loading.
+    checkpoint: Checkpoint,
+
     /// In-memory index (just heads + strategies, very small).
     index: RwLock<StateIndex>,
 
-    /// LRU cache for reconstructed states.
-    cache: RwLock<LruCache<String, CachedState>>,
+    /// LRU cache for reconstructed states (serialized bytes).
+    ///
+    /// All three caches are keyed per `(branch, state)` and validated by
+    /// `head_offset`, and all three share a value between branches whose
+    /// head for the state is at the same offset — see `state::cache`.
+    cache: RwLock<SharedCache<StateBytes>>,
 
     /// LRU cache for per-item byte spans of array-shaped states.
-    /// Populated lazily by `get_state_items`; invalidated in lockstep
-    /// with `cache` (same key scheme, same head_offset validity check).
-    items_cache: RwLock<LruCache<String, CachedItems>>,
+    /// Populated lazily by `get_state_items`, then kept current across
+    /// Append/Edit/Redact writes by deriving the next value from the cached
+    /// one (`record_update_with`) instead of being dropped and re-read.
+    items_cache: RwLock<SharedCache<StateItems>>,
 
     /// LRU cache for decoded Tree states. Populated lazily by
     /// `get_tree_state`; same key scheme and head_offset validity as above.
-    tree_cache: RwLock<LruCache<String, CachedTree>>,
+    tree_cache: RwLock<SharedCache<TreeState>>,
 
     /// Reference to record log for disk-based chain traversal.
     log: Option<Arc<RecordLog>>,
@@ -194,6 +367,43 @@ pub struct StateManager {
     /// Path to the persisted field-index file, derived once at construction
     /// as a sibling of `path` (`state.bin` -> `state-indexes.bin`).
     field_index_path: PathBuf,
+
+    /// Branches that were deleted since the last `purge_retired_branches`.
+    /// Their chain heads stay in `index` (and so in the next `state.bin`)
+    /// until the store has durably recorded the deletion — see
+    /// `retire_branch`.
+    retired_branches: parking_lot::Mutex<Vec<BranchId>>,
+
+    /// What this session knows of each head's `item_count`, per branch and
+    /// state. A head created or counted in this session has an entry, which
+    /// follows the head while every write keeps the count exact (an Append,
+    /// an AppendMany, an Edit, a Redact, a Set, Delta or full Snapshot of an
+    /// array, the store's own snapshots). A head loaded from `state.bin`, a
+    /// head another write left uncounted (a `DeltaSnapshot` the caller
+    /// wrote, a value that isn't an array) and a head installed or copied
+    /// from elsewhere have none, as their count may be off: a release before
+    /// 0.5.0 stored some counts wrong, and loading keeps a stored count as it
+    /// is. A batched append counts such a head's items before it takes its
+    /// ordinals (`checked_item_count`), and the batched calls' head-record
+    /// fast paths serve only an exact entry.
+    ///
+    /// In memory only. A head saved with one more field would make releases
+    /// that predate it refuse `state.bin`: their decoder rejects a head
+    /// longer than the fields they know.
+    counts: RwLock<HashMap<BranchId, HashMap<String, CountCheck>>>,
+
+    /// Number of times a state value was rebuilt from the log
+    /// (`reconstruct_from_disk`). Everything served from a cache — this
+    /// branch's own entry or one shared with another branch — leaves it
+    /// untouched, which makes it the observable for "this read did not
+    /// re-materialize".
+    reconstructions: AtomicU64,
+
+    /// Code a test runs once at a named point of a read (see
+    /// `run_test_hook`), so it can land a write or a count there, as another
+    /// thread can.
+    #[cfg(test)]
+    test_hooks: parking_lot::Mutex<HashMap<&'static str, Box<dyn FnOnce(&StateManager) + Send>>>,
 }
 
 /// Derive the field-index file path as a sibling of the state-index path.
@@ -218,13 +428,19 @@ impl StateManager {
 
         Ok(Self {
             path,
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(StateIndex::default()),
-            cache: RwLock::new(LruCache::new(cache_size)),
-            items_cache: RwLock::new(LruCache::new(cache_size)),
-            tree_cache: RwLock::new(LruCache::new(cache_size)),
+            cache: RwLock::new(SharedCache::new(cache_size)),
+            items_cache: RwLock::new(SharedCache::new(cache_size)),
+            tree_cache: RwLock::new(SharedCache::new(cache_size)),
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            retired_branches: parking_lot::Mutex::new(Vec::new()),
+            counts: RwLock::new(HashMap::new()),
+            reconstructions: AtomicU64::new(0),
+            #[cfg(test)]
+            test_hooks: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -246,13 +462,19 @@ impl StateManager {
 
         let manager = Self {
             path: path.clone(),
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(StateIndex::default()),
-            cache: RwLock::new(LruCache::new(cache_size)),
-            items_cache: RwLock::new(LruCache::new(cache_size)),
-            tree_cache: RwLock::new(LruCache::new(cache_size)),
+            cache: RwLock::new(SharedCache::new(cache_size)),
+            items_cache: RwLock::new(SharedCache::new(cache_size)),
+            tree_cache: RwLock::new(SharedCache::new(cache_size)),
             log: None,
             field_indexes: RwLock::new(FieldIndexManager::new()),
             field_index_path,
+            retired_branches: parking_lot::Mutex::new(Vec::new()),
+            counts: RwLock::new(HashMap::new()),
+            reconstructions: AtomicU64::new(0),
+            #[cfg(test)]
+            test_hooks: parking_lot::Mutex::new(HashMap::new()),
         };
 
         if path.exists() {
@@ -291,6 +513,23 @@ impl StateManager {
             }
         }
         Ok(())
+    }
+
+    /// Last state update included in this metadata checkpoint.
+    ///
+    /// Store serializes mutations and checkpoints under its write lock. Heads
+    /// are saved together, and branch copies only refer to earlier records, so
+    /// their maximum offset also covers every preceding state update. Branch
+    /// deletion retains heads, so it cannot move this watermark backwards.
+    /// None means no update has been checkpointed, including offset zero.
+    pub(crate) fn checkpoint_offset(&self) -> Option<u64> {
+        self.index.read().heads.iter().map(|(_, h)| h.head_offset).max()
+    }
+
+    /// Highest branch identity referenced by state metadata, including copied
+    /// heads that may have reached disk before their branch was published.
+    pub(crate) fn max_branch_id(&self) -> Option<BranchId> {
+        self.index.read().heads.iter().map(|((branch, _), _)| branch).max()
     }
 
     /// Register a new state with its strategy.
@@ -348,11 +587,35 @@ impl StateManager {
         offset: u64,
         operation: &StateOperation,
     ) -> Result<()> {
+        self.record_update_with(branch_id, state_id, offset, operation, false)
+    }
+
+    /// `record_update`, with the caller's assurance about the value.
+    ///
+    /// `content_preserving` says that `operation` is a snapshot (full or
+    /// delta) of exactly the value the state already had at its previous
+    /// head — true for the snapshots the store writes itself (threshold
+    /// snapshots, `compact_state`, `tree_snapshot`) when no other write
+    /// reached the state between reading the value and recording the
+    /// snapshot. Such a record moves the chain head without changing what
+    /// the state materializes to, so the cached values are kept and re-filed
+    /// under the new head instead of being dropped. It must be `false` for a
+    /// snapshot whose payload came from anywhere else.
+    pub(crate) fn record_update_with(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        offset: u64,
+        operation: &StateOperation,
+        content_preserving: bool,
+    ) -> Result<()> {
         let mut index = self.index.write();
 
-        let key = (branch_id, state_id.to_string());
-        let head = index.heads.entry(key.clone()).or_insert_with(|| {
-            StateChainHead {
+        let branch_heads = index.heads.by_branch.entry(branch_id).or_default();
+        // Where the chain stood before this record (`None`: first record).
+        let prev_offset = branch_heads.get(state_id).map(|h| h.head_offset);
+        if !branch_heads.contains_key(state_id) {
+            branch_heads.insert(state_id.to_string(), StateChainHead {
                 head_offset: offset,
                 ops_since_delta_snapshot: 0,
                 delta_snapshots_since_full: 0,
@@ -361,11 +624,20 @@ impl StateManager {
                 has_non_append_since_snapshot: false,
                 item_count: 0,
                 item_count_at_last_full: 0,
-            }
-        });
+            });
+        }
+        let head = branch_heads
+            .get_mut(state_id)
+            .expect("head inserted above");
 
         head.head_offset = offset;
+        if is_non_append_change(operation) {
+            head.has_non_append_since_snapshot = true;
+        }
 
+        // Whether the operation set the count from the value it holds: an
+        // array, or no bytes at all for a Set or Delta.
+        let mut counted_from_value = false;
         match operation {
             StateOperation::Snapshot(data) => {
                 // Full snapshot resets everything
@@ -377,7 +649,10 @@ impl StateManager {
                 // Update item count from snapshot: array-shaped (AppendLog) states
                 // count elements, map-shaped (Tree) states count entries.
                 head.item_count = match serde_json::from_slice::<serde_json::Value>(data) {
-                    Ok(serde_json::Value::Array(arr)) => arr.len(),
+                    Ok(serde_json::Value::Array(arr)) => {
+                        counted_from_value = true;
+                        arr.len()
+                    }
                     Ok(serde_json::Value::Object(map)) => map.len(),
                     _ => 0,
                 };
@@ -385,7 +660,6 @@ impl StateManager {
             }
             StateOperation::DeltaSnapshot(_) => {
                 // Delta snapshot resets op counter, increments delta counter
-                // Note: Delta doesn't change item_count - it consolidates existing items
                 head.ops_since_delta_snapshot = 0;
                 head.delta_snapshots_since_full += 1;
                 head.last_delta_snapshot_offset = Some(offset);
@@ -394,16 +668,26 @@ impl StateManager {
                 head.ops_since_delta_snapshot += 1;
                 head.item_count += 1;
             }
+            StateOperation::AppendMany(items) => {
+                // One operation for the cadence, however many items, as a
+                // TreeBatch counts. Append-only, so a delta snapshot may
+                // still consolidate it (`compute_delta_items` takes its
+                // items).
+                head.ops_since_delta_snapshot += 1;
+                head.item_count += items.len();
+            }
             StateOperation::Redact { start, end } => {
                 head.ops_since_delta_snapshot += 1;
-                head.has_non_append_since_snapshot = true;
-                // Redact removes items (clamped to valid range)
-                let remove_count = end.saturating_sub(*start).min(head.item_count);
-                head.item_count = head.item_count.saturating_sub(remove_count);
+                // Redact removes the items of [start, end) that exist: both
+                // ends are clamped to the length, as the materialized value
+                // clamps them, so a range running past the end removes only
+                // the items before it.
+                let start = (*start).min(head.item_count);
+                let end = (*end).min(head.item_count);
+                head.item_count -= end.saturating_sub(start);
             }
             StateOperation::Edit { .. } => {
                 head.ops_since_delta_snapshot += 1;
-                head.has_non_append_since_snapshot = true;
                 // Edit doesn't change count
             }
             StateOperation::Set(data) => {
@@ -411,15 +695,14 @@ impl StateManager {
                 // Set replaces the entire state. Append-log delta snapshots only
                 // consolidate Append operations, so allowing a delta after Set
                 // would walk past the replacement and resurrect older appends.
-                // Force the next threshold snapshot to contain the full state.
-                head.has_non_append_since_snapshot = true;
-                if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(data) {
-                    head.item_count = arr.len();
+                if let Some(count) = replaced_item_count(data) {
+                    head.item_count = count;
+                    counted_from_value = true;
                 }
             }
             StateOperation::TreeSet { .. } => {
                 head.ops_since_delta_snapshot += 1;
-                // Upper-bound estimate: overwrites count as inserts (newness is
+                // An estimate: overwrites count as inserts (newness is
                 // unknown here without the tree contents). Corrected from the
                 // parsed snapshot bytes at each full snapshot. Consumed by
                 // `get_state_len` only; snapshot spacing reads the exact
@@ -446,32 +729,96 @@ impl StateManager {
                 head.delta_snapshots_since_full += 1;
                 head.last_delta_snapshot_offset = Some(offset);
             }
-            StateOperation::Delta { .. } | StateOperation::Field { .. } => {
+            StateOperation::Delta { new_value, .. } => {
                 head.ops_since_delta_snapshot += 1;
-                // Delta/Field operations for Struct type - don't change count
+                if let Some(count) = replaced_item_count(new_value) {
+                    head.item_count = count;
+                    counted_from_value = true;
+                }
+            }
+            StateOperation::Field { .. } => {
+                head.ops_since_delta_snapshot += 1;
             }
         }
 
-        // Invalidate cache for this state (need to invalidate for all branches)
-        // Use a cache key that includes branch
-        let cache_key = format!("{}:{}", branch_id.0, state_id);
-        self.cache.write().pop(&cache_key);
-        self.items_cache.write().pop(&cache_key);
+        // Carry what this session knows of the count to the new head: one
+        // the operation set from the value it holds is exact, an operation
+        // that adds, edits or removes items keeps the check as it was, and
+        // any other leaves the new head unchecked.
+        let carried = match prev_offset {
+            // The record creates the head, so its count starts from nothing.
+            None => Some(true),
+            Some(prev) => self.count_check(branch_id, state_id, prev).map(|check| check.exact),
+        };
+        let checked = match operation {
+            _ if counted_from_value => Some(true),
+            StateOperation::Append(_)
+            | StateOperation::AppendMany(_)
+            | StateOperation::Edit { .. }
+            | StateOperation::Redact { .. } => carried,
+            // The store's own delta snapshot restates the value it read.
+            StateOperation::DeltaSnapshot(_) if content_preserving => carried,
+            _ => None,
+        };
+        self.set_count_check(
+            branch_id,
+            state_id,
+            checked.map(|exact| CountCheck { at: offset, exact }),
+        );
 
-        // Incrementally maintain any registered field indexes for this state.
-        // Gated on `has_indexes_for` so states with nothing registered pay
-        // no parse cost at all on the hot append path.
+        // Bring this branch's cached values for the state in line with the
+        // new head. Entries are per branch: nothing another branch holds is
+        // touched, including a value this branch was sharing with it.
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        let preserved_from = if content_preserving { prev_offset } else { None };
+
+        // Serialized bytes: kept across a content-preserving snapshot,
+        // otherwise dropped (the next `get_state` rebuilds them).
+        {
+            let mut cache = self.cache.write();
+            match preserved_from {
+                Some(prev) => cache.rekey(&cache_key, prev, offset),
+                None => cache.pop(&cache_key),
+            }
+        }
+
+        // Per-item form: derive the new value from the one cached at the
+        // previous head (this branch's own, or one another branch holds at
+        // that offset) rather than dropping it — otherwise every append
+        // would cost the next slice read a full re-materialization. Only
+        // when a value is already cached: a write never materializes.
+        {
+            let mut items_cache = self.items_cache.write();
+            let next = prev_offset
+                .and_then(|prev| items_cache.take(&cache_key, prev))
+                .and_then(|items| Self::advance_items(items, operation, content_preserving));
+            if let Some(items) = next {
+                items_cache.put(cache_key.clone(), offset, items);
+            }
+        }
+
+        // Decoded trees are not dropped on write (a stale entry is detected
+        // by head_offset on the next read); a content-preserving snapshot
+        // keeps the decoded tree current.
+        if let Some(prev) = preserved_from {
+            self.tree_cache.write().rekey(&cache_key, prev, offset);
+        }
+
+        // Incrementally maintain the field indexes registered for this state
+        // ON THIS BRANCH. Gated on `has_indexes_on` so a slot with nothing
+        // registered on the branch being written pays no parse cost at all
+        // on the hot append path — including when other branches do index it.
         //
-        // Parse failures poison (drop) every field index registered for this
-        // state_id rather than being silently skipped: skipping would leave
-        // `by_ordinal` one short forever, permanently misaligning every
-        // later ordinal against the real slot content with no signal to the
-        // caller. A poisoned index is simply gone — `register_field_index`
-        // rebuilds it from scratch — which is far safer than confidently
-        // returning wrong ordinals. Branch mismatches (a write on a branch
-        // other than the one an index was registered against) poison the
-        // same way; see `FieldIndexManager`'s "Branch scoping" docs.
-        if self.field_indexes.read().has_indexes_for(state_id) {
+        // Parse failures poison (drop) every field index this branch holds
+        // for this state_id rather than being silently skipped: skipping
+        // would leave `by_ordinal` one short forever, permanently
+        // misaligning every later ordinal against the real slot content with
+        // no signal to the caller. A poisoned index is simply gone —
+        // `register_field_index` rebuilds it from scratch — which is far
+        // safer than confidently returning wrong ordinals. Indexes other
+        // branches hold for the same state_id are never touched by this
+        // write; see `FieldIndexManager`'s "Branch scoping" docs.
+        if self.field_indexes.read().has_indexes_on(state_id, branch_id) {
             match operation {
                 StateOperation::Append(item) => {
                     match serde_json::from_slice::<serde_json::Value>(item) {
@@ -479,7 +826,26 @@ impl StateManager {
                             .field_indexes
                             .write()
                             .on_append(state_id, branch_id, offset, &value),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
+                    }
+                }
+                StateOperation::AppendMany(items) => {
+                    // Each item at its own ordinal, in order, as its own
+                    // Append would be. Every item is parsed before any is
+                    // indexed: one that doesn't parse poisons the indexes,
+                    // as it would on its own.
+                    let values: std::result::Result<Vec<serde_json::Value>, _> = items
+                        .iter()
+                        .map(|item| serde_json::from_slice::<serde_json::Value>(item))
+                        .collect();
+                    let mut field_indexes = self.field_indexes.write();
+                    match values {
+                        Ok(values) => {
+                            for value in &values {
+                                field_indexes.on_append(state_id, branch_id, offset, value);
+                            }
+                        }
+                        Err(_) => field_indexes.poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::DeltaSnapshot(_) => {
@@ -512,7 +878,7 @@ impl StateManager {
                             *index as u32,
                             &value,
                         ),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 StateOperation::Redact { start, end } => {
@@ -520,8 +886,8 @@ impl StateManager {
                         state_id,
                         branch_id,
                         offset,
-                        *start as u32,
-                        *end as u32,
+                        *start,
+                        *end,
                     );
                 }
                 StateOperation::Set(data)
@@ -543,7 +909,7 @@ impl StateManager {
                             offset,
                             items.iter(),
                         ),
-                        Err(_) => self.field_indexes.write().poison_state(state_id),
+                        Err(_) => self.field_indexes.write().poison_state_on(state_id, branch_id),
                     }
                 }
                 // Tree ops (path->entry maps) and Struct Field ops are not
@@ -560,15 +926,154 @@ impl StateManager {
         Ok(())
     }
 
+    /// Run the code a test set for `point`, once, if it set any.
+    #[cfg(test)]
+    fn run_test_hook(&self, point: &'static str) {
+        let hook = self.test_hooks.lock().remove(point);
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    /// Have `hook` run once at `point` (see `run_test_hook`).
+    #[cfg(test)]
+    fn set_test_hook(&self, point: &'static str, hook: impl FnOnce(&StateManager) + Send + 'static) {
+        self.test_hooks.lock().insert(point, Box::new(hook));
+    }
+
+    /// This session's check of the count of the head of `state_id` on
+    /// `branch_id`, if there is one for the head at `head_offset`.
+    fn count_check(&self, branch_id: BranchId, state_id: &str, head_offset: u64) -> Option<CountCheck> {
+        self.counts
+            .read()
+            .get(&branch_id)
+            .and_then(|states| states.get(state_id))
+            .copied()
+            .filter(|check| check.at == head_offset)
+    }
+
+    /// The head of `state_id` on `branch_id` and this session's check of its
+    /// count, read under one hold of the index. Every write that sets a
+    /// head's count and its check does both under the index's write lock,
+    /// so the pair is one moment's: read apart, a count landing between the
+    /// two reads would vouch for a count the copied head doesn't hold.
+    fn head_and_check(&self, branch_id: BranchId, state_id: &str) -> Option<(StateChainHead, Option<CountCheck>)> {
+        let index = self.index.read();
+        let head = index.heads.get(branch_id, state_id)?.clone();
+        let check = self.count_check(branch_id, state_id, head.head_offset);
+        Some((head, check))
+    }
+
+    fn set_count_check(&self, branch_id: BranchId, state_id: &str, check: Option<CountCheck>) {
+        let mut counts = self.counts.write();
+        match check {
+            Some(check) => {
+                let states = counts.entry(branch_id).or_default();
+                match states.get_mut(state_id) {
+                    Some(slot) => *slot = check,
+                    None => {
+                        states.insert(state_id.to_string(), check);
+                    }
+                }
+            }
+            None => {
+                if let Some(states) = counts.get_mut(&branch_id) {
+                    states.remove(state_id);
+                }
+            }
+        }
+    }
+
+    /// The state's item count on the branch, for a batched append to take
+    /// its first ordinal from: the head's `item_count` once this session has
+    /// checked it, and otherwise the number of items the state's value
+    /// holds, which the head then keeps as its count. 0 for a state with no
+    /// head on the branch.
+    ///
+    /// Counting reads the whole value once (`get_state_items`, so its items
+    /// stay cached for the batch and the reads after it), at most once per
+    /// head this session loaded or left unchecked, except that counts racing
+    /// without the lock may each read it. A value that doesn't
+    /// materialize as a JSON array has no items to count: the head keeps its
+    /// stored count, which is returned, and the value isn't read for a count
+    /// again until a write replaces it or leaves the head unchecked. An
+    /// error reading the log is returned, and nothing changes: an I/O error,
+    /// or a record of the chain that fails its checksum or whose framing is
+    /// bad, damage that came after open checked every record. A record that
+    /// reads and doesn't decode, or an operation that doesn't apply (an Edit
+    /// past the end), is part of a value that doesn't materialize, as above.
+    ///
+    /// A write takes its ordinals from the count only while holding
+    /// `Store::write_lock`, so the head can't move between the count and the
+    /// write that uses it. Called without the lock, as a batch does first so
+    /// that other writers wait only for each record it reads (each read takes
+    /// the log file's lock, which an append takes too), not the whole count,
+    /// it may race a write: the count is then kept only if the head is still
+    /// the one whose value was read, as heads only move forward (each to the
+    /// offset of a newer record), so the value read was that head's. A head
+    /// that moved keeps its own count, which is returned.
+    pub(crate) fn checked_item_count(&self, branch_id: BranchId, state_id: &str) -> Result<usize> {
+        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
+            return Ok(0);
+        };
+        #[cfg(test)]
+        self.run_test_hook("count: head read");
+        if check.is_some() {
+            return Ok(head.item_count);
+        }
+        let (count, exact) = match self.get_state_items(branch_id, state_id) {
+            Ok(Some(items)) => (items.len(), true),
+            Ok(None) => (0, true),
+            Err(
+                error @ (StoreError::Io(_)
+                | StoreError::ChecksumMismatch { .. }
+                | StoreError::InvalidFormat(_)),
+            ) => return Err(error),
+            Err(_) => (head.item_count, false),
+        };
+        #[cfg(test)]
+        self.run_test_hook("count: value read");
+        let mut index = self.index.write();
+        match index.heads.get_mut(branch_id, state_id) {
+            // A write that landed after the value was read has moved the
+            // head and set its count from the one before plus what it wrote;
+            // `count` is the older head's, and stored over it would drop
+            // that write's items until the next count.
+            Some(current) if current.head_offset == head.head_offset => {
+                current.item_count = count;
+                self.set_count_check(
+                    branch_id,
+                    state_id,
+                    Some(CountCheck { at: head.head_offset, exact }),
+                );
+                Ok(count)
+            }
+            Some(current) => Ok(current.item_count),
+            None => Ok(0),
+        }
+    }
+
     /// Get the current value of a state.
     ///
     /// Uses LRU cache for fast repeated access. On cache miss,
-    /// reconstructs state by traversing the chain from disk.
+    /// reconstructs state by traversing the chain from disk — unless another
+    /// branch already holds the value for the same chain head, in which case
+    /// that value is shared.
     pub fn get_state(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_state_shared(branch_id, state_id)?
+            .map(|state| state.data.clone()))
+    }
+
+    /// `get_state` without the final copy: the cached bytes themselves.
+    fn get_state_shared(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<StateBytes>>> {
         let index = self.index.read();
 
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -576,14 +1081,23 @@ impl StateManager {
 
         let cache_key = format!("{}:{}", branch_id.0, state_id);
 
-        // Check cache
-        {
-            let mut cache = self.cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(Some(cached.value.clone()));
-                }
-                // Stale cache entry, will reconstruct
+        // Check cache: this branch's entry, or a value another branch holds
+        // at the same head offset.
+        if let Some(cached) = self.cache.write().get(&cache_key, head.head_offset) {
+            return Ok(Some(cached));
+        }
+
+        // The per-item form may be current when the bytes are not (it is
+        // kept across writes, the bytes are dropped). Joining canonical
+        // items yields exactly the bytes a reconstruction would serialize,
+        // without touching the log. Not cached: the items already hold the
+        // data, and a second full copy per branch is what this avoids.
+        if let Some(items) = self.items_cache.read().peek(&cache_key, head.head_offset) {
+            if items.is_canonical() {
+                return Ok(Some(Arc::new(StateBytes {
+                    data: Self::join_items(&items, 0, items.len()),
+                    canonical: true,
+                })));
             }
         }
 
@@ -593,90 +1107,215 @@ impl StateManager {
             .as_ref()
             .ok_or_else(|| StoreError::NotInitialized)?;
 
-        let value = self.reconstruct_from_disk(log, head.head_offset)?;
+        let (data, canonical) = self.reconstruct_from_disk(log, head.head_offset)?;
+        let value = Arc::new(StateBytes { data, canonical });
 
         // Cache the result
-        {
-            let mut cache = self.cache.write();
-            cache.put(
-                cache_key,
-                CachedState {
-                    value: value.clone(),
-                    head_offset: head.head_offset,
-                },
-            );
-        }
+        self.cache
+            .write()
+            .put(cache_key, head.head_offset, Arc::clone(&value));
 
         Ok(Some(value))
+    }
+
+    /// Items `start..end` re-joined as a JSON array (item bytes verbatim).
+    pub(crate) fn join_items(items: &StateItems, start: usize, end: usize) -> Vec<u8> {
+        let total: usize = items.range(start, end).map(|i| i.len() + 1).sum();
+        let mut out = Vec::with_capacity(total + 2);
+        out.push(b'[');
+        for (i, item) in items.range(start, end).enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(item);
+        }
+        out.push(b']');
+        out
+    }
+
+    /// The value the per-item cache holds for the state after `operation`,
+    /// derived from `items`, the value it held before. `None` when the new
+    /// value cannot be derived (the entry is then dropped and the next read
+    /// re-materializes, as every write used to cause).
+    ///
+    /// Derivation must produce exactly what re-materializing would.
+    /// Materialization decodes every item and serializes it again, so the
+    /// base is first brought into that form (`StateItems::into_canonical` —
+    /// a no-op for a value that already is, and otherwise computed once and
+    /// shared by every branch deriving from the same inherited value), and
+    /// an appended or edited item is stored re-serialized.
+    fn advance_items(
+        items: Arc<StateItems>,
+        operation: &StateOperation,
+        content_preserving: bool,
+    ) -> Option<Arc<StateItems>> {
+        fn reserialize(item: &[u8]) -> Option<Arc<[u8]>> {
+            let value: serde_json::Value = serde_json::from_slice(item).ok()?;
+            serde_json::to_vec(&value).ok().map(Arc::from)
+        }
+
+        match operation {
+            StateOperation::Snapshot(_) | StateOperation::DeltaSnapshot(_)
+                if content_preserving =>
+            {
+                Some(items)
+            }
+            StateOperation::Append(item) => {
+                let item = reserialize(item)?;
+                let mut items = items.into_canonical()?;
+                Arc::make_mut(&mut items).push(item);
+                Some(items)
+            }
+            StateOperation::AppendMany(batch) => {
+                let batch: Vec<Arc<[u8]>> = batch
+                    .iter()
+                    .map(|item| reserialize(item))
+                    .collect::<Option<_>>()?;
+                let mut items = items.into_canonical()?;
+                let target = Arc::make_mut(&mut items);
+                for item in batch {
+                    target.push(item);
+                }
+                Some(items)
+            }
+            StateOperation::Edit { index, new_value } => {
+                if *index >= items.len() {
+                    return None;
+                }
+                let item = reserialize(new_value)?;
+                let mut items = items.into_canonical()?;
+                Arc::make_mut(&mut items).set(*index, item);
+                Some(items)
+            }
+            StateOperation::Redact { start, end } => {
+                let mut items = items.into_canonical()?;
+                Arc::make_mut(&mut items).remove_range(*start, *end);
+                Some(items)
+            }
+            _ => None,
+        }
     }
 
     /// Get the current value of an array-shaped (AppendLog) state as
     /// per-item raw JSON byte spans.
     ///
-    /// The full state is materialized at most once per head_offset; the
-    /// split result is cached and shared out as `Arc`, so item and slice
-    /// reads are O(returned data) instead of O(state size). Validity is
-    /// governed by the same head_offset discipline as `get_state` — any
-    /// write to the state (on this branch) produces a new head_offset and
-    /// the next read re-materializes. No caller-side invalidation exists.
+    /// The full state is materialized at most once; the split result is
+    /// cached and shared out as `Arc`, so item and slice reads are
+    /// O(returned data) instead of O(state size). Validity is governed by
+    /// the same head_offset discipline as `get_state`. A write to the state
+    /// on this branch moves the head; the cached items follow it when the
+    /// new value can be derived from them (Append, AppendMany, Edit, Redact,
+    /// and the store's own snapshots), and are otherwise dropped so the next
+    /// read re-materializes. A branch whose head is at an offset another
+    /// branch has cached shares that branch's items. No caller-side
+    /// invalidation exists.
     ///
     /// Returns an error if the state is not a JSON array (e.g. a Snapshot
     /// strategy state holding an object) — matching the behavior of the
-    /// previous slice implementation.
+    /// previous slice implementation. The point lookups (`get_state_item`,
+    /// `get_state_items_by_ordinal`) answer `None` for such a state instead,
+    /// where its bytes hold one JSON value; bytes that don't (`{`, `123abc`)
+    /// are a `Deserialization` error from every lookup, except the last item
+    /// served from the head record alone, which reads no earlier item.
     pub fn get_state_items(
         &self,
         branch_id: BranchId,
         state_id: &str,
-    ) -> Result<Option<Arc<Vec<Vec<u8>>>>> {
+    ) -> Result<Option<Arc<StateItems>>> {
+        match self.lookup_state_items(branch_id, state_id)? {
+            ItemsLookup::Items(items) => Ok(Some(items)),
+            ItemsLookup::NoValue => Ok(None),
+            ItemsLookup::NotArray(e) => Err(StoreError::Deserialization(e)),
+        }
+    }
+
+    /// `get_state_items` for a point lookup: a state whose value isn't an
+    /// array has no item at any ordinal, so it answers `None`, as a state
+    /// with no value does, where `get_state_items` returns an error.
+    fn state_items_for_lookup(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<StateItems>>> {
+        match self.lookup_state_items(branch_id, state_id)? {
+            ItemsLookup::Items(items) => Ok(Some(items)),
+            ItemsLookup::NoValue | ItemsLookup::NotArray(_) => Ok(None),
+        }
+    }
+
+    /// The body of `get_state_items`, which keeps apart a state with no
+    /// value and one whose value isn't an array.
+    fn lookup_state_items(&self, branch_id: BranchId, state_id: &str) -> Result<ItemsLookup> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
-            None => return Ok(None),
+            None => return Ok(ItemsLookup::NoValue),
         };
         drop(index);
 
         let cache_key = format!("{}:{}", branch_id.0, state_id);
 
         // Check items cache
-        {
-            let mut cache = self.items_cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(Some(Arc::clone(&cached.items)));
-                }
-                // Stale entry, will re-materialize
-            }
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(ItemsLookup::Items(cached));
         }
+
+        #[cfg(test)]
+        self.run_test_hook("items lookup: head read");
 
         // Materialize the full state once (served from the byte cache when
         // warm), then split into item spans without building a Value tree.
-        let state = match self.get_state(branch_id, state_id)? {
+        let state = match self.get_state_shared(branch_id, state_id)? {
             Some(s) => s,
-            None => return Ok(None),
+            None => return Ok(ItemsLookup::NoValue),
         };
 
-        let items: Vec<Vec<u8>> = if state.is_empty() {
-            Vec::new()
+        let items = if state.data.is_empty() {
+            StateItems::from_items(std::iter::empty(), state.canonical)
         } else {
-            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&state)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-            raw.iter().map(|r| r.get().as_bytes().to_vec()).collect()
+            let raw: Vec<&serde_json::value::RawValue> = match serde_json::from_slice(&state.data) {
+                Ok(raw) => raw,
+                // serde_json reports a value of another type (an object, a
+                // string, ...) where it wanted a sequence as a data error, as
+                // soon as it sees the value's first byte, so malformed bytes
+                // that start like one (`{`, `123abc`) are a data error too.
+                // Only bytes that hold one JSON value are a value that isn't
+                // an array; the rest are malformed, which is an error.
+                Err(e) if e.classify() == serde_json::error::Category::Data => {
+                    if let Err(malformed) =
+                        serde_json::from_slice::<&serde_json::value::RawValue>(&state.data)
+                    {
+                        return Err(StoreError::Deserialization(malformed.to_string()));
+                    }
+                    return Ok(ItemsLookup::NotArray(e.to_string()));
+                }
+                Err(e) => return Err(StoreError::Deserialization(e.to_string())),
+            };
+            StateItems::from_items(raw.iter().map(|r| r.get().as_bytes()), state.canonical)
         };
         let items = Arc::new(items);
 
-        {
-            let mut cache = self.items_cache.write();
-            cache.put(
-                cache_key,
-                CachedItems {
-                    items: Arc::clone(&items),
-                    head_offset: head.head_offset,
-                },
-            );
+        // `get_state_shared` read the head again, and a write that moved it
+        // since the read above leaves `state` the newer head's value. Filed
+        // under the older offset, it would be what any branch still at that
+        // offset reads, and counts, as its own (#70). So the items are filed
+        // only if the head is still where it was read: heads only move
+        // forward, each to the offset of a newer record, so an unchanged head
+        // means the value is that head's. Otherwise they are returned
+        // uncached, as the newer version this read saw.
+        let unmoved = self
+            .index
+            .read()
+            .heads
+            .get(branch_id, state_id)
+            .is_some_and(|current| current.head_offset == head.head_offset);
+        if unmoved {
+            self.items_cache
+                .write()
+                .put(cache_key, head.head_offset, Arc::clone(&items));
         }
 
-        Ok(Some(items))
+        Ok(ItemsLookup::Items(items))
     }
 
     /// Point lookup of a single AppendLog item.
@@ -688,64 +1327,157 @@ impl StateManager {
     /// lookup fell into `get_state_items` and re-materialized the entire
     /// state on every single append (2026-08-01 Mythos: each materialization
     /// re-parsed a 114 MB snapshot chain — 10-30s CPU stalls at every turn
-    /// boundary). When the head record is an `Append` and the caller asks
-    /// for the final index, the item is served from the head record alone:
+    /// boundary). When the head record is an `Append` (or an `AppendMany`,
+    /// whose last item is the state's last, where this session has checked
+    /// the head's count: see `checked_item_count`) and the caller asks for
+    /// the final index, the item is served from the head record alone:
     /// O(one record read) regardless of state size, no cache churn.
     ///
-    /// Byte fidelity: an Append record stores exactly the bytes that
-    /// materialization re-emits for that item — both sides serialize the
-    /// same `serde_json::Value`, and Value objects are BTreeMap-backed so
-    /// key order is canonical. Asserted by the fast/slow equivalence test.
+    /// Byte fidelity: an item appended as a `serde_json::Value`, as
+    /// `append_to_state_json_with_identity` and its batched form append
+    /// theirs, is stored as that Value's serialization, and materialization
+    /// re-emits exactly those bytes: it parses them and serializes the
+    /// result, and a parsed Value object keeps its keys in the order they
+    /// were parsed in (serde_json's `preserve_order`). Asserted by the
+    /// fast/slow equivalence test. On the head-record path, an item appended
+    /// as raw bytes is served as given, which may spell it differently
+    /// (whitespace, number form, escapes) from the materialization path and
+    /// a warm items cache.
     ///
     /// Fallbacks preserve the previous semantics: a warm items cache is
     /// used when valid (same head_offset discipline as `get_state_items`),
-    /// and any non-Append head or non-final index takes the full
-    /// materialization path.
+    /// and any other head or non-final index takes the full materialization
+    /// path. A state whose value isn't an array (a Snapshot state holding an
+    /// object, a Tree state) has no item at any index: `None`, not the
+    /// error `get_state_items` returns for it. Bytes that aren't one JSON
+    /// value (no bytes at all read as an empty list) are the
+    /// `Deserialization` error, as from `get_state_items`,
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item.
     pub fn get_state_item(
         &self,
         branch_id: BranchId,
         state_id: &str,
         index: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let head = {
-            let idx = self.index.read();
-            match idx.heads.get(&(branch_id, state_id.to_string())) {
-                Some(h) => h.clone(),
-                None => return Ok(None),
-            }
+        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
+            return Ok(None);
         };
+        let exact = check.is_some_and(|check| check.exact);
 
         // Warm cache wins: O(1) and avoids even the head-record read.
         let cache_key = format!("{}:{}", branch_id.0, state_id);
-        {
-            let mut cache = self.items_cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(cached.items.get(index).cloned());
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(cached.get(index).map(|item| item.to_vec()));
+        }
+        #[cfg(test)]
+        self.run_test_hook("item lookup: cache missed");
+
+        // Head-record fast path: last item + Append head.
+        if head.item_count > 0 && index == head.item_count - 1 {
+            if let Some(item) = self.last_item_from_head(&head, exact)? {
+                return Ok(Some(item));
+            }
+        }
+
+        // Slow path: full materialization (result cached for later reads).
+        match self.state_items_for_lookup(branch_id, state_id)? {
+            Some(items) => Ok(items.get(index).map(|item| item.to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Point lookups of several AppendLog items in one call: for each ordinal
+    /// in `ordinals`, in the order given, what `get_state_item` returns for
+    /// it, `None` where it is out of range, the state has no value on this
+    /// branch, or its value isn't an array, except at the last index of a
+    /// head whose count this session hasn't found exact (unchecked, or
+    /// checked on a value that doesn't materialize), where `get_state_item`
+    /// answers from the stored count and this from the value. Ordinals may
+    /// repeat and come in any order.
+    ///
+    /// Every answer comes from one version of the state, and the version is
+    /// read once: from the warm item cache when it is current; from the head
+    /// record alone when every ordinal asked for is the last one, as
+    /// `get_state_item`'s fast path serves it, and this session has checked
+    /// the head's count (see `checked_item_count`); and otherwise from one
+    /// materialization, cached for later reads. So a batch of ordinals costs
+    /// at most one materialization, not one per ordinal; at the last index of
+    /// a head whose count this session hasn't found exact, that is a
+    /// materialization where `get_state_item` reads only the head record. An
+    /// empty request reads nothing. An ordinal past the end costs what it
+    /// costs `get_state_item`: on a cold cache, the materialization that
+    /// finds the end, as the head's item count isn't exact for every store.
+    /// The bytes are the same as `get_state_item`'s for items written in
+    /// serde_json's own spelling; an item written in another comes back as
+    /// written from the head record and re-serialized from the rest, as
+    /// there.
+    pub fn get_state_items_by_ordinal(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+        ordinals: &[usize],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // Nothing asked, nothing read.
+        if ordinals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
+            return Ok(vec![None; ordinals.len()]);
+        };
+        let exact = check.is_some_and(|check| check.exact);
+        let pick = |items: &StateItems| -> Vec<Option<Vec<u8>>> {
+            ordinals
+                .iter()
+                .map(|&i| items.get(i).map(|item| item.to_vec()))
+                .collect()
+        };
+
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        if let Some(cached) = self.items_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(pick(&cached));
+        }
+        #[cfg(test)]
+        self.run_test_hook("item lookup: cache missed");
+
+        // Only the last item asked for: the head record may hold it, as for
+        // `get_state_item`, where this session has found the head's count
+        // exact, so that the last item is the one the count makes last. The
+        // check was read with the head, so it vouches for this head's count.
+        if let Some(last) = head.item_count.checked_sub(1).filter(|_| exact) {
+            if ordinals.iter().all(|&i| i == last) {
+                if let Some(item) = self.last_item_from_head(&head, exact)? {
+                    return Ok(vec![Some(item); ordinals.len()]);
                 }
             }
         }
 
-        // Head-record fast path: last item + Append head.
-        if head.item_count > 0 && index == head.item_count - 1 {
-            let log = self
-                .log
-                .as_ref()
-                .ok_or_else(|| StoreError::NotInitialized)?;
-            let record = log.read_at(head.head_offset)?;
-            let update = StateUpdateRecord::decode(&record)?;
-            if let StateOperation::Append(item) = update.operation {
-                return Ok(Some(item));
-            }
-            // Non-Append head (Edit / Redact / snapshot / Set): the last
-            // item isn't recoverable from the head record alone.
+        match self.state_items_for_lookup(branch_id, state_id)? {
+            Some(items) => Ok(pick(&items)),
+            None => Ok(vec![None; ordinals.len()]),
         }
+    }
 
-        // Slow path: full materialization (result cached for later reads).
-        match self.get_state_items(branch_id, state_id)? {
-            Some(items) => Ok(items.get(index).cloned()),
-            None => Ok(None),
-        }
+    /// The state's last item, read from its head record alone, when that
+    /// record is an `Append`, or an `AppendMany` whose head count is `exact`
+    /// (the caller's check, read with `head`); `None` for any other head
+    /// (Edit / Redact / snapshot / Set, an AppendMany with a count not known
+    /// exact), whose last item the record alone doesn't give or may not be
+    /// the one the count makes last.
+    fn last_item_from_head(&self, head: &StateChainHead, exact: bool) -> Result<Option<Vec<u8>>> {
+        let log = self
+            .log
+            .as_ref()
+            .ok_or_else(|| StoreError::NotInitialized)?;
+        let record = log.read_at(head.head_offset)?;
+        let update = StateUpdateRecord::decode(&record)?;
+        Ok(match update.operation {
+            StateOperation::Append(item) => Some(item),
+            // A batch at the head ends with the last item, as the last of its
+            // items appended one at a time would.
+            StateOperation::AppendMany(mut items) if exact => items.pop(),
+            _ => None,
+        })
     }
 
     /// Get the current value of a Tree state as its decoded path→entry map.
@@ -769,8 +1501,7 @@ impl StateManager {
         state_id: &str,
     ) -> Result<Option<Arc<TreeState>>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -778,102 +1509,58 @@ impl StateManager {
 
         let cache_key = format!("{}:{}", branch_id.0, state_id);
 
-        // Check tree cache
-        {
-            let mut cache = self.tree_cache.write();
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.head_offset == head.head_offset {
-                    return Ok(Some(Arc::clone(&cached.tree)));
-                }
-                // Stale entry, will re-parse
-            }
+        // Check tree cache (own entry, or one another branch holds at the
+        // same head offset)
+        if let Some(cached) = self.tree_cache.write().get(&cache_key, head.head_offset) {
+            return Ok(Some(cached));
         }
+        #[cfg(test)]
+        self.run_test_hook("tree lookup: head read");
 
         // Materialize the state bytes once (served from the byte cache when
         // warm), then decode the map once per head_offset.
-        let state = match self.get_state(branch_id, state_id)? {
-            Some(s) if !s.is_empty() => s,
+        let state = match self.get_state_shared(branch_id, state_id)? {
+            Some(s) if !s.data.is_empty() => s,
             _ => return Ok(None),
         };
 
-        let tree: TreeState = serde_json::from_slice(&state)
+        let tree: TreeState = serde_json::from_slice(&state.data)
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;
         let tree = Arc::new(tree);
 
-        {
-            let mut cache = self.tree_cache.write();
-            cache.put(
-                cache_key,
-                CachedTree {
-                    tree: Arc::clone(&tree),
-                    head_offset: head.head_offset,
-                },
-            );
+        // As in `lookup_state_items` (#70): `get_state_shared` read the head
+        // again, so the tree is filed under the head read above only if the
+        // head hasn't moved since, which makes it that head's tree.
+        let unmoved = self
+            .index
+            .read()
+            .heads
+            .get(branch_id, state_id)
+            .is_some_and(|current| current.head_offset == head.head_offset);
+        if unmoved {
+            self.tree_cache
+                .write()
+                .put(cache_key, head.head_offset, Arc::clone(&tree));
         }
 
         Ok(Some(tree))
     }
 
     /// Reconstruct state by traversing chain from disk.
-    ///
-    /// For AppendLog with incremental snapshots:
-    /// - Full Snapshot: Stop traversal completely, use as base
-    /// - DeltaSnapshot: Consolidates ops before it; continue to find more deltas/full snapshot
-    /// - Regular ops: Collect only if before any snapshot
-    ///
-    /// Reconstruction: base_snapshot + delta_snapshots + recent_ops
-    fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<Vec<u8>> {
-        let mut operations = Vec::new();
-        let mut current_offset = Some(head_offset);
-        let mut hit_snapshot = false; // Once we hit any snapshot, stop collecting regular ops
-
-        // Follow chain backwards, collecting operations
-        while let Some(offset) = current_offset {
-            let record = log.read_at(offset)?;
-
-            // Parse the state update from the record payload
-            let update = StateUpdateRecord::decode(&record)?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) | StateOperation::Set(_) => {
-                    // Full-state terminal: both Snapshot and Set replace the
-                    // entire state in materialize_operations, so anything older
-                    // is superseded. Add it and stop. Walking past a Set was the
-                    // bug that made cold reconstruction of Snapshot-strategy
-                    // states O(full chain) — those states are written via Set
-                    // and never get a periodic Snapshot, so the walk ran to
-                    // sequence 0. Mirrors get_state_tail's Set handling.
-                    operations.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) | StateOperation::TreeDeltaSnapshot(_) => {
-                    // Delta snapshot - add it and continue looking for more snapshots
-                    // but stop collecting regular operations
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    // Regular operation - only collect if we haven't hit a snapshot yet
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
+    fn reconstruct_from_disk(&self, log: &RecordLog, head_offset: u64) -> Result<(Vec<u8>, bool)> {
+        self.reconstructions.fetch_add(1, Ordering::Relaxed);
+        let mut operations = super::ChainWalk::new(log, head_offset, None).collect::<Result<Vec<_>>>()?;
 
         // Apply operations in forward order (reverse of collection order),
         // decoding once and encoding once — per-op application made cold
         // reconstruction O(tail × N).
         operations.reverse();
-        crate::state::materialize_operations(operations)
+        crate::state::materialize_operations_tagged(operations)
     }
 
     /// Get the chain head for a state.
     pub fn get_head(&self, branch_id: BranchId, state_id: &str) -> Option<StateChainHead> {
-        let key = (branch_id, state_id.to_string());
-        self.index.read().heads.get(&key).cloned()
+        self.index.read().heads.get(branch_id, state_id).cloned()
     }
 
     /// Get the strategy for a state.
@@ -887,8 +1574,7 @@ impl StateManager {
     pub fn snapshot_needed(&self, branch_id: BranchId, state_id: &str) -> Option<SnapshotNeeded> {
         let index = self.index.read();
 
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h,
             None => return None,
         };
@@ -927,15 +1613,6 @@ impl StateManager {
                 if ops_covered_since_full >= full_interval {
                     Some(SnapshotNeeded::Full)
                 } else if head.ops_since_delta_snapshot >= *delta_snapshot_every {
-                    // Delta snapshots only track Append operations, so after a
-                    // non-Append op (Edit, Redact, Set) no delta may be taken
-                    // until a full resets the chain — a delta would walk past
-                    // the mutation and resurrect older values. We do NOT force
-                    // an early full for it (historically that meant a full
-                    // snapshot of the whole state every delta interval while
-                    // edits kept occurring — O(N²/D) disk): the raw tail just
-                    // grows until the size-aware full above fires, and
-                    // single-pass materialization keeps reading it O(N).
                     if head.has_non_append_since_snapshot {
                         None
                     } else {
@@ -984,62 +1661,159 @@ impl StateManager {
     }
 
     /// Copy state chain heads from one branch to another (for branching).
-    pub fn copy_heads_for_branch(&self, from_branch: BranchId, to_branch: BranchId) {
+    ///
+    /// Heads are copied verbatim, snapshot accounting included, so the new
+    /// branch schedules snapshots exactly as its parent would have. With
+    /// `selection` only the selected states are copied; the others have no
+    /// head on the new branch and read there as registered-but-empty.
+    ///
+    /// Cost is proportional to the heads copied (plus a `log n` lookup per
+    /// exact id or prefix), never to the number of branches or to the heads
+    /// other branches hold. Returns the number of heads copied.
+    pub fn copy_heads_for_branch(
+        &self,
+        from_branch: BranchId,
+        to_branch: BranchId,
+        selection: Option<&StateSelection>,
+    ) -> usize {
         let mut index = self.index.write();
 
-        // Find all heads for the source branch
-        let heads_to_copy: Vec<_> = index.heads.iter()
-            .filter(|((branch_id, _), _)| *branch_id == from_branch)
-            .map(|((_, state_id), head)| (state_id.clone(), head.clone()))
-            .collect();
+        let copied: BTreeMap<String, StateChainHead> = match index.heads.branch(from_branch) {
+            None => return 0,
+            Some(parent) => match selection {
+                None => parent.clone(),
+                // Collecting into a map dedups a state named twice (by id
+                // and by prefix, or by overlapping prefixes).
+                Some(selection) => Self::select_heads(parent, selection)
+                    .map(|(state_id, head)| (state_id.clone(), head.clone()))
+                    .collect(),
+            },
+        };
 
-        // Copy them to the new branch
-        for (state_id, head) in heads_to_copy {
-            index.heads.insert((to_branch, state_id), head);
+        let count = copied.len();
+        if count > 0 {
+            for (state_id, head) in &copied {
+                self.share_cached(to_branch, state_id, head.head_offset);
+            }
+            // A copied head has its parent's count, so it has the parent's
+            // check of it too.
+            let mut counts = self.counts.write();
+            let inherited: Vec<(String, CountCheck)> = counts
+                .get(&from_branch)
+                .map(|parent| {
+                    copied
+                        .iter()
+                        .filter_map(|(state_id, head)| {
+                            parent
+                                .get(state_id)
+                                .filter(|check| check.at == head.head_offset)
+                                .map(|check| (state_id.clone(), *check))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !inherited.is_empty() {
+                counts.entry(to_branch).or_default().extend(inherited);
+            }
+            drop(counts);
+            index
+                .heads
+                .by_branch
+                .entry(to_branch)
+                .or_default()
+                .extend(copied);
+        }
+        count
+    }
+
+    /// Give `branch_id` a reference to whatever is already cached for the
+    /// chain head `head_offset` it has just been handed.
+    ///
+    /// Without this a new branch would only find its parent's cached value
+    /// if it happened to read before the parent's next write moved the
+    /// parent's entry on. Holding its own reference pins the value the
+    /// branch actually inherited. Limited to the per-item and decoded-tree
+    /// forms, which share structure with their successors (pinning one costs
+    /// a few pointers); the serialized bytes are a flat copy per version and
+    /// are shared only on demand, by a read at the same offset.
+    fn share_cached(&self, branch_id: BranchId, state_id: &str, head_offset: u64) {
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+        self.items_cache.write().adopt(cache_key.clone(), head_offset);
+        self.tree_cache.write().adopt(cache_key, head_offset);
+    }
+
+    /// The entries of one branch's head map that `selection` covers. A state
+    /// covered more than once is yielded more than once; callers dedup.
+    fn select_heads<'a>(
+        heads: &'a BTreeMap<String, StateChainHead>,
+        selection: &'a StateSelection,
+    ) -> impl Iterator<Item = (&'a String, &'a StateChainHead)> + 'a {
+        let exact = selection
+            .state_ids
+            .iter()
+            .filter_map(move |id| heads.get_key_value(id.as_str()));
+        let prefixed = selection.state_prefixes.iter().flat_map(move |prefix| {
+            heads
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(move |(id, _)| id.starts_with(prefix.as_str()))
+        });
+        exact.chain(prefixed)
+    }
+
+    /// The heads of `branch_id` covered by `selection` (all of them when
+    /// `selection` is `None`), each state once, ordered by state id.
+    pub fn selected_heads(
+        &self,
+        branch_id: BranchId,
+        selection: Option<&StateSelection>,
+    ) -> Vec<(String, StateChainHead)> {
+        let index = self.index.read();
+        let heads = match index.heads.branch(branch_id) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        match selection {
+            None => heads.iter().map(|(id, h)| (id.clone(), h.clone())).collect(),
+            Some(selection) => Self::select_heads(heads, selection)
+                .map(|(id, h)| (id.clone(), h.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
         }
     }
 
-    /// Set a state chain head for a branch at a specific offset.
+    /// Install a complete chain head for a branch.
     ///
     /// Used by `create_branch_at` to point a new branch's state head at an
     /// existing position in the parent's chain, without writing new records.
-    pub fn set_head_for_branch(
-        &self,
-        branch_id: BranchId,
-        state_id: &str,
-        head_offset: u64,
-        item_count: usize,
-    ) {
+    /// The caller supplies the whole head — including the snapshot accounting
+    /// the chain had at that position — because the accounting decides which
+    /// kind of snapshot the branch may take next: starting a branch with
+    /// "no non-append ops since the last snapshot" while its inherited chain
+    /// holds an uncovered Redact/Edit/Set/Delta lets an append-only delta snapshot
+    /// walk past that mutation and lose it.
+    pub fn insert_head_for_branch(&self, branch_id: BranchId, state_id: &str, head: StateChainHead) {
         let mut index = self.index.write();
-
-        let head = StateChainHead {
-            head_offset,
-            // Fresh snapshot accounting - the branch starts its own tracking
-            ops_since_delta_snapshot: 0,
-            delta_snapshots_since_full: 0,
-            last_delta_snapshot_offset: None,
-            last_full_snapshot_offset: None,
-            has_non_append_since_snapshot: false,
-            item_count,
-            // No record is written here — this head aliases into the parent's
-            // chain. The branch starts at size N with the parent's snapshots
-            // behind it; treating N as the spacing baseline keeps the doubling
-            // schedule (the branch's first full fires once it has grown by N).
-            item_count_at_last_full: item_count,
-        };
-
+        self.share_cached(branch_id, state_id, head.head_offset);
         index.heads.insert((branch_id, state_id.to_string()), head);
     }
 
     /// Register (or refresh) a secondary index on a JSON field of every item
     /// currently in `state_id` (materialized on `branch_id`), extracted via
     /// the JSON-pointer `field_path`. Idempotent: a no-op if an index for
-    /// this `(state_id, field_path)` is already registered, fresh (same
-    /// `branch_id` and the slot's current `head_offset`), and of the same
-    /// `kind` — see `FieldIndexManager::register`. Registering from a
-    /// different branch than whatever last held this `(state_id,
-    /// field_path)` index replaces it outright (only one branch's index can
-    /// be live per field at a time — see `FieldIndexManager`'s module docs).
+    /// this `(state_id, field_path)` is already registered on `branch_id`,
+    /// fresh (the slot's current `head_offset`), and of the same `kind` —
+    /// see `FieldIndexManager::register`. Each branch holds its own index:
+    /// registering here neither replaces nor disturbs one another branch
+    /// holds for the same field (see `FieldIndexManager`'s module docs).
+    ///
+    /// When another branch already holds this index at the very `head_offset`
+    /// this branch's slot is at — a branch that has not written to a slot it
+    /// inherited, registering what its parent registered — that index is
+    /// copied instead of rebuilt: no materialization, no JSON decode.
     ///
     /// The freshness check runs BEFORE this materializes/parses the slot's
     /// JSON — `head_offset` alone (already cheap: an index lookup, not a
@@ -1069,10 +1843,33 @@ impl StateManager {
             return Ok(());
         }
 
-        let items: Vec<serde_json::Value> = match self.get_state(branch_id, state_id)? {
-            Some(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes)
+        if self.field_indexes.write().register_from_sibling(
+            state_id,
+            field_path,
+            kind,
+            branch_id,
+            head_offset,
+        )? {
+            return Ok(());
+        }
+
+        // Decode from the per-item cache when it is current (no log walk,
+        // no second copy of the slot); otherwise materialize.
+        let cached_items = head_offset.and_then(|offset| {
+            let cache_key = format!("{}:{}", branch_id.0, state_id);
+            self.items_cache.write().get(&cache_key, offset)
+        });
+        let items: Vec<serde_json::Value> = match cached_items {
+            Some(cached) => cached
+                .iter()
+                .map(serde_json::from_slice)
+                .collect::<std::result::Result<_, _>>()
                 .map_err(|e| StoreError::Deserialization(e.to_string()))?,
-            _ => Vec::new(),
+            None => match self.get_state_shared(branch_id, state_id)? {
+                Some(state) if !state.data.is_empty() => serde_json::from_slice(&state.data)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?,
+                _ => Vec::new(),
+            },
         };
 
         self.field_indexes.write().register(
@@ -1088,10 +1885,10 @@ impl StateManager {
     /// Query ordinals of a registered `Number` field index within
     /// `[gte, lte]` (either bound optional), scoped to `branch_id`. Returns
     /// `None` if no such index is currently registered FOR `branch_id`
-    /// (never registered, wrong kind, poisoned by a cross-branch write or a
-    /// parse failure, or registered against a *different* branch — a pure
-    /// read after `switch_branch` with no intervening write must never
-    /// serve another branch's ordinals) — distinct from `Some(vec![])`, an
+    /// (never registered there, wrong kind, or poisoned by a parse failure;
+    /// an index another branch holds is never served — a pure read after
+    /// `switch_branch` with no intervening write must never see another
+    /// branch's ordinals) — distinct from `Some(vec![])`, an
     /// index that exists, matches this branch, and has no matches.
     #[allow(clippy::too_many_arguments)]
     pub fn query_field_index_range(
@@ -1154,11 +1951,72 @@ impl StateManager {
     pub fn clear_cache(&self) {
         self.cache.write().clear();
         self.items_cache.write().clear();
+        self.tree_cache.write().clear();
+    }
+
+    /// How many times a state value has been rebuilt from the log since this
+    /// manager was created. A read served from a cache does not count.
+    pub fn reconstruction_count(&self) -> u64 {
+        self.reconstructions.load(Ordering::Relaxed)
     }
 
     /// Get cache statistics.
     pub fn cache_len(&self) -> usize {
         self.cache.read().len()
+    }
+
+    /// Release what is held for a branch that has just been deleted.
+    ///
+    /// Derived data goes at once: the branch's cache entries (values other
+    /// branches still reference stay alive for them) and its field indexes.
+    ///
+    /// Its chain heads are only MARKED here and removed by
+    /// `purge_retired_branches`, which the store calls after it has saved
+    /// the branch list. `state.bin` and `branches.bin` are separate files
+    /// written one after the other; if the heads left `state.bin` first, a
+    /// crash between the two writes would bring the branch back (still
+    /// listed in `branches.bin`) with every state empty. Keeping them until
+    /// the deletion itself is durable means a crash can only bring the
+    /// branch back whole, or leave unreferenced heads behind — never a
+    /// branch stripped of its state.
+    pub fn retire_branch(&self, branch_id: BranchId) {
+        let prefix = format!("{}:", branch_id.0);
+        self.cache.write().pop_prefix(&prefix);
+        self.items_cache.write().pop_prefix(&prefix);
+        self.tree_cache.write().pop_prefix(&prefix);
+        self.field_indexes.write().drop_branch(branch_id);
+        self.counts.write().remove(&branch_id);
+        self.retired_branches.lock().push(branch_id);
+    }
+
+    /// Remove the chain heads of every branch retired so far. Call only
+    /// once the deletion of those branches has been durably saved. Returns
+    /// the number of heads removed. The next `save` writes a `state.bin`
+    /// without them.
+    pub fn purge_retired_branches(&self) -> usize {
+        let retired: Vec<BranchId> = std::mem::take(&mut *self.retired_branches.lock());
+        if retired.is_empty() {
+            return 0;
+        }
+        let mut index = self.index.write();
+        // A batch counts outside the store's write lock (see
+        // `checked_item_count`), so a count it checked can be kept for the
+        // branch after `retire_branch` dropped the branch's counts. It goes
+        // with the heads, under the same lock as they do.
+        let mut counts = self.counts.write();
+        retired
+            .into_iter()
+            .filter_map(|branch_id| {
+                counts.remove(&branch_id);
+                index.heads.remove_branch(branch_id)
+            })
+            .map(|heads| heads.len())
+            .sum()
+    }
+
+    /// Total number of chain heads held, across all branches.
+    pub fn head_count(&self) -> usize {
+        self.index.read().heads.len()
     }
 
     /// Get compaction statistics for a state.
@@ -1167,8 +2025,7 @@ impl StateManager {
     /// and the offset of the oldest operation that's still needed.
     pub fn get_compaction_stats(&self, branch_id: BranchId, state_id: &str) -> Option<CompactionStats> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = index.heads.get(&key)?;
+        let head = index.heads.get(branch_id, state_id)?;
         // Each delta snapshot covers delta_snapshot_every ops; a strategy
         // without delta snapshots never increments delta_snapshots_since_full,
         // so the multiplier is moot there.
@@ -1193,8 +2050,7 @@ impl StateManager {
     /// by creating a full snapshot at the current head.
     pub fn count_chain_operations(&self, branch_id: BranchId, state_id: &str) -> Result<Option<ChainStats>> {
         let index = self.index.read();
-        let key = (branch_id, state_id.to_string());
-        let head = match index.heads.get(&key) {
+        let head = match index.heads.get(branch_id, state_id) {
             Some(h) => h.clone(),
             None => return Ok(None),
         };
@@ -1244,28 +2100,18 @@ impl StateManager {
 
     /// Save state index to file.
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
-
-        // Write magic
-        file.write_all(STATE_INDEX_MAGIC)?;
-
-        // Write version
-        file.write_all(&[STATE_INDEX_VERSION])?;
-
-        // Serialize index with MessagePack
         let index = self.index.read();
-        let encoded =
-            rmp_serde::to_vec(&*index).map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        // Write length and data
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+        let encoded = rmp_serde::to_vec(&*index)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        self.checkpoint.save(
+            &self.path,
+            &[
+                STATE_INDEX_MAGIC,
+                &[STATE_INDEX_VERSION],
+                &(encoded.len() as u64).to_le_bytes(),
+                &encoded,
+            ],
+        )?;
         drop(index);
 
         // Field indexes live in their own file (`state-indexes.bin`), kept
@@ -1274,12 +2120,12 @@ impl StateManager {
         // bearing), while a missing/stale field-index file is recoverable
         // (derived data — `load` returns `None` for it, never an error).
         //
-        // Written AFTER `state.bin` is already durably synced above, and its
+        // Written AFTER `state.bin` is already saved above, and its
         // own failure is deliberately swallowed (logged, not propagated):
         // `state.bin` is the real durable data this function exists to
         // protect, and a disk-full/permission failure writing the derived
         // index must not make `Store::sync()` report failure for data that
-        // in fact synced fine — callers reading `sync()`'s `Result` as "did
+        // in fact saved fine — callers reading `sync()`'s `Result` as "did
         // my durable data make it to disk" would otherwise get a false
         // negative. The next successful `save()` (or a fresh
         // `register_field_index`) recovers it; nothing is lost except the
@@ -1356,7 +2202,7 @@ impl StateManager {
             field_indexes.prune_stale(|state_id, branch_id| {
                 current_index
                     .heads
-                    .get(&(branch_id, state_id.to_string()))
+                    .get(branch_id, state_id)
                     .map(|h| h.head_offset)
             });
             drop(current_index);
@@ -1434,6 +2280,282 @@ mod tests {
         // Get state
         let state = manager.get_state(TEST_BRANCH, "counter").unwrap().unwrap();
         assert_eq!(state, b"42");
+    }
+
+    /// A write that moves a branch's head while a lookup of its items is
+    /// between reading the head and materializing it leaves the lookup with
+    /// the newer value. That value isn't filed under the older head, where a
+    /// branch still at that head would take it for its own (#70): here a
+    /// batch's count on a branch forked at the head, which the race would
+    /// set to the newer value's length.
+    #[test]
+    fn a_lookup_whose_head_moves_before_it_materializes_caches_nothing_under_the_old_head() {
+        const SIDE: BranchId = BranchId(2);
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let first = StateOperation::Append(b"1".to_vec());
+        let at_fork = append_state_update(&log, "items", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", at_fork, &first).unwrap();
+        manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
+        // Unchecked on both branches, as heads loaded from state.bin are.
+        manager.set_count_check(TEST_BRANCH, "items", None);
+        manager.set_count_check(SIDE, "items", None);
+
+        // The main branch's count reads its head, then a write moves it on.
+        let log_for_hook = Arc::clone(&log);
+        manager.set_test_hook("items lookup: head read", move |manager: &StateManager| {
+            let second = StateOperation::Append(b"2".to_vec());
+            let offset = append_state_update(&log_for_hook, "items", Some(at_fork), second.clone(), 2);
+            manager.record_update(TEST_BRANCH, "items", offset, &second).unwrap();
+        });
+        manager.checked_item_count(TEST_BRANCH, "items").unwrap();
+        assert!(manager.test_hooks.lock().is_empty(), "the write ran inside the lookup");
+        assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 2);
+
+        assert!(
+            manager.items_cache.write().live_at(at_fork).is_none(),
+            "nothing is filed under the head the write moved past"
+        );
+        assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 1, "the side branch holds one item");
+        let side_items = manager.get_state_items(SIDE, "items").unwrap().unwrap();
+        assert_eq!(side_items.len(), 1);
+    }
+
+    /// The tree cache's form of #70: a write that moves the head while a
+    /// tree read is between its head read and the materialization leaves
+    /// the read with the newer tree, which isn't filed under the older head,
+    /// where a fork still at that head would read it as its own.
+    #[test]
+    fn a_tree_read_whose_head_moves_before_it_materializes_caches_nothing_under_the_old_head() {
+        const SIDE: BranchId = BranchId(2);
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "files".to_string(),
+                strategy: StateStrategy::Tree {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let entry = crate::types::TreeEntry { blob_hash: "ab".repeat(32), size: 1, mode: 0o644 };
+        let first = StateOperation::TreeSet { path: "a".into(), entry: entry.clone() };
+        let at_fork = append_state_update(&log, "files", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "files", at_fork, &first).unwrap();
+        manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
+
+        let log_for_hook = Arc::clone(&log);
+        manager.set_test_hook("tree lookup: head read", move |manager: &StateManager| {
+            let second = StateOperation::TreeSet { path: "b".into(), entry };
+            let offset = append_state_update(&log_for_hook, "files", Some(at_fork), second.clone(), 2);
+            manager.record_update(TEST_BRANCH, "files", offset, &second).unwrap();
+        });
+        assert_eq!(manager.get_tree_state(TEST_BRANCH, "files").unwrap().unwrap().len(), 2, "the newer tree");
+        assert!(manager.test_hooks.lock().is_empty(), "the write ran inside the read");
+
+        assert!(manager.tree_cache.write().live_at(at_fork).is_none(), "nothing filed under the old head");
+        let side = manager.get_tree_state(SIDE, "files").unwrap().unwrap();
+        assert_eq!(side.keys().collect::<Vec<_>>(), ["a"], "the fork's own tree");
+    }
+
+    /// A state "items" on the main branch holding `ops` appended in order,
+    /// whose head then has the stored count `stale` and no check, as a head
+    /// loaded from state.bin a release counted wrong would.
+    fn stale_head(ops: &[StateOperation], stale: usize) -> (TempDir, Arc<RecordLog>, StateManager) {
+        let (dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let mut prev = None;
+        for (seq, op) in ops.iter().enumerate() {
+            let offset = append_state_update(&log, "items", prev, op.clone(), seq as u64 + 1);
+            manager.record_update(TEST_BRANCH, "items", offset, op).unwrap();
+            prev = Some(offset);
+        }
+        manager.index.write().heads.get_mut(TEST_BRANCH, "items").unwrap().item_count = stale;
+        manager.set_count_check(TEST_BRANCH, "items", None);
+        (dir, log, manager)
+    }
+
+    fn appends(n: u8) -> Vec<StateOperation> {
+        (1..=n).map(|i| StateOperation::Append(vec![b'0' + i])).collect()
+    }
+
+    /// A count on another thread can correct a stale head between a
+    /// reader's read of the head and its read of the head's check. The
+    /// reader takes both under one lock, so it never pairs the stale count
+    /// it copied with the check that vouches for the corrected one: here a
+    /// batch's count, which would return the stale count as its first
+    /// ordinal.
+    #[test]
+    fn a_count_never_returns_a_stale_count_a_check_landed_beside() {
+        let (_dir, _log, manager) = stale_head(&appends(3), 0);
+        manager.set_test_hook("count: head read", |manager: &StateManager| {
+            assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        });
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        assert!(manager.test_hooks.lock().is_empty(), "the other count ran in between");
+    }
+
+    /// The same race for the item lookups' head-record paths: a count that
+    /// lands after the lookup copied the head (stored count 4, one too
+    /// many) must not let the copy's last index, 3, be served from the head
+    /// record as if it were in range.
+    #[test]
+    fn an_item_lookup_never_serves_a_stale_last_index_a_check_landed_beside() {
+        let correct = |manager: &StateManager| {
+            assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        };
+
+        let (_dir, _log, manager) = stale_head(&appends(3), 4);
+        manager.set_test_hook("item lookup: cache missed", correct);
+        assert_eq!(manager.get_state_items_by_ordinal(TEST_BRANCH, "items", &[3]).unwrap(), [None]);
+        assert!(manager.test_hooks.lock().is_empty());
+
+        let batch = StateOperation::AppendMany(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
+        let (_dir, _log, manager) = stale_head(&[batch], 4);
+        manager.set_test_hook("item lookup: cache missed", correct);
+        assert_eq!(manager.get_state_item(TEST_BRANCH, "items", 3).unwrap(), None);
+        assert!(manager.test_hooks.lock().is_empty());
+    }
+
+    /// A count read without the store's write lock can race a write that
+    /// lands after the value is read: the write's head keeps the count the
+    /// write set (the one before plus its item), and the older value's
+    /// count isn't stored over it.
+    #[test]
+    fn a_count_read_before_a_write_isnt_stored_over_the_writes_count() {
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let first = StateOperation::Append(b"1".to_vec());
+        let before = append_state_update(&log, "items", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", before, &first).unwrap();
+        manager.set_count_check(TEST_BRANCH, "items", None);
+
+        let log_for_hook = Arc::clone(&log);
+        manager.set_test_hook("count: value read", move |manager: &StateManager| {
+            let second = StateOperation::Append(b"2".to_vec());
+            let offset = append_state_update(&log_for_hook, "items", Some(before), second.clone(), 2);
+            manager.record_update(TEST_BRANCH, "items", offset, &second).unwrap();
+        });
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 2, "the moved head's count");
+        assert!(manager.test_hooks.lock().is_empty(), "the write ran after the read");
+        assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 2, "the write's count stands");
+        assert_eq!(manager.get_state_items(TEST_BRANCH, "items").unwrap().unwrap().len(), 2);
+    }
+
+    /// A fork copies the parent's heads and, for each head the parent has
+    /// checked at the same offset, the check too, so the fork's first batch
+    /// takes the count without reading the value again.
+    #[test]
+    fn a_fork_takes_the_parents_check_of_a_head_it_copies() {
+        const SIDE: BranchId = BranchId(2);
+        let (_dir, _log, manager) = stale_head(&appends(3), 0);
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 3);
+        let offset = manager.get_head(TEST_BRANCH, "items").unwrap().head_offset;
+
+        manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
+        let check = manager.count_check(SIDE, "items", offset).expect("the fork has the parent's check");
+        assert!(check.exact);
+        let before = manager.reconstruction_count();
+        assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 3);
+        assert_eq!(manager.reconstruction_count(), before, "the fork's count read nothing");
+    }
+
+    /// A batch counts outside the store's write lock, so its count can be
+    /// kept for a branch after `retire_branch` dropped the branch's counts,
+    /// while the heads are still there. Purging the branch's heads drops it.
+    #[test]
+    fn purging_a_retired_branch_drops_a_count_checked_after_it_was_retired() {
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 100,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        let append = StateOperation::Append(b"1".to_vec());
+        let offset = append_state_update(&log, "items", None, append.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", offset, &append).unwrap();
+        assert!(manager.counts.read().contains_key(&TEST_BRANCH), "the write checked its count");
+
+        // Retiring drops the branch's counts at once, leaving its head
+        // unchecked, and the heads stay until the purge.
+        manager.retire_branch(TEST_BRANCH);
+        assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "retire drops the counts");
+        assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 1);
+        assert!(
+            manager.counts.read().contains_key(&TEST_BRANCH),
+            "the count landed after the retire, beside the heads still held"
+        );
+
+        assert_eq!(manager.purge_retired_branches(), 1);
+        assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "it goes with the heads");
+    }
+
+    /// A batch moves the chain head by one operation and all of its items,
+    /// stays append-only for the snapshot schedule, and materializes as its
+    /// items in order after what came before.
+    #[test]
+    fn test_append_many_head_accounting() {
+        let (_dir, log, manager) = setup_test();
+        manager
+            .register_state(StateRegistration {
+                id: "items".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 2,
+                    full_snapshot_every: 100,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        let first = StateOperation::Append(b"1".to_vec());
+        let offset1 = append_state_update(&log, "items", None, first.clone(), 1);
+        manager.record_update(TEST_BRANCH, "items", offset1, &first).unwrap();
+
+        let batch = StateOperation::AppendMany(vec![b"2".to_vec(), b"3".to_vec(), b"4".to_vec()]);
+        let offset2 = append_state_update(&log, "items", Some(offset1), batch.clone(), 2);
+        manager.record_update(TEST_BRANCH, "items", offset2, &batch).unwrap();
+
+        let head = manager.get_head(TEST_BRANCH, "items").unwrap();
+        assert_eq!(head.head_offset, offset2);
+        assert_eq!(head.item_count, 4);
+        assert_eq!(head.ops_since_delta_snapshot, 2);
+        assert!(!head.has_non_append_since_snapshot);
+        assert_eq!(manager.snapshot_needed(TEST_BRANCH, "items"), Some(SnapshotNeeded::Delta));
+        assert_eq!(manager.get_state(TEST_BRANCH, "items").unwrap().unwrap(), b"[1,2,3,4]");
+        assert_eq!(manager.get_state_item(TEST_BRANCH, "items", 3).unwrap().unwrap(), b"4");
     }
 
     #[test]
@@ -1582,15 +2704,15 @@ mod tests {
             .record_update(TEST_BRANCH, "data", offset, &StateOperation::Set(b"\"cached\"".to_vec()))
             .unwrap();
 
-        // First call - cache miss
-        assert_eq!(manager.cache_len(), 0);
+        let before = manager.reconstruction_count();
         let _ = manager.get_state(TEST_BRANCH, "data").unwrap();
-        assert_eq!(manager.cache_len(), 1);
+        let rebuilds = manager.reconstruction_count();
+        assert!(rebuilds > before, "setup: the first read rebuilt the state");
 
         // Second call - cache hit (no additional disk reads)
         let state = manager.get_state(TEST_BRANCH, "data").unwrap().unwrap();
         assert_eq!(state, b"\"cached\"");
-        assert_eq!(manager.cache_len(), 1);
+        assert_eq!(manager.reconstruction_count(), rebuilds, "the repeat read rebuilt the state");
     }
 
     #[test]
@@ -1618,7 +2740,6 @@ mod tests {
 
         // Populate cache
         let _ = manager.get_state(TEST_BRANCH, "data").unwrap();
-        assert_eq!(manager.cache_len(), 1);
 
         // Update invalidates cache
         let offset2 = append_state_update(
@@ -1631,7 +2752,6 @@ mod tests {
         manager
             .record_update(TEST_BRANCH, "data", offset2, &StateOperation::Set(b"\"v2\"".to_vec()))
             .unwrap();
-        assert_eq!(manager.cache_len(), 0);
 
         // Next read gets new value
         let state = manager.get_state(TEST_BRANCH, "data").unwrap().unwrap();
@@ -2141,5 +3261,144 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot);
         assert_eq!(head.item_count, 0);
         assert_eq!(head.item_count_at_last_full, 0);
+    }
+    /// `state.bin` compatibility: `BranchHeads` must read the flat
+    /// `(branch_id, state_id) -> head` map every existing store holds, and
+    /// write a map the previous in-memory layout reads back unchanged.
+    #[test]
+    fn test_state_index_wire_format_is_flat_map() {
+        /// `StateIndex` exactly as it was declared through 0.4.0.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyStateIndex {
+            heads: HashMap<(BranchId, String), StateChainHead>,
+            strategies: HashMap<String, StateStrategy>,
+        }
+
+        fn head(n: u64) -> StateChainHead {
+            StateChainHead {
+                head_offset: n,
+                ops_since_delta_snapshot: n + 1,
+                delta_snapshots_since_full: n + 2,
+                last_delta_snapshot_offset: Some(n + 3),
+                last_full_snapshot_offset: if n % 2 == 0 { Some(n + 4) } else { None },
+                has_non_append_since_snapshot: n % 2 == 1,
+                item_count: (n + 5) as usize,
+                item_count_at_last_full: (n + 6) as usize,
+            }
+        }
+
+        let mut legacy = LegacyStateIndex {
+            heads: HashMap::new(),
+            strategies: HashMap::new(),
+        };
+        let mut n = 0;
+        for branch in [1u64, 2, 7, 300] {
+            for state in ["messages", "agent/a/tree", "", "ünïcode"] {
+                legacy.heads.insert((BranchId(branch), state.to_string()), head(n));
+                n += 1;
+            }
+        }
+        legacy.strategies.insert("messages".to_string(), StateStrategy::Snapshot);
+        legacy.strategies.insert(
+            "agent/a/tree".to_string(),
+            StateStrategy::Tree { delta_snapshot_every: 5, full_snapshot_every: 3 },
+        );
+
+        // Old bytes -> new layout.
+        let legacy_bytes = rmp_serde::to_vec(&legacy).unwrap();
+        let index: StateIndex = rmp_serde::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(index.heads.len(), legacy.heads.len());
+        for ((branch, state), expected) in &legacy.heads {
+            let got = index.heads.get(*branch, state).expect("head survived");
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        }
+        assert_eq!(index.strategies.len(), 2);
+
+        // New bytes -> old layout.
+        let new_bytes = rmp_serde::to_vec(&index).unwrap();
+        assert_eq!(
+            new_bytes.len(),
+            legacy_bytes.len(),
+            "same encoding, entry order aside"
+        );
+        let back: LegacyStateIndex = rmp_serde::from_slice(&new_bytes).unwrap();
+        assert_eq!(back.heads.len(), legacy.heads.len());
+        for (key, expected) in &legacy.heads {
+            assert_eq!(format!("{:?}", back.heads[key]), format!("{expected:?}"));
+        }
+        assert_eq!(back.strategies.len(), 2);
+
+        // An empty index round-trips too (a store with no state writes yet).
+        let empty = rmp_serde::to_vec(&StateIndex::default()).unwrap();
+        let legacy_empty = rmp_serde::to_vec(&LegacyStateIndex {
+            heads: HashMap::new(),
+            strategies: HashMap::new(),
+        })
+        .unwrap();
+        assert_eq!(empty, legacy_empty);
+        assert!(rmp_serde::from_slice::<StateIndex>(&legacy_empty).unwrap().heads.is_empty());
+    }
+
+    #[test]
+    fn test_copy_heads_selection() {
+        let (_dir, _log, manager) = setup_test();
+        let parent = BranchId(1);
+        let other = BranchId(9);
+        let head = |n: u64| StateChainHead {
+            head_offset: n,
+            ops_since_delta_snapshot: 3,
+            delta_snapshots_since_full: 2,
+            last_delta_snapshot_offset: Some(n),
+            last_full_snapshot_offset: Some(1),
+            has_non_append_since_snapshot: true,
+            item_count: 10,
+            item_count_at_last_full: 4,
+        };
+        for (i, id) in ["a/1", "a/2", "a0", "ab", "b/1", "shared"].iter().enumerate() {
+            manager.insert_head_for_branch(parent, id, head(100 + i as u64));
+            manager.insert_head_for_branch(other, id, head(900 + i as u64));
+        }
+
+        let ids = |branch| -> Vec<String> {
+            manager.selected_heads(branch, None).into_iter().map(|(id, _)| id).collect()
+        };
+
+        // Everything.
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(2), None), 6);
+        assert_eq!(ids(BranchId(2)), ids(parent));
+
+        // Exact ids and prefixes, overlapping, plus names that match nothing.
+        let selection = StateSelection {
+            state_ids: vec!["shared".into(), "a/1".into(), "missing".into()],
+            state_prefixes: vec!["a/".into(), "a/1".into(), "zzz".into()],
+        };
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(3), Some(&selection)), 3);
+        assert_eq!(ids(BranchId(3)), vec!["a/1", "a/2", "shared"]);
+        // Verbatim, accounting included, and taken from the parent — not
+        // from another branch holding the same state ids.
+        for (id, got) in manager.selected_heads(BranchId(3), None) {
+            let expected = manager.get_head(parent, &id).unwrap();
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        }
+        assert_eq!(
+            manager
+                .selected_heads(parent, Some(&selection))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["a/1", "a/2", "shared"]
+        );
+
+        // Empty selection inherits nothing; so does an unknown parent.
+        assert_eq!(
+            manager.copy_heads_for_branch(parent, BranchId(4), Some(&StateSelection::default())),
+            0
+        );
+        assert!(ids(BranchId(4)).is_empty());
+        assert_eq!(manager.copy_heads_for_branch(BranchId(77), BranchId(5), None), 0);
+
+        // The empty prefix selects every state.
+        let all = StateSelection { state_ids: vec![], state_prefixes: vec![String::new()] };
+        assert_eq!(manager.copy_heads_for_branch(parent, BranchId(6), Some(&all)), 6);
     }
 }

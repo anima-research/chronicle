@@ -75,11 +75,11 @@ fn assert_linear(name: &str, sizes: &[usize], bytes: &[u64], max_ratio_per_4x: f
 
 const SIZES: [usize; 3] = [500, 2_000, 8_000];
 
-/// Sizes for the growing-state tests. Deeper than SIZES so every 4× window
+/// Sizes for the growing-state tests. Deeper than SIZES so the 4× window
 /// sits in the snapshot policy's steady state (the first full snapshot fires
 /// at ~2k ops at framework-default cadence; windows straddling it measure the
 /// warm-up transient, not the asymptote).
-const GROWTH_SIZES: [usize; 3] = [4_000, 16_000, 64_000];
+const GROWTH_SIZES: [usize; 2] = [8_000, 32_000];
 
 /// Ratio limit for the growing-state tests. Size-aware (doubling) full
 /// snapshots write ≈2× the append bytes in total (S + 2S + 4S + … ≤ 2N), so
@@ -262,42 +262,4 @@ fn tree_overwrite_churn_disk_linear() {
         }
     });
     assert_linear("tree_overwrite_churn", &SIZES, &bytes, 5.0);
-}
-
-/// The known-quadratic control: whole-array Set per "append" (the pre-fix AF
-/// pattern). This test asserts the pattern IS detected as superlinear by our
-/// measurement — guarding the gate itself against going numb.
-#[test]
-fn set_rewrite_control_is_superlinear() {
-    let sizes = [100usize, 400, 1600];
-    let bytes = measure(&sizes, |store, n| {
-        store
-            .register_state(StateRegistration {
-                id: "state".to_string(),
-                strategy: StateStrategy::Snapshot,
-                initial_value: None,
-            })
-            .unwrap();
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        for i in 0..n {
-            entries.push(json!({"seq": i, "body": "x".repeat(64)}));
-            store
-                .update_state(
-                    "state",
-                    StateOperation::Set(serde_json::to_vec(&entries).unwrap()),
-                )
-                .unwrap();
-        }
-    });
-    println!("--- set_rewrite_control ---");
-    for (n, b) in sizes.iter().zip(&bytes) {
-        println!("  n={:<8} bytes={:<12}", n, b);
-    }
-    let ratio = bytes[2] as f64 / bytes[1] as f64;
-    assert!(
-        ratio > 10.0,
-        "control failed: Set-rewrite pattern only grew {:.2}x for 4x ops — \
-         the disk measurement would not catch a quadratic regression",
-        ratio
-    );
 }

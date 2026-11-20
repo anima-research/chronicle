@@ -1,5 +1,6 @@
 //! Branch manager implementation.
 
+use crate::atomic_file::Checkpoint;
 use crate::error::{Result, StoreError};
 use crate::types::{Branch, BranchId, Sequence, Timestamp};
 use parking_lot::RwLock;
@@ -33,8 +34,8 @@ pub struct ReconciliationReport {
     /// adopt them as ghosts.
     pub orphaned_branch_ids: Vec<BranchId>,
 }
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Magic bytes for branch index file.
@@ -94,6 +95,9 @@ pub struct BranchManager {
     /// Path to branch index file.
     path: PathBuf,
 
+    /// Last successfully published checkpoint, never seeded just by loading.
+    checkpoint: Checkpoint,
+
     /// In-memory index.
     index: RwLock<BranchIndex>,
 
@@ -125,6 +129,7 @@ impl BranchManager {
 
         Ok(Self {
             path,
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(index),
             current: RwLock::new(main_id),
         })
@@ -136,6 +141,7 @@ impl BranchManager {
 
         let manager = Self {
             path: path.clone(),
+            checkpoint: Checkpoint::default(),
             index: RwLock::new(BranchIndex::default()),
             current: RwLock::new(BranchId(1)),
         };
@@ -273,6 +279,12 @@ impl BranchManager {
             .expect("Current branch should always exist")
     }
 
+    /// Id of the current branch (the store-wide cursor), without cloning the
+    /// branch record.
+    pub fn current_id(&self) -> BranchId {
+        *self.current.read()
+    }
+
     /// Switch to a different branch.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
         let index = self.index.read();
@@ -362,6 +374,18 @@ impl BranchManager {
         report
     }
 
+    /// Reserve an identity that reached state.bin before branches.bin. It may
+    /// have inherited state heads without ever appending a record of its own,
+    /// so log-only reconciliation cannot prevent its accidental reuse.
+    pub(crate) fn reserve_id_after(&self, id: BranchId) -> Result<()> {
+        let next = id.0.checked_add(1).ok_or_else(|| {
+            StoreError::Corruption("branch identity space exhausted in state metadata".into())
+        })?;
+        let mut index = self.index.write();
+        index.next_id = index.next_id.max(next);
+        Ok(())
+    }
+
     /// Update the head of a branch.
     pub fn update_head(&self, branch_id: BranchId, new_head: Sequence) -> Result<()> {
         let mut index = self.index.write();
@@ -387,7 +411,7 @@ impl BranchManager {
     /// Delete a branch (cannot delete main or current branch).
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         if name == MAIN_BRANCH {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete main branch".to_string(),
             ));
         }
@@ -401,7 +425,7 @@ impl BranchManager {
             .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
 
         if *id == current_id {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete current branch".to_string(),
             ));
         }
@@ -579,7 +603,7 @@ impl BranchManager {
         reparent_to: Option<&str>,
     ) -> Result<usize> {
         if name == MAIN_BRANCH {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete main branch".to_string(),
             ));
         }
@@ -593,19 +617,18 @@ impl BranchManager {
             .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
 
         if branch_id == current_id {
-            return Err(StoreError::BranchNotFound(
+            return Err(StoreError::InvalidOperation(
                 "Cannot delete current branch".to_string(),
             ));
         }
 
         // Get new parent ID if reparenting
         let new_parent_id = match reparent_to {
-            Some(parent_name) => Some(
-                *index
-                    .name_to_id
-                    .get(parent_name)
-                    .ok_or_else(|| StoreError::BranchNotFound(parent_name.to_string()))?,
-            ),
+            Some(parent_name) => Some(*index.name_to_id.get(parent_name).ok_or_else(|| {
+                StoreError::InvalidOperation(format!(
+                    "Cannot delete {name}: the branch to reparent its children onto, {parent_name}, doesn't exist"
+                ))
+            })?),
             None => None,
         };
 
@@ -697,32 +720,25 @@ impl BranchManager {
     }
 
     /// Save branch index to file.
+    ///
+    /// Reads `current` and `index` under separate locks, so a consistent
+    /// checkpoint relies on the caller holding `Store::write_lock`, as
+    /// `Store` does for this and for every mutation of either.
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
-
-        // Write magic
-        file.write_all(BRANCH_INDEX_MAGIC)?;
-
-        // Write version
-        file.write_all(&[BRANCH_INDEX_VERSION])?;
-
-        // Write current branch
         let current_id = *self.current.read();
-        file.write_all(&current_id.0.to_le_bytes())?;
-
-        // Serialize index with MessagePack
         let index = self.index.read();
         let encoded = rmp_serde::to_vec(&*index)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
-
-        file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-        file.write_all(&encoded)?;
-
-        file.sync_all()?;
+        self.checkpoint.save(
+            &self.path,
+            &[
+                BRANCH_INDEX_MAGIC,
+                &[BRANCH_INDEX_VERSION],
+                &current_id.0.to_le_bytes(),
+                &(encoded.len() as u64).to_le_bytes(),
+                &encoded,
+            ],
+        )?;
         Ok(())
     }
 
@@ -876,8 +892,49 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
 
-        let result = manager.delete_branch(MAIN_BRANCH);
-        assert!(result.is_err());
+        for result in [
+            manager.delete_branch(MAIN_BRANCH),
+            manager.delete_branch_with_reparent(MAIN_BRANCH, None).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::InvalidOperation(m)) if m == "Cannot delete main branch"),
+                "{result:?}"
+            );
+            assert!(manager.get_branch(MAIN_BRANCH).is_some());
+        }
+    }
+
+    #[test]
+    fn deleting_a_branch_that_is_not_there_is_branch_not_found() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+
+        for result in [
+            manager.delete_branch("nowhere"),
+            manager
+                .delete_branch_with_reparent("nowhere", None)
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::BranchNotFound(name)) if name == "nowhere"),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reparenting_delete_onto_a_missing_branch_is_refused_as_an_invalid_operation() {
+        let dir = TempDir::new().unwrap();
+        let manager = BranchManager::new(dir.path().join("branches.bin")).unwrap();
+        manager.create_branch("child", None).unwrap();
+
+        let result = manager.delete_branch_with_reparent("child", Some("missing"));
+        assert!(
+            matches!(&result, Err(StoreError::InvalidOperation(m))
+                if m == "Cannot delete child: the branch to reparent its children onto, missing, doesn't exist"),
+            "{result:?}"
+        );
+        assert!(manager.get_branch("child").is_some());
     }
 
     #[test]
@@ -888,8 +945,16 @@ mod tests {
         manager.create_branch("feature", None).unwrap();
         manager.switch_branch("feature").unwrap();
 
-        let result = manager.delete_branch("feature");
-        assert!(result.is_err());
+        for result in [
+            manager.delete_branch("feature"),
+            manager.delete_branch_with_reparent("feature", None).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(StoreError::InvalidOperation(m)) if m == "Cannot delete current branch"),
+                "{result:?}"
+            );
+            assert!(manager.get_branch("feature").is_some());
+        }
     }
 
     #[test]
@@ -1067,7 +1132,10 @@ mod tests {
 
         // Create hierarchy: main -> feature -> sub-feature
         manager.create_branch("feature", None).unwrap();
-        manager.create_branch("sub-feature", Some("feature")).unwrap();
+        let sub = manager.create_branch("sub-feature", Some("feature")).unwrap();
+        manager
+            .update_head(sub.id, Sequence(sub.branch_point.unwrap().0 + 1))
+            .unwrap();
 
         // GC feature with reparenting to main
         let result = manager.gc(BranchGcOptions {
@@ -1077,18 +1145,10 @@ mod tests {
             ..Default::default()
         }).unwrap();
 
-        // Both should be deleted since both are empty, but feature first
-        // sub-feature gets reparented to main, then deleted too
-        assert!(result.deleted.len() >= 1);
-
-        // sub-feature should now have main as parent (or be deleted)
-        let remaining = manager.list_branches();
-        for branch in &remaining {
-            if branch.name != MAIN_BRANCH {
-                // Any remaining non-main branch should have main as parent
-                assert_eq!(branch.parent, Some(BranchId(1)));
-            }
-        }
+        assert_eq!(result.deleted, vec!["feature".to_string()]);
+        assert_eq!(result.reparented, 1);
+        let main_id = manager.get_branch(MAIN_BRANCH).unwrap().id;
+        assert_eq!(manager.get_branch("sub-feature").unwrap().parent, Some(main_id));
     }
 
     #[test]

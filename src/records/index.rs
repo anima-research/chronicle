@@ -6,7 +6,7 @@
 
 use crate::error::Result;
 use crate::records::RecordLog;
-use crate::types::{BranchId, RecordId, Sequence};
+use crate::types::{BranchId, Record, RecordId, Sequence};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -20,7 +20,14 @@ pub struct RecordIndex {
     /// Record ID to offset.
     id_to_offset: RwLock<HashMap<RecordId, u64>>,
 
-    /// Record type to record IDs.
+    /// Record type to record IDs, in log order, which is ascending ID order:
+    /// an append takes the next ID and adds it here under the store's write
+    /// lock, and a rebuild at open reads the log in order. After a torn tail
+    /// the log issues IDs again from just above the last surviving record, so
+    /// the order holds. The records the tail dropped are gone, though, and
+    /// their IDs are issued again to new records: a last ID taken before the
+    /// crash can name a different record afterwards, possibly of another type,
+    /// and a count taken then can skip new ones.
     type_index: RwLock<HashMap<String, Vec<RecordId>>>,
 
     /// caused_by index: record_id -> records that have it in caused_by.
@@ -50,11 +57,22 @@ impl RecordIndex {
     /// This scans the entire log sequentially and builds all indexes.
     /// For a store with 1M records, this typically takes 1-3 seconds on SSD.
     pub fn rebuild_from_log(path: impl AsRef<Path>, log: &RecordLog) -> Result<Self> {
+        Self::rebuild_from_log_with(path, log, |_, _| Ok(()))
+    }
+
+    /// Visit records during the existing startup scan, so state recovery does
+    /// not need another full pass over the log.
+    pub(crate) fn rebuild_from_log_with(
+        path: impl AsRef<Path>,
+        log: &RecordLog,
+        mut visit: impl FnMut(u64, &Record) -> Result<()>,
+    ) -> Result<Self> {
         let index = Self::new(path)?;
 
         // Iterate through all records in the log
         for result in log.iter() {
             let (offset, record) = result?;
+            visit(offset, &record)?;
 
             // Add to all indexes
             index.add(
@@ -79,6 +97,10 @@ impl RecordIndex {
     }
 
     /// Add an entry to the index.
+    ///
+    /// Within a record type, IDs must be added in ascending order, as every
+    /// store path does (see `type_index`), since `get_by_type` returns them in
+    /// the order added. A debug build asserts it.
     pub fn add(
         &self,
         id: RecordId,
@@ -92,11 +114,17 @@ impl RecordIndex {
         self.entries.write().insert((branch, sequence), offset);
         self.id_to_offset.write().insert(id, offset);
 
-        self.type_index
-            .write()
-            .entry(record_type.to_string())
-            .or_default()
-            .push(id);
+        {
+            let mut type_index = self.type_index.write();
+            let ids = type_index.entry(record_type.to_string()).or_default();
+            debug_assert!(
+                ids.last().is_none_or(|last| last.0 < id.0),
+                "type {record_type:?}: record {} added after {}, out of ascending order",
+                id.0,
+                ids.last().map_or(0, |last| last.0),
+            );
+            ids.push(id);
+        }
 
         for &cause in caused_by {
             self.caused_by_index
@@ -125,7 +153,15 @@ impl RecordIndex {
         self.id_to_offset.read().get(&id).copied()
     }
 
-    /// Get all record IDs of a given type.
+    /// The offsets of several record IDs, in the order given, `None` for an
+    /// ID with no record. One lookup of the ID map for them all.
+    pub fn get_offsets_by_id(&self, ids: &[RecordId]) -> Vec<Option<u64>> {
+        let id_to_offset = self.id_to_offset.read();
+        ids.iter().map(|id| id_to_offset.get(id).copied()).collect()
+    }
+
+    /// Get all record IDs of a given type, in ascending ID order (see
+    /// `type_index`).
     pub fn get_by_type(&self, record_type: &str) -> Vec<RecordId> {
         self.type_index
             .read()
@@ -242,6 +278,17 @@ mod tests {
     use super::*;
     use crate::types::RecordInput;
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "out of ascending order")]
+    fn adding_a_type_out_of_ascending_order_panics_in_a_debug_build() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+        index.add(RecordId(2), branch, Sequence(1), 0, "message", &[], &[]);
+        index.add(RecordId(1), branch, Sequence(2), 100, "message", &[], &[]);
+    }
 
     #[test]
     fn test_add_and_lookup() {

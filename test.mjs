@@ -1,11 +1,18 @@
+import { rmSync } from 'node:fs';
 import { JsStore } from './index.js';
+
+// A run that failed mid-way leaves ./test-store behind, and the next run's
+// by-type ID assertions then read the old run's records (Weft, 2026-10-17).
+// Start clean; leave clean.
+const STORE = './test-store';
+rmSync(STORE, { recursive: true, force: true });
 
 console.log('Testing record-store TypeScript bindings...\n');
 
 // Test 1: Create a new store
 console.log('1. Creating store...');
 const store = JsStore.openOrCreate({
-  path: './test-store',
+  path: STORE,
   blobCacheSize: 100
 });
 console.log('✓ Store created');
@@ -315,7 +322,7 @@ if (!operationFailedAfterClose) {
 console.log('\n38. Testing subscription APIs...');
 // Re-open store for subscription test
 const store2 = JsStore.openOrCreate({
-  path: './test-store',
+  path: STORE,
   blobCacheSize: 100
 });
 const subId = store2.subscribe({});
@@ -366,5 +373,6 @@ store2.unsubscribe(subId3);
 console.log('✓ pollSubscriptionTimeout works correctly');
 
 store2.close();
+rmSync(STORE, { recursive: true, force: true });
 
 console.log('\n✅ All tests passed!');

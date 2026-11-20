@@ -12,7 +12,7 @@ This scanner is READ-ONLY. For every state chain in records.log it computes:
 
   as-code  — the state exactly as chronicle reconstructs it (base full
              Snapshot + DeltaSnapshots + trailing raw ops), and
-  raw-truth — a replay of raw ops only (Append/Set/Edit/Redact/Delta),
+  raw-truth — a replay of raw ops only (Append/AppendMany/Set/Edit/Redact/Delta),
              ignoring every Snapshot/DeltaSnapshot, which are purely derived.
 
 A mismatch means the chain is poisoned (by a bad delta, or by a full
@@ -23,16 +23,23 @@ even when the head state happens to currently match.
 Usage:
     scan-delta-poison.py <store-dir-or-records.log> [--json] [--verbose]
 
-Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error.
+It needs chronicle_payload.py beside it.
+
+A record typed state_update that doesn't decode as a state update is skipped, as chronicle
+skips it, and a line on stderr says so.
+
+Exit codes: 0 = all clean, 1 = poisoned chain(s) found, 2 = usage/IO error, a record that
+fails its checksum, or a kind of operation it doesn't read (chronicle_payload.READ).
 """
 import sys, os, struct, json, datetime
+from chronicle_payload import read_update, require_checksum, require_read, say_skipped
 
-RAW_OPS = ("Append", "Set", "Edit", "Redact", "Delta")
+RAW_OPS = ("Append", "AppendMany", "Set", "Edit", "Redact", "Delta")
 NON_APPEND_RAW = ("Set", "Edit", "Redact", "Delta")
 TREE_OPS = ("TreeSet", "TreeRemove", "TreeBatch", "TreeDeltaSnapshot")
 
 
-def parse_log(path):
+def parse_log(path, skipped):
     """Parse records.log; return {offset: update_dict} for state_update records."""
     records = {}
     with open(path, "rb") as f:
@@ -54,19 +61,23 @@ def parse_log(path):
                 rid, seq, br, ts = struct.unpack("<QQQq", need(32))
                 tlen = struct.unpack("<H", need(2))[0]
                 rtype = need(tlen).decode()
-                need(1)
+                enc = need(1)[0]
                 plen = struct.unpack("<I", need(4))[0]
                 payload = need(plen)
                 cbc = struct.unpack("<H", need(2))[0]
                 need(8 * cbc)
                 ltc = struct.unpack("<H", need(2))[0]
                 need(8 * ltc)
-                need(4)
+                checksum = struct.unpack("<I", need(4))[0]
             except EOFError:
                 break  # torn tail on a live store - scan what is durable
+            require_checksum(payload, checksum, start, "scan-delta-poison.py")
             if rtype != "state_update":
                 continue
-            upd = json.loads(payload)
+            upd, kind = read_update(enc, payload, start, skipped)
+            if upd is None:
+                continue
+            require_read(kind, start, "scan-delta-poison.py")
             upd["_offset"] = start
             upd["_seq"] = seq
             upd["_ts"] = ts
@@ -94,6 +105,10 @@ def apply_raw(state, op):
     if name == "Append":
         arr = state if isinstance(state, list) else ([] if state is None else state)
         arr.append(op_data(op, "Append"))
+        return arr
+    if name == "AppendMany":
+        arr = state if isinstance(state, list) else ([] if state is None else state)
+        arr.extend(json.loads(bytes(item)) for item in op["AppendMany"])
         return arr
     if name == "Edit":
         idx = op["Edit"]["index"]
@@ -217,7 +232,9 @@ def main():
         print(f"error: {path} not found", file=sys.stderr)
         return 2
 
-    records = parse_log(path)
+    skipped = []
+    records = parse_log(path, skipped)
+    say_skipped(skipped, "scan-delta-poison.py")
 
     # Heads = state_update records that nothing points back to (per branch fork).
     referenced = {

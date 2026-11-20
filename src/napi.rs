@@ -1,27 +1,172 @@
 //! NAPI bindings for Node.js/TypeScript.
 
 use crate::{
-    error::StoreError,
+    error::{ErrorCode, StoreError},
+    state::StateSelection,
     subscriptions::{
         DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
         SubscriptionHandle, SubscriptionId,
     },
     types::{TreeChange, TreeEntry, TreeOp},
-    CompactionSummary, FieldIndexKind, Record, RecordId, Sequence, StateOperation,
+    Branch, BranchId, CompactionSummary, FieldIndexKind, Record, RecordId, Sequence, StateOperation,
     StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use napi::bindgen_prelude::*;
+use napi::{Env, JsDeferred, JsObject};
 use napi_derive::napi;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+
+// napi gives an error's status to JavaScript as `error.code`. Errors napi
+// raises while converting a call's arguments come before the method runs,
+// and keep napi's own status.
+type Result<T> = napi::Result<T, ErrorCode>;
+
+fn coded(code: ErrorCode, reason: impl ToString) -> napi::Error<ErrorCode> {
+    napi::Error::new(code, reason)
+}
+
+// napi's deferred promises, and a method returning napi's own `Result`, take
+// only napi's `Error`, whose status napi would give as `error.code`. One made
+// from a JavaScript error is thrown, or rejected, as that error, so building
+// the coded error first keeps its code. A JavaScript error can be made only on
+// the JavaScript thread, so the blob writer rejects through the callback
+// `resolve` runs there.
+fn as_js_error(env: Env, error: napi::Error<ErrorCode>) -> napi::Error {
+    napi::Error::from(JsError::from(error).into_unknown(env))
+}
 
 /// JavaScript-friendly Store wrapper.
+///
+/// There are two kinds of handle onto one open store:
+///
+/// - the **root** handle, returned by `create` / `open` / `openOrCreate`.
+///   Its branch-dependent methods follow the store-wide current branch
+///   (`switchBranch` / `currentBranch`), exactly as before views existed;
+/// - **views**, returned by `view(branchName)`. A view shares the root's
+///   underlying store — same log, same caches, same lock file — but every
+///   branch-dependent method on it targets the one branch it is pinned to. A
+///   view never reads or moves the current branch, so any number of views
+///   (and the root) can be used side by side on different branches.
+///
+/// Lifetime: the root owns the store. `close()` on the root closes the store
+/// for every view at once (they throw "Store has been closed" from then on)
+/// and releases the lock file before it returns, however many views are
+/// still referenced. `close()` on a view only detaches that view.
+///
+/// JSON objects you write come back with their keys in the order you wrote
+/// them (in a JavaScript object, its own property order), at every level
+/// and from every method that returns them. The tree methods keep a tree
+/// state's entries by path, not in the order they were set. An object stored
+/// by an earlier version keeps the order it was stored in, which for the
+/// JSON-writing methods was sorted.
 #[napi]
 pub struct JsStore {
-    inner: Option<Arc<Store>>,
+    /// The open store, shared by the root handle and every view made from
+    /// it. The root's `close()` empties the slot, which is what closes the
+    /// store for all of them and lets the `Store` (and its lock file) drop
+    /// even while views are still alive.
+    shared: Arc<RwLock<Option<OpenStore>>>,
+    /// The branch this handle is pinned to; `None` on the root handle.
+    pinned: Option<PinnedBranch>,
+    /// Set once `close()` has been called on a view.
+    detached: bool,
     /// Active subscription handles, stored by ID.
     subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
+}
+
+impl Drop for JsStore {
+    fn drop(&mut self) {
+        self.release_subscriptions();
+    }
+}
+
+struct OpenStore {
+    store: Arc<Store>,
+    blob_writer: Mutex<Option<BlobWriter>>,
+}
+
+type ResolveHash = Box<dyn FnOnce(Env) -> napi::Result<String> + Send>;
+
+struct BlobJob {
+    content: Vec<u8>,
+    content_type: String,
+    chunked: bool,
+    done: JsDeferred<String, ResolveHash>,
+}
+
+struct BlobWriter {
+    jobs: crossbeam_channel::Sender<BlobJob>,
+    thread: JoinHandle<()>,
+}
+
+impl BlobWriter {
+    fn start(store: Arc<Store>) -> napi::Result<Self> {
+        let (jobs, queue) = crossbeam_channel::unbounded::<BlobJob>();
+        let thread = std::thread::Builder::new()
+            .name("chronicle-blob-writer".into())
+            .spawn(move || {
+                for job in queue {
+                    let BlobJob {
+                        content,
+                        content_type,
+                        chunked,
+                        done,
+                    } = job;
+                    let stored = catch_unwind(AssertUnwindSafe(|| {
+                        if chunked {
+                            store.store_blob_chunked(&content, &content_type)
+                        } else {
+                            store.store_blob(&content, &content_type)
+                        }
+                    }));
+                    match stored {
+                        Ok(Ok(hash)) => {
+                            let hash = hash.to_string();
+                            done.resolve(Box::new(move |_| Ok(hash)));
+                        }
+                        Ok(Err(error)) => {
+                            let error = to_napi_error(error);
+                            done.resolve(Box::new(move |env| Err(as_js_error(env, error))));
+                        }
+                        Err(_) => done.reject(napi::Error::from_reason(
+                            "storing the blob panicked partway, so it may or may not be stored",
+                        )),
+                    }
+                }
+            })
+            .map_err(|error| {
+                napi::Error::from_reason(format!(
+                    "cannot start the thread that stores blobs, so nothing was stored: {error}"
+                ))
+            })?;
+        Ok(Self { jobs, thread })
+    }
+
+    fn finish(self) {
+        drop(self.jobs);
+        let _ = self.thread.join();
+    }
+}
+
+/// Options for `storeBlobAsync`.
+#[napi(object)]
+pub struct JsStoreBlobOptions {
+    /// Store content of more than one chunk as its chunks: see
+    /// `storeBlobAsync`.
+    pub chunked: Option<bool>,
+}
+
+/// The branch a view is bound to. Bound by id: ids are never reused, so a
+/// view cannot be silently re-pointed at a different branch that later takes
+/// the same name. The name is kept for `pinnedBranch()` and error messages
+/// (branches cannot be renamed).
+struct PinnedBranch {
+    id: BranchId,
+    name: String,
 }
 
 /// Record returned to JavaScript.
@@ -50,6 +195,29 @@ impl From<Record> for JsRecord {
     }
 }
 
+/// What `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`
+/// recorded.
+#[napi(object)]
+pub struct JsAppendedBatch {
+    /// The one record that holds the whole batch, at one sequence.
+    pub record: JsRecord,
+    /// The index the batch's first item took: the number of items the state
+    /// held on the handle's branch just before the batch. Item `i` of the
+    /// batch is at `firstOrdinal + i`.
+    ///
+    /// The first batch to a state on a branch the store opened with, or on
+    /// one `createBranchAt` started, counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write
+    /// to the state lands during that count, and `getStateLen` reports that
+    /// count from then on:
+    /// a count a release before 0.5.0 stored can be off. A value that isn't
+    /// a JSON array, or holds an item that isn't JSON, has no items to count,
+    /// and this is then the length `getStateLen` reports; the batch is
+    /// recorded, and the state then fails to materialize, as after an
+    /// `appendToState` to it, so the items can't be read at those indices.
+    pub first_ordinal: i64,
+}
+
 /// Branch info returned to JavaScript.
 #[napi(object)]
 pub struct JsBranch {
@@ -59,6 +227,41 @@ pub struct JsBranch {
     pub parent_id: Option<String>,
     pub branch_point: Option<i64>,
     pub created: i64,
+}
+
+impl From<Branch> for JsBranch {
+    fn from(branch: Branch) -> Self {
+        JsBranch {
+            id: branch.id.0.to_string(),
+            name: branch.name,
+            head: branch.head.0 as i64,
+            parent_id: branch.parent.map(|p| p.0.to_string()),
+            branch_point: branch.branch_point.map(|s| s.0 as i64),
+            created: branch.created.0,
+        }
+    }
+}
+
+/// Which of the parent's states a selective fork inherits
+/// (`createBranchWithStates` / `createBranchAtWithStates`).
+///
+/// A state is inherited if its id equals one of `stateIds` or starts with one
+/// of `statePrefixes` (a plain string prefix of the id). Omitting both — or
+/// passing two empty arrays — inherits nothing. Ids and prefixes that match
+/// no state are ignored.
+#[napi(object)]
+pub struct JsStateFilter {
+    pub state_ids: Option<Vec<String>>,
+    pub state_prefixes: Option<Vec<String>>,
+}
+
+impl From<JsStateFilter> for StateSelection {
+    fn from(filter: JsStateFilter) -> Self {
+        StateSelection {
+            state_ids: filter.state_ids.unwrap_or_default(),
+            state_prefixes: filter.state_prefixes.unwrap_or_default(),
+        }
+    }
 }
 
 /// Store statistics.
@@ -72,16 +275,58 @@ pub struct JsStoreStats {
     pub blob_size_bytes: i64,
 }
 
-/// Torn-tail recovery report surfaced to JavaScript. Present only when the
-/// most recent `open` truncated a torn/partial tail record.
+/// What the most recent `open` had to recover, surfaced to JavaScript:
+/// a torn/partial tail record it truncated, updates it replayed for a state
+/// with no registration, or records typed `state_update` it skipped.
 #[napi(object)]
 pub struct JsRecoveryReport {
-    /// Byte offset the log was truncated back to (end of the last valid record).
+    /// Byte offset the log was truncated back to (end of the last valid
+    /// record), or the log's length when nothing was torn.
     pub truncated_at: i64,
-    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced records).
+    /// Number of trailing bytes discarded (up to `sync_interval` un-fsynced
+    /// records). 0 when nothing was torn.
     pub dropped_bytes: i64,
     /// Number of valid records that survived recovery.
     pub valid_records: i64,
+    /// Each state whose updates were replayed although the store holds no
+    /// registration for it: one written without a registration, or whose
+    /// registration an earlier release lost in a crash.
+    pub unregistered_states: Vec<JsUnregisteredState>,
+    /// Records typed `state_update` that don't decode as state updates, which
+    /// open skipped. They stay in the log as ordinary records.
+    pub undecodable_state_updates: i64,
+    /// Records typed `state_update` on a branch that the store's branch
+    /// checkpoint doesn't hold, which open didn't replay, since nothing can
+    /// read that branch: an earlier release saved a branch only at sync.
+    pub updates_on_missing_branches: i64,
+}
+
+/// A state whose updates `open` replayed without a registration.
+#[napi(object)]
+pub struct JsUnregisteredState {
+    pub id: String,
+    /// How many of its updates were replayed.
+    pub updates: i64,
+}
+
+/// A state whose snapshot after a recorded write failed at its most recent
+/// attempt on a branch, as `snapshotFailures()` lists it.
+#[napi(object)]
+pub struct JsSnapshotFailure {
+    pub state_id: String,
+    /// The name of the branch the writes and their snapshots were on.
+    pub branch: String,
+    /// How many writes in a row found the state's snapshot due on the branch
+    /// and failed to take it, counted since the store opened or the last
+    /// snapshot of the state there. Outcomes are counted in sequence order:
+    /// where writes to the state race, a failure that comes in after a later
+    /// write's outcome isn't counted, so the count can be lower than the
+    /// number of writes that failed.
+    pub failures: i64,
+    /// The sequence of the most recent of those writes.
+    pub sequence: i64,
+    /// The error the most recent attempt failed with.
+    pub error: String,
 }
 
 /// Configuration for creating a store.
@@ -224,6 +469,14 @@ pub struct JsStoreEvent {
     /// "branch_created", "branch_deleted", "caught_up", "dropped"
     pub event_type: String,
     /// JSON-serialized event data.
+    ///
+    /// A "state_delta" carries `state_id`, `sequence` and the recorded
+    /// `operation`, keyed by its variant name. An item's bytes are an array
+    /// of integers: `{"Append": [..]}` for one item, and
+    /// `{"AppendMany": [[..], [..], ..]}` for a batch from
+    /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`, which
+    /// is one event for the whole batch at its one sequence. A subscriber
+    /// that follows an append log by its deltas needs both.
     pub data: String,
 }
 
@@ -305,8 +558,8 @@ pub struct JsTreeListEntry {
     pub mode: i32,
 }
 
-fn to_napi_error(e: StoreError) -> napi::Error {
-    napi::Error::from_reason(e.to_string())
+fn to_napi_error(e: StoreError) -> napi::Error<ErrorCode> {
+    napi::Error::new(e.code(), e.to_string())
 }
 
 /// Shared JsStateRegistration -> StateStrategy conversion for
@@ -322,20 +575,73 @@ fn js_registration_strategy(registration: &JsStateRegistration) -> Result<StateS
             delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
             full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
         },
-        _ => return Err(napi::Error::from_reason("Invalid strategy")),
+        _ => return Err(coded(ErrorCode::InvalidOperation, "Invalid strategy")),
     })
 }
 
 #[napi]
 impl JsStore {
     /// Get the inner store, returning an error if closed.
-    fn get_store(&self) -> Result<&Arc<Store>> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Store has been closed"))
+    fn get_store(&self) -> Result<Arc<Store>> {
+        self.with_open(|open| Arc::clone(&open.store))
     }
 
-    /// Create a new store at the given path.
+    fn with_open<T>(&self, f: impl FnOnce(&OpenStore) -> T) -> Result<T> {
+        if self.detached {
+            return Err(coded(ErrorCode::StoreClosed, "View has been closed"));
+        }
+        self.shared
+            .read()
+            .as_ref()
+            .map(f)
+            .ok_or_else(|| coded(ErrorCode::StoreClosed, "Store has been closed"))
+    }
+
+    /// The store plus the branch this handle's branch-dependent methods act
+    /// on: the pinned branch for a view, the store's current branch for the
+    /// root. Fails if a view's branch has been deleted.
+    fn target(&self) -> Result<(Arc<Store>, BranchId)> {
+        let store = self.get_store()?;
+        let branch = match &self.pinned {
+            Some(pinned) => {
+                if !store.branch_exists(pinned.id) {
+                    return Err(coded(ErrorCode::BranchNotFound, format!(
+                        "Branch not found: '{}' (the branch this view is pinned to has been deleted)",
+                        pinned.name
+                    )));
+                }
+                pinned.id
+            }
+            None => store.current_branch().id,
+        };
+        Ok((store, branch))
+    }
+
+    fn release_subscriptions(&self) {
+        let handles: Vec<u64> = self.subscription_handles.lock().drain().map(|(id, _)| id).collect();
+        if let Some(open) = self.shared.read().as_ref() {
+            for id in handles {
+                open.store.unsubscribe(SubscriptionId(id));
+            }
+        }
+    }
+
+    /// Wrap a freshly opened store in a root handle.
+    fn root(store: Store) -> JsStore {
+        JsStore {
+            shared: Arc::new(RwLock::new(Some(OpenStore {
+                store: Arc::new(store),
+                blob_writer: Mutex::new(None),
+            }))),
+            pinned: None,
+            detached: false,
+            subscription_handles: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Create a new store at the given path. Refuses a path that already holds
+    /// a store (its MANIFEST, records.log, state.bin or branches.bin); use
+    /// `openOrCreate` or `open` for a store that may exist.
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -344,10 +650,7 @@ impl JsStore {
             create_if_missing: false,
         };
         let store = Store::create(store_config).map_err(to_napi_error)?;
-        Ok(JsStore {
-            inner: Some(Arc::new(store)),
-            subscription_handles: Mutex::new(HashMap::new()),
-        })
+        Ok(Self::root(store))
     }
 
     /// Open an existing store.
@@ -359,10 +662,7 @@ impl JsStore {
             create_if_missing: false,
         };
         let store = Store::open(store_config).map_err(to_napi_error)?;
-        Ok(JsStore {
-            inner: Some(Arc::new(store)),
-            subscription_handles: Mutex::new(HashMap::new()),
-        })
+        Ok(Self::root(store))
     }
 
     /// Open or create a store.
@@ -374,36 +674,123 @@ impl JsStore {
             create_if_missing: true,
         };
         let store = Store::open_or_create(store_config).map_err(to_napi_error)?;
-        Ok(JsStore {
-            inner: Some(Arc::new(store)),
-            subscription_handles: Mutex::new(HashMap::new()),
-        })
+        Ok(Self::root(store))
     }
 
     /// Close the store, releasing the lock and any resources.
-    /// After closing, all operations on this store will fail.
+    /// After closing, the store's methods throw `StoreClosed`, but for
+    /// `isClosed()`, `pinnedBranch()` and `close()` itself, which answer as
+    /// before, and a poll, which first returns what was queued.
+    ///
+    /// On the root handle this closes the store itself. It first waits for
+    /// every `storeBlobAsync` already called on it or on any view made from
+    /// it to finish, holding the calling thread while it does. Then the store
+    /// is synced, every view made from this handle stops working ("Store has
+    /// been closed"), and the lock file is released before `close()` returns
+    /// — live views do not keep the store or its lock alive. If the record
+    /// log's fsync has failed, this throws that error after closing the
+    /// store, so it can be reopened.
+    ///
+    /// On a view this only detaches the view: its subscriptions are removed
+    /// and its methods throw "View has been closed", but for `isClosed()`,
+    /// `pinnedBranch()` and `close()`, and a poll, which finds no
+    /// subscription. The store stays open, nothing is synced, and the root
+    /// and other views are unaffected. A view never needs to be closed;
+    /// dropping it is enough. Any handle's subscriptions are removed when
+    /// it's garbage-collected.
     #[napi]
     pub fn close(&mut self) -> Result<()> {
-        if let Some(store) = self.inner.take() {
+        if self.pinned.is_some() {
+            if !self.detached {
+                self.release_subscriptions();
+                self.detached = true;
+            }
+            return Ok(());
+        }
+
+        let open = self.shared.write().take();
+        if let Some(OpenStore { store, blob_writer }) = open {
+            if let Some(writer) = blob_writer.into_inner() {
+                writer.finish();
+            }
             // Sync before closing
             store.sync().map_err(to_napi_error)?;
-            // Drop the Arc - if this is the last reference, the store will be dropped
+            // Drop the Arc. The slot and the writer thread, joined above, were
+            // the only long-lived references (views hold the slot, not the
+            // store), so the store is dropped here.
             drop(store);
         }
         Ok(())
     }
 
     /// Check if the store has been closed.
+    ///
+    /// On a view: true once the view itself was closed OR the root closed
+    /// the store.
     #[napi]
     pub fn is_closed(&self) -> bool {
-        self.inner.is_none()
+        self.detached || self.shared.read().is_none()
     }
 
-    /// Torn-tail recovery the log performed on open, if any.
+    /// Open a view: a handle onto this same store whose branch-dependent
+    /// methods all act on `branchName`, whatever the current branch is and
+    /// wherever it moves afterwards.
     ///
-    /// Returns a report when `open` silently truncated a torn/partial tail
-    /// record (crash during append), or `null` when the log opened cleanly.
-    /// Lets JS callers detect lost un-fsynced writes without scraping logs.
+    /// On a view:
+    /// - records, states, trees, queries, field indexes, compaction,
+    ///   `listStates()` item counts, `currentSequence()` and subscription
+    ///   catch-up use the pinned branch; `currentBranch()` returns it;
+    /// - `switchBranch` throws (the root's cursor is the only cursor);
+    /// - `createBranch(name)` / `createBranchWithStates(name, undefined, ..)`
+    ///   / `createEmptyBranch(name)` with `from` omitted use the pinned
+    ///   branch as the parent;
+    /// - everything else (blobs, `registerState`, `getRecord`, `sync`,
+    ///   `stats`, `listBranches`, `setAutoSnapshot`, ...) is store-wide and
+    ///   behaves as on the root handle.
+    ///
+    /// Creating a view is O(1): it allocates nothing per state and reads
+    /// nothing from the log. Views share the store's caches, so a state the
+    /// view's branch inherited unchanged is served from the value already
+    /// materialized for the parent. All handles of one store must be used
+    /// from the thread that opened it, like the root handle.
+    ///
+    /// If the pinned branch is deleted, every branch-dependent method of the
+    /// view throws "Branch not found". See `close()` for lifetime.
+    #[napi]
+    pub fn view(&self, branch_name: String) -> Result<JsStore> {
+        let store = self.get_store()?;
+        let branch = store
+            .get_branch(&branch_name)
+            .ok_or_else(|| to_napi_error(StoreError::BranchNotFound(branch_name.clone())))?;
+        Ok(JsStore {
+            shared: Arc::clone(&self.shared),
+            pinned: Some(PinnedBranch {
+                id: branch.id,
+                name: branch.name,
+            }),
+            detached: false,
+            subscription_handles: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Name of the branch this handle is pinned to, or `null` on the root
+    /// handle (which follows the current branch).
+    #[napi]
+    pub fn pinned_branch(&self) -> Option<String> {
+        self.pinned.as_ref().map(|p| p.name.clone())
+    }
+
+    /// What the most recent open had to recover, if anything.
+    ///
+    /// Returns a report when `open` truncated a torn/partial tail record
+    /// (crash during append), replayed updates for a state with no
+    /// registration, skipped records typed `state_update` that don't decode
+    /// as state updates, or passed over updates on a branch the store never
+    /// saved, and `null` when none of these happened. A report doesn't by
+    /// itself mean a tail was torn: `droppedBytes` is 0 when nothing was. Nor
+    /// does a state with no registration mean damage: a state written without
+    /// one is named whenever its updates are replayed. Lets JS callers detect
+    /// lost un-fsynced writes without scraping logs.
     #[napi]
     pub fn recovery(&self) -> Result<Option<JsRecoveryReport>> {
         let store = self.get_store()?;
@@ -411,27 +798,70 @@ impl JsStore {
             truncated_at: r.truncated_at as i64,
             dropped_bytes: r.dropped_bytes as i64,
             valid_records: r.valid_records as i64,
+            unregistered_states: r
+                .unregistered_states
+                .into_iter()
+                .map(|(id, updates)| JsUnregisteredState {
+                    id,
+                    updates: updates as i64,
+                })
+                .collect(),
+            undecodable_state_updates: r.undecodable_state_updates as i64,
+            updates_on_missing_branches: r.updates_on_missing_branches as i64,
         }))
+    }
+
+    /// The states whose snapshot after a recorded write failed at its most
+    /// recent attempt, one entry per branch and state, ordered by when each
+    /// branch was created (its internal id), then by state id; an empty
+    /// array when none has. The same on every handle
+    /// of the store.
+    ///
+    /// A write that reaches a state's snapshot cadence takes the snapshot
+    /// after its record, and when that snapshot fails, the write still
+    /// returns its record (issue #39). The store logs a `tracing` warning,
+    /// which a Node process doesn't show, and counts the failure here, with
+    /// the sequence of the write and the error. An entry goes once a
+    /// snapshot of the state on that branch is recorded (by a later write
+    /// or `compactState`), or a write finds none due. Kept in memory only: a
+    /// reopened store lists none until a write's snapshot fails again. A
+    /// deleted branch's entries aren't listed.
+    #[napi]
+    pub fn snapshot_failures(&self) -> Result<Vec<JsSnapshotFailure>> {
+        let store = self.get_store()?;
+        Ok(store
+            .snapshot_failures()
+            .into_iter()
+            .map(|failure| JsSnapshotFailure {
+                state_id: failure.state_id,
+                branch: failure.branch,
+                failures: failure.failures as i64,
+                sequence: failure.sequence.0 as i64,
+                error: failure.error,
+            })
+            .collect())
     }
 
     // --- Records ---
 
     /// Append a record to the store.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append(&self, record_type: String, payload: Buffer) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let input = crate::RecordInput::raw(&record_type, payload.to_vec());
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
     /// Append a JSON record.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_json(&self, record_type: String, data: serde_json::Value) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let input =
             crate::RecordInput::json(&record_type, &data).map_err(|e| to_napi_error(e.into()))?;
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
@@ -441,9 +871,38 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let record = store.get_record(RecordId(id)).map_err(to_napi_error)?;
         Ok(record.map(Into::into))
+    }
+
+    /// Get several records by ID in one call. The result has one entry per
+    /// ID, in the order given: the record, as `getRecord` returns it, or
+    /// `null` for an ID with no record. IDs may repeat. The records are read
+    /// under one hold of the log file, so a long list holds other reads and
+    /// appends of the store until it is read; split it to let them in.
+    /// Throws, reading nothing, if an ID isn't a record ID. A record that
+    /// fails to read throws its error, which doesn't name the ID;
+    /// `getRecord` on each ID finds which.
+    #[napi]
+    pub fn get_records(&self, ids: Vec<String>) -> Result<Vec<Option<JsRecord>>> {
+        let store = self.get_store()?;
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<u64>().map(RecordId).map_err(|_| {
+                    coded(
+                        ErrorCode::InvalidOperation,
+                        format!("Invalid record ID: {:?}", id),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let records = store.get_records(&ids).map_err(to_napi_error)?;
+        Ok(records
+            .into_iter()
+            .map(|record| record.map(Into::into))
+            .collect())
     }
 
     /// Decode a `state_update` record's payload to a JSON string, regardless
@@ -452,13 +911,15 @@ impl JsStore {
     /// `JSON.parse(record.payload)` — after the 2026-08 encoding migration
     /// the raw payload is no longer guaranteed to be JSON. The operation's
     /// value bytes are surfaced as JSON integer arrays (the legacy shape),
-    /// so existing shape-expectations keep holding.
+    /// so existing shape-expectations keep holding. Returns `null` when no
+    /// record has this id or its type isn't `state_update`, and throws for a
+    /// record typed `state_update` that doesn't decode as a state update.
     #[napi]
     pub fn get_state_update_json(&self, id: String) -> Result<Option<String>> {
         let store = self.get_store()?;
         let id: u64 = id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let record = match store.get_record(RecordId(id)).map_err(to_napi_error)? {
             Some(r) => r,
             None => return Ok(None),
@@ -469,11 +930,16 @@ impl JsStore {
         let update =
             crate::types::StateUpdateRecord::decode(&record).map_err(to_napi_error)?;
         let json = serde_json::to_string(&update)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         Ok(Some(json))
     }
 
-    /// Get record IDs by type.
+    /// Get the IDs of a type's records across all branches, in ascending ID
+    /// order, which is log order: the last is the newest. The IDs are decimal
+    /// strings, so compare them as numbers. The records a torn tail drops at
+    /// open are gone, and their IDs are issued again to new records, possibly
+    /// of another type: a last ID taken before the crash can name a different
+    /// record afterwards, and a count taken then can skip new ones.
     #[napi]
     pub fn get_record_ids_by_type(&self, record_type: String) -> Result<Vec<String>> {
         let store = self.get_store()?;
@@ -486,7 +952,20 @@ impl JsStore {
 
     // --- Blobs ---
 
-    /// Store a blob and return its hash.
+    /// Store a blob and return its hash. Bytes already stored are left as they
+    /// are, unless their file is cut short, damaged or holds other bytes, which
+    /// is replaced, as is a chunked blob's file (see `storeBlobAsync`) whose
+    /// chunks are missing, damaged or other bytes; bytes this open store has
+    /// stored, or read and checked while storing, may be taken as stored
+    /// without reading their file, until a `getBlob` of them fails. A symbolic
+    /// link at the blob's name is read through, and one that leads nowhere is
+    /// replaced. Throws when something other than a regular file, such as a
+    /// directory, is at the blob's name or a link's target, when its file can't
+    /// be read or is in a blob format version newer than this chronicle reads,
+    /// when writing or syncing the blob fails, and for a content type longer
+    /// than 65,535 bytes. A sync that fails after the blob is in place still
+    /// throws, and storing the blob again before the store closes tries the
+    /// sync again.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -496,22 +975,130 @@ impl JsStore {
         Ok(hash.to_string())
     }
 
-    /// Get a blob by hash.
+    /// Store a blob without holding the calling thread, resolving with its
+    /// hash once it's stored, or rejecting with the error that stopped it.
+    /// Without `chunked`, it's stored as `storeBlob` stores it, and the error
+    /// is the one `storeBlob` would throw. The bytes are copied before this
+    /// returns, so the buffer can be reused at once. These stores run one at a
+    /// time on a thread of the open store's own, which its root handle and
+    /// views share, in the order they're called on any of them; a `storeBlob`
+    /// meanwhile isn't ordered with them. Each holds its copy of the bytes
+    /// until it settles, so awaiting them is what bounds that memory.
+    /// The root's `close()` waits for every one already called, and one
+    /// called on a view still finishes after that view's `close()`. A store
+    /// whose root and views are all dropped without `close()` finishes the
+    /// ones already called, and then releases its lock. On a closed store or
+    /// view this throws, as every method does.
+    ///
+    /// With `chunked: true`, content is cut where its own bytes say, into
+    /// chunks of at most 64 KiB, each at least 2 KiB but the last, so any
+    /// content over 2 KiB can be cut into more than one, and content sharing long
+    /// runs of bytes with earlier chunked content shares those runs' chunks
+    /// too. Each chunk
+    /// is stored as a blob, and a file under the whole content's hash names
+    /// them in order, written only once every chunk is stored and each one
+    /// this store wrote is synced.
+    /// Content the cut leaves as one chunk is stored whole. `getBlob` returns the
+    /// content either way, and a blob already stored in the other form is
+    /// left as it is when it reads back as the content. Chunking pays where
+    /// content repeats earlier chunked content: each chunk is a file of its
+    /// own, about 10 KiB on average, and a `getBlob` of a chunked blob reads
+    /// each one the blob cache doesn't hold, so content sharing nothing with
+    /// what's stored takes more files to store and to read than it would
+    /// whole, and more disk, since each file takes whole blocks. Only
+    /// `chunked: true` writes a chunked blob, and nothing else in a store
+    /// changes with it. A chronicle release from before `storeBlobAsync`,
+    /// 0.6.0 included, can't read a chunked blob: its `getBlob` of that hash
+    /// throws, naming an unsupported blob version, and it reads blobs stored
+    /// whole as before. To go back, close the store and run
+    /// `tools/unchunk-blobs.py <store> --apply` from chronicle's repository
+    /// with Python 3: it rewrites each chunked blob whole under the same
+    /// hash, and those releases then read it. It stops at a chunked blob
+    /// whose list or a chunk it can't read, naming its file, and leaves that
+    /// blob and those after it as they are.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn store_blob_async(
+        &self,
+        env: Env,
+        content: Buffer,
+        content_type: String,
+        options: Option<JsStoreBlobOptions>,
+    ) -> napi::Result<JsObject> {
+        let chunked = options.and_then(|options| options.chunked).unwrap_or(false);
+        self.with_open(|open| {
+            let mut writer = open.blob_writer.lock();
+            if writer.is_none() {
+                *writer = Some(BlobWriter::start(Arc::clone(&open.store))?);
+            }
+            let content = content.to_vec();
+            let (done, promise) = env.create_deferred::<String, ResolveHash>()?;
+            let job = BlobJob {
+                content,
+                content_type,
+                chunked,
+                done,
+            };
+            if let Err(crossbeam_channel::SendError(job)) =
+                writer.as_ref().expect("started above").jobs.send(job)
+            {
+                job.done.reject(napi::Error::from_reason(
+                    "the thread that stores blobs has stopped, so nothing was stored",
+                ));
+            }
+            Ok(promise)
+        })
+        .map_err(|error| as_js_error(env, error))?
+    }
+
+    /// Get a blob by hash. A blob read since the store opened may be answered
+    /// from memory. Otherwise it throws when the blob's file is cut
+    /// short or damaged, which storing the same bytes again replaces, or when
+    /// something other than a regular file is at its name or a link's target.
+    /// It also throws when the file can't be opened or read, such as for its
+    /// permissions, when a link at its name loops, and when the file is in a
+    /// blob format version newer than this chronicle reads, which storing
+    /// doesn't replace. A symbolic link that leads nowhere reads as no blob.
+    /// A chunked blob (see `storeBlobAsync`) is read through its chunks, and
+    /// a chunk read since the store opened may be answered from memory. It
+    /// throws when a chunk read from its file is missing, cut short, damaged
+    /// or other bytes, which storing the same bytes again repairs.
     #[napi]
     pub fn get_blob(&self, hash: String) -> Result<Option<Buffer>> {
         let store = self.get_store()?;
         let hash = crate::Hash::from_hex(&hash)
-            .map_err(|_| napi::Error::from_reason("Invalid hash"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid hash"))?;
         let blob = store.get_blob(&hash).map_err(to_napi_error)?;
         Ok(blob.map(|b| Buffer::from(b.content)))
     }
 
     // --- Branches ---
 
-    /// Create a new branch.
+    /// The parent a fork uses when `from` is omitted: the pinned branch on a
+    /// view (which must still exist), `None` on the root so the store falls
+    /// back to its own default.
+    fn default_parent(&self, from: Option<String>) -> Result<Option<String>> {
+        match (&from, &self.pinned) {
+            (None, Some(pinned)) => {
+                self.target()?;
+                Ok(Some(pinned.name.clone()))
+            }
+            _ => Ok(from),
+        }
+    }
+
+    /// Create a new branch, and checkpoint it before returning.
+    /// If the checkpoint fails, this throws but the branch stays in memory;
+    /// the next successful checkpoint publishes it and tells subscribers:
+    /// `sync()`, or the retry that every later mutation makes first. Calling
+    /// this again retries that checkpoint first and, once it succeeds, throws,
+    /// since the branch exists.
+    ///
+    /// With `from` omitted the parent is the current branch — on a view, the
+    /// branch the view is pinned to.
     #[napi]
     pub fn create_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
+        let from = self.default_parent(from)?;
         let branch = store
             .create_branch(&name, from.as_deref())
             .map_err(to_napi_error)?;
@@ -525,8 +1112,62 @@ impl JsStore {
         })
     }
 
+    /// Create a new branch that inherits only the states `filter` selects
+    /// (exact `stateIds` and/or `statePrefixes`; see `JsStateFilter`).
+    ///
+    /// Selected states are inherited exactly as `createBranch` inherits
+    /// them. Every other state has no value on the new branch — it reads
+    /// there as a registered state does on a `createEmptyBranch` branch
+    /// (`getState` → null, `getStateLen` → null) — and a write to it starts a
+    /// fresh chain that shares nothing with the parent's.
+    ///
+    /// Copying the heads costs in proportion to the number of states
+    /// inherited, not to how many states the parent has, how many branches
+    /// exist, or how much history the store holds; the checkpoint that ends
+    /// the call still saves every branch's heads. With `from` omitted the
+    /// parent is the current branch (on a view, the pinned branch).
+    #[napi]
+    pub fn create_branch_with_states(
+        &self,
+        name: String,
+        from: Option<String>,
+        filter: JsStateFilter,
+    ) -> Result<JsBranch> {
+        let store = self.get_store()?;
+        let from = self.default_parent(from)?;
+        let branch = store
+            .create_branch_with_states(&name, from.as_deref(), &filter.into())
+            .map_err(to_napi_error)?;
+        Ok(branch.into())
+    }
+
+    /// Create a new branch at a specific sequence point of `from`, inheriting
+    /// only the states `filter` selects. The historical counterpart of
+    /// `createBranchWithStates`: selected states read as they did on `from`
+    /// at `atSequence`, the others have no value.
+    #[napi]
+    pub fn create_branch_at_with_states(
+        &self,
+        name: String,
+        from: String,
+        at_sequence: i64,
+        filter: JsStateFilter,
+    ) -> Result<JsBranch> {
+        let store = self.get_store()?;
+        let branch = store
+            .create_branch_at_with_states(
+                &name,
+                &from,
+                Sequence(at_sequence as u64),
+                &filter.into(),
+            )
+            .map_err(to_napi_error)?;
+        Ok(branch.into())
+    }
+
     /// Create a new branch at a specific sequence point.
     /// This enables time-travel branching - the new branch will have state as of that sequence.
+    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
     pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -544,9 +1185,11 @@ impl JsStore {
     }
 
     /// Create a new branch without copying state from parent.
+    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
+        let from = self.default_parent(from)?;
         let branch = store
             .create_empty_branch(&name, from.as_deref())
             .map_err(to_napi_error)?;
@@ -560,10 +1203,26 @@ impl JsStore {
         })
     }
 
-    /// Switch to a branch.
+    /// Switch to a branch, and checkpoint the switch before returning.
+    /// If the checkpoint fails, this throws but the switch stays in effect;
+    /// the next successful checkpoint publishes it: `sync()`, or the retry
+    /// that every later mutation makes first, so later writes go to the new
+    /// branch.
+    ///
+    ///
+    /// Root handle only. A view is pinned to its branch for life and throws:
+    /// moving the store-wide current branch from a view would silently
+    /// redirect the root handle.
     #[napi]
     pub fn switch_branch(&self, name: String) -> Result<JsBranch> {
         let store = self.get_store()?;
+        if let Some(pinned) = &self.pinned {
+            return Err(coded(ErrorCode::InvalidOperation, format!(
+                "switchBranch is not available on a view (pinned to branch '{}'); \
+                 call view('{}') on the store for a handle on that branch instead",
+                pinned.name, name
+            )));
+        }
         let branch = store.switch_branch(&name).map_err(to_napi_error)?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
@@ -575,11 +1234,13 @@ impl JsStore {
         })
     }
 
-    /// Get the current branch.
+    /// Get the current branch. On a view: the branch it is pinned to.
     #[napi]
     pub fn current_branch(&self) -> Result<JsBranch> {
-        let store = self.get_store()?;
-        let branch = store.current_branch();
+        let (store, branch) = self.target()?;
+        let branch = store
+            .get_branch_by_id(branch)
+            .ok_or_else(|| coded(ErrorCode::BranchNotFound, "Branch not found"))?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
             name: branch.name,
@@ -608,16 +1269,41 @@ impl JsStore {
             .collect())
     }
 
-    /// Delete a branch.
+    /// Delete a branch, and checkpoint the deletion before returning.
+    /// If the checkpoint fails, this throws but the branch stays deleted in
+    /// memory; the next successful checkpoint publishes the deletion and
+    /// tells subscribers: `sync()`, or the retry that every later mutation
+    /// makes first. Calling this again retries that checkpoint first and,
+    /// once it succeeds, throws, since the branch is gone.
+    ///
+    ///
+    /// The main branch and the current branch cannot be deleted; nor can a
+    /// view delete the branch it is itself pinned to. Each of these throws
+    /// `InvalidOperation`. A branch that OTHER views are pinned to can be
+    /// deleted — those views then throw "Branch not found" from every
+    /// branch-dependent method.
     #[napi]
     pub fn delete_branch(&self, name: String) -> Result<()> {
         let store = self.get_store()?;
+        if let Some(pinned) = &self.pinned {
+            if pinned.name == name && store.branch_exists(pinned.id) {
+                return Err(to_napi_error(StoreError::InvalidOperation(format!(
+                    "Cannot delete the branch this view is pinned to ('{}')",
+                    name
+                ))));
+            }
+        }
         store.delete_branch(&name).map_err(to_napi_error)
     }
 
     // --- State Management ---
 
-    /// Register a new state.
+    /// Register a new state, and checkpoint it before returning. If the
+    /// checkpoint fails, this throws but the registration stays in memory;
+    /// the next successful checkpoint publishes it: `sync()`, or the retry
+    /// that every later mutation makes first. Calling this again retries that
+    /// checkpoint first and, once it succeeds, throws, since the state is
+    /// registered.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -635,10 +1321,14 @@ impl JsStore {
     /// Update the strategy parameters of an already-registered state.
     /// Same strategy kind only; cadence fields (deltaSnapshotEvery /
     /// fullSnapshotEvery) are free to change and steer future snapshot
-    /// scheduling. Use after registerState throws "State already exists"
+    /// scheduling. Use after registerState throws with `code` `StateExists`
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
+    /// Checkpoints before returning. If the checkpoint fails, this throws but
+    /// the new strategy stays in memory; the next successful checkpoint
+    /// publishes it: `sync()`, or the retry that every later mutation makes
+    /// first.
     #[napi]
     pub fn update_state_strategy(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -651,20 +1341,20 @@ impl JsStore {
     /// Get state value.
     #[napi]
     pub fn get_state(&self, state_id: String) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
-        let state = store.get_state(&state_id).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let state = store.get_state_on(branch, &state_id).map_err(to_napi_error)?;
         Ok(state.map(Buffer::from))
     }
 
     /// Get state as JSON.
     #[napi]
     pub fn get_state_json(&self, state_id: String) -> Result<Option<serde_json::Value>> {
-        let store = self.get_store()?;
-        let state = store.get_state(&state_id).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let state = store.get_state_on(branch, &state_id).map_err(to_napi_error)?;
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -674,9 +1364,9 @@ impl JsStore {
     /// Set state value (for Snapshot strategy).
     #[napi]
     pub fn set_state(&self, state_id: String, value: Buffer) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(&state_id, StateOperation::Set(value.to_vec()))
+            .update_state_on(branch, &state_id, StateOperation::Set(value.to_vec()))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -684,11 +1374,11 @@ impl JsStore {
     /// Set state as JSON.
     #[napi]
     pub fn set_state_json(&self, state_id: String, value: serde_json::Value) -> Result<JsRecord> {
-        let store = self.get_store()?;
-        let bytes =
-            serde_json::to_vec(&value).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let (store, branch) = self.target()?;
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         let record = store
-            .update_state(&state_id, StateOperation::Set(bytes))
+            .update_state_on(branch, &state_id, StateOperation::Set(bytes))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -696,9 +1386,9 @@ impl JsStore {
     /// Append to an AppendLog state.
     #[napi]
     pub fn append_to_state(&self, state_id: String, item: Buffer) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(&state_id, StateOperation::Append(item.to_vec()))
+            .update_state_on(branch, &state_id, StateOperation::Append(item.to_vec()))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -710,11 +1400,11 @@ impl JsStore {
         state_id: String,
         item: serde_json::Value,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
-        let bytes =
-            serde_json::to_vec(&item).map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let (store, branch) = self.target()?;
+        let bytes = serde_json::to_vec(&item)
+            .map_err(|e| coded(ErrorCode::Serialization, e.to_string()))?;
         let record = store
-            .update_state(&state_id, StateOperation::Append(bytes))
+            .update_state_on(branch, &state_id, StateOperation::Append(bytes))
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -728,6 +1418,15 @@ impl JsStore {
     /// `appendToStateJson` + `editStateItem` when the caller wants each
     /// stored item to carry its own chronicle identity — it avoids the
     /// follow-up Edit that would otherwise promote every snapshot to Full.
+    ///
+    /// Throws, writing nothing, for an `item` that isn't a JSON object.
+    /// Once the item is recorded the call returns its record. A write that
+    /// reaches the state's snapshot cadence takes the snapshot after its
+    /// record, and if that snapshot fails the call still returns: the store
+    /// logs a `tracing` warning and lists the state in `snapshotFailures()`,
+    /// and the next write to the state checks the cadence again and takes
+    /// the snapshot if one is still due (after an Edit or Redact, a delta
+    /// snapshot waits for the next full one; issue #39).
     #[napi]
     pub fn append_to_state_json_with_identity(
         &self,
@@ -736,11 +1435,124 @@ impl JsStore {
         id_field: String,
         sequence_field: String,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .append_to_state_json_with_identity(&state_id, item, &id_field, &sequence_field)
+            .append_to_state_json_with_identity_on(branch, &state_id, item, &id_field, &sequence_field)
             .map_err(to_napi_error)?;
         Ok(record.into())
+    }
+
+    /// Append several JSON items to an AppendLog state as one record, at one
+    /// sequence, and return that record with the index the first item took
+    /// (`firstOrdinal`); item `i` is at `firstOrdinal + i`. `JsAppendedBatch`
+    /// says when the batch counts the state's items to find that index.
+    ///
+    /// Reads see the items exactly as if each had been appended with
+    /// `appendToStateJson`, in order, except that a historical read or a
+    /// branch cut by sequence keeps or drops the batch whole, as it has one
+    /// sequence. The batch counts as one operation
+    /// toward the state's snapshot cadence, and subscribers get one
+    /// "state_delta" event for it (see `JsStoreEvent.data`). Throws, writing
+    /// nothing, for an empty `items`. Once the batch is recorded the call
+    /// returns it. A write that reaches the snapshot cadence takes the
+    /// snapshot after its record, and if that snapshot fails the call still
+    /// returns: the store logs a `tracing` warning and lists the state in
+    /// `snapshotFailures()`, and the next write to the state checks the
+    /// cadence again and takes the snapshot if one is still due (after an
+    /// Edit or Redact, a delta snapshot waits for the next full one; issue
+    /// #39).
+    ///
+    /// Just before a store's first batch is written, its `MANIFEST` moves to
+    /// version 2, and it stays there even if that batch then fails (see
+    /// `appendManyToStateJsonWithIdentity`), so releases from before batched
+    /// appends refuse to open it, where the directory holding the `MANIFEST`
+    /// (for a linked one, the one holding its target) is synced (on
+    /// Windows, where this process may not open that directory, or on a
+    /// system that doesn't sync directories, a power loss can undo the move
+    /// to version 2 and keep the batch; see Breaking).
+    #[napi]
+    pub fn append_many_to_state_json(
+        &self,
+        state_id: String,
+        items: Vec<serde_json::Value>,
+    ) -> Result<JsAppendedBatch> {
+        let (store, branch) = self.target()?;
+        let batch = store
+            .append_many_to_state_json_on(branch, &state_id, &items)
+            .map_err(to_napi_error)?;
+        Ok(JsAppendedBatch {
+            record: batch.record.into(),
+            first_ordinal: batch.first_ordinal as i64,
+        })
+    }
+
+    /// Append several JSON objects to an AppendLog state as one record, at
+    /// one sequence, writing that record's id and sequence into each of them
+    /// first, and return the record with the index the first item took
+    /// (`firstOrdinal`, found as `JsAppendedBatch` says); item `i` is at
+    /// `firstOrdinal + i`. It is the batched form of
+    /// `appendToStateJsonWithIdentity`, as `appendManyToStateJson` is of
+    /// `appendToStateJson`.
+    ///
+    /// Each item is stamped as `appendToStateJsonWithIdentity` stamps its
+    /// one item: `idField` receives the record id (as a string, matching
+    /// `JsRecord.id`), `sequenceField` the sequence (as a number), and
+    /// existing values at those keys are overwritten. The batch is one
+    /// record, so every item of it carries the same id and sequence, those
+    /// of `record`. A branch cut by an item's sequence (`createBranchAt` at
+    /// it keeps the item, at the one before drops it) keeps or drops the
+    /// whole batch with it.
+    ///
+    /// Otherwise it is `appendManyToStateJson`: reads see the stamped items
+    /// as if each had been appended alone, the batch counts as one operation
+    /// toward the snapshot cadence, and subscribers get one "state_delta"
+    /// event for it. Throws, writing nothing, for an empty `items`, an item
+    /// that isn't a JSON object, or an `idField` equal to `sequenceField`,
+    /// where an item couldn't hold both the record id and the sequence. Once
+    /// the batch is recorded the call
+    /// returns it. A write that reaches the snapshot cadence takes the
+    /// snapshot after its record, and if that snapshot fails the call still
+    /// returns: the store logs a `tracing` warning and lists the state in
+    /// `snapshotFailures()`, and the next write to the state checks the
+    /// cadence again and takes the snapshot if one is still due (after an
+    /// Edit or Redact, a delta snapshot waits for the next full one; issue
+    /// #39).
+    ///
+    /// Just before a store's first batch is written, by this call or
+    /// `appendManyToStateJson`, its `MANIFEST` moves to version 2, and it
+    /// stays there even if that batch then fails, so releases from before
+    /// batched appends refuse to open it, where the directory holding the
+    /// `MANIFEST` (for a linked one, the one holding its target) is synced
+    /// (on Windows, where this process may not open that directory, or on a
+    /// system that doesn't sync directories, a power loss can undo
+    /// the move to version 2 and keep the batch; see Breaking). If the move
+    /// itself fails, the call throws and the batch isn't recorded; it throws
+    /// too if only the
+    /// directory sync after the move fails, with the `MANIFEST` already at
+    /// version 2. A store never asked to record a batch keeps the format they
+    /// open.
+    #[napi]
+    pub fn append_many_to_state_json_with_identity(
+        &self,
+        state_id: String,
+        items: Vec<serde_json::Value>,
+        id_field: String,
+        sequence_field: String,
+    ) -> Result<JsAppendedBatch> {
+        let (store, branch) = self.target()?;
+        let batch = store
+            .append_many_to_state_json_with_identity_on(
+                branch,
+                &state_id,
+                &items,
+                &id_field,
+                &sequence_field,
+            )
+            .map_err(to_napi_error)?;
+        Ok(JsAppendedBatch {
+            record: batch.record.into(),
+            first_ordinal: batch.first_ordinal as i64,
+        })
     }
 
     /// Edit an item in an AppendLog state.
@@ -751,9 +1563,10 @@ impl JsStore {
         index: i64,
         new_value: Buffer,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(
+            .update_state_on(
+                branch,
                 &state_id,
                 StateOperation::Edit {
                     index: index as usize,
@@ -772,9 +1585,10 @@ impl JsStore {
         start: i64,
         end: i64,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .update_state(
+            .update_state_on(
+                branch,
                 &state_id,
                 StateOperation::Redact {
                     start: start as usize,
@@ -788,11 +1602,27 @@ impl JsStore {
     /// Get the length of an AppendLog state.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let len = store
-            .get_state_len(&state_id)
+            .get_state_len_on(branch, &state_id)
             .map_err(to_napi_error)?;
         Ok(len.map(|l| l as i64))
+    }
+
+    /// Revision key for a state's value on this handle's branch: the log
+    /// offset of its newest chain record, or `null` if the state has no
+    /// value there. It changes on every write to that state on that branch
+    /// (append, edit, redact, set, and the store's own snapshots) and on
+    /// nothing else, so a cached copy of the value is current exactly while
+    /// this number is unchanged — including across several handles on the
+    /// same branch, which a per-handle counter cannot see. O(1).
+    #[napi]
+    pub fn state_head_offset(&self, state_id: String) -> Result<Option<i64>> {
+        let (store, branch) = self.target()?;
+        let offset = store
+            .state_head_offset_on(branch, &state_id)
+            .map_err(to_napi_error)?;
+        Ok(offset.map(|o| o as i64))
     }
 
     /// Get a slice of an AppendLog state.
@@ -803,9 +1633,9 @@ impl JsStore {
         offset: i64,
         limit: i64,
     ) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let slice = store
-            .get_state_slice(&state_id, offset as usize, limit as usize)
+            .get_state_slice_on(branch, &state_id, offset as usize, limit as usize)
             .map_err(to_napi_error)?;
         Ok(slice.map(Buffer::from))
     }
@@ -815,7 +1645,12 @@ impl JsStore {
     /// O(item size) once the per-item cache is warm — unlike `getStateJson`,
     /// which materializes and converts the entire state on every call. Use
     /// this for point lookups in large states. Returns `null` if the state
-    /// doesn't exist or the index is out of range.
+    /// doesn't exist, the index is negative or out of range, or the state's
+    /// value isn't an array. Throws the deserialization error if the state's
+    /// bytes aren't one JSON value (no bytes at all read as an empty list),
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item: an `appendToState`'s, or a batch's last item where
+    /// this session found the head's count exact.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -825,26 +1660,77 @@ impl JsStore {
         if index < 0 {
             return Ok(None);
         }
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let item = store
-            .get_state_item(&state_id, index as usize)
+            .get_state_item_on(branch, &state_id, index as usize)
             .map_err(to_napi_error)?;
         match item {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
         }
     }
 
+    /// Get several items of an AppendLog state by index, as JSON, in one
+    /// call. The result has one entry per index in `ordinals`, in the order
+    /// given: what `getStateItemJson` returns for that index, so `null` if it
+    /// is negative or out of range, the state doesn't exist, or the state's
+    /// value isn't an array, except at the last index of a head whose count
+    /// this session hasn't found exact (unchecked, or checked on a value that
+    /// doesn't materialize), where `getStateItemJson` answers from the stored
+    /// count and this from the value. Throws, as `getStateItemJson` does, if
+    /// the state's bytes aren't one JSON value (no bytes at all read as an
+    /// empty list), except the last item served from the head record alone,
+    /// which reads no earlier item. Indices may repeat and come in any order.
+    ///
+    /// Every entry comes from the same version of the state, and a cold
+    /// state is materialized at most once for the whole call, not once per
+    /// index. A request with no index that is zero or more (an empty one,
+    /// or one of negative indices only) reads nothing.
+    #[napi]
+    pub fn get_state_items_json(
+        &self,
+        state_id: String,
+        ordinals: Vec<i64>,
+    ) -> Result<Vec<Option<serde_json::Value>>> {
+        // A negative index answers null without a read, as getStateItemJson's
+        // does; only the others go to the store.
+        let asked: Vec<Option<usize>> = ordinals.iter().map(|&i| usize::try_from(i).ok()).collect();
+        let wanted: Vec<usize> = asked.iter().flatten().copied().collect();
+        if wanted.is_empty() {
+            return Ok(vec![None; ordinals.len()]);
+        }
+        let (store, branch) = self.target()?;
+        let mut items = store
+            .get_state_items_by_ordinal_on(branch, &state_id, &wanted)
+            .map_err(to_napi_error)?
+            .into_iter();
+        asked
+            .into_iter()
+            .map(|ordinal| {
+                // One answer per index the store was asked for, in order.
+                let item = match ordinal {
+                    Some(_) => items.next().flatten(),
+                    None => None,
+                };
+                item.map(|bytes| {
+                    serde_json::from_slice(&bytes)
+                        .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))
+                })
+                .transpose()
+            })
+            .collect()
+    }
+
     /// Get the last N items from an AppendLog state.
     #[napi]
     pub fn get_state_tail(&self, state_id: String, count: i64) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let tail = store
-            .get_state_tail(&state_id, count as usize)
+            .get_state_tail_on(branch, &state_id, count as usize)
             .map_err(to_napi_error)?;
         Ok(tail.map(Buffer::from))
     }
@@ -874,9 +1760,9 @@ impl JsStore {
     /// Compact a state by creating a full snapshot.
     #[napi]
     pub fn compact_state(&self, state_id: String) -> Result<Option<JsRecord>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let record = store
-            .compact_state(&state_id)
+            .compact_state_on(branch, &state_id)
             .map_err(to_napi_error)?;
         Ok(record.map(Into::into))
     }
@@ -884,17 +1770,17 @@ impl JsStore {
     /// Compact all states.
     #[napi]
     pub fn compact_all_states(&self) -> Result<i64> {
-        let store = self.get_store()?;
-        let count = store.compact_all_states().map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let count = store.compact_all_states_on(branch).map_err(to_napi_error)?;
         Ok(count as i64)
     }
 
     /// Get compaction summary.
     #[napi]
     pub fn get_compaction_summary(&self) -> Result<JsCompactionSummary> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let summary = store
-            .get_compaction_summary()
+            .get_compaction_summary_on(branch)
             .map_err(to_napi_error)?;
         Ok(summary.into())
     }
@@ -919,6 +1805,7 @@ impl JsStore {
     // --- New UI/Explorer Methods ---
 
     /// Append a record with caused_by/linked_to links.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_with_links(
         &self,
@@ -926,7 +1813,7 @@ impl JsStore {
         payload: Buffer,
         options: JsRecordOptions,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let caused_by: Vec<RecordId> = options
             .caused_by
             .unwrap_or_default()
@@ -943,11 +1830,12 @@ impl JsStore {
         let input = crate::RecordInput::raw(&record_type, payload.to_vec())
             .with_caused_by(caused_by)
             .with_linked_to(linked_to);
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
     /// Append a JSON record with caused_by/linked_to links.
+    /// The internal `state_update` type is reserved for the state-update helpers.
     #[napi]
     pub fn append_json_with_links(
         &self,
@@ -955,7 +1843,7 @@ impl JsStore {
         data: serde_json::Value,
         options: JsRecordOptions,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let caused_by: Vec<RecordId> = options
             .caused_by
             .unwrap_or_default()
@@ -973,7 +1861,7 @@ impl JsStore {
             .map_err(|e| to_napi_error(e.into()))?
             .with_caused_by(caused_by)
             .with_linked_to(linked_to);
-        let record = store.append(input).map_err(to_napi_error)?;
+        let record = store.append_on(branch, input).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
@@ -988,7 +1876,7 @@ impl JsStore {
     /// - `types`: Filter by record types
     #[napi]
     pub fn query(&self, filter: JsQueryFilter) -> Result<Vec<JsRecord>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let from_seq = filter.from_sequence.map(|s| Sequence(s as u64));
         let to_seq = filter.to_sequence.map(|s| Sequence(s as u64));
         // Default limit to 10,000 to avoid capacity overflow panics
@@ -1006,7 +1894,8 @@ impl JsStore {
         };
 
         let records = store
-            .query_range(
+            .query_range_on(
+                branch,
                 from_seq,
                 to_seq,
                 fetch_limit,
@@ -1029,8 +1918,7 @@ impl JsStore {
     /// List all registered states with their info.
     #[napi]
     pub fn list_states(&self) -> Result<Vec<JsStateInfo>> {
-        let store = self.get_store()?;
-        let branch_id = store.current_branch().id;
+        let (store, branch_id) = self.target()?;
         Ok(store
             .state
             .state_ids()
@@ -1067,16 +1955,19 @@ impl JsStore {
     /// Get the current sequence number (head of current branch).
     #[napi]
     pub fn current_sequence(&self) -> Result<i64> {
-        let store = self.get_store()?;
-        Ok(store.current_branch().head.0 as i64)
+        let (store, branch) = self.target()?;
+        let branch = store
+            .get_branch_by_id(branch)
+            .ok_or_else(|| coded(ErrorCode::BranchNotFound, "Branch not found"))?;
+        Ok(branch.head.0 as i64)
     }
 
     /// Get state value at a specific sequence (historical access).
     #[napi]
     pub fn get_state_at(&self, state_id: String, at_sequence: i64) -> Result<Option<Buffer>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let state = store
-            .get_state_at(&state_id, Sequence(at_sequence as u64))
+            .get_state_at_on(branch, &state_id, Sequence(at_sequence as u64))
             .map_err(to_napi_error)?;
         Ok(state.map(Buffer::from))
     }
@@ -1088,14 +1979,14 @@ impl JsStore {
         state_id: String,
         at_sequence: i64,
     ) -> Result<Option<serde_json::Value>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let state = store
-            .get_state_at(&state_id, Sequence(at_sequence as u64))
+            .get_state_at_on(branch, &state_id, Sequence(at_sequence as u64))
             .map_err(to_napi_error)?;
         match state {
             Some(bytes) => {
                 let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                    .map_err(|e| coded(ErrorCode::Deserialization, e.to_string()))?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -1108,7 +1999,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let effects = store.index.get_caused_by(RecordId(id));
         Ok(effects.iter().map(|id| id.0.to_string()).collect())
     }
@@ -1119,12 +2010,37 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = record_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid record ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid record ID"))?;
         let links = store.index.get_linked_to(RecordId(id));
         Ok(links.iter().map(|id| id.0.to_string()).collect())
     }
 
-    /// Sync all pending writes to disk.
+    /// Flush pending record/state contents and publish metadata checkpoints.
+    /// A failure to save field indexes is only logged, since they are derived.
+    /// Once an fsync of the record log has failed, this call's own or a
+    /// periodic one, this throws that failure every time until the store is
+    /// reopened, and publishes nothing: records written before it may not
+    /// have reached the disk, and a later fsync can't show that they did.
+    /// Its message begins `Durability lost:`, and its `code` is
+    /// `DurabilityLost`. Registering a state, changing a strategy, and
+    /// creating, deleting or switching a branch throw it too, unless a check
+    /// of their own refuses them first, and so does any write while one of
+    /// them waits for its checkpoint.
+    /// Reopening the store is the only way to resume durable writes.
+    /// Reopening can't tell whether records the operating system still caches
+    /// reached the disk: if they didn't while later records did, an open
+    /// after the cache drops them refuses the store as mid-log corruption.
+    /// Reopen replays complete state updates past the last checkpoint; other
+    /// records are only indexed again.
+    /// On Unix a save also syncs the containing directory, where the system
+    /// can. On Windows it doesn't wait for the rename to reach the disk, so
+    /// after an OS crash or power loss the store may open from an earlier
+    /// checkpoint.
+    /// State registration, strategy changes and branch changes checkpoint
+    /// before returning. After one of those checkpoints fails, further
+    /// mutations retry it before proceeding, and the change stays applied in
+    /// memory. A failed sync with no such change pending holds back no later
+    /// append or state update.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
@@ -1181,7 +2097,7 @@ impl JsStore {
         let store = self.get_store()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         // Remove handle from our map
         self.subscription_handles.lock().remove(&id);
@@ -1194,45 +2110,63 @@ impl JsStore {
     /// Perform catch-up for a subscription (replay historical data).
     ///
     /// This replays state snapshots and historical records based on the
-    /// subscription's `from_sequence` setting.
+    /// subscription's `fromSequence` setting, from the branch of the handle
+    /// it's called on: the current branch on the root, its own branch on a
+    /// view. Any handle of the store can catch up a subscription made
+    /// through another, replaying its own branch. A subscription the store
+    /// doesn't hold throws `SubscriptionDropped`: one it dropped because its
+    /// buffer overran, during a catch-up or live, and one that was
+    /// unsubscribed through any handle, was a view's when the view was
+    /// closed, was a handle's when the handle was garbage-collected, or was
+    /// never made.
     #[napi]
     pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         store
-            .catch_up_subscription(SubscriptionId(id))
+            .catch_up_subscription_on(branch, SubscriptionId(id))
             .map_err(to_napi_error)
     }
 
     /// Poll for the next event from a subscription (non-blocking).
     ///
-    /// Returns null if no events are available.
+    /// Returns null if no events are available. A poll reaches only the
+    /// subscriptions made through its own handle; another ID throws
+    /// `SubscriptionNotFound`. Once a subscription has ended and the events
+    /// queued for it are read, a poll throws `StoreClosed` after the root's
+    /// `close()`, whatever ended the subscription before, and otherwise
+    /// `SubscriptionDropped`: the store dropped it because its buffer
+    /// overran, or it was unsubscribed through another handle, which queues
+    /// a last `dropped` event saying so when the buffer has room for it.
+    /// Its handle holds an ended subscription, buffer and all, until it's
+    /// unsubscribed through that handle, the handle is a view that's closed,
+    /// or the handle is garbage-collected. After the root's `close()`,
+    /// `unsubscribe` throws `StoreClosed`, so only the last two free it.
     #[napi]
     pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
             .get(&id)
-            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+            .ok_or_else(|| coded(ErrorCode::SubscriptionNotFound, "Subscription not found"))?;
 
         match handle.try_recv() {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Err(napi::Error::from_reason("Subscription disconnected"))
-            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(self.ended()),
         }
     }
 
     /// Poll for the next event with a timeout (milliseconds).
     ///
-    /// Returns null if no event received within the timeout.
+    /// Returns null if no event received within the timeout. Throws as
+    /// `pollSubscription` does.
     #[napi]
     pub fn poll_subscription_timeout(
         &self,
@@ -1241,20 +2175,26 @@ impl JsStore {
     ) -> Result<Option<JsStoreEvent>> {
         let id: u64 = subscription_id
             .parse()
-            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+            .map_err(|_| coded(ErrorCode::InvalidOperation, "Invalid subscription ID"))?;
 
         let handles = self.subscription_handles.lock();
         let handle = handles
             .get(&id)
-            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+            .ok_or_else(|| coded(ErrorCode::SubscriptionNotFound, "Subscription not found"))?;
 
         let timeout = std::time::Duration::from_millis(timeout_ms as u64);
         match handle.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event.into())),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(napi::Error::from_reason("Subscription disconnected"))
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.ended()),
+        }
+    }
+
+    fn ended(&self) -> napi::Error<ErrorCode> {
+        if self.shared.read().is_none() {
+            coded(ErrorCode::StoreClosed, "Store has been closed")
+        } else {
+            to_napi_error(StoreError::SubscriptionDropped)
         }
     }
 
@@ -1275,14 +2215,14 @@ impl JsStore {
         path: String,
         entry: JsTreeEntry,
     ) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let tree_entry = TreeEntry {
             blob_hash: entry.blob_hash,
             size: entry.size as u64,
             mode: entry.mode as u32,
         };
         let record = store
-            .tree_set(&state_id, &path, &tree_entry)
+            .tree_set_on(branch, &state_id, &path, &tree_entry)
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -1290,22 +2230,22 @@ impl JsStore {
     /// Remove a single file from a tree state.
     #[napi]
     pub fn tree_remove(&self, state_id: String, path: String) -> Result<JsRecord> {
-        let store = self.get_store()?;
-        let record = store.tree_remove(&state_id, &path).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let record = store.tree_remove_on(branch, &state_id, &path).map_err(to_napi_error)?;
         Ok(record.into())
     }
 
     /// Apply a batch of tree operations atomically.
     #[napi]
     pub fn tree_batch(&self, state_id: String, ops: Vec<JsTreeOp>) -> Result<JsRecord> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let tree_ops: Vec<TreeOp> = ops
             .into_iter()
             .map(|op| match op.op.as_str() {
                 "set" => {
-                    let entry = op
-                        .entry
-                        .ok_or_else(|| napi::Error::from_reason("TreeOp 'set' requires entry"))?;
+                    let entry = op.entry.ok_or_else(|| {
+                        coded(ErrorCode::InvalidOperation, "TreeOp 'set' requires entry")
+                    })?;
                     Ok(TreeOp::Set {
                         path: op.path,
                         entry: TreeEntry {
@@ -1316,15 +2256,15 @@ impl JsStore {
                     })
                 }
                 "remove" => Ok(TreeOp::Remove { path: op.path }),
-                other => Err(napi::Error::from_reason(format!(
-                    "Invalid tree op: '{}', expected 'set' or 'remove'",
-                    other
-                ))),
+                other => Err(coded(
+                    ErrorCode::InvalidOperation,
+                    format!("Invalid tree op: '{}', expected 'set' or 'remove'", other),
+                )),
             })
             .collect::<Result<Vec<_>>>()?;
 
         let record = store
-            .tree_batch(&state_id, &tree_ops)
+            .tree_batch_on(branch, &state_id, &tree_ops)
             .map_err(to_napi_error)?;
         Ok(record.into())
     }
@@ -1332,9 +2272,9 @@ impl JsStore {
     /// Get a single file entry from a tree state.
     #[napi]
     pub fn tree_get(&self, state_id: String, path: String) -> Result<Option<JsTreeEntry>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let entry = store
-            .tree_get(&state_id, &path)
+            .tree_get_on(branch, &state_id, &path)
             .map_err(to_napi_error)?;
         Ok(entry.map(|e| JsTreeEntry {
             blob_hash: e.blob_hash,
@@ -1350,9 +2290,9 @@ impl JsStore {
         state_id: String,
         prefix: Option<String>,
     ) -> Result<Vec<JsTreeListEntry>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let entries = store
-            .tree_list(&state_id, prefix.as_deref())
+            .tree_list_on(branch, &state_id, prefix.as_deref())
             .map_err(to_napi_error)?;
         Ok(entries
             .into_iter()
@@ -1373,9 +2313,10 @@ impl JsStore {
         from_sequence: i64,
         to_sequence: i64,
     ) -> Result<Vec<JsTreeChange>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let changes = store
-            .tree_diff(
+            .tree_diff_on(
+                branch,
                 &state_id,
                 Sequence(from_sequence as u64),
                 Sequence(to_sequence as u64),
@@ -1426,8 +2367,8 @@ impl JsStore {
     /// Force a full snapshot of a tree state (compaction).
     #[napi]
     pub fn tree_snapshot(&self, state_id: String) -> Result<Option<JsRecord>> {
-        let store = self.get_store()?;
-        let record = store.tree_snapshot(&state_id).map_err(to_napi_error)?;
+        let (store, branch) = self.target()?;
+        let record = store.tree_snapshot_on(branch, &state_id).map_err(to_napi_error)?;
         Ok(record.map(|r| r.into()))
     }
 
@@ -1442,10 +2383,20 @@ impl JsStore {
     /// already registered, fresh (same branch, same slot head), and of the
     /// same kind. Incrementally maintained thereafter as the slot mutates
     /// (append, edit, redact, set/snapshot) on the branch it was registered
-    /// on, and persisted alongside the store. A write on a *different*
-    /// branch for the same `stateId` drops (poisons) this index rather than
-    /// mixing the two branches' ordinals — re-call this to rebuild it for
-    /// whichever branch you're now on.
+    /// on, and persisted alongside the store.
+    ///
+    /// Indexes are per branch (the current branch; on a view, the pinned
+    /// branch). Writes on other branches to the same `stateId` neither
+    /// update nor drop this index, and a branch that has not registered the
+    /// index has none: queries there return `null` until it registers its
+    /// own. Registering on a branch whose slot is unchanged since it forked
+    /// copies the parent's index instead of rebuilding it; either way each
+    /// branch's index costs memory proportional to the slot's length.
+    ///
+    /// Unlike `registerState`, this doesn't checkpoint before returning: an
+    /// index is derived from its state, so a crash before the next `sync()`
+    /// loses only the index. Queries then return `null`, the cue to call
+    /// this again.
     #[napi]
     pub fn register_state_field_index(
         &self,
@@ -1453,19 +2404,22 @@ impl JsStore {
         field: String,
         kind: String,
     ) -> Result<()> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         let kind = match kind.as_str() {
             "number" => FieldIndexKind::Number,
             "string" => FieldIndexKind::String,
             _ => {
-                return Err(napi::Error::from_reason(format!(
-                    "Invalid field index kind '{}': expected \"number\" or \"string\"",
-                    kind
-                )))
+                return Err(coded(
+                    ErrorCode::InvalidOperation,
+                    format!(
+                        "Invalid field index kind '{}': expected \"number\" or \"string\"",
+                        kind
+                    ),
+                ))
             }
         };
         store
-            .register_state_field_index(&state_id, &field, kind)
+            .register_state_field_index_on(branch, &state_id, &field, kind)
             .map_err(to_napi_error)
     }
 
@@ -1475,8 +2429,8 @@ impl JsStore {
     /// `getStateItemJson`/`getStateSlice`.
     ///
     /// Returns `null` if no such `"number"` index is currently registered
-    /// (never registered, registered as `"string"` instead, or dropped by a
-    /// cross-branch write or a parse failure) — distinct from `[]`, an index
+    /// on this branch (never registered there, registered as `"string"`
+    /// instead, or dropped by a parse failure) — distinct from `[]`, an index
     /// that exists but has no matches in range. Treat `null` as "call
     /// `registerStateFieldIndex` again", not as "empty range".
     #[napi]
@@ -1486,8 +2440,9 @@ impl JsStore {
         field: String,
         opts: JsIndexRangeQuery,
     ) -> Result<Option<Vec<u32>>> {
-        let store = self.get_store()?;
-        Ok(store.query_state_index_range(
+        let (store, branch) = self.target()?;
+        Ok(store.query_state_index_range_on(
+            branch,
             &state_id,
             &field,
             opts.gte,
@@ -1511,8 +2466,9 @@ impl JsStore {
         value: String,
         opts: JsIndexEqQuery,
     ) -> Result<Option<Vec<u32>>> {
-        let store = self.get_store()?;
-        Ok(store.query_state_index_eq(
+        let (store, branch) = self.target()?;
+        Ok(store.query_state_index_eq_on(
+            branch,
             &state_id,
             &field,
             &value,
@@ -1531,9 +2487,9 @@ impl JsStore {
         state_id: String,
         field: String,
     ) -> Result<Option<Vec<JsValueCount>>> {
-        let store = self.get_store()?;
+        let (store, branch) = self.target()?;
         Ok(store
-            .get_state_index_value_counts(&state_id, &field)
+            .get_state_index_value_counts_on(branch, &state_id, &field)
             .map(|counts| {
                 counts
                     .into_iter()

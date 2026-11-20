@@ -1,0 +1,101 @@
+name: Checkpoint platforms
+
+on:
+  push:
+    paths:
+      - '.github/workflows/checkpoint-platforms.yml'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'src/**'
+      - 'tests/append_many.rs'
+      - 'tests/atomic_metadata.rs'
+      - 'tests/blob_storage.rs'
+      - 'tests/create_existing_store.rs'
+      - 'tests/crash_state_recovery.rs'
+      - 'tests/lock_file.rs'
+      - 'tests/review7_fixes.rs'
+  pull_request:
+    paths:
+      - '.github/workflows/checkpoint-platforms.yml'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'src/**'
+      - 'tests/append_many.rs'
+      - 'tests/atomic_metadata.rs'
+      - 'tests/blob_storage.rs'
+      - 'tests/create_existing_store.rs'
+      - 'tests/crash_state_recovery.rs'
+      - 'tests/lock_file.rs'
+      - 'tests/review7_fixes.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkpoint-tests:
+    name: Checkpoints (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Bounds a hung run, which would otherwise hold its runner for six hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Exercise native file replacement, permissions, long paths and caching.
+      # Cross-compilation alone cannot establish these OS filesystem contracts.
+      - name: Atomic checkpoint unit tests
+        run: cargo test --lib atomic_file -- --nocapture
+
+      - name: Store checkpoint integration tests
+        run: cargo test --test atomic_metadata -- --nocapture
+
+      - name: Blob store tests
+        run: cargo test --test blob_storage -- --nocapture
+
+      - name: Blob storage unit tests
+        run: cargo test --lib 'blobs::' -- --nocapture
+
+      # LOCK's handling depends on each platform's locks (mandatory on
+      # Windows) and file types, so its tests run here too.
+      - name: Store lock tests
+        run: cargo test --test lock_file -- --nocapture
+
+      - name: Lock error mapping test
+        run: cargo test --lib store::tests::only_another_holders_lock_is_reported_as_locked -- --nocapture
+
+      # A store's first batch marks its MANIFEST through the same checkpoint
+      # replacement, and create's refusal of an existing store reads each
+      # platform's directory entries and file types, so their tests run here
+      # too.
+      - name: Batched append tests
+        run: cargo test --test append_many -- --nocapture
+
+      - name: Create over an existing store tests
+        run: cargo test --test create_existing_store -- --nocapture
+
+      # The batch replay tests re-run the test binary as a child that writes
+      # and is killed or exits, then cut the log with set_len: nothing
+      # Unix-only. The filter picks the three batch tests.
+      - name: Batch replay after a crash tests
+        run: cargo test --test crash_state_recovery batch -- --nocapture
+
+      # Open syncs the directory a marked MANIFEST was renamed into, and
+      # these two Unix tests (a directory that can't be listed, a MANIFEST
+      # linked into another directory) reach it; on Windows they are
+      # compiled out and the filter runs none.
+      - name: Marked store open tests
+        run: cargo test --test review7_fixes a_marked_store -- --nocapture

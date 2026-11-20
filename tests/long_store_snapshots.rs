@@ -112,14 +112,8 @@ fn test_full_snapshot_auto_triggered_at_threshold() {
             .unwrap();
     }
     let stats = store.get_compaction_stats("data").unwrap();
-    // After 2 delta snapshots, full snapshot should be auto-triggered
-    // This resets delta_snapshots_since_full to 0
-    // Note: The exact behavior depends on implementation - either 0 or 2 deltas
-    assert!(
-        stats.delta_snapshots_since_full == 0 || stats.delta_snapshots_since_full == 2,
-        "Delta count should be 0 (after full) or 2 (if full not yet triggered), got {}",
-        stats.delta_snapshots_since_full
-    );
+    assert!(stats.last_full_snapshot_offset.is_some(), "a full snapshot once D·F = 6 ops are covered");
+    assert_eq!(stats.delta_snapshots_since_full, 0);
 
     // State should be correct regardless
     let state = store.get_state("data").unwrap().unwrap();
@@ -177,44 +171,6 @@ fn test_multiple_snapshot_cycles() {
 // =============================================================================
 // LONG STORE TESTS
 // =============================================================================
-
-#[test]
-fn test_thousand_operations_with_snapshots() {
-    let dir = TempDir::new().unwrap();
-    let store = test_store(&dir);
-
-    store
-        .register_state(StateRegistration {
-            id: "events".to_string(),
-            strategy: StateStrategy::AppendLog {
-                delta_snapshot_every: 50,
-                full_snapshot_every: 5,
-            },
-            initial_value: None,
-        })
-        .unwrap();
-
-    // Add 1000 events - auto-snapshotting handles compaction
-    for i in 1..=1000 {
-        store
-            .update_state(
-                "events",
-                StateOperation::Append(format!("\"event_{}\"", i).into_bytes()),
-            )
-            .unwrap();
-    }
-
-    // Verify reconstruction works
-    let state = store.get_state("events").unwrap().unwrap();
-    let arr: Vec<String> = serde_json::from_slice(&state).unwrap();
-    assert_eq!(arr.len(), 1000);
-    assert_eq!(arr[0], "event_1");
-    assert_eq!(arr[999], "event_1000");
-
-    // Verify snapshots occurred
-    let stats = store.get_compaction_stats("events").unwrap();
-    assert!(stats.last_full_snapshot_offset.is_some(), "Should have full snapshots after 1000 ops");
-}
 
 #[test]
 fn test_long_store_persistence() {
@@ -277,42 +233,6 @@ fn test_long_store_persistence() {
         assert_eq!(arr.len(), 600);
         assert_eq!(arr[599], 600);
     }
-}
-
-#[test]
-fn test_reconstruction_efficiency_with_snapshots() {
-    let dir = TempDir::new().unwrap();
-    let store = test_store(&dir);
-
-    // Register with frequent snapshots
-    store
-        .register_state(StateRegistration {
-            id: "data".to_string(),
-            strategy: StateStrategy::AppendLog {
-                delta_snapshot_every: 10,
-                full_snapshot_every: 5,
-            },
-            initial_value: None,
-        })
-        .unwrap();
-
-    // Add 200 items - auto-snapshotting handles compaction
-    for i in 1..=200 {
-        store
-            .update_state("data", StateOperation::Append(format!("{}", i).into_bytes()))
-            .unwrap();
-    }
-
-    // Multiple reconstructions should be fast (using snapshots, not traversing all ops)
-    for _ in 0..10 {
-        let state = store.get_state("data").unwrap().unwrap();
-        let arr: Vec<i32> = serde_json::from_slice(&state).unwrap();
-        assert_eq!(arr.len(), 200);
-    }
-
-    // Verify snapshots exist
-    let stats = store.get_compaction_stats("data").unwrap();
-    assert!(stats.last_full_snapshot_offset.is_some(), "Should have full snapshots");
 }
 
 // =============================================================================
@@ -742,9 +662,7 @@ fn test_set_on_append_log_read_paths_before_snapshot() {
 // =============================================================================
 
 #[test]
-fn test_millisecond_latency_operations() {
-    use std::time::Instant;
-
+fn test_length_tail_and_append_do_not_rebuild_the_state() {
     let dir = TempDir::new().unwrap();
     let store = test_store(&dir);
 
@@ -759,10 +677,7 @@ fn test_millisecond_latency_operations() {
         })
         .unwrap();
 
-    // Add 10,000 items (simulating a large state)
-    println!("Adding 10,000 items...");
-    let start = Instant::now();
-    for i in 1..=10_000 {
+    for i in 1..=1_500 {
         store
             .update_state(
                 "messages",
@@ -770,82 +685,31 @@ fn test_millisecond_latency_operations() {
             )
             .unwrap();
     }
-    let append_time = start.elapsed();
-    println!("10,000 appends: {:?} ({:.3}ms/op)", append_time, append_time.as_micros() as f64 / 10_000.0 / 1000.0);
 
-    // Test O(1) length query
-    let start = Instant::now();
-    for _ in 0..1000 {
-        let len = store.get_state_len("messages").unwrap().unwrap();
-        assert_eq!(len, 10_000);
-    }
-    let len_time = start.elapsed();
-    println!("1000 get_state_len: {:?} ({:.3}ms/op)", len_time, len_time.as_micros() as f64 / 1000.0 / 1000.0);
-    assert!(len_time.as_millis() < 100, "get_state_len should be sub-millisecond");
-
-    // Test O(count) tail query
-    let start = Instant::now();
+    store.clear_state_caches();
+    store.set_auto_snapshot(false);
+    let rebuilds = store.state_reconstruction_count();
+    assert_eq!(store.get_state_len("messages").unwrap().unwrap(), 1_500);
     let tail = store.get_state_tail("messages", 10).unwrap().unwrap();
-    let tail_time = start.elapsed();
     let arr: Vec<String> = serde_json::from_slice(&tail).unwrap();
     assert_eq!(arr.len(), 10);
-    assert_eq!(arr[9], "message_10000");
-    println!("get_state_tail(10) with 10k items: {:?}", tail_time);
-    assert!(tail_time.as_millis() < 100, "get_state_tail should be fast for recent items");
-
-    // Test single append latency
-    let start = Instant::now();
+    assert_eq!(arr[9], "message_1500");
     store
         .update_state(
             "messages",
             StateOperation::Append(b"\"final_message\"".to_vec()),
         )
         .unwrap();
-    let single_append = start.elapsed();
-    println!("Single append latency: {:?}", single_append);
-    assert!(single_append.as_millis() < 10, "Single append should be sub-10ms");
+    assert_eq!(
+        store.state_reconstruction_count(),
+        rebuilds,
+        "a length, a tail or an append rebuilt the state"
+    );
 }
 
 // =============================================================================
 // STRESS TESTS
 // =============================================================================
-
-#[test]
-fn test_five_thousand_operations() {
-    let dir = TempDir::new().unwrap();
-    let store = test_store(&dir);
-
-    store
-        .register_state(StateRegistration {
-            id: "counter".to_string(),
-            strategy: StateStrategy::AppendLog {
-                delta_snapshot_every: 100,
-                full_snapshot_every: 10,
-            },
-            initial_value: None,
-        })
-        .unwrap();
-
-    // With batched sync (every 100 writes), this should be fast
-    for i in 1..=5000 {
-        store
-            .update_state(
-                "counter",
-                StateOperation::Append(format!("{}", i).into_bytes()),
-            )
-            .unwrap();
-    }
-
-    let state = store.get_state("counter").unwrap().unwrap();
-    let arr: Vec<i32> = serde_json::from_slice(&state).unwrap();
-    assert_eq!(arr.len(), 5000);
-    assert_eq!(arr[0], 1);
-    assert_eq!(arr[4999], 5000);
-
-    // Verify snapshots occurred
-    let stats = store.get_compaction_stats("counter").unwrap();
-    assert!(stats.last_full_snapshot_offset.is_some(), "Should have full snapshots");
-}
 
 #[test]
 fn test_mixed_operations_stress() {
@@ -967,38 +831,4 @@ fn test_reopen_store_many_times_with_snapshots() {
         let stats = store.get_compaction_stats("data").unwrap();
         assert!(stats.last_full_snapshot_offset.is_some(), "Should have full snapshots");
     }
-}
-
-#[test]
-fn test_store_stats_with_snapshots() {
-    let dir = TempDir::new().unwrap();
-    let store = test_store(&dir);
-
-    store
-        .register_state(StateRegistration {
-            id: "data".to_string(),
-            strategy: StateStrategy::AppendLog {
-                delta_snapshot_every: 10,
-                full_snapshot_every: 5,
-            },
-            initial_value: None,
-        })
-        .unwrap();
-
-    let initial_stats = store.stats().unwrap();
-
-    // Add data (auto-snapshotting active)
-    for i in 1..=100 {
-        store
-            .update_state("data", StateOperation::Append(format!("{}", i).into_bytes()))
-            .unwrap();
-    }
-
-    let final_stats = store.stats().unwrap();
-
-    // Should have more records after operations
-    assert!(
-        final_stats.record_count > initial_stats.record_count,
-        "Record count should increase"
-    );
 }

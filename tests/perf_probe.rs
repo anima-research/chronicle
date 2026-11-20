@@ -135,3 +135,112 @@ fn probe_snapshot_tally() {
     }
     println!("full snapshots at (seq, bytes): {:?}", snapshot_seqs);
 }
+
+/// How long `Store::open` takes over a large log, and how much of it one pass
+/// of the record iterator is. Open reads every record twice: the validating
+/// scan, then the index rebuild through the iterator. Each point is the min of
+/// 3 opens through a warm page cache, so it measures the reads' CPU and
+/// syscall cost, not the disk.
+#[test]
+#[ignore = "manual probe"]
+fn probe_open_time_over_a_large_log() {
+    for records in [50_000usize, 200_000] {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = create_store(&dir);
+            for i in 0..records {
+                let input =
+                    RecordInput::json("event", &json!({"seq": i, "body": "x".repeat(64)})).unwrap();
+                store.append(input).unwrap();
+            }
+            store.sync().unwrap();
+        }
+        let config = || StoreConfig {
+            path: dir.path().join("store"),
+            blob_cache_size: 1000,
+            create_if_missing: false,
+        };
+        let mut open_ms = f64::INFINITY;
+        let mut iterate_ms = f64::INFINITY;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let store = Store::open(config()).unwrap();
+            open_ms = open_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            let t = Instant::now();
+            let seen = store.iter_from(chronicle::Sequence(0)).count();
+            iterate_ms = iterate_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(seen, records);
+        }
+        println!(
+            "records={:<8} open {:>9.1} ms   one iterator pass {:>9.1} ms",
+            records, open_ms, iterate_ms
+        );
+    }
+}
+
+/// How long the first batch after an open to a large state holds up a writer
+/// of something else. That batch counts the state's items, reading its whole
+/// value once, as the head came from `state.bin`; the probe times the batch
+/// and the slowest of the plain record appends another thread makes while
+/// it runs. Each point is one open through a warm page cache.
+#[test]
+#[ignore = "manual probe"]
+fn probe_first_batch_after_open_and_another_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    for items in [50_000usize, 200_000] {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = create_store(&dir);
+            register_log(&store, 100, 20);
+            for chunk in 0..items / 1_000 {
+                let batch: Vec<_> = (0..1_000)
+                    .map(|i| json!({"kind": "entry", "seq": chunk * 1_000 + i, "body": "x".repeat(64)}))
+                    .collect();
+                store.append_many_to_state_json("log", &batch).unwrap();
+            }
+            store.sync().unwrap();
+        }
+        let store = Store::open(StoreConfig {
+            path: dir.path().join("store"),
+            blob_cache_size: 1000,
+            create_if_missing: false,
+        })
+        .unwrap();
+        let started = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        let (batch_ms, worst_ms, writes) = std::thread::scope(|scope| {
+            let batch = scope.spawn(|| {
+                let t = Instant::now();
+                started.store(true, Ordering::SeqCst);
+                store.append_many_to_state_json("log", &[json!({"kind": "entry"})]).unwrap();
+                let elapsed = t.elapsed();
+                done.store(true, Ordering::SeqCst);
+                elapsed
+            });
+            // Every write counted starts after the batch's call has begun and
+            // before it has returned (as far as `done` shows).
+            while !started.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            let mut worst = Duration::ZERO;
+            let mut writes = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                let t = Instant::now();
+                store.append(RecordInput::json("event", &json!({"n": writes})).unwrap()).unwrap();
+                worst = worst.max(t.elapsed());
+                writes += 1;
+            }
+            let batch = batch.join().unwrap();
+            (batch.as_secs_f64() * 1000.0, worst.as_secs_f64() * 1000.0, writes)
+        });
+        // The slowest other write means something only where some started
+        // while the batch's call was running.
+        assert!(writes > 0, "no other write started while the batch was running");
+        println!(
+            "items={:<8} first batch {:>8.1} ms   slowest other write {:>8.1} ms   ({} other writes)",
+            items, batch_ms, worst_ms, writes
+        );
+    }
+}

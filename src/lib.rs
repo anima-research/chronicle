@@ -32,6 +32,7 @@
 //! store.create_branch("experiment", None)?;
 //! ```
 
+mod atomic_file;
 pub mod blobs;
 pub mod branches;
 pub mod error;
@@ -52,10 +53,11 @@ pub use branches::{
 pub use error::{Result, StoreError};
 pub use records::{RecordIndex, RecordLog, RecoveryReport};
 pub use state::{
-    apply_operation, materialize_operations, ChainStats, CompactionStats, FieldIndexKind,
-    FieldIndexManager, SnapshotNeeded, StateChainHead, StateIndex, StateManager,
+    apply_operation, materialize_operations, BranchHeads, ChainStats, CompactionStats,
+    FieldIndexKind, FieldIndexManager, SnapshotNeeded, StateChainHead, StateIndex, StateItems,
+    StateManager, StateSelection,
 };
-pub use store::{CompactionSummary, Store, StoreConfig};
+pub use store::{AppendedBatch, CompactionSummary, Store, StoreConfig};
 pub use subscriptions::{
     BranchSummary, DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
     SubscriptionHandle, SubscriptionId, SubscriptionManager,

@@ -132,12 +132,13 @@ impl SubscriptionManager {
     /// Mark a subscription as caught up (finished historical replay).
     pub fn mark_caught_up(&self, id: SubscriptionId) -> Result<()> {
         let mut subs = self.subscriptions.write();
-        if let Some(sub) = subs.get_mut(&id) {
-            sub.caught_up = true;
-            if !sub.try_send(StoreEvent::CaughtUp) {
-                subs.remove(&id);
-                return Err(StoreError::SubscriptionDropped);
-            }
+        let Some(sub) = subs.get_mut(&id) else {
+            return Err(StoreError::SubscriptionDropped);
+        };
+        sub.caught_up = true;
+        if !sub.try_send(StoreEvent::CaughtUp) {
+            subs.remove(&id);
+            return Err(StoreError::SubscriptionDropped);
         }
         Ok(())
     }
@@ -182,6 +183,13 @@ impl SubscriptionManager {
     }
 
     /// Broadcast a state delta to matching subscriptions.
+    ///
+    /// One event per recorded operation, carrying the operation as it was
+    /// recorded. A batched append (`StateOperation::AppendMany`) is therefore
+    /// one event holding every item of the batch, at the batch's one
+    /// sequence, not one event per item: a subscriber that follows an append
+    /// log by its deltas must take each item of an `AppendMany` as it takes
+    /// an `Append`.
     pub fn broadcast_state_delta(
         &self,
         state_id: &str,
@@ -259,14 +267,18 @@ impl SubscriptionManager {
     // --- Catch-up Helpers ---
 
     /// Send an event directly to a subscription (for catch-up).
-    /// Returns false if the subscription was dropped.
+    /// Returns false if the subscription was dropped: it was gone already, or
+    /// it couldn't take the event and is dropped now.
     pub fn send_to(&self, id: SubscriptionId, event: StoreEvent) -> bool {
-        let subs = self.subscriptions.read();
-        if let Some(sub) = subs.get(&id) {
-            sub.try_send(event)
-        } else {
-            false
+        let mut subs = self.subscriptions.write();
+        let Some(sub) = subs.get(&id) else {
+            return false;
+        };
+        if sub.try_send(event) {
+            return true;
         }
+        subs.remove(&id);
+        false
     }
 
     /// Get the config for a subscription (for catch-up logic).
@@ -364,8 +376,7 @@ mod tests {
         manager.broadcast_record(&record);
 
         // Should NOT receive (no more events after CaughtUp)
-        let result = handle.recv_timeout(Duration::from_millis(50));
-        assert!(result.is_err());
+        assert!(matches!(handle.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     }
 
     #[test]
@@ -407,7 +418,29 @@ mod tests {
         manager.broadcast_record(&record);
 
         // Should NOT receive (not caught up yet)
-        let result = handle.recv_timeout(Duration::from_millis(50));
-        assert!(result.is_err());
+        assert!(matches!(handle.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_send_to_a_subscription_whose_receiver_is_gone_drops_it() {
+        let manager = SubscriptionManager::new();
+        let handle = manager.subscribe(SubscriptionConfig::default());
+        let id = handle.id;
+        assert_eq!(manager.subscription_count(), 1);
+        drop(handle);
+        assert!(!manager.send_to(id, StoreEvent::CaughtUp));
+        assert_eq!(manager.subscription_count(), 0);
+    }
+
+    #[test]
+    fn marking_a_subscription_that_is_gone_caught_up_says_it_was_dropped() {
+        let manager = SubscriptionManager::new();
+        let handle = manager.subscribe(SubscriptionConfig::default());
+        assert!(manager.mark_caught_up(handle.id).is_ok());
+        manager.unsubscribe(handle.id);
+        assert!(matches!(
+            manager.mark_caught_up(handle.id),
+            Err(StoreError::SubscriptionDropped)
+        ));
     }
 }
