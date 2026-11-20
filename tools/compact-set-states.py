@@ -63,10 +63,12 @@ It refuses, and changes nothing, when:
   * a record typed state_update lies after the newest head on a branch that
     branches.bin holds, unless the tool parses it and finds no state_id or no
     operation: it may be a state update that state.bin does not have yet, and
-    only chronicle's open settles that (from chronicle 0.5.0, an open and a
-    close of the store apply such an update, and the check before a run is
-    one; with 0.4.0, which replays nothing at open, or a record that chronicle
-    does not decode, a write of any state and a close clear it),
+    only chronicle's open settles that (from chronicle 0.5.0 an open of the
+    store applies such an update when its link matches the head of its state,
+    and refuses to open the store when it does not, and the check before a run
+    is such an open; with 0.4.0, which replays nothing at open, or a record
+    that chronicle does not decode, a write of any state and a close clear
+    it),
   * branches.bin is not a branch index that it reads,
   * state.bin names an offset where its record is not, or a state update links
     to an offset where no record is,

@@ -21,17 +21,17 @@
   version or feature it doesn't read, a named state that is not whole-value,
   a record typed as a state change after the newest head on a live branch,
   which may be an update that `state.bin` doesn't have yet (from chronicle
-  0.5.0 an open and a close apply such an update, and with 0.4.0, or for a
-  record that chronicle doesn't decode, a write of any state and a close
-  clear it), a
-  torn log, a record that fails its checksum, a state change in the JSON or
-  the positional form that would need a new link, and the files of an
-  earlier run. It follows a linked `records.log`, `state.bin` or
-  `state-indexes.bin` as chronicle does. A run that stops at any point
-  leaves a store that opens as before, or one that open refuses, and
-  `--go-back` then undoes the run; after a run that finished it puts the old
-  files back while both are there and `records.log` and `state.bin` are as
-  the run left them.
+  0.5.0 an open of the store applies such an update when its link matches
+  the head of its state, and refuses to open the store when it does not, and
+  with 0.4.0, or for a record that chronicle doesn't decode, a write of any
+  state and a close clear it), a torn log, a record that fails its checksum,
+  a state change in the JSON or the positional form that would need a new
+  link, and the files of an earlier run. It follows a linked `records.log`,
+  `state.bin` or `state-indexes.bin` as chronicle does. A run that stops at
+  any point leaves a store that opens as before, or one that open refuses,
+  and `--go-back` then undoes the run; after a run that finished it puts the
+  old files back while both are there and `records.log` and `state.bin` are
+  as the run left them.
 - `tools/state-digests.mjs` prints digests of what chronicle's read gives on
   every branch of a store, and its current branch, with no content, so a
   store can be compared with itself before and after the tool. Given the
