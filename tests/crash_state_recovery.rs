@@ -2,7 +2,7 @@
 //! These tests cover process death, not storage-device/power-loss behavior.
 
 use chronicle::{
-    BranchId, FieldIndexKind, PayloadEncoding, RecordId, RecordInput, RecordLog, Sequence,
+    BranchId, FieldIndexKind, Hash, PayloadEncoding, RecordId, RecordInput, RecordLog, Sequence,
     StateOperation, StateRegistration, StateStrategy, StateUpdateRecord, Store, StoreConfig,
     StoreError, Timestamp, TreeEntry,
 };
@@ -959,20 +959,27 @@ fn chunk(id: usize, marked: bool) -> Value {
     row
 }
 
-fn entry(hash: &str, size: u64, mode: u32) -> TreeEntry {
+/// The blobs of the adoption's three tree entries, of three lengths.
+const MAIN_BLOB: &[u8] = &[b'm'; 9];
+const OLD_BLOB: &[u8] = &[b'o'; 20];
+const ADOPTED_BLOB: &[u8] = &[b'a'; 300];
+
+/// The tree entry of a file holding `content`, as a workspace writes one: the
+/// hash a store gives the content, and its length.
+fn entry(content: &[u8], mode: u32) -> TreeEntry {
     TreeEntry {
-        blob_hash: hash.into(),
-        size,
+        blob_hash: Hash::from_bytes(content).to_hex(),
+        size: content.len() as u64,
         mode,
     }
 }
 
 fn old_entry() -> TreeEntry {
-    entry("old", 20, 0o600)
+    entry(OLD_BLOB, 0o600)
 }
 
 fn adopted_entry() -> TreeEntry {
-    entry("adopted", 300, 0o755)
+    entry(ADOPTED_BLOB, 0o755)
 }
 
 // Only in crash_writer, never in the process running the tests: let the
@@ -1104,22 +1111,17 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                         .id,
                 );
             }
-            // Model death after the final log append but BEFORE the Store
-            // installs its index entry. No further write through this Store.
+            // The last record lands once this writer is dead (see the test),
+            // at the branch and sequence its next append would take.
             let branch = store.current_branch();
-            let log = RecordLog::open(path.join("records.log")).unwrap();
-            let (kind, text) = TYPED_RECORDS[4];
-            let (last, _) = log
-                .append(
-                    RecordInput::raw(kind, text.as_bytes().to_vec()),
-                    branch.id,
-                    branch.head.next(),
-                )
-                .unwrap();
-            ids.push(last.id);
             std::fs::write(
                 path.join("tail-ids.json"),
-                serde_json::to_vec(&ids).unwrap(),
+                serde_json::to_vec(&json!({
+                    "ids": ids,
+                    "branch": branch.id.0,
+                    "next": branch.head.next().0,
+                }))
+                .unwrap(),
             )
             .unwrap();
         }
@@ -1181,7 +1183,8 @@ fn interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix
         let store = open_store(dir.path()).unwrap();
         let journal = value(&store, JOURNAL);
         if point == "watermark" {
-            // pins appendToStateJson.15: keep the caller's seq numbers paired with items in log order.
+            // pins appendToStateJson.15: the core keeps each item's own seq, in log order, through an interrupted prefix.
+            // The items reach the core as bytes here: what JsStore.appendToStateJson makes of a supplied seq has no test in this file.
             assert_eq!(journal, json!(journal_items()));
         }
         // pins setStateJson.12: the published watermark coexists with the old journal until the clear lands.
@@ -1242,8 +1245,14 @@ fn an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence
                     full_snapshot_every: 2,
                 },
             );
+            // Each entry's blob is stored before the fault, as a workspace
+            // stores the file before it adopts it.
+            for content in [MAIN_BLOB, OLD_BLOB, ADOPTED_BLOB] {
+                let hash = store.store_blob(content, "application/octet-stream").unwrap();
+                assert_eq!(hash.to_hex(), entry(content, 0).blob_hash);
+            }
             let main = store.current_branch().id;
-            let other = entry("main", 9, 0o644);
+            let other = entry(MAIN_BLOB, 0o644);
             store.tree_set("files", "tool", &other).unwrap();
             let workspace = store.create_branch("workspace", None).unwrap().id;
             store.switch_branch("workspace").unwrap();
@@ -1383,10 +1392,24 @@ fn open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death() {
         .unwrap();
     drop(store);
     crash(dir.path(), "checkpoint/typed-tail");
-    let mut ids = vec![prefix.id];
-    let tail: Vec<RecordId> =
+    let written: Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("tail-ids.json")).unwrap()).unwrap();
-    ids.extend(tail);
+    let mut ids = vec![prefix.id];
+    ids.extend(serde_json::from_value::<Vec<RecordId>>(written["ids"].clone()).unwrap());
+    // A record in the log that no store indexed, as a writer that dies
+    // between its log append and its index entry leaves it. The writer is
+    // dead, so no store has the log open while this appends.
+    let (kind, text) = TYPED_RECORDS[4];
+    let log = RecordLog::open(dir.path().join("records.log")).unwrap();
+    let (last, _) = log
+        .append(
+            RecordInput::raw(kind, text.as_bytes().to_vec()),
+            BranchId(written["branch"].as_u64().unwrap()),
+            Sequence(written["next"].as_u64().unwrap()),
+        )
+        .unwrap();
+    drop(log);
+    ids.push(last.id);
     assert_eq!(ids.len(), TYPED_RECORDS.len());
 
     let store = Store::open_or_create(config(dir.path())).unwrap();

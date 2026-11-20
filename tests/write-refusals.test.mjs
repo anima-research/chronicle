@@ -32,12 +32,14 @@ function withPendingCheckpoint(store, path, tryWrites) {
   }
 }
 
-// sh's limit of 32 blocks admits small seed records but not a 64 KiB payload
-// (whether the shell counts in 512-byte or 1024-byte blocks). Only this child
-// is limited; the test can open the store again with no limit. The pipe keeps
-// fixtures, including large attempted payloads, out of argv and off disk.
-function runLimited(fixture) {
-  execFileSync('sh', ['-c', 'ulimit -f 32 && exec "$@"', 'limited-store',
+// Run this file again in a child whose files may grow to `blocks` of the
+// shell's blocks (512 or 1024 bytes) and no further. A limit of 0 lets no file
+// of the store grow, whichever file a write would extend; 32 admits small seed
+// records but not a 64 KiB payload, so such a write starts and is torn. Only
+// this child is limited; the test can open the store again with no limit. The
+// pipe keeps fixtures, including large attempted payloads, out of argv and off disk.
+function runLimited(fixture, blocks) {
+  execFileSync('sh', ['-c', `ulimit -f ${blocks} && exec "$@"`, 'limited-store',
     process.execPath, fileURLToPath(import.meta.url), '--limited'], {
     input: JSON.stringify(fixture), timeout: 30_000,
   });
@@ -119,33 +121,25 @@ function readBack(read, whileFaulted) {
   }
 }
 
-function checkIdentity(side, { kind, rows, ids, items }, whileFaulted) {
-  // Decide what landed from the records, NOT from the state read under test.
-  const now = updateIds(side);
-  assert.deepEqual(now.slice(0, ids.length), ids);
-  const extra = now.slice(ids.length);
-  assert.ok(extra.length <= 1, 'one write can publish at most one owning record');
-  let landed = [];
-  if (extra.length) {
-    const record = side.getRecord(extra[0]);
-    const update = JSON.parse(side.getStateUpdateJson(extra[0]));
-    assert.equal(update.state_id, 'index');
-    const bodies = kind === 'single' ? [update.operation.Append] : update.operation.AppendMany;
-    landed = bodies.map(bytes => JSON.parse(Buffer.from(bytes).toString('utf8')));
-    // The owner's actual id and sequence are the oracle for the rereads below.
-    assert.deepEqual(landed, items.map(item => stamp(item, record)), 'only a complete, correctly stamped update may land');
-  }
+// The fault tears the write before its record is published: no file of the
+// child may hold more than 32 blocks (16 or 32 KiB), and the item's body alone
+// is over 64 KiB, so the whole record cannot land. Every successful read, in
+// the child while the fault is in force and cold in the parent, must then show
+// the rows from before the write. No fault here throws after a whole record
+// landed: that half of the requirements has no test.
+function checkIdentity(side, { kind, rows, ids }, whileFaulted) {
+  assert.deepEqual(updateIds(side), ids, 'the torn write published no update record');
   if (kind === 'single') {
     const next = readBack(() => side.getStateItemJson('index', rows.length), whileFaulted);
     if (!next.unavailable) {
-      // pins appendToStateJsonWithIdentity.11: the pre-append ordinal is absent or holds the entire owning record's stamped item.
-      assert.deepEqual(next.value, landed[0] ?? null);
+      // pins appendToStateJsonWithIdentity.11: after a write torn by its fault, the pre-append ordinal holds no new item.
+      assert.equal(next.value, null);
     }
   }
   const full = readBack(() => side.getStateJson('index'), whileFaulted);
   if (!full.unavailable) {
-    // pins getStateJson.15: successful reread agrees with independently recorded items, never a partial batch.
-    assert.deepEqual(full.value, [...rows, ...landed]);
+    // pins getStateJson.15: a successful reread after the torn write reports what landed: the old rows, never a partial batch.
+    assert.deepEqual(full.value, rows);
   }
 }
 
@@ -258,13 +252,13 @@ test('Tree and journal mutations preserve the OS cause and do not publish a refu
     const replacement = entry(JSON.stringify(list.slice(1)), 0o640);
     side.treeSet(tree, file, original);
     side.treeSet(tree, checkpoint, saved.entry);
-    // The seed ends beyond the child's ceiling: even a small treeRemove hits
-    // EFBIG at record publication. No need to measure/manipulate the log file.
-    side.appendJson(journal, { event: 'seed', data: randomBytes(64 * 1024).toString('base64') });
+    side.appendJson(journal, { event: 'seed' });
     fixture = { path, kind: 'tree', original, revised, saved, replacement,
       ids: updateIds(side), journalIds: side.getRecordIdsByType(journal) };
   } finally { root.close(); }
-  runLimited(fixture);
+  // No file may grow in the child, so even a small treeRemove fails before its
+  // record lands, whichever file would hold it. The child's open still succeeds.
+  runLimited(fixture, 0);
 
   const reopened = JsStore.open({ path });
   try {
@@ -303,7 +297,7 @@ test('Interrupted identity writes expose no partial stamped row or batch', posix
       assert.deepEqual(side.getStateJson('index'), rows);
       fixture = { kind, path, ids: updateIds(side), rows, items };
     } finally { root.close(); }
-    runLimited(fixture);
+    runLimited(fixture, 32);
     const recovered = JsStore.open({ path });
     try { checkIdentity(recovered.view('side'), fixture, false); }
     finally { recovered.close(); }

@@ -68,15 +68,27 @@ test('Toggling automatic snapshots acts immediately without losing disabled-peri
       // pins setAutoSnapshot.2: the next eligible write itself takes an automatic snapshot in the same turn.
       assert.deepEqual(operationKinds(store, id, endOfSetup).slice(-2), ['Append', 'DeltaSnapshot']);
     } else if (exit === 'compact') {
-      store.compactState(id);
-      const bytes = operations(store, id, endOfSetup).at(-1)?.Snapshot;
+      // Sample just before the call, so that nothing re-enabling wrote is credited to compaction.
+      const beforeCompaction = mark(store);
+      const headBefore = store.stateHeadOffset(id);
+      const compacted = store.compactState(id);
+      const headAfter = store.stateHeadOffset(id);
+      const bytes = operations(store, id, beforeCompaction).at(-1)?.Snapshot;
       // pins compactState.4: without another append, compaction writes a full snapshot of the accumulated rows.
       assert.deepEqual(bytes && JSON.parse(Buffer.from(bytes).toString('utf8')), messages);
-      // pins compactState.4: the snapshot became the slot's head, not merely a detached record.
-      assert.equal(store.listStates().find((state) => state.id === id)?.opsSinceSnapshot, 0);
+      // pins compactState.4: the snapshot became the slot's head, not merely a detached record: the call wrote
+      // that one update and moved the head, and the next write on the slot follows the moved head (below).
+      assert.deepEqual({
+        written: store.getRecordIdsByType('state_update').slice(beforeCompaction),
+        moved: headAfter !== headBefore,
+        opsSinceSnapshot: store.listStates().find((state) => state.id === id)?.opsSinceSnapshot,
+      }, { written: [compacted?.id], moved: true, opsSinceSnapshot: 0 });
       store.createBranch('child', 'main');
       // pins setAutoSnapshot.3: a child forked at the compacted head inherits every disabled-period row.
       assert.deepEqual(store.view('child').getStateJson(id), messages);
+      const next = store.appendToStateJson(id, { participant: 'User', content: [] });
+      // pins compactState.4: the next update of the slot links back to the head that compaction installed.
+      assert.equal(JSON.parse(store.getStateUpdateJson(next.id)).prev_update_offset, headAfter);
     } else {
       store.close();
       // pins setAutoSnapshot.3: a close straight after re-enabling leaves all the rows readable in order on reopen.
@@ -178,6 +190,25 @@ test('The first full cadence is measured in delta intervals', (t) => {
   // pins updateStateStrategy.3: delta at 50 and 100, no full through 4,999, first full at 50 × 100 appends.
   assert.deepEqual(appendSchedule(operationKinds(store, id, start)), {
     writes: 5000, boundaries: [...deltas, [5000, 'Snapshot']],
+  });
+});
+
+test('After the first full snapshot, a growing log spaces the next by its length at the last', (t) => {
+  const { store } = freshStore(t);
+  const id = 'messages';
+  // The caller's 50 and 100 scaled down to 5 and 2, set as the caller sets them,
+  // by retuning a registered slot: 10 appends where the caller's make 5,000.
+  store.registerState(appendLog(id, 3, 7));
+  store.updateStateStrategy(appendLog(id, 5, 2));
+  for (let i = 0; i < 80; i++) store.appendToStateJsonWithIdentity(id, { n: i }, 'id', 'sequence');
+  const fulls = [10, 20, 40, 80];
+  // differs from updateStateStrategy.3, which reads the cadence as a full snapshot every delta × full appends:
+  // the store takes the first after 10, and each later one when the appends since the last full reach the
+  // slot's length at it, so at 20, 40 and 80 and not at every multiple of 10. Deltas come every 5 appends between.
+  assert.deepEqual(appendSchedule(operationKinds(store, id)), {
+    writes: 80,
+    boundaries: Array.from({ length: 16 }, (_, i) => 5 * (i + 1))
+      .map((at) => [at, fulls.includes(at) ? 'Snapshot' : 'DeltaSnapshot']),
   });
 });
 

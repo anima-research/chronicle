@@ -194,7 +194,8 @@ test('Repair on a stopped copy preserves historical coordinates and leaves the o
   const originalHead = resident.currentSequence();
   resident.close();
 
-  cpSync(residentPath, repairPath, { recursive: true });
+  // Copy as an operator's `cp -R` does: a link inside the store stays the link it was.
+  cpSync(residentPath, repairPath, { recursive: true, verbatimSymlinks: true });
   const repair = keep(JsStore.open({ path: repairPath }));
   const report = { branch: repair.currentBranch().name, stateId: slot, sequenceBefore: repair.currentSequence() };
   assert.equal(report.branch, 'work');
@@ -215,7 +216,7 @@ test('Repair on a stopped copy preserves historical coordinates and leaves the o
   assert.deepEqual(repair.getStateJsonAt(report.stateId, report.sequenceBefore), old);
   repair.switchBranch('main'); // cold readback must select the branch named in the report
   repair.close();
-  cpSync(repairPath, readbackPath, { recursive: true });
+  cpSync(repairPath, readbackPath, { recursive: true, verbatimSymlinks: true });
   const readback = keep(JsStore.open({ path: readbackPath }));
   readback.switchBranch(report.branch);
   // pins getStateJsonAt.8 the report's coordinates on a stopped copy recover the persisted pre-repair text

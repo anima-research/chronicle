@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import test from 'node:test';
 import { JsStore } from './index.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chronicle-key-order-'));
@@ -255,7 +256,12 @@ try {
     const receipt = (level) => ({ entries: [[{ level, 'café\ufffd': 'last\ufffd', literal: '\\ud800' }]] });
     const revisionBytes = receiptBytes(2);
     const draftBytes = receiptBytes(5);
+    const draftSeed = receiptBytes(1);
+    draft.setState(slot, draftSeed);
     store.setState(slot, revisionBytes);
+    // pins setState.5: the switched root's write lands on revision alone; draft still holds its own value,
+    // read before the pinned view writes again.
+    assert.deepEqual([store.getState(slot), draft.getState(slot)], [revisionBytes, draftSeed]);
     draft.setState(slot, draftBytes);
     // pins setState.1: the namespaced slot stores the UTF-8 Buffers exactly, duplicate key spellings included.
     assert.deepEqual([store.getState(slot), draft.getState(slot)], [revisionBytes, draftBytes]);
@@ -318,7 +324,9 @@ try {
     const slot = 'messages';
     store.registerState({ id: slot, strategy: 'append_log' });
     const record = store.appendToStateJsonWithIdentity(slot, { content: [{ text: 'before' }], obsolete: true }, 'id', 'sequence');
-    const stamp = { id: record.id, sequence: Number(record.sequence) };
+    // The caller keeps the append's sequence as it comes and compares it by strict equality.
+    assert.equal(typeof record.sequence, 'number');
+    const stamp = { id: record.id, sequence: record.sequence };
     const original = { content: [{ text: 'before' }], obsolete: true, ...stamp };
     const retained = store.getStateItemJson(slot, 0);
     const replacement = { content: [{ text: 'edited ✓' }], ...stamp };
@@ -327,12 +335,39 @@ try {
     // pins editStateItem.2: UTF-8 JSON is the whole message, retaining the supplied identity and dropping the old key.
     assert.deepEqual(reread, replacement);
     // pins getStateItemJson.10: point lookup still supplies the append record's id and numeric sequence, not the slot or edit sequence.
-    assert.deepEqual([reread.id, reread.sequence], [record.id, Number(record.sequence)]);
+    assert.deepEqual([reread.id, reread.sequence], [record.id, record.sequence]);
     // pins editStateItem.15: the new point value is canonical under fresh materialization, and is a distinct object.
     assert.equal(bytesOf(reread), bytesOf(store.getStateJson(slot)[0]));
     assert.notStrictEqual(reread, retained);
     // pins getStateItemJson.12: after the changed slot was read again, its retained old message still has the original contents.
     assert.deepEqual(retained, original);
+  });
+
+  await test('A channel named __proto__ keeps its own generation counter through a snapshot', {
+    todo: 'getStateJson reads an own __proto__ key back as nothing: the binding assigns each key of the object it builds, and the __proto__ setter ignores a number.',
+  }, () => {
+    const at = path.join(dir, 'proto-key');
+    let store = JsStore.openOrCreate({ path: at });
+    try {
+      const slot = 'conversation-router';
+      store.registerState({ id: slot, strategy: 'snapshot' });
+      // As agent-framework stores its counters: a Map keyed by channel ID, made an object by Object.fromEntries.
+      const generations = Object.fromEntries(new Map([['__proto__', 7], ['general', 2]]));
+      store.setStateJson(slot, { generations });
+      const own = (handle) => {
+        const read = handle.getStateJson(slot).generations;
+        return [Object.getPrototypeOf(read) === Object.prototype, Object.getOwnPropertyDescriptor(read, '__proto__')?.value, read.general];
+      };
+      // The stored bytes keep the key, so a loss is in the read.
+      assert.equal(text(store.getState(slot)), '{"generations":{"__proto__":7,"general":2}}');
+      // differs from setStateJson.9: an own __proto__ counter should read back as an own number, and the prototype stay Object's.
+      assert.deepEqual(own(store), [true, 7, 2]);
+      store.close();
+      store = JsStore.openOrCreate({ path: at });
+      assert.deepEqual(own(store), [true, 7, 2]);
+    } finally {
+      store.close();
+    }
   });
 
   console.log(`\n✅ Key order tests passed! (${step} passed, 0 failed, 0 skipped)`);

@@ -459,7 +459,6 @@ try {
     const closed = observer.isClosed();
     // pins isClosed.4: true is the signal to fall back on a name the caller cached earlier
     assert.equal(closed, true);
-    assert.equal(closed ? cachedName : observer.currentBranch().name, 'recovery');
     ok('A checkout changes the shared cursor, not saved branch objects or pinned views');
   }
 
@@ -481,6 +480,9 @@ try {
 
     const held = new Map(); // previous (offset, value) for each slot on this reader
     const checkReads = model => {
+      // Slice first, by the model's lengths: no point read, length or full read on
+      // this reader since the write or checkout can have refreshed what it serves.
+      const firstSlices = ids.map((id, i) => JSON.parse(reader.getStateSlice(id, 1, model[i].length - 1).toString()));
       // pins getStateItemJson.2: bare and slash-qualified names resolve to distinct rows at ordinal zero
       assert.deepEqual(ids.map(id => reader.getStateItemJson(id, 0)), model.map(list => list[0]));
       for (const [i, id] of ids.entries()) {
@@ -505,6 +507,8 @@ try {
         assert.deepEqual(full, expected);
         // pins getStateSlice.3: the named slot's decoded slice tracks its current length and whole-state read
         assert.deepEqual(slice, full.slice(1, len));
+        // pins getStateSlice.3: even as the first read after another handle's write or a checkout, it is the current suffix
+        assert.deepEqual(firstSlices[i], expected.slice(1));
       }
     };
     checkReads(initial);

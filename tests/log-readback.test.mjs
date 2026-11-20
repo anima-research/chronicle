@@ -88,6 +88,10 @@ test('A stopped log can be backfilled by its persisted duplicate positions', (t)
   const second = { id: '91', sequence: 509, content: 'later copy' };
   const right = { id: '13', metadata: { c: 3, a: 'right' } };
   for (const row of [left, gone, first, middle, second, right]) store.appendToStateJson(messages, structuredClone(row));
+  // One neighbor written by the byte setter, in another serialization than the store's own.
+  const spacedBytes = Buffer.from('{ "id": "14",  "metadata": { "d": [4] } }', 'utf8');
+  const spaced = utf8Json(spacedBytes);
+  store.appendToState(messages, spacedBytes);
   const removed = store.getStateJson(messages).findIndex(({ id }) => id === gone.id);
   store.redactStateItems(messages, removed, removed + 1);
   store = reopen();
@@ -97,14 +101,23 @@ test('A stopped log can be backfilled by its persisted duplicate positions', (t)
   // pins getStateJson.9 — positions in the full read have shifted past the removed item
   assert.deepEqual(positions, [1, 3]);
   const [a, b] = positions;
-  const neighborBytes = () => [0, 2, 4].map((i) => Buffer.from(store.getStateSlice(messages, i, 1)));
+  // After a write or a reopen the store gives every item in its own
+  // serialization, so these are the bytes it gives, not those a byte setter
+  // wrote. Those stay in the records, compared after the reopen below.
+  const neighborBytes = () => [0, 2, 4, 5].map((i) => Buffer.from(store.getStateSlice(messages, i, 1)));
   const before = neighborBytes();
+  const updateIds = () => store.getRecordIdsByType('state_update');
+  const earlier = updateIds();
+  const records = () => earlier.map((id) => store.getStateUpdateJson(id));
+  const originalRecords = records();
+  // The spaced neighbor's record holds its bytes as written: a rewrite would show.
+  assert.ok(originalRecords.some((json) => json.includes(JSON.stringify([...spacedBytes]))));
   const replacement = { id: '91', sequence: 503, content: [{ type: 'text', text: 'backfilled' }] };
   const bytes = jsonBytes(replacement);
   const originalBytes = Buffer.from(bytes);
   const editA = store.editStateItem(messages, a, bytes);
   // pins open.16 — the reopened handle edits the slot found in its read, leaving the distinguishable other copy alone
-  assert.deepEqual(store.getStateJson(messages), [left, replacement, middle, second, right]);
+  assert.deepEqual(store.getStateJson(messages), [left, replacement, middle, second, right, spaced]);
   // pins editStateItem.11 — the same serialized bytes are available for the next edit
   assert.deepEqual(bytes, originalBytes);
   const editB = store.editStateItem(messages, b, bytes);
@@ -112,15 +125,23 @@ test('A stopped log can be backfilled by its persisted duplicate positions', (t)
   assert.deepEqual(bytes, originalBytes);
   // pins editStateItem.1 — both independently addressed slots now hold the supplied item, not just the first ID match
   assert.deepEqual(positions.map((i) => store.getStateItemJson(messages, i)), [replacement, replacement]);
-  const expected = [left, replacement, middle, replacement, right];
+  const expected = [left, replacement, middle, replacement, right, spaced];
   // pins getStateJson.9 — editing the two positions taken from the full read moves or replaces no neighbor
   assert.deepEqual(store.getStateJson(messages), expected);
-  // pins editStateItem.13 — even the bytes read at the unrelated positions have not changed
+  // pins editStateItem.13 — the bytes the store gives at the unrelated positions have not changed
   assert.deepEqual(neighborBytes(), before);
 
   store = reopen();
-  // pins editStateItem.13 — both persisted updates decode as per-slot Edits, not Sets
-  assert.deepEqual([editA, editB].map(({ id }) => JSON.parse(store.getStateUpdateJson(id)).operation.Edit?.index), positions);
+  const now = updateIds();
+  assert.deepEqual(now.slice(0, earlier.length), earlier);
+  const added = now.slice(earlier.length).map((id) => ({ id, ...JSON.parse(store.getStateUpdateJson(id)) }));
+  // The store's own snapshots may follow a write; they derive from the value and are no caller's Set.
+  const written = added.filter(({ operation }) => !('Snapshot' in operation || 'DeltaSnapshot' in operation));
+  // pins editStateItem.13 — the two edits added just their two per-slot Edits, and no Set of the whole array
+  assert.deepEqual(written.map(({ id, state_id, operation }) => [id, state_id, Object.keys(operation), operation.Edit?.index]),
+    [[editA.id, messages, ['Edit'], a], [editB.id, messages, ['Edit'], b]]);
+  // pins editStateItem.13 — the records holding the unrelated items, the spaced bytes among them, are as they were
+  assert.deepEqual(records(), originalRecords);
   // pins editStateItem.13 — replay keeps the earlier redaction; it does not bring '11' back
   assert.deepEqual(store.getStateJson(messages), expected);
 });
@@ -201,8 +222,11 @@ test('Suffix reads preserve the boundary, even with a bad window item or an enor
   const window = 'workshop/window';
   registerLogs(store, window);
   const limit = 2 ** 31 - 1;
-  // pins getStateSlice.9 — a registered slot with no written value yields null
-  assert.equal(store.getStateSlice(window, 0, limit), null);
+  const empty = store.getStateSlice(window, 0, limit);
+  // pins getStateSlice.9 — a registered slot with no written value is a successful empty window: null or a Buffer
+  assert.ok(empty === null || Buffer.isBuffer(empty));
+  // pins getStateSlice.9 — if encoded, that empty window really decodes to []
+  assert.deepEqual(empty === null ? [] : utf8Json(empty), []);
   store.appendToStateJson(window, { v: 1 });
   const record = store.appendToStateJsonWithIdentity(window, { id: 'row-0' }, 'by', 'at');
   const boundary = { id: 'row-0', by: record.id, at: record.sequence };

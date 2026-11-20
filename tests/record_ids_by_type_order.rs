@@ -83,23 +83,36 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
     };
     let intact_pair = layout("compile-intact", 10);
     let torn_pair = layout("compile-torn", 11);
-    let (intact_layout, newest_layout) = {
+    let (intact_layout, newest_layout, intact_sequence, synced_records) = {
         let store = Store::create(config(&path)).unwrap();
         for i in 0..10 {
             append(&store, if i % 2 == 0 { "layout" } else { "message" }, i);
         }
         store.sync().unwrap();
+        let synced_records = store.stats().unwrap().record_count;
         // Two more layouts; the second is torn below, as a crash mid-append
-        // would leave it.
+        // would leave it. Each write is one record at the next sequence, so
+        // no other record, of any type, holds a part of the pair.
         let write_layout = |pair: &Value| {
-            store
+            let records = store.stats().unwrap().record_count;
+            let head = store.current_branch().head;
+            let record = store
                 .append(RecordInput::json("layout", pair).unwrap())
-                .unwrap()
-                .id
+                .unwrap();
+            // pins appendJson.11: the layout and its receipt are written as one record, with no other beside it.
+            assert_eq!(
+                (
+                    store.stats().unwrap().record_count,
+                    store.current_branch().head,
+                    record.sequence
+                ),
+                (records + 1, head.next(), head.next())
+            );
+            record
         };
         let intact = write_layout(&intact_pair);
         let newest = write_layout(&torn_pair);
-        for (id, expected) in [(intact, &intact_pair), (newest, &torn_pair)] {
+        for (id, expected) in [(intact.id, &intact_pair), (newest.id, &torn_pair)] {
             let record = store.get_record(id).unwrap().unwrap();
             // pins appendJson.11: live lookup returns the layout and its own receipt together.
             assert_eq!(
@@ -107,7 +120,7 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
                 *expected
             );
         }
-        (intact, newest)
+        (intact.id, newest.id, intact.sequence, synced_records)
     };
     let log_path = path.join("records.log");
     let len = std::fs::metadata(&log_path).unwrap().len();
@@ -130,6 +143,26 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
     assert_eq!(
         serde_json::from_slice::<Value>(&intact.payload).unwrap(),
         intact_pair
+    );
+    let tail: Vec<(RecordId, String)> = store
+        .iter_from(intact_sequence)
+        .map(|read| {
+            let (_, record) = read.unwrap();
+            (record.id, record.record_type)
+        })
+        .collect();
+    // pins appendJson.11: past the synced records, the recovered log holds the intact pair's one record and nothing of the torn one.
+    assert_eq!(
+        (
+            tail,
+            store.current_branch().head,
+            store.stats().unwrap().record_count
+        ),
+        (
+            vec![(intact_layout, "layout".to_string())],
+            intact_sequence,
+            synced_records + 1
+        )
     );
     assert_ascending(&store, "layout", 6);
     // The torn record's ID is issued again, here to a record of another type,

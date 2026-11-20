@@ -164,17 +164,18 @@ test('Three exact history indexes agree on message ordinals across two state IDs
       const expectedValues = expected.map(([v]) => v);
       const entries = [...store.getStateIndexValueCounts(id, field)];
       // pins getStateIndexValueCounts.3 iterate the immediate result and read string channel IDs from .value
+      // pins getStateIndexValueCounts.2 the values belong to this slot and this exact nested path
       assert.deepEqual(entries.map(entry => entry.value).sort(), expectedValues);
-      // pins getStateIndexValueCounts.2 counts belong to this slot and this exact nested path
+      // The store's own counts agree too, though the caller reads only the values.
       assert.deepEqual(countPairs(entries), expected);
       // pins getStateIndexValueCounts.5 every entry is from a valid string in that field, none from missing/null/numeric IDs
       assert.ok(entries.every(({ value }) => typeof value === 'string' && expectedValues.includes(value)));
-      // pins registerStateFieldIndex.6 skipped values neither add entries nor move the true positions of valid ones
-      assert.deepEqual([
-        entries.reduce((n, entry) => n + entry.count, 0),
-        ascending(eq(store, id, field, channelAt(later, field) ?? 'Room')),
-      ], [rows.filter(row => typeof channelAt(row, field) === 'string').length,
-        expectedEq(rows, field, channelAt(later, field) ?? 'Room')]);
+      // pins registerStateFieldIndex.6 skipped values add no entries (above) and don't move the true positions of valid ones
+      assert.deepEqual(ascending(eq(store, id, field, channelAt(later, field) ?? 'Room')),
+        expectedEq(rows, field, channelAt(later, field) ?? 'Room'));
+      // Nor do they add to the store's own counts.
+      assert.equal(entries.reduce((n, entry) => n + entry.count, 0),
+        rows.filter(row => typeof channelAt(row, field) === 'string').length);
       for (const key of new Set([...listedKeys, 'Room', 'Room ', 'roOm', 'room'])) {
         // pins queryStateIndexEq.3 exact comparison, including case, whitespace and the other schema's values
         assert.deepEqual(ascending(eq(store, id, field, key)), expectedEq(rows, field, key));
@@ -209,6 +210,68 @@ test('Three exact history indexes agree on message ordinals across two state IDs
       assert.deepEqual(range(store, id, opts), expectedRange(rows, opts));
     }
   }
+});
+
+test('Registration straight after opening a store older than field indexes indexes its history', t => {
+  const { store } = temporaryStore(t, true);
+  // The first state call on the opened 0.2.1 store, so nothing has read the
+  // slot or cached its items: the registration has to read the old records.
+  store.registerStateFieldIndex(SHARED, '/n', 'number');
+  store.registerStateFieldIndex(SHARED, '/text', 'string');
+  // pins registerStateFieldIndex.7 a cold registration indexes every message written before field indexes
+  assert.deepEqual([
+    store.queryStateIndexRange(SHARED, '/n', { gte: 17, lte: 19 }),
+    store.queryStateIndexRange(SHARED, '/n', {}),
+    store.queryStateIndexEq(SHARED, '/text', 'message 42 says hello', {}),
+  ], [[17, 18, 19], Array.from({ length: 50 }, (_, n) => n), [42]]);
+});
+
+function cpuMicrosSince(start) {
+  const { user, system } = process.cpuUsage(start);
+  return user + system;
+}
+
+// The best of five batches of 96 narrow time queries, spread over the history
+// so that most lie far from both ends. Each query matches two messages.
+function narrowRangeTime(messages) {
+  const dir = mkdtempSync(join(tmpdir(), 'chronicle-history-cost-'));
+  let store;
+  try {
+    store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    registerLog(store, SHARED);
+    registerHistory(store, SHARED);
+    for (let i = 0; i < messages; i += 4096) {
+      store.appendManyToStateJson(SHARED, Array.from({ length: Math.min(4096, messages - i) },
+        (_, k) => message(`item ${i + k}`, i + k, 'room', 'room')));
+    }
+    const firsts = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.6180339887498949) % 1) * (messages - 1)));
+    const window = first => ({ gte: MS + first, lte: MS + first + 1 });
+    const expected = firsts.map(first => [first, first + 1]);
+    // Don't charge the first query for any first build.
+    assert.deepEqual(firsts.map(first => range(store, SHARED, window(first))), expected);
+    const times = [];
+    for (let sample = 0; sample < 5; ++sample) {
+      const found = new Array(firsts.length);
+      const start = process.cpuUsage();
+      for (let i = 0; i < firsts.length; ++i) found[i] = range(store, SHARED, window(firsts[i]));
+      times.push(cpuMicrosSince(start));
+      assert.deepEqual(found, expected);
+    }
+    return Math.min(...times);
+  } finally {
+    store?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('A narrow time query through the binding costs the same over a long history', () => {
+  const small = narrowRangeTime(256);
+  const large = narrowRangeTime(32768);
+  // The history grows 128x. A floor of 20 ms absorbs the noise of a tiny
+  // baseline and a coarse CPU clock; reading the messages costs far more.
+  const floor = 20_000;
+  // pins registerStateFieldIndex.4 the registered index answers millisecond bounds without scanning the history
+  assert.ok(large < 3 * small + floor, `96 narrow queries took ${small} µs CPU over 256 messages, ${large} over 32,768`);
 });
 
 test('Shared-handle edits cannot leave queryable stale channel or timestamp hits', t => {
@@ -283,8 +346,11 @@ test("Switching and reusing a branch name cannot revive another identity's index
       // pins queryStateIndexRange.5 even at a common timestamp only this branch's position is returned
       assert.deepEqual(range(view, id, at(10)), expectedRange(model[id], at(10)));
       for (const field of channels) {
-        // pins getStateIndexValueCounts.8 current branch enumeration has its own keys/counts and no foreign ones
-        assert.deepEqual(countPairs(view.getStateIndexValueCounts(id, field)), expectedEntries(model[id], field));
+        const entries = [...view.getStateIndexValueCounts(id, field)];
+        // pins getStateIndexValueCounts.8 current branch enumeration has its own channel IDs and no foreign ones
+        assert.deepEqual(entries.map(({ value }) => value).sort(), expectedEntries(model[id], field).map(([value]) => value));
+        // The store's own counts are this branch's too, though the caller reads only the values.
+        assert.deepEqual(countPairs(entries), expectedEntries(model[id], field));
       }
     }
   }

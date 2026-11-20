@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import { JsStore } from '../index.js';
 
 const body = 'a message '.repeat(8);
-// Number relative to the start of the suffix, so the two sizes receive
-// exactly the same queries and return exactly the same JSON, even at -1.
+// Number relative to the start of the suffix, so the suffix reads at the two
+// sizes receive exactly the same queries and return exactly the same JSON,
+// even at -1. Every item has the same size, in the prefix too.
 function item(n) {
   return { by: String(n).padStart(7, '0'), body };
 }
@@ -30,7 +31,7 @@ function measure(prefix) {
     assert.equal(JSON.parse(reader.getStateSlice('log', 0, prefix).toString('utf8')).length, prefix);
     assert.deepEqual(reader.getStateItemJson('log', prefix - 2), item(-2));
 
-    const pointTimes = [], sliceTimes = [];
+    const pointTimes = [], sliceTimes = [], windowTimes = [];
     let added = 0;
     for (let sample = 0; sample < 5; ++sample) {
       let sliceTime = 0;
@@ -58,10 +59,22 @@ function measure(prefix) {
       for (let i = 0; i < positions.length; ++i) found[i] = reader.getStateItemJson('log', positions[i]);
       pointTimes.push(cpuMicrosSince(start));
       assert.deepEqual(found, positions.map((position) => item(position - prefix)));
+
+      // Pages of three items, spread over the whole log at other places than
+      // the points, as a caller paging through history reads them: a fast path
+      // for the suffix alone doesn't make them cheap.
+      const width = 3;
+      const offsets = Array.from({ length: 96 }, (_, i) => Math.floor(((i * 0.7548776662466927 + 0.5) % 1) * (total - width)));
+      const pages = new Array(offsets.length);
+      const windowStart = process.cpuUsage();
+      for (let i = 0; i < offsets.length; ++i) pages[i] = reader.getStateSlice('log', offsets[i], width);
+      windowTimes.push(cpuMicrosSince(windowStart));
+      assert.deepEqual(pages.map((page) => JSON.parse(page.toString('utf8'))),
+        offsets.map((offset) => Array.from({ length: width }, (_, k) => item(offset + k - prefix))));
     }
     // As in reconstruction_scaling.rs, take the best batch CPU time so a
     // single GC pause or a busy host doesn't determine the scaling result.
-    return { point: Math.min(...pointTimes), slice: Math.min(...sliceTimes) };
+    return { point: Math.min(...pointTimes), slice: Math.min(...sliceTimes), window: Math.min(...windowTimes) };
   } finally {
     writer?.close();
     reader?.close();
@@ -69,7 +82,7 @@ function measure(prefix) {
   }
 }
 
-test('Warm point and suffix conversion do not scale with the untouched prefix', () => {
+test('Warm point, page and suffix conversion do not scale with the untouched prefix', () => {
   const small = measure(256);
   const large = measure(32768);
   // The prefix grows 128x (>78x even counting all of the new suffixes).
@@ -81,6 +94,8 @@ test('Warm point and suffix conversion do not scale with the untouched prefix', 
   assert.ok(large.point < 6 * small.point + floor, `point batch grew from ${small.point} to ${large.point} µs CPU`);
   // pins getStateSlice.5: reading the old boundary plus new items costs the window, not the accumulated log.
   assert.ok(large.slice < 6 * small.slice + floor, `suffix batch grew from ${small.slice} to ${large.slice} µs CPU`);
+  // pins getStateSlice.5: pages spread over the log cost the page, not the log around them.
+  assert.ok(large.window < 6 * small.window + floor, `page batch grew from ${small.window} to ${large.window} µs CPU`);
 });
 
 function branchIdTime({ messages, branches }) {

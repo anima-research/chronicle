@@ -272,6 +272,8 @@ test('Open does not initialize, settle or sanitize application state', (t) => {
   assert.deepEqual(opened.getStateJson(counterId), invalidCounter);
   // pins open.3: malformed bytes aren't silently converted to null or an empty receipt.
   assert.throws(() => opened.getStateJson(receiptId));
+  // pins open.3: the raw handle still holds those very bytes for the caller to inspect or repair.
+  assert.deepEqual(opened.getState(receiptId), Buffer.from('[unterminated'));
   // pins open.3: opening added no missing application slot such as the resolutions map.
   assert.deepEqual(idsOf(opened.listStates()).sort(), [summariesId, counterId, receiptId].sort());
 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { constants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
@@ -81,6 +81,8 @@ test("the store's errors carry their kind", () => {
   const foreign = Buffer.from([0xff, 0, 0x61]);
   store.setState('notes', foreign);
   // pins getStateJson.19: foreign snapshot bytes fail the JSON read before the raw probe.
+  assert.throws(() => store.getStateJson('notes'));
+  // The store's code and wording for that failure, which WindowIndex doesn't read.
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
   const raw = store.getState('notes');
   // pins getState.3: the raw read of even a non-JSON snapshot returns a Buffer.
@@ -521,6 +523,42 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
     });
   }
   store.close();
+});
+
+// As agent-framework's workspace reads a system error (errnoCode, in
+// src/modules/workspace/answers.ts): a conventional errno code first, else on
+// POSIX the number that ends an "IO error: " message, named as Node names it.
+const errnoNames = new Map();
+for (const [name, number] of Object.entries(constants.errno)) if (!errnoNames.has(number)) errnoNames.set(number, name);
+function workspaceErrno({ code, message }) {
+  if (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) return code;
+  const os = /^IO error: .*\(os error (\d+)\)$/s.exec(message);
+  return os === null ? undefined : errnoNames.get(Number(os[1]));
+}
+
+test('a blob write that the system refuses carries its errno as workspace reads it', {
+  skip: process.platform === 'win32' && "limits the size of a child's files with the POSIX shell",
+}, () => {
+  const { store, dir } = freshStore();
+  store.close();
+  // The child may write files of up to 64 blocks, of 512 or 1,024 bytes as its
+  // shell counts them: room for the store's own files, not for this blob. Node
+  // ignores SIGXFSZ, so the write past the limit fails with EFBIG.
+  const outcome = JSON.parse(execFileSync('/bin/sh', ['-c', 'ulimit -f 64 && exec "$0" "$@"', process.execPath, '--input-type=module', '-e', `
+    import { JsStore } from './index.js';
+    const store = JsStore.open({ path: process.argv[1] });
+    let outcome = null;
+    try {
+      store.storeBlob(Buffer.alloc(1 << 20, 0x5a), 'application/octet-stream');
+    } catch (error) {
+      outcome = { code: error.code, message: error.message };
+    }
+    store.close();
+    process.stdout.write(JSON.stringify(outcome));
+  `, dir], { cwd: import.meta.dirname, encoding: 'utf8', timeout: 30_000 }));
+  assert.notEqual(outcome, null, 'the blob was stored past the limit on the size of files');
+  // pins storeBlob.9: a failure writing the blob's bytes, not only one looking at its path, gives workspace the errno.
+  assert.equal(workspaceErrno(outcome), 'EFBIG', `${outcome.code}: ${outcome.message}`);
 });
 
 test('storeBlobAsync on a closed view or store throws StoreClosed', () => {

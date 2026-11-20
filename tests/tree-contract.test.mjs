@@ -175,7 +175,9 @@ test('Listing uses exact literal prefixes and ordered original path spellings', 
   const { store } = fresh(t, FILES);
   const base = stage(store, 'first version', 0o644);
   const draft = 'drafts/sub/note';
-  for (const path of ['src2/f', 'src/sub/f', 'src', 'src/f', 'a//b.txt', 'a//B.txt', 'a/plain', 'gone', draft]) {
+  // Each pair of case variants goes in against path order.
+  for (const path of ['src2/f', 'src/sub/f', 'src', 'src/f', 'a//b.txt', 'a//B.txt', 'a/plain', 'gone', draft,
+    'docs/readme.md', 'docs/README.md']) {
     store.treeSet(FILES, path, base);
   }
   store.treeSet(FILES, draft, stage(store, 'second', 0o100644));
@@ -186,7 +188,7 @@ test('Listing uses exact literal prefixes and ordered original path spellings', 
 
   const all = store.treeList(FILES);
   const paths = list => list.map(e => e.path);
-  const names = ['a//B.txt', 'a//b.txt', 'a/plain', draft, 'src', 'src/f', 'src/sub/f', 'src2/f'];
+  const names = ['a//B.txt', 'a//b.txt', 'a/plain', 'docs/README.md', 'docs/readme.md', draft, 'src', 'src/f', 'src/sub/f', 'src2/f'];
   const expected = names.map(path => row(path, path === draft ? latest : base));
   // pins treeList.3 — exactly the live off-disk keys, including just the current draft, no removed key or implied directories.
   assert.deepEqual([rows(all), fields(store.treeGet(FILES, draft))], [expected, latest]);
@@ -203,6 +205,8 @@ test('Listing uses exact literal prefixes and ordered original path spellings', 
   assert.equal(all.filter(e => e.path === draft).length, 1);
   // pins treeList.11 — the first case-folded match is determined by path order, not insertion order.
   assert.deepEqual(paths(all).filter(path => path.toLowerCase() === 'a//b.txt'), ['a//B.txt', 'a//b.txt']);
+  // pins treeList.11 — under a directory's prefix, as the spelling step lists it, valid variants come in path order too.
+  assert.deepEqual(paths(store.treeList(FILES, 'docs/')), ['docs/README.md', 'docs/readme.md']);
 });
 
 test('File and intent removals rewind together and respect separate write order', t => {
@@ -370,15 +374,27 @@ test('A pre-record write failure leaves every valid batch target unchanged',
 
 test('A malformed live tree cannot masquerade as a miss or empty inventory', t => {
   const f = fresh(t, FILES);
-  f.store.treeSet(FILES, 'formerly-present', stage(f.store, 'file', 0o644));
+  const file = stage(f.store, 'file', 0o644);
+  f.store.treeSet(FILES, 'formerly-present', file);
+  // Read the good tree on this handle first, so that a handle that kept it
+  // decoded has an old answer to fall back on.
+  assert.deepEqual([point(f.store, FILES, 'formerly-present'), rows(f.store.treeList(FILES))],
+    [file, [row('formerly-present', file)]]);
+  // The fixture makes the tree undecodable through the byte setter. That the
+  // store takes this write is what the fixture needs, not a requirement here.
   f.store.setState(FILES, Buffer.from('"a string, not a keyed tree"'));
+  const diagnostic = error => error != null && (error instanceof Error ? error.message : String(error)).trim().length > 0;
+  const refusals = (store, when) => {
+    // pins treeGet.6 — indeterminate point read synchronously throws a reportable cause, not stale data or null.
+    assert.throws(() => store.treeGet(FILES, 'formerly-present'), diagnostic, `${when} treeGet`);
+    // pins treeList.5 — a decode failure throws a diagnostic instead of an empty, partial or stale inventory.
+    assert.throws(() => store.treeList(FILES), diagnostic, `${when} treeList`);
+  };
+  // As a commit's readback does: the same handle, straight after the write.
+  refusals(f.store, 'warm');
   const branch = f.store.currentBranch();
   f.store.close();
   f.store = JsStore.open({ path: f.dir });
   assert.equal(f.store.currentBranch().id, branch.id);
-  const diagnostic = error => error != null && (error instanceof Error ? error.message : String(error)).trim().length > 0;
-  // pins treeGet.6 — indeterminate point read synchronously throws a reportable cause, not stale data or null.
-  assert.throws(() => f.store.treeGet(FILES, 'formerly-present'), diagnostic);
-  // pins treeList.5 — a cold decode failure throws a diagnostic instead of an empty or partial inventory.
-  assert.throws(() => f.store.treeList(FILES), diagnostic);
+  refusals(f.store, 'cold');
 });

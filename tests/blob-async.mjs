@@ -111,34 +111,50 @@ try {
     }
   });
 
-  await test('openOrCreate honors the supplied blob read-cache capacity', () => {
+  await test('openOrCreate honors the supplied blob read-cache capacity, for a new store and an existing one', () => {
+    const contents = ['oldest', 'middle', 'newest'].map((s) => Buffer.from(s));
+    // Read in another order than the writes, so that a cache filled by the
+    // writes rather than the reads can't pass.
+    const readOrder = [2, 0, 1];
     for (const capacity of [1, 2]) {
-      const at = join(dir, `cache-${capacity}`);
-      const offline = `${at}-offline`;
-      if (process.platform === 'win32') {
-        // Move a junction rather than a directory with open files on Windows.
-        symlinkSync(mkdtempSync(join(dir, 'backing-')), at, 'junction');
-      }
-      const handle = JsStore.openOrCreate({ path: at, blobCacheSize: capacity });
-      try {
-        const contents = ['oldest', 'middle', 'newest'].map((s) => Buffer.from(s));
-        const keys = contents.map((b) => handle.storeBlob(b, 'text/plain'));
-        for (const [i, key] of keys.entries()) assert.deepEqual(handle.getBlob(key), contents[i]);
-
-        // Take the configured path offline, without depending on any files inside it.
-        renameSync(at, offline);
-        try {
-          const reads = keys.map((key) => {
-            try { return handle.getBlob(key); }
-            catch { return null; } // An uncached read may fail while storage is unavailable.
-          });
-          // pins openOrCreate.17: exactly the configured number of recent reads remain available.
-          assert.deepEqual(reads, capacity === 1 ? [null, null, contents[2]] : [null, contents[1], contents[2]]);
-        } finally {
-          renameSync(offline, at);
+      // ContextManager passes blobCacheSize to openOrCreate whether or not the
+      // store exists yet, and the two cases open the store differently.
+      for (const existing of [false, true]) {
+        const at = join(dir, `cache-${capacity}-${existing ? 'existing' : 'new'}`);
+        const offline = `${at}-offline`;
+        if (process.platform === 'win32') {
+          // Move a junction rather than a directory with open files on Windows.
+          symlinkSync(mkdtempSync(join(dir, 'backing-')), at, 'junction');
         }
-      } finally {
-        handle.close();
+        let keys;
+        if (existing) {
+          // Written and closed by a handle with the default capacity: the
+          // tested handle has written nothing and read nothing before.
+          const seed = JsStore.openOrCreate({ path: at });
+          try { keys = contents.map((b) => seed.storeBlob(b, 'text/plain')); } finally { seed.close(); }
+        }
+        const handle = JsStore.openOrCreate({ path: at, blobCacheSize: capacity });
+        try {
+          keys ??= contents.map((b) => handle.storeBlob(b, 'text/plain'));
+          for (const i of readOrder) assert.deepEqual(handle.getBlob(keys[i]), contents[i]);
+
+          // Take the configured path offline, without depending on any files inside it.
+          renameSync(at, offline);
+          try {
+            const reads = keys.map((key) => {
+              try { return handle.getBlob(key); }
+              catch { return null; } // An uncached read may fail while storage is unavailable.
+            });
+            const kept = new Set(readOrder.slice(-capacity)); // the last `capacity` blobs read
+            // pins openOrCreate.17: exactly the configured number of recent reads remain available.
+            assert.deepEqual(reads, contents.map((b, i) => kept.has(i) ? b : null),
+              `${existing ? 'an existing' : 'a new'} store opened with blobCacheSize ${capacity}`);
+          } finally {
+            renameSync(offline, at);
+          }
+        } finally {
+          handle.close();
+        }
       }
     }
   });

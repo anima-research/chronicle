@@ -1630,13 +1630,20 @@ mod tests {
         fs::write(&file, vec![0; len]).unwrap();
         assert!(reopened(&dir).get(&hash).is_err());
 
-        storage.store(&content, "application/json").unwrap();
+        // The caller reads back whether the retry returned or threw, so the
+        // readback is checked either way, and the retry's result only names
+        // the case in a failure.
+        let retry = storage.store(&content, "application/json").map(drop);
         let readback = |reader: &BlobStorage| {
             reader.get(&hash).map(|blob| blob.map(|b| b.content)).map_err(|_| ())
         };
         let immediate = readback(&storage);
-        // pins storeBlob.14: a successful store is not proof of repair; the old key must agree with a cold read.
-        assert_eq!(immediate, readback(&reopened(&dir)));
+        // pins storeBlob.14: neither a returned nor a thrown store is proof of repair; the old key must agree with a cold read.
+        assert_eq!(
+            immediate,
+            readback(&reopened(&dir)),
+            "after a retry that gave {retry:?}"
+        );
         if let Ok(Some(bytes)) = immediate {
             // pins storeBlob.14: readable means the original contents, not damaged bytes.
             assert_eq!(bytes, content);

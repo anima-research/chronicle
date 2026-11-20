@@ -127,7 +127,10 @@ test('A typed journal outlives historical cuts and deletion of a contributing br
   store.registerState({ id: 'settings', strategy: 'snapshot' });
   store.registerState({ id: 'messages', strategy: 'append_log' });
   store.registerState({ id: 'files', strategy: 'tree' });
-  const state = () => [store.getStateJson('settings'), store.getStateJson('messages'), store.treeGet('files', 'note')];
+  // The tree entry is compared by the fields callers use, so a field the
+  // store adds can't break the comparison.
+  const fields = (e) => e && { blobHash: e.blobHash, size: e.size, mode: e.mode };
+  const state = () => [store.getStateJson('settings'), store.getStateJson('messages'), fields(store.treeGet('files', 'note'))];
   const oldFile = { blobHash: 'old', size: 3, mode: 0o644 };
   const newFile = { ...oldFile, blobHash: 'new' };
   store.setStateJson('settings', 'old');

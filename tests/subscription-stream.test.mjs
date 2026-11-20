@@ -98,9 +98,10 @@ test('Interleaved polls drain distinct filtered streams in order without consumi
   for (const id of [a, b]) assert.equal(store.pollSubscription(id)?.eventType, 'caught_up');
   // pins pollSubscription.3: an exhausted active queue gives strictly null without ending the subscription.
   assert.deepEqual(ids.map(id => store.pollSubscription(id)), [null, null, null]);
-  const note = store.appendJson('note', 'later'), flag = store.appendJson('flag', 'later');
+  const note = store.appendJson('note', 'later'), post = store.appendJson('post', 'later'), flag = store.appendJson('flag', 'later');
   // pins pollSubscription.3: the same IDs resume on later writes, without another catch-up.
-  assert.deepEqual(ids.map(id => drain(store, id).map(recordId)), [[note.id], [flag.id], [note.id, flag.id]]);
+  // pins subscribe.5: live records, too, of both named types and not of the third.
+  assert.deepEqual(ids.map(id => drain(store, id).map(recordId)), [[note.id, post.id], [flag.id], [note.id, post.id, flag.id]]);
 
   store.unsubscribe(a);
   const next = store.appendJson('flag', 'after cancellation');
@@ -142,10 +143,10 @@ test('Event inclusion flags select replay and live classes with bare names and J
     assert.equal(typeof event.data, 'string', event.eventType);
     assert.doesNotThrow(() => JSON.parse(event.data), event.eventType);
   }
-  // pins subscribe.8: each subscription includes its requested class and excludes the other two.
-  assert.deepEqual([replay.map(typesOf), live.map(group => new Set(typesOf(group)))], [
+  // pins subscribe.8: each subscription includes its requested class, an event for each write, and excludes the other two.
+  assert.deepEqual([replay.map(typesOf), live.map(typesOf)], [
     [['record', 'caught_up'], ['state_snapshot', 'caught_up'], ['caught_up']],
-    [new Set(['record']), new Set(['state_delta']), new Set(['branch_created', 'branch_head', 'branch_deleted'])],
+    [['record'], ['state_delta'], ['branch_head', 'branch_head', 'branch_created', 'branch_deleted']],
   ]);
   // pins catchUpSubscription.5: even the live-only subscription supplies an unprefixed, parseable completion marker.
   assert.equal(replay[2][0]?.eventType, 'caught_up');
@@ -155,12 +156,13 @@ test('Event inclusion flags select replay and live classes with bare names and J
   assert.deepEqual([deletion?.eventType, JSON.parse(deletion.data).name], ['branch_deleted', side.name]);
 
   const branchData = type => JSON.parse(live[2].find(e => e.eventType === type).data);
-  const { branch, head } = branchData('branch_head');
+  const heads = live[2].filter(e => e.eventType === 'branch_head').map(e => JSON.parse(e.data))
+    .map(({ branch, head }) => [branch, head]);
   const created = branchData('branch_created').branch;
-  // pins pollSubscription.7: branch and dropped payload fields live directly in the decoded API object.
-  assert.deepEqual([branch, head, created.id, created.name, created.head, created.created,
+  // pins pollSubscription.7: branch and dropped payload fields live directly in the decoded API object, a head for each write.
+  assert.deepEqual([heads, created.id, created.name, created.head, created.created,
     branchData('branch_deleted').name, JSON.parse(dropped.data).reason],
-  [main.name, later.sequence, Number(side.id), side.name, side.head, side.created, side.name, 'unsubscribed']);
+  [[[main.name, later.sequence], [main.name, delta.sequence]], Number(side.id), side.name, side.head, side.created, side.name, 'unsubscribed']);
   for (const [i, id] of subscriptions.entries()) {
     const events = [...replay[i], ...live[i]];
     if (i === 2) events.push(dropped);
@@ -210,7 +212,7 @@ test('An explicit branch name selects the live records of that branch', {
   const work = store.view('work');
   const onWork = work.appendJson('note', 'on work');
   work.close();
-  // pins subscribe.6: a non-current branch selected by name gets its write and excludes the current branch's.
+  // differs from subscribe.6: a non-current branch selected by name should get its write and exclude the current branch's.
   assert.deepEqual(drain(store, named).map(recordId), [onWork.id]);
 });
 
@@ -227,7 +229,7 @@ test('An explicit branch name selects the replayed records of that branch', {
   store.catchUpSubscription(named);
   const events = drain(store, named);
   assert.equal(events.pop()?.eventType, 'caught_up');
-  // pins subscribe.6: a catch-up through a handle on main replays the named branch's records, not main's.
+  // differs from subscribe.6: a catch-up through a handle on main should replay the named branch's records, not main's.
   assert.deepEqual(events.map(recordId), [onWork.id]);
 });
 
@@ -288,14 +290,15 @@ test('Replay honors selected state IDs and explicit and default snapshot byte li
 
   // Live changes follow the same selection as the replay did.
   store.setStateJson('fits', 'é');
+  store.setStateJson('over', 'é');
   store.setStateJson('unselected', 'still out');
   const changed = id => drain(store, id).map(event => {
     assert.equal(event.eventType, 'state_delta');
     return JSON.parse(event.data).state_id;
   });
-  // pins subscribe.7: a live change of an unselected state does not reach a subscription that lists other states.
-  assert.deepEqual(changed(smallId), ['fits']);
-  assert.deepEqual(changed(defaultId), ['fits', 'unselected']);
+  // pins subscribe.7: live changes of both listed states reach the subscription, and one of an unselected state does not.
+  assert.deepEqual(changed(smallId), ['fits', 'over']);
+  assert.deepEqual(changed(defaultId), ['fits', 'over', 'unselected']);
 });
 
 function cutArray(t) {
@@ -315,7 +318,7 @@ test('The snapshot byte cap includes the delimiters of a replayed JSON array', {
   todo: 'Array truncation budgets the elements but not the brackets and commas in the delivered snapshot.',
 }, t => {
   const snapshot = cutArray(t);
-  // pins subscribe.3: marking an array truncated isn't enough if its delivered data still exceeds the byte cap.
+  // differs from subscribe.3: marking an array truncated isn't enough if its delivered data still exceeds the byte cap.
   assert.ok(jsonBytes(snapshot.data) <= 9, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of 9`);
 });
 

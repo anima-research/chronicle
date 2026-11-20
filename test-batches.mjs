@@ -291,22 +291,25 @@ try {
   }
   ok('on a view, an identity batch counts and stamps on the view\'s branch');
 
-  {
-    const observed = () => ({
-      sequence: store.currentSequence(), head: store.currentBranch().head,
-      revision: store.stateHeadOffset('win'), count: store.getStateLen('win'), items: store.getStateJson('win'),
-    });
-    const prior = observed();
-    // pins appendToStateJsonWithIdentity.8: the single form synchronously throws, leaving the log and populated state alone.
-    assert.throws(() => store.appendToStateJsonWithIdentity('win', ['not an object'], 'by', 'at'));
-    assert.deepEqual(observed(), prior);
-  }
+  // The store-wide record inventory too: a record written and then not
+  // adopted as a head would leave the heads alone but not these.
+  const observed = () => ({
+    sequence: store.currentSequence(), head: store.currentBranch().head,
+    revision: store.stateHeadOffset('win'), count: store.getStateLen('win'), items: store.getStateJson('win'),
+    records: store.stats().recordCount, updates: store.getRecordIdsByType('state_update'),
+  });
+  const prior = observed();
+  // pins appendToStateJsonWithIdentity.8: the single form synchronously throws, leaving the log and populated state alone.
+  assert.throws(() => store.appendToStateJsonWithIdentity('win', ['not an object'], 'by', 'at'));
+  assert.deepEqual(observed(), prior);
   ok('A refused single stamped append does not advance the log');
 
   const before = store.getStateJson('win');
   store.close();
   store = JsStore.open({ path: idPath });
   assert.deepEqual(store.getStateJson('win'), before, 'the stamped items after a reopen');
+  // pins appendToStateJsonWithIdentity.8: nor does a reopen find a record of the refused append, or another head.
+  assert.deepEqual(observed(), prior);
   assert.equal(idManifest(), 2);
   store.close();
   ok('the stamped items read back after a reopen');

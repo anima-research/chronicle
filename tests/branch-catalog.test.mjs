@@ -234,16 +234,22 @@ test('Listed ancestry describes immediate parents and inclusive cuts, not curren
   }
   store.switchBranch(main.name);
   store.deleteBranch(child.name);
+  // The workspace follows a link through the list's IDs, and stops where the
+  // link is nullish or names no row. The orphan's link may be either.
+  const orphanParent = (rows) => {
+    const link = named(rows, leaf.name).parentId;
+    return rows.filter((b) => b.id === link).map((b) => b.name);
+  };
   const afterDelete = store.listBranches();
-  // pins listBranches.7: the link remains to the deleted parent, whose row no longer exists
-  assert.equal(named(afterDelete, leaf.name).parentId, child.id);
   assert.ok(!afterDelete.some((b) => b.id === child.id));
+  // pins listBranches.7: the orphan's link leads to no live row, so no ancestor is made up for it
+  assert.deepEqual(orphanParent(afterDelete), []);
   const newParent = store.createBranch(child.name);
   const afterReuse = store.listBranches();
   assert.equal(named(afterReuse, child.name).id, newParent.id);
-  // pins listBranches.7: name reuse must not reparent the old leaf to the new live branch
-  assert.equal(named(afterReuse, leaf.name).parentId, child.id);
   assert.ok(!afterReuse.some((b) => b.id === child.id));
+  // pins listBranches.7: name reuse must not reparent the old leaf to the new live branch, or to any other
+  assert.deepEqual(orphanParent(afterReuse), []);
 });
 
 test('Deletion through a parent view invalidates only the saved selective creation', (t) => {

@@ -258,6 +258,10 @@ test('Failing a barrier leaves exactly the landed journal suffix and state reada
   assert.equal(child.signal, 'SIGKILL', child.stderr);
   const entries = JSON.parse(child.stdout);
   const recovered = f.open();
+  // The entries and the state updates were in the log before the retry, so
+  // they would be found here if it did nothing: this shows that the retry
+  // repeated and lost none of them, not that it made them durable, which only
+  // a loss of power can show.
   for (const type of new Set(entries.map(entry => entry.type))) {
     // pins sync.13: after the retried barrier and the death of the process, receipts, acceptances and starts are each there once.
     assert.deepEqual(recovered.getRecordIdsByType(type).map(id => readEntry(recovered, id)),
@@ -265,7 +269,7 @@ test('Failing a barrier leaves exactly the landed journal suffix and state reada
   }
   // pins sync.9: successful sync preserves the replacement mode across death without close.
   assert.deepEqual(recovered.getStateJson('mode'), newMode);
-  // pins setStateJson.5: the retried barrier covers the already-written replacement queue.
+  // pins setStateJson.5: after the retried barrier and the death of the process, the already-written replacement queue is there.
   assert.deepEqual(recovered.getStateJson('queue'), newQueue);
 });
 
@@ -302,4 +306,17 @@ test('Close consumes the root even when its final barrier throws', t => {
   assert.equal(reopened.isClosed(), false);
   assert.throws(() => store.currentBranch());
   assert.throws(() => view.currentBranch());
+});
+
+test('Close reports the failure of its own barrier when no sync failed before it', t => {
+  const f = fixture(t);
+  const store = f.create();
+  store.registerState({ id: 'work', strategy: 'snapshot' });
+  store.setStateJson('work', 'dirty state head');
+  withBlockedCheckpoint(f.path, 'state.bin', () => {
+    // pins close.3: with no earlier failure to hand back, close throws the store's error from its own final sync.
+    assert.throws(() => store.close(), e => e instanceof Error && Object.values(ErrorCode).includes(e.code));
+    assert.equal(store.isClosed(), true);
+  });
+  assert.equal(f.open().isClosed(), false);
 });

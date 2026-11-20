@@ -19,7 +19,7 @@
 //! 2 and keep the batch; see the Breaking note).
 
 use chronicle::{
-    FieldIndexKind, Sequence, StateOperation, StateRegistration, StateStrategy,
+    FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy,
     StateUpdateRecord, Store, StoreConfig, StoreError,
 };
 use serde_json::{json, Value};
@@ -1079,9 +1079,20 @@ fn identity_batch_case(presented: bool) {
     }
 }
 
+/// Identity writers race each other and two ordinary record writers, which
+/// take record IDs by another path: one on the same branch, which takes
+/// sequences there too, and one on another branch, which takes IDs only.
+/// A writer that could take the ID an identity append reserved would leave
+/// a stamp naming another record, or two records at one ID or sequence.
 #[test]
 fn contending_single_identity_writers_each_stamp_their_own_one_record() {
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Barrier};
+
+    enum Wrote {
+        Stamped(chronicle::Record, Value),
+        Plain(chronicle::Record, Vec<u8>),
+    }
 
     const WRITERS: usize = 4;
     const ROUNDS: usize = 24;
@@ -1089,14 +1100,16 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
     let store = Arc::new(Store::create(config(dir.path())).unwrap());
     register(&store, "log", 10, 10);
     store.set_auto_snapshot(false);
+    let side = store.create_branch("side", None).unwrap();
+    let main = store.current_branch();
     let records_before = store.stats().unwrap().record_count;
-    let head_before = store.current_branch().head;
+    let side_before = store.get_branch_by_id(side.id).unwrap().head;
 
     // Line up a fresh wave for every race, without depending on which writer wins.
-    let ready = Arc::new(Barrier::new(WRITERS));
+    let ready = Arc::new(Barrier::new(WRITERS + 2));
     let mut writes = Vec::new();
     for round in 0..ROUNDS {
-        let threads: Vec<_> = (0..WRITERS)
+        let mut threads: Vec<_> = (0..WRITERS)
             .map(|writer| {
                 let store = Arc::clone(&store);
                 let ready = Arc::clone(&ready);
@@ -1105,22 +1118,81 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
                     let input = item.clone();
                     ready.wait();
                     let record = store.append_to_state_json_with_identity("log", input, "by", "at").unwrap();
-                    (record, item)
+                    Wrote::Stamped(record, item)
                 })
             })
             .collect();
+        for branch in [None, Some(side.id)] {
+            let store = Arc::clone(&store);
+            let ready = Arc::clone(&ready);
+            threads.push(std::thread::spawn(move || {
+                let payload = format!("plain {round} {branch:?}").into_bytes();
+                let input = RecordInput::raw("plain", payload.clone());
+                ready.wait();
+                let record = match branch {
+                    None => store.append(input),
+                    Some(branch) => store.append_on(branch, input),
+                }
+                .unwrap();
+                Wrote::Plain(record, payload)
+            }));
+        }
         writes.extend(threads.into_iter().map(|h| h.join().unwrap()));
     }
 
     // pins appendToStateJsonWithIdentity.5: one record per append, with no intermediate write.
-    assert_eq!(store.stats().unwrap().record_count, records_before + (WRITERS * ROUNDS) as u64);
-    writes.sort_by_key(|(r, _)| r.sequence);
+    assert_eq!(
+        store.stats().unwrap().record_count,
+        records_before + (ROUNDS * (WRITERS + 2)) as u64
+    );
+    let ids: BTreeSet<_> = writes
+        .iter()
+        .map(|(Wrote::Stamped(r, _) | Wrote::Plain(r, _))| r.id.0)
+        .collect();
+    assert_eq!(ids.len(), writes.len(), "every write took an ID of its own");
+    let sequences = |branch: chronicle::BranchId| -> Vec<u64> {
+        let mut taken: Vec<u64> = writes
+            .iter()
+            .map(|(Wrote::Stamped(r, _) | Wrote::Plain(r, _))| r)
+            .filter(|r| r.branch == branch)
+            .map(|r| r.sequence.0)
+            .collect();
+        taken.sort_unstable();
+        taken
+    };
+    // pins appendToStateJsonWithIdentity.5: each writer took a separate sequence for its one write.
+    assert_eq!(
+        sequences(main.id),
+        ((main.head.0 + 1)..=(main.head.0 + (ROUNDS * (WRITERS + 1)) as u64)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sequences(side.id),
+        ((side_before.0 + 1)..=(side_before.0 + ROUNDS as u64)).collect::<Vec<_>>()
+    );
+
+    let mut stamped_writes: Vec<_> = writes
+        .iter()
+        .filter_map(|write| match write {
+            Wrote::Stamped(record, item) => Some((record, item)),
+            Wrote::Plain(record, payload) => {
+                let stored = store.get_record(record.id).unwrap().unwrap();
+                assert_eq!(
+                    (stored.id, stored.branch, stored.sequence, &stored.payload),
+                    (record.id, record.branch, record.sequence, payload)
+                );
+                None
+            }
+        })
+        .collect();
+    stamped_writes.sort_by_key(|(r, _)| r.sequence);
     let mut expected = Vec::new();
-    for (i, (returned, input)) in writes.iter().enumerate() {
-        // pins appendToStateJsonWithIdentity.5: each writer took a separate sequence for its one write.
-        assert_eq!(returned.sequence, Sequence(head_before.0 + 1 + i as u64));
+    for (returned, input) in stamped_writes {
+        assert_eq!(returned.branch, main.id);
         let stored = store.get_record(returned.id).unwrap().unwrap();
-        assert_eq!((stored.id, stored.sequence), (returned.id, returned.sequence));
+        assert_eq!(
+            (stored.id, stored.branch, stored.sequence),
+            (returned.id, returned.branch, returned.sequence)
+        );
         let bytes = match StateUpdateRecord::decode(&stored).unwrap().operation {
             StateOperation::Append(bytes) => bytes,
             other => panic!("expected a stamped append, got {other:?}"),

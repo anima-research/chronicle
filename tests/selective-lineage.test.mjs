@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as nextTurn } from 'node:timers/promises';
-import { JsStore } from '../index.js';
+import { ErrorCode, JsStore } from '../index.js';
 
 const MSG = 'messages';
 const AUX = 'peer/messages';
@@ -23,7 +23,7 @@ function fresh(t) {
   store = JsStore.openOrCreate({ path });
   store.setAutoSnapshot(false);
   return {
-    directory, store,
+    directory, path, store,
     reopen() {
       store.close();
       store = JsStore.open({ path });
@@ -69,6 +69,11 @@ test('A sampled non-main parent name works for all three named-parent forks', as
   const parent = source.currentBranch();
   const head = source.currentSequence();
   const liveSeed = values(source, slots);
+  const parentContext = source.stateHeadOffset(CTX);
+  // Equal values, but the twin's context row is a record of its own: a
+  // child's context head tells which of the two it inherited.
+  assert.ok(Number.isFinite(parentContext));
+  assert.notEqual(twin.stateHeadOffset(CTX), parentContext);
   // The seeds come from reads, so check first that the writes above are in them.
   assert.ok(atCut.every((value) => value !== null) && liveSeed.every((value) => value !== null));
   assert.deepEqual([atCut.at(-1), liveSeed.at(-1)], [{ phase: 'initial' }, { phase: 'live' }]);
@@ -107,6 +112,9 @@ test('A sampled non-main parent name works for all three named-parent forks', as
       twin.createBranchWithStates('via-twin/live', parent.name, filter).parentId,
       twin.createBranchAtWithStates('via-twin/past', parent.name, cut, filter).parentId,
     ], [parent.id, parent.id, parent.id]);
+    // pins currentBranch.9: each of those children inherited the named parent's context record, not the receiver's.
+    assert.deepEqual(['via-twin/plain', 'via-twin/live', 'via-twin/past'].map(name => source.view(name).stateHeadOffset(CTX)),
+      [parentContext, parentContext, parentContext]);
     // pins view.2: the slash-delimited name resolves to the fork and its rows from either handle.
     for (const v of [plain, store.view(plainName)]) assert.deepEqual([v.currentBranch().id, values(v, slots)], [a.id, atCut]);
     // pins createBranchWithStates.2: a named derived parent's head is both the fork point and initial head.
@@ -303,6 +311,68 @@ test('Selective fork input refusals do not allocate or adopt a child', t => {
     assert.deepEqual(observe(), before);
   }
 });
+
+// Obstruct pathname lookups in the store's directory, not any particular file:
+// the open log still takes records, but no checkpoint can be saved. Restore
+// it before anything else writes, and on every exit.
+function withStoreDirectoryHidden(path, run) {
+  const saved = `${path}-saved`;
+  renameSync(path, saved);
+  try {
+    writeFileSync(path, 'not a directory');
+    run();
+  } finally {
+    rmSync(path, { force: true });
+    renameSync(saved, path);
+  }
+}
+
+test('A selective fork whose own checkpoint fails throws, and the store keeps the child',
+  { skip: process.platform === 'win32' && 'renames the open store directory' }, t => {
+    const fixture = fresh(t);
+    const { store } = fixture;
+    logs(store, MSG);
+    const row = stamped(store, MSG, { text: 'parent row' });
+    const from = store.currentBranch().name;
+    const cut = store.currentSequence();
+    const filter = { stateIds: [MSG] };
+    const names = (handle = store) => handle.listBranches().map(({ name }) => name).sort();
+    const original = names();
+    // The throw comes from the obstructed save, not from a refusal of the input.
+    const ioError = error => error?.code === ErrorCode.Io;
+    const exists = error => error?.code === ErrorCode.BranchExists;
+    const live = 'derived/live';
+    const past = 'derived/past';
+
+    // A valid parent and fresh names, and the sync leaves no checkpoint pending:
+    // the publication of the call's own child is the first write to fail.
+    store.sync();
+    withStoreDirectoryHidden(fixture.path, () => {
+      // pins createBranchWithStates.13: a failure to publish the new child throws in the call.
+      assert.throws(() => store.createBranchWithStates(live, from, filter), ioError);
+      // differs from createBranchWithStates.13, which leaves no child to clean up: the store keeps the child it allocated.
+      assert.deepEqual(names(), [...original, live].sort());
+    });
+    // differs from createBranchWithStates.13: the next checkpoint publishes the kept child, so a retry finds the name taken.
+    assert.throws(() => store.createBranchWithStates(live, from, filter), exists);
+    assert.deepEqual(store.view(live).getStateJson(MSG), [row]);
+
+    store.sync();
+    withStoreDirectoryHidden(fixture.path, () => {
+      // pins createBranchAtWithStates.16: a failure to publish the new child throws before returning one.
+      assert.throws(() => store.createBranchAtWithStates(past, from, cut, filter), ioError);
+      // differs from createBranchAtWithStates.16, which leaves no child for derive to clean up: the store keeps the child.
+      assert.deepEqual(names(), [...original, live, past].sort());
+    });
+    // differs from createBranchAtWithStates.16: the next checkpoint publishes the kept child, so a retry finds the name taken.
+    assert.throws(() => store.createBranchAtWithStates(past, from, cut, filter), exists);
+    assert.deepEqual(store.view(past).getStateJson(MSG), [row]);
+
+    const reopened = fixture.reopen();
+    // The kept children outlast the store's restart: a caller has them to clean up.
+    assert.deepEqual([names(reopened), reopened.view(live).getStateJson(MSG), reopened.view(past).getStateJson(MSG)],
+      [[...original, live, past].sort(), [row], [row]]);
+  });
 
 test('Storage, presentation and later writes have distinct inclusive cutoffs', t => {
   const { store } = fresh(t);

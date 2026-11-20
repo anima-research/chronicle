@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { cpSync, mkdtempSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -89,6 +89,7 @@ function compactChecked(root, view, checkpoint) {
     { head: mainHead, events: mainEvents });
   // pins compactState.7 the immediate logical count and array exclude the entire prefix
   assert.deepEqual([view.getStateLen(ledger), view.getStateJson(ledger)], [1, [checkpoint]]);
+  return { compactedFrom: oldHead };
 }
 
 function checkpointWriter(root, view, options) {
@@ -104,8 +105,8 @@ function checkpointWriter(root, view, options) {
   view.redactStateItems(ledger, 0, oldCount);
   // pins getStateLen.8 the saved count is an exclusive end and removes precisely the old events
   assert.deepEqual(view.getStateJson(ledger), [checkpoint]);
-  if (options.compact) compactChecked(root, view, checkpoint);
-  return { eventId, sequence };
+  const compacted = options.compact ? compactChecked(root, view, checkpoint) : {};
+  return { stamp: { eventId, sequence }, ...compacted };
 }
 
 function checkRecoveredCheckpoint(path, checkpoint) {
@@ -120,6 +121,29 @@ function checkRecoveredCheckpoint(path, checkpoint) {
     // pins compactState.6 the other branch still reads its own original ledger after recovery
     assert.deepEqual(root.getStateJson(ledger), mainEvents);
   });
+}
+
+// Compaction writes one snapshot record, and it is the last record the writer
+// wrote before it died. A copy of the store whose log has lost that record's
+// last byte is what a death in the middle of the write leaves. No call stops
+// a write partway, so the fault setup cuts the store's record log.
+function checkTornCompaction(path, checkpoint, compactedFrom) {
+  const torn = `${path}-torn`;
+  cpSync(path, torn, { recursive: true, verbatimSymlinks: true });
+  try {
+    const log = join(torn, 'records.log');
+    truncateSync(log, statSync(log).size - 1);
+    reopen(torn, root => {
+      assert.ok(root.recovery()?.droppedBytes > 0, 'the cut tore the last record');
+      const view = root.view(branch);
+      assert.equal(view.stateHeadOffset(ledger), compactedFrom, 'the torn record was the compaction');
+      // pins compactState.8 a death in the middle of compaction's write leaves the reader the checkpoint, beside the legacy snapshot
+      assert.deepEqual({ length: view.getStateLen(ledger), ledger: view.getStateJson(ledger), legacy: view.getStateJson(legacy) },
+        { length: 1, ledger: [checkpoint], legacy: [legacyRecord] });
+    });
+  } finally {
+    rmSync(torn, { recursive: true, force: true });
+  }
 }
 
 const audit = 'framework/tool-result-guard';
@@ -201,7 +225,7 @@ if (process.argv[2] === '--crash-writer') {
   const view = action === 'progress' ? undefined : root.view(branch);
   globalThis.liveWriterHandles = [root, view];
   const writers = { pending: pendingWriter, checkpoint: checkpointWriter,
-    compact(root, view, checkpoint) { compactChecked(root, view, checkpoint); return {}; },
+    compact: compactChecked,
     mixed: mixedWriter, progress: progressWriter };
   const coordinates = writers[action](root, view, JSON.parse(options));
   writeSync(1, JSON.stringify(coordinates));
@@ -230,13 +254,15 @@ if (process.argv[2] === '--crash-writer') {
           eventId: attempt.pendingId, sequence: attempt.sequence });
       });
       const options = { ...attempt, compact, empty };
-      const stamp = runWriter(path, 'checkpoint', options);
+      const { stamp, compactedFrom } = runWriter(path, 'checkpoint', options);
       const checkpoint = { ...checkpointEvent(options), ...stamp };
+      if (compact) checkTornCompaction(path, checkpoint, compactedFrom);
       checkRecoveredCheckpoint(path, checkpoint);
       if (!compact) {
         // A restart interrupted the sequence between redact and compact. Finish
         // the same operation on the recovered survivor and die at its return.
-        runWriter(path, 'compact', checkpoint);
+        const { compactedFrom } = runWriter(path, 'compact', checkpoint);
+        checkTornCompaction(path, checkpoint, compactedFrom);
         checkRecoveredCheckpoint(path, checkpoint);
       }
     }
@@ -284,7 +310,7 @@ if (process.argv[2] === '--crash-writer') {
       assert.ok(!saved.ids.includes(next.id));
       root.switchBranch(saved.branch);
       const archive = root.getStateJson(audit).find(e => e.type === 'staged');
-      // pins storeBlob.4 returning to a branch with a durable reference still gives the bytes, without restaging
+      // pins storeBlob.4 after a sync and the death of the process, returning to a branch with the reference still gives the bytes, without restaging
       assert.deepEqual(root.getBlob(archive.content.blobId), content);
 
       // Make the *configured store path*, not any particular internal file,

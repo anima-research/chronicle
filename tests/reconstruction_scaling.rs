@@ -27,8 +27,10 @@
 //! print items/tail per point so the phase is auditable, not assumed.
 //!
 //! A separate gate measures metadata and narrow index probes with the value
-//! caches cold. Those probes must *not* rebuild the state; their outputs stay
-//! bounded as the message history or the number of branches grows.
+//! caches cold. Those probes must *not* rebuild the state; their cost stays
+//! flat as the message history grows (a range's may grow with its logarithm),
+//! except the channel counts', which may grow with their index but stays flat
+//! as the content behind it grows.
 //!
 //! Timing discipline: each rebuild point is the min of 3 rebuilds, each timed by the
 //! thread's CPU time, so time spent waiting to run on a busy machine isn't
@@ -296,10 +298,24 @@ struct ProbeStore {
     _dir: TempDir,
     messages: usize,
     branches: usize,
+    body_bytes: usize,
     head: u64,
 }
 
 fn indexed_messages(messages: usize, branches: usize) -> ProbeStore {
+    indexed_messages_of(messages, branches, 64)
+}
+
+/// The id each message carries, of one length for every message, so that a
+/// key compared with each id in turn costs the same whichever it meets.
+fn message_id(i: usize) -> String {
+    format!("m{i:06}")
+}
+
+/// `messages` messages whose bodies hold `body_bytes` bytes each (the bulky
+/// ones at least `messages * 64`), indexed by channel, by timestamp, and by
+/// an id of their own.
+fn indexed_messages_of(messages: usize, branches: usize, body_bytes: usize) -> ProbeStore {
     let dir = TempDir::new().unwrap();
     let store = Store::create(config(&dir)).unwrap();
     // Put the current branch last, with all earlier branches as ancestors.
@@ -335,9 +351,9 @@ fn indexed_messages(messages: usize, branches: usize) -> ProbeStore {
         // The head and the indexed matches themselves get bulky. Even reading
         // just their content is not a metadata/ordinal-only lookup.
         let bulky = last || i == messages / 2 || i == messages / 2 + 1;
-        let body = "x".repeat(if bulky { messages * 64 } else { 64 });
+        let body = "x".repeat(if bulky { body_bytes.max(messages * 64) } else { body_bytes });
         let message = json!({"channel": if last { "rare" } else { "common" },
-                             "timestamp": i, "body": body});
+                             "id": message_id(i), "timestamp": i, "body": body});
         store
             .update_state(
                 "messages",
@@ -357,12 +373,16 @@ fn indexed_messages(messages: usize, branches: usize) -> ProbeStore {
     store
         .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
         .unwrap();
+    store
+        .register_state_field_index("messages", "/id", FieldIndexKind::String)
+        .unwrap();
     store.sync().unwrap();
     ProbeStore {
         store,
         _dir: dir,
         messages,
         branches,
+        body_bytes,
         head,
     }
 }
@@ -397,8 +417,8 @@ fn probe_growth<T>(
             })
             .fold(f64::INFINITY, f64::min);
         println!(
-            "  {name}: {} messages, {} branches: {min_ms:.3} ms/128 calls",
-            p.messages, p.branches
+            "  {name}: {} messages of {} bytes, {} branches: {min_ms:.3} ms/128 calls",
+            p.messages, p.body_bytes, p.branches
         );
         min_ms
     };
@@ -436,33 +456,74 @@ fn cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content() {
         |p| p.store.get_state_len("messages").unwrap(),
         |p, got| assert_eq!(got, Some(p.messages)),
     );
-    // pins getStateLen.5: a cold count doesn't visit one record or item per message.
+    // pins getStateLen.5: on the writing handle, a count with the value caches cold doesn't grow with history.
+    // (The first count on a reopened store, whose head this session hasn't checked, is in src/store.rs.)
     assert!(
         growth < FLAT,
         "getStateLen cost grew {growth:.2}x with history"
     );
 
+    // An index-sized read may grow with the index, but not with the content
+    // the index points at. So one store holds the small store's index, item
+    // for item, over bodies of 64 KiB each: some 200 times the small store's
+    // content, which a scan and decode of the slot would read on every call
+    // (such a scan measured 18x here, an ordinal-by-ordinal count 0.8x).
+    let heavy = indexed_messages_of(small.messages, small.branches, 64 * 1024);
+    let counts = |p: &ProbeStore| p.store.get_state_index_value_counts("messages", "/channel");
+    let check_counts = |p: &ProbeStore, got: Option<Vec<(String, u32)>>| {
+        let mut counts = got.expect("registered channel index");
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            [
+                (String::from("common"), p.messages as u32 - 1),
+                (String::from("rare"), 1)
+            ]
+        );
+    };
+    let content = probe_growth("getStateIndexValueCounts", &small, &heavy, counts, check_counts);
+    // pins getStateIndexValueCounts.9: with the index the same size, the cost doesn't follow the slot's content.
+    assert!(
+        content < FLAT,
+        "getStateIndexValueCounts cost grew {content:.2}x with message content"
+    );
+    let index = probe_growth("getStateIndexValueCounts", &small, &deep, counts, check_counts);
+    let index_ratio = deep.messages as f64 / small.messages as f64;
+    // pins getStateIndexValueCounts.9: as the index grows 64x, the cost grows no faster than the index.
+    assert!(
+        index < FLAT * index_ratio,
+        "getStateIndexValueCounts cost grew {index:.2}x for {index_ratio:.0}x the index"
+    );
+
+    // Every message has an id of its own, so the larger store's id index holds
+    // 64x the distinct keys. Hits spread over the history, and misses of the
+    // ids' length, which a walk of the keys would compare with every one
+    // (such a walk measured 37x to 50x here).
+    let id_keys = |p: &ProbeStore| -> Vec<(String, Vec<u32>)> {
+        let n = p.messages;
+        let hits = [0, n / 3, 2 * n / 3, n - 1].map(|i| (message_id(i), vec![i as u32]));
+        let misses = [n, n + 1, 3 * n, 999_999].map(|i| (message_id(i), vec![]));
+        hits.into_iter().chain(misses).collect()
+    };
     let growth = probe_growth(
-        "getStateIndexValueCounts",
+        "queryStateIndexEq by id",
         &small,
         &deep,
-        |p| p.store.get_state_index_value_counts("messages", "/channel"),
+        |p| {
+            id_keys(p)
+                .into_iter()
+                .map(|(key, _)| p.store.query_state_index_eq("messages", "/id", &key, None, None))
+                .collect::<Vec<_>>()
+        },
         |p, got| {
-            let mut counts = got.expect("registered channel index");
-            counts.sort_unstable();
-            assert_eq!(
-                counts,
-                [
-                    (String::from("common"), p.messages as u32 - 1),
-                    (String::from("rare"), 1)
-                ]
-            );
+            let expected: Vec<_> = id_keys(p).into_iter().map(|(_, ordinals)| Some(ordinals)).collect();
+            assert_eq!(got, expected);
         },
     );
-    // pins getStateIndexValueCounts.9: two channel counts cost the same as the slot grows.
+    // pins queryStateIndexEq.12: a key among thousands of distinct values costs what it does among a hundred.
     assert!(
         growth < FLAT,
-        "getStateIndexValueCounts cost grew {growth:.2}x with history"
+        "queryStateIndexEq cost grew {growth:.2}x with distinct keys"
     );
 
     let growth = probe_growth(
