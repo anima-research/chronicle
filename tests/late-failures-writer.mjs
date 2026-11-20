@@ -174,7 +174,7 @@ function attempt(work) {
     const value = work();
     return { ok: true, value: value === undefined ? null : JSON.parse(JSON.stringify(value)) };
   } catch (error) {
-    return { ok: false, code: error?.code ?? null, message: String(error?.message ?? error) };
+    return { ok: false, error: error instanceof Error, code: error?.code ?? null, message: String(error?.message ?? error) };
   }
 }
 

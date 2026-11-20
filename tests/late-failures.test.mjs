@@ -305,7 +305,7 @@ async function reopened(scenario, extra, runs) {
 
 function errnoCode(failure) {
   if (typeof failure.code === 'string' && /^E[A-Z0-9]+$/.test(failure.code)) return failure.code;
-  const match = /^IO error: .*\(os error (\d+)\)$/s.exec(failure.message);
+  const match = failure.error && /^IO error: .*\(os error (\d+)\)$/s.exec(failure.message);
   if (match) return Object.keys(constants.errno).find(code => constants.errno[code] === Number(match[1]));
 }
 
@@ -404,6 +404,12 @@ function judge(scenario, clean, run, reopen) {
   }
   const atBarrier = scenario.kind === 'close' ? out.old : out.syncReads;
   const before = { copy: barriers.filter(barrier => barrier !== 'close'), store: barriers };
+  const lastRead = {
+    copy: name => out.syncReads[name],
+    store: scenario.kind === 'close'
+      ? name => (out.reads[1][name].ok ? out.reads[1][name] : out.old[name])
+      : name => (out.closedReads[name].ok ? out.closedReads[name] : out.syncReads[name]),
+  };
   for (const [where, answer] of Object.entries(reopen)) {
     const which = where === 'copy' ? 'the copy' : 'the closed store';
     if (!answer.opened.ok) {
@@ -419,6 +425,11 @@ function judge(scenario, clean, run, reopen) {
         add('the reopen', `${which}, opened again, gave ${JSON.stringify(read.value)} for ${name}, where the handle gave ${JSON.stringify(handle.value)} at ${before[where].join(' and ')}`);
       } else if (!oldOrNew(name, read.value)) {
         add('the reopen', `${which}, opened again, gave ${JSON.stringify(read.value)} for ${name}, which is not the old or the new value`);
+      } else if (!isDeepStrictEqual(read.value, old[name].value)) {
+        const last = lastRead[where](name);
+        if (!last.ok || !isDeepStrictEqual(last.value, read.value)) {
+          add('the reopen', `${which}, opened again, gave the new value for ${name}, where the handle last gave ${shown(last)}`);
+        }
       }
     }
   }
