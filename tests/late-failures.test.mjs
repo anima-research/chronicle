@@ -19,7 +19,17 @@ const MKDIRS = new Set(['mkdir', 'mkdirat']);
 const BY_DESCRIPTOR = new Set([...WRITES, ...READS, ...SYNCS]);
 const NOT_MEASURED = 'The instrument does not measure';
 const UNREADABLE_ERRNO = 'The error for a refused sync of the directories that hold a blob has words after its OS error, so a caller cannot read the errno.';
+const OLD_AFTER_THROW = new Set(['setStateJson', 'appendToStateJson', 'treeSet', 'treeRemove',
+  'createBranchWithStates', 'createBranchAtWithStates', 'switchBranch']);
+const NEW_BRANCH_AFTER_THROW = 'When a refused request makes the call throw, the handle already shows the new branch.';
+const newAfterThrow = problem => problem.newAfterThrow === true;
 const TODOS = [
+  { scenario: 'createBranchWithStates', rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
+  { scenario: 'createBranchAtWithStates', rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
+  {
+    scenario: 'switchBranch', rule: 'the reads', owns: newAfterThrow,
+    todo: 'When a refused request makes switchBranch throw, the handle has already switched to the target.',
+  },
   { scenario: 'storeBlob', point: 'fsync 1', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: () => true },
   { scenario: 'storeBlob', point: 'fsync 3', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: () => true },
   {
@@ -397,6 +407,15 @@ function judge(scenario, clean, run, reopen) {
     whole('the reads', 'the reads after sync', out.syncReads, false);
     oneState('the reads', 'the reads after sync', out.syncReads);
   }
+  if (!out.call.ok && OLD_AFTER_THROW.has(scenario.name)) {
+    for (const [what, reads] of [['the reads after the call', out.reads[0]], ['the second reads after the call', out.reads[1]]]) {
+      for (const [name, read] of Object.entries(reads)) {
+        if (read.ok && !isDeepStrictEqual(read.value, old[name].value)) {
+          problems.get('the reads').push({ text: `${what}, ${name} gave ${JSON.stringify(read.value)} after the call threw, not the old value`, newAfterThrow: true });
+        }
+      }
+    }
+  }
   for (const name of Object.keys(out.reads[0])) {
     if (!isDeepStrictEqual(out.reads[0][name], out.reads[1][name])) {
       add('the reads', `two reads of ${name} disagree: ${shown(out.reads[0][name])} and ${shown(out.reads[1][name])}`);
@@ -559,7 +578,7 @@ if (skip) {
             assert.fail(`${NOT_MEASURED}: three aimed runs did not refuse ${point.id} (${at}): ${result.misses.get(point.id).join('; ')}`);
           }
           const judged = runs.map(run => [run, judge(scenario, result.clean, run, result.answers.get(run))]);
-          const todos = TODOS.filter(each => each.scenario === scenario.name && each.point === point.id);
+          const todos = TODOS.filter(each => each.scenario === scenario.name && (each.point === undefined || each.point === point.id));
           const ownedBy = (rule, problem) => todos.find(each => each.rule === rule && each.owns(problem));
           const holds = keep => {
             for (const [run, problems] of judged) {
