@@ -26,7 +26,11 @@
 //! scales off the measured item ratio instead of assuming 4×. The tables
 //! print items/tail per point so the phase is auditable, not assumed.
 //!
-//! Timing discipline: each point is the min of 3 rebuilds, each timed by the
+//! A separate gate measures metadata and narrow index probes with the value
+//! caches cold. Those probes must *not* rebuild the state; their outputs stay
+//! bounded as the message history or the number of branches grows.
+//!
+//! Timing discipline: each rebuild point is the min of 3 rebuilds, each timed by the
 //! thread's CPU time, so time spent waiting to run on a busy machine isn't
 //! counted, and the gates serialize on a mutex so they never contend with each
 //! other. Tables print with `-- --nocapture`. Unix only: the thread's CPU time
@@ -34,7 +38,8 @@
 #![cfg(unix)]
 
 use chronicle::{
-    StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, TreeEntry,
+    BranchId, FieldIndexKind, StateOperation, StateRegistration, StateStrategy, Store,
+    StoreConfig, TreeEntry,
 };
 use serde_json::json;
 use std::sync::Mutex;
@@ -284,4 +289,243 @@ fn cold_read_tree_linear() {
         })
         .collect();
     assert_cold_linear("cold_tree", &points);
+}
+
+struct ProbeStore {
+    store: Store,
+    _dir: TempDir,
+    messages: usize,
+    branches: usize,
+    active: BranchId,
+    head: u64,
+}
+
+fn indexed_messages(messages: usize, branches: usize) -> ProbeStore {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(&dir)).unwrap();
+    // Put the current branch last, with all earlier branches as ancestors.
+    // Looking up its ID should need neither an ancestry walk nor a list scan.
+    let mut parent = store.current_branch().name;
+    for i in 2..branches {
+        parent = store
+            .create_empty_branch(&format!("other-{i}"), Some(&parent))
+            .unwrap()
+            .name;
+    }
+    let active = store
+        .create_empty_branch("active", Some(&parent))
+        .unwrap()
+        .id;
+    store.switch_branch("active").unwrap();
+    store
+        .register_state(StateRegistration {
+            id: "messages".into(),
+            strategy: StateStrategy::AppendLog {
+                // Every message contributes a record to the unsnapshotted tail.
+                delta_snapshot_every: messages as u64 + 1,
+                full_snapshot_every: 20,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+    let mut previous_head = None;
+    for i in 0..messages {
+        let last = i == messages - 1;
+        if last {
+            previous_head = store.state_head_offset("messages").unwrap();
+        }
+        // The head and the indexed matches themselves get bulky. Even reading
+        // just their content is not a metadata/ordinal-only lookup.
+        let bulky = last || i == messages / 2 || i == messages / 2 + 1;
+        let body = "x".repeat(if bulky { messages * 64 } else { 64 });
+        let message = json!({"channel": if last { "rare" } else { "common" },
+                             "timestamp": i, "body": body});
+        store
+            .update_state(
+                "messages",
+                StateOperation::Append(serde_json::to_vec(&message).unwrap()),
+            )
+            .unwrap();
+    }
+    let head = store.state_head_offset("messages").unwrap().unwrap();
+    assert_ne!(
+        Some(head),
+        previous_head,
+        "last append should advance the freshness token"
+    );
+    store
+        .register_state_field_index("messages", "/channel", FieldIndexKind::String)
+        .unwrap();
+    store
+        .register_state_field_index("messages", "/timestamp", FieldIndexKind::Number)
+        .unwrap();
+    store.sync().unwrap();
+    ProbeStore {
+        store,
+        _dir: dir,
+        messages,
+        branches,
+        active,
+        head,
+    }
+}
+
+/// Each trial sums CPU time for 128 *individually cold* calls. Neither
+/// clearing the value caches nor validating/dropping the result is timed.
+/// This keeps a slow first call from hiding among a batch of warm hits.
+fn probe_growth<T>(
+    name: &str,
+    small: &ProbeStore,
+    large: &ProbeStore,
+    read: impl Fn(&ProbeStore) -> T,
+    check: impl Fn(&ProbeStore, T),
+) -> f64 {
+    let measure = |p: &ProbeStore| {
+        let min_ms = (0..3)
+            .map(|_| {
+                let mut total = 0.0;
+                for _ in 0..128 {
+                    p.store.clear_state_caches();
+                    let rebuilds = p.store.state_reconstruction_count();
+                    let (result, ms) = timed_ms(|| read(p));
+                    total += ms;
+                    check(p, result);
+                    assert_eq!(
+                        p.store.state_reconstruction_count(),
+                        rebuilds,
+                        "{name} rebuilt the slot"
+                    );
+                }
+                total
+            })
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "  {name}: {} messages, {} branches: {min_ms:.3} ms/128 calls",
+            p.messages, p.branches
+        );
+        min_ms
+    };
+    let base = measure(small);
+    measure(large) / base
+}
+
+#[test]
+fn cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content() {
+    let _serial = GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let small = indexed_messages(128, 2);
+    let deep = indexed_messages(8192, 2);
+    let wide = indexed_messages(128, 128);
+    // 64x along just one axis per comparison. Allow slack for clocks, cache
+    // locality and hashing, but not for a walk of the message/branch list.
+    const FLAT: f64 = 3.0;
+    let growth = probe_growth(
+        "stateHeadOffset",
+        &small,
+        &deep,
+        |p| p.store.state_head_offset("messages").unwrap(),
+        |p, got| assert_eq!(got, Some(p.head)),
+    );
+    // pins stateHeadOffset.9: cold freshness checks are independent of the chain.
+    assert!(
+        growth < FLAT,
+        "stateHeadOffset cost grew {growth:.2}x with history"
+    );
+
+    let growth = probe_growth(
+        "getStateLen",
+        &small,
+        &deep,
+        |p| p.store.get_state_len("messages").unwrap(),
+        |p, got| assert_eq!(got, Some(p.messages)),
+    );
+    // pins getStateLen.5: a cold count doesn't visit one record or item per message.
+    assert!(
+        growth < FLAT,
+        "getStateLen cost grew {growth:.2}x with history"
+    );
+
+    // A root JsStore resolves its current ID, then looks up that branch by ID.
+    let branch_id = |p: &ProbeStore| {
+        p.store
+            .get_branch_by_id(p.store.current_branch().id)
+            .unwrap()
+            .id
+    };
+    let current = |p: &ProbeStore, id: BranchId| assert_eq!(id, p.active);
+    let history = probe_growth("currentBranch.id", &small, &deep, branch_id, current);
+    let branches = probe_growth("currentBranch.id", &small, &wide, branch_id, current);
+    // pins currentBranch.17: repeated ID reads traverse neither history nor the branch list.
+    assert!(
+        history < FLAT && branches < FLAT,
+        "currentBranch.id grew {history:.2}x with history, {branches:.2}x with branches"
+    );
+
+    let growth = probe_growth(
+        "getStateIndexValueCounts",
+        &small,
+        &deep,
+        |p| p.store.get_state_index_value_counts("messages", "/channel"),
+        |p, got| {
+            let mut counts = got.expect("registered channel index");
+            counts.sort_unstable();
+            assert_eq!(
+                counts,
+                [
+                    (String::from("common"), p.messages as u32 - 1),
+                    (String::from("rare"), 1)
+                ]
+            );
+        },
+    );
+    // pins getStateIndexValueCounts.9: two channel counts cost the same as the slot grows.
+    assert!(
+        growth < FLAT,
+        "getStateIndexValueCounts cost grew {growth:.2}x with history"
+    );
+
+    let growth = probe_growth(
+        "queryStateIndexEq",
+        &small,
+        &deep,
+        |p| {
+            p.store
+                .query_state_index_eq("messages", "/channel", "rare", None, None)
+        },
+        |p, got| assert_eq!(got, Some(vec![p.messages as u32 - 1])),
+    );
+    // pins queryStateIndexEq.12: one match, regardless of how many nonmatches precede it.
+    assert!(
+        growth < FLAT,
+        "queryStateIndexEq cost grew {growth:.2}x with nonmatches"
+    );
+
+    let growth = probe_growth(
+        "queryStateIndexRange",
+        &small,
+        &deep,
+        |p| {
+            // Interior bounds: a scan starting at *either* end must pass
+            // thousands of nonmatching timestamps on the larger store.
+            let mid = (p.messages / 2) as f64;
+            p.store.query_state_index_range(
+                "messages",
+                "/timestamp",
+                Some(mid),
+                Some(mid + 1.0),
+                None,
+                None,
+                false,
+            )
+        },
+        |p, got| {
+            let mid = (p.messages / 2) as u32;
+            assert_eq!(got, Some(vec![mid, mid + 1]))
+        },
+    );
+    let log_ratio = (deep.messages as f64).log2() / (small.messages as f64).log2();
+    // pins queryStateIndexRange.12: seek to a narrow two-ordinal range; allow logarithmic growth.
+    assert!(
+        growth < FLAT * log_ratio,
+        "queryStateIndexRange cost grew {growth:.2}x with history"
+    );
 }

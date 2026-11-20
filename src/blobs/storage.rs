@@ -1165,6 +1165,8 @@ mod tests {
         );
         assert_eq!(staged(&dir.path().join("blobs")), 0);
         assert!(!storage.known.lock().contains_key(&hash));
+        // pins getBlob.9: the writer can read the installed bytes before any retry or reopen.
+        assert_eq!(storage.get(&hash).unwrap().unwrap().content, b"in place");
         assert_eq!(
             reopened(&dir).get(&hash).unwrap().unwrap().content,
             b"in place"
@@ -1178,6 +1180,14 @@ mod tests {
         assert!(storage.known.lock().contains_key(&hash));
         assert_eq!(storage.store(b"in place", "text/plain").unwrap(), hash);
         assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+
+        // The caller still holds the hash after the contents go missing.
+        assert!(storage.delete(&hash).unwrap());
+        assert!(storage.get(&hash).unwrap().is_none());
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        storage.store(b"in place", "text/plain").unwrap_err();
+        // pins storeBlob.14: the old key reads back as restored even though the repair threw.
+        assert_eq!(storage.get(&hash).unwrap().unwrap().content, b"in place");
     }
 
     // Stores of one content racing from several storages each stage their
@@ -1609,6 +1619,27 @@ mod tests {
                 content,
                 "chunked: {chunked}"
             );
+        }
+
+        // Retry a whole blob without first alerting the writer to the damage.
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let hash = storage.store(&content, "application/json").unwrap();
+        let file = storage.blob_path(&hash);
+        let len = fs::metadata(&file).unwrap().len() as usize;
+        fs::write(&file, vec![0; len]).unwrap();
+        assert!(reopened(&dir).get(&hash).is_err());
+
+        storage.store(&content, "application/json").unwrap();
+        let readback = |reader: &BlobStorage| {
+            reader.get(&hash).map(|blob| blob.map(|b| b.content)).map_err(|_| ())
+        };
+        let immediate = readback(&storage);
+        // pins storeBlob.14: a successful store is not proof of repair; the old key must agree with a cold read.
+        assert_eq!(immediate, readback(&reopened(&dir)));
+        if let Ok(Some(bytes)) = immediate {
+            // pins storeBlob.14: readable means the original contents, not damaged bytes.
+            assert_eq!(bytes, content);
         }
     }
 

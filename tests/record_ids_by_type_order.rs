@@ -7,6 +7,7 @@
 
 use chronicle::types::{StateOperation, StateRegistration, StateStrategy};
 use chronicle::{RecordId, RecordInput, Store, StoreConfig};
+use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
@@ -72,7 +73,17 @@ fn type_lists_ascend_with_interleaved_types_and_across_a_reopen() {
 fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
-    let newest_layout = {
+    let layout = |compile_id: &str, count: u64| {
+        json!({
+            "compileId": compile_id,
+            "kind": "snapshot",
+            "units": [{"k": "m", "n": count}],
+            "receipt": {"compileId": compile_id, "kind": "baseline", "messages": count}
+        })
+    };
+    let intact_pair = layout("compile-intact", 10);
+    let torn_pair = layout("compile-torn", 11);
+    let (intact_layout, newest_layout) = {
         let store = Store::create(config(&path)).unwrap();
         for i in 0..10 {
             append(&store, if i % 2 == 0 { "layout" } else { "message" }, i);
@@ -80,8 +91,23 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         store.sync().unwrap();
         // Two more layouts; the second is torn below, as a crash mid-append
         // would leave it.
-        append(&store, "layout", 10);
-        append(&store, "layout", 11)
+        let write_layout = |pair: &Value| {
+            store
+                .append(RecordInput::json("layout", pair).unwrap())
+                .unwrap()
+                .id
+        };
+        let intact = write_layout(&intact_pair);
+        let newest = write_layout(&torn_pair);
+        for (id, expected) in [(intact, &intact_pair), (newest, &torn_pair)] {
+            let record = store.get_record(id).unwrap().unwrap();
+            // pins appendJson.11: live lookup returns the layout and its own receipt together.
+            assert_eq!(
+                serde_json::from_slice::<Value>(&record.payload).unwrap(),
+                *expected
+            );
+        }
+        (intact, newest)
     };
     let log_path = path.join("records.log");
     let len = std::fs::metadata(&log_path).unwrap().len();
@@ -96,13 +122,35 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         !store.get_records_by_type("layout").contains(&newest_layout),
         "the torn record is gone"
     );
+    // pins getRecord.13: the saved compile mark resolves to nothing before its ID is reused.
+    // pins appendJson.11: recovery publishes neither part of the torn pair.
+    assert!(store.get_record(newest_layout).unwrap().is_none());
+    let intact = store.get_record(intact_layout).unwrap().unwrap();
+    // pins appendJson.11: recovery still exposes the complete preceding layout and receipt.
+    assert_eq!(
+        serde_json::from_slice::<Value>(&intact.payload).unwrap(),
+        intact_pair
+    );
     assert_ascending(&store, "layout", 6);
     // The torn record's ID is issued again, here to a record of another type,
     // and each list still ascends.
+    let replacement_payload = json!({"compileId": "compile-new", "message": 12});
+    let replacement = store
+        .append(RecordInput::json("message", &replacement_payload).unwrap())
+        .unwrap();
     assert_eq!(
-        append(&store, "message", 12),
-        newest_layout,
+        replacement.id, newest_layout,
         "the torn record's ID is issued again"
+    );
+    let found = store.get_record(newest_layout).unwrap().unwrap();
+    // pins getRecord.13: the saved ID now names the replacement, not the old compile's payload.
+    assert_eq!(
+        (
+            found.id,
+            found.record_type.as_str(),
+            serde_json::from_slice::<Value>(&found.payload).unwrap()
+        ),
+        (newest_layout, "message", replacement_payload)
     );
     append(&store, "layout", 13);
     assert_ascending(&store, "layout", 7);

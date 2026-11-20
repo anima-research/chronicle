@@ -33,6 +33,24 @@ const phaseHolds = () => {
   assert.deepEqual(found, []);
 };
 
+// Give each normalization scenario its own store. Reopen the same path for
+// cold reads without leaving a handle from the warm part of the test open.
+const scenario = (name, run) => {
+  const open = () => JsStore.openOrCreate({ path: path.join(dir, name) });
+  let store = open();
+  const reopen = () => {
+    store.close();
+    store = open();
+    return store;
+  };
+  try {
+    run(store, reopen);
+  } finally {
+    store.close();
+  }
+  ok(name);
+};
+
 try {
   let store = JsStore.openOrCreate({ path: storePath });
   store.registerState({ id: 'snap', strategy: 'snapshot' });
@@ -190,7 +208,134 @@ try {
   store.close();
   ok('after compaction, and a reopen after it, the order holds');
 
-  console.log('\n✅ Key order tests passed!');
+  scenario('JS snapshot replacement preserves caller-owned keys and normalized JSON values', (store) => {
+    const slot = 'checkpoints';
+    store.registerState({ id: slot, strategy: 'snapshot' });
+    const first = { kept: 'root', deleted: 'old', path: ['a', 'b', 'c'] };
+    store.setStateJson(slot, first);
+    // pins setStateJson.1: the first snapshot is the whole supplied value.
+    assert.deepEqual(store.getStateJson(slot), first);
+
+    const patch = [{ op: 'replace', path: '/title', value: 'new' }];
+    const pin = { id: 'p1', firstMessageId: 'a', lastMessageId: 'b', kind: 'pin' }; // no name
+    const limits = { high: Number.MAX_VALUE, low: -Number.MAX_VALUE, tiny: Number.MIN_VALUE, overflow: null };
+    const expected = {
+      kept: 'root', path: ['b', 'a'], destinations: { constructor: 'channel-c' },
+      checkpoint: { patch }, pins: [pin], limits, summary: 'before\ufffdafter',
+    };
+    store.setStateJson(slot, { ...expected, checkpoint: { data: undefined, patch }, summary: 'before\ud800after' });
+    const actual = store.getStateJson(slot);
+    // pins setStateJson.9: an Object.prototype name still denotes an own stored destination.
+    assert.deepEqual([Object.hasOwn(actual.destinations, 'constructor'), actual.destinations.constructor], [true, 'channel-c']);
+    // pins setStateJson.14: an undefined snapshot cannot mask the patch; an unnamed pin survives without a name.
+    assert.deepEqual([Object.hasOwn(actual.checkpoint, 'data'), actual.checkpoint.patch,
+      Object.hasOwn(actual.pins[0], 'name'), actual.pins], [false, patch, false, [pin]]);
+    // pins setStateJson.15: finite JSON boundary numbers and an already-normalized overflow null stay JSON values.
+    assert.deepEqual(actual.limits, { high: Number.MAX_VALUE, low: -Number.MAX_VALUE, tiny: Number.MIN_VALUE, overflow: null });
+    // pins setStateJson.17: the lone half in the middle of the summary becomes U+FFFD at that position.
+    assert.equal(actual.summary, 'before\ufffdafter');
+    // pins setStateJson.1: full replacement drops `deleted`, retains `kept`, and replaces (not merges) `path`.
+    assert.deepEqual(actual, expected);
+  });
+
+  scenario('Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches', (store, reopen) => {
+    const slot = 'agent/context/kvunified:presentation-receipt';
+    store.registerState({ id: slot, strategy: 'snapshot' });
+    // Both destinations are non-default: falling back to main for either
+    // the root or the pinned view cannot accidentally put a write in place.
+    store.createBranch('draft');
+    store.createBranch('revision');
+    store.switchBranch('draft');
+    const draft = store.view('draft');
+    store.switchBranch('revision');
+
+    // Bytes as prepared by the caller, not an object to re-encode: two
+    // different original keys have already been escaped to the same key.
+    const receiptBytes = (level) => Buffer.from(String.raw`{"entries":[[{"level":${level},"café\ufffd":"first","café\ufffd":"last\ufffd","literal":"\\ud800"}]]}`);
+    const receipt = (level) => ({ entries: [[{ level, 'café\ufffd': 'last\ufffd', literal: '\\ud800' }]] });
+    const revisionBytes = receiptBytes(2);
+    const draftBytes = receiptBytes(5);
+    store.setState(slot, revisionBytes);
+    draft.setState(slot, draftBytes);
+    // pins setState.1: the namespaced slot stores the UTF-8 Buffers exactly, duplicate key spellings included.
+    assert.deepEqual([store.getState(slot), draft.getState(slot)], [revisionBytes, draftBytes]);
+    // pins setState.4: decoded normalized keys collide (last wins); U+FFFD and literal backslash text stay distinct.
+    assert.deepEqual(store.getStateJson(slot), receipt(2));
+    store.switchBranch('draft');
+    // pins setState.5: switching back sees the pinned write, without overwriting the switched root's branch.
+    assert.deepEqual([store.getStateJson(slot), store.view('revision').getStateJson(slot)], [receipt(5), receipt(2)]);
+    const cold = reopen();
+    // pins setState.3: reopened byte-written slots still decode with both array levels and their nested fields intact.
+    assert.deepEqual([cold.view('draft').getStateJson(slot), cold.view('revision').getStateJson(slot)], [receipt(5), receipt(2)]);
+  });
+
+  scenario('Append, identity append and prepared byte edit agree on stored JSON normalization', (store, reopen) => {
+    const slot = 'messages';
+    store.registerState({ id: slot, strategy: 'append_log' });
+    store.appendToStateJson(slot, [{ zeta: [2, 1], alpha: 'one', optional: undefined }, 'last']);
+    const first = [{ zeta: [2, 1], alpha: 'one' }, 'last'];
+    // pins appendToStateJson.1: first write to an unseeded log can be a JS array item with a nested optional field.
+    assert.deepEqual(store.getStateItemJson(slot, 0), first);
+
+    store.appendToStateJson(slot, { zeta: 'x\ud800y', optional: undefined, alpha: { low: 'a\udc00b', literal: '\\ud800' } });
+    const plain = { zeta: 'x\ufffdy', alpha: { low: 'a\ufffdb', literal: '\\ud800' } };
+    const warmPoint = store.getStateItemJson(slot, 1);
+    // pins appendToStateJson.9: JS strings with either kind of lone half read back as readable replacement text.
+    assert.deepEqual([warmPoint.zeta, warmPoint.alpha.low], ['x\ufffdy', 'a\ufffdb']);
+
+    const record = store.appendToStateJsonWithIdentity(slot, { zeta: '\udc00!', optional: undefined, alpha: ['\\udc00'] }, 'id', 'sequence');
+    const stamped = { zeta: '\ufffd!', alpha: ['\\udc00'], id: record.id, sequence: Number(record.sequence) };
+    const warmTail = store.getStateItemJson(slot, 2);
+    const checkLog = (full, point, tail, head) => {
+      // pins getStateJson.16: full and point stringifications use the write-order oracle, with omitted optional fields and normalized text.
+      assert.deepEqual([bytesOf(full), bytesOf(point), Object.hasOwn(full[1], 'optional'), Object.hasOwn(point, 'optional')],
+        [bytesOf([head, plain, stamped]), bytesOf(plain), false, false]);
+      // pins appendToStateJsonWithIdentity.13: the stamped tail has exactly the expected serialized shape on point and full reads.
+      assert.deepEqual([bytesOf(tail), bytesOf(full.at(-1)), Object.hasOwn(tail, 'optional'), Object.hasOwn(full.at(-1), 'optional')],
+        [bytesOf(stamped), bytesOf(stamped), false, false]);
+    };
+    checkLog(store.getStateJson(slot), warmPoint, warmTail, first);
+    const warmStrings = [bytesOf(warmPoint), bytesOf(warmTail)];
+
+    // Leave the warm point-read messages in place for comparison with the
+    // cold rebuild; replace only the head, using the caller's prepared bytes.
+    store.editStateItem(slot, 0, Buffer.from(String.raw`{"zeta":"x\ufffdy","literal":"\\ud800","kind":"edited"}`));
+    const edited = { zeta: 'x\ufffdy', literal: '\\ud800', kind: 'edited' };
+    const checkEdit = (handle) => {
+      // pins editStateItem.7: immediately and on replay the prepared replacement escape decodes, while the doubled backslash stays literal.
+      assert.deepEqual([handle.getStateItemJson(slot, 0), handle.getStateJson(slot)[0]], [edited, edited]);
+    };
+    checkEdit(store);
+    const cold = reopen();
+    checkEdit(cold);
+    const rebuilt = cold.getStateJson(slot);
+    checkLog(rebuilt, cold.getStateItemJson(slot, 1), cold.getStateItemJson(slot, 2), edited);
+    // pins getStateItemJson.11: serialization of the actual warm point reads matches the corresponding messages in a fresh rebuild.
+    assert.deepEqual(warmStrings, rebuilt.slice(1).map(bytesOf));
+  });
+
+  scenario('Editing stamped content returns a new canonical point value, not a mutated cached object', (store) => {
+    const slot = 'messages';
+    store.registerState({ id: slot, strategy: 'append_log' });
+    const record = store.appendToStateJsonWithIdentity(slot, { content: [{ text: 'before' }], obsolete: true }, 'id', 'sequence');
+    const stamp = { id: record.id, sequence: Number(record.sequence) };
+    const original = { content: [{ text: 'before' }], obsolete: true, ...stamp };
+    const retained = store.getStateItemJson(slot, 0);
+    const replacement = { content: [{ text: 'edited ✓' }], ...stamp };
+    store.editStateItem(slot, 0, Buffer.from(bytesOf(replacement)));
+    const reread = store.getStateItemJson(slot, 0);
+    // pins editStateItem.2: UTF-8 JSON is the whole message, retaining the supplied identity and dropping the old key.
+    assert.deepEqual(reread, replacement);
+    // pins getStateItemJson.10: point lookup still supplies the append record's id and numeric sequence, not the slot or edit sequence.
+    assert.deepEqual([reread.id, reread.sequence], [record.id, Number(record.sequence)]);
+    // pins editStateItem.15: the new point value is canonical under fresh materialization, and is a distinct object.
+    assert.equal(bytesOf(reread), bytesOf(store.getStateJson(slot)[0]));
+    assert.notStrictEqual(reread, retained);
+    // pins getStateItemJson.12: after the changed slot was read again, its retained old message still has the original contents.
+    assert.deepEqual(retained, original);
+  });
+
+  console.log(`\n✅ Key order tests passed! (${step} passed, 0 failed, 0 skipped)`);
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

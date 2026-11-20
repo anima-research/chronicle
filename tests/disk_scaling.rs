@@ -1,11 +1,12 @@
 //! Disk-growth scaling gates.
 //!
 //! Deterministic CI gates for the superlinear-scaling campaign: total on-disk
-//! bytes must grow (near-)linearly in operation count. Each test runs the same
-//! workload at N and 4N ops and asserts the byte ratio stays well below the
+//! bytes must grow (near-)linearly in operation count. The bulk tests run the same
+//! workload at N and 4N ops and assert the byte ratio stays well below the
 //! quadratic signature (~16x); the ratio for linear growth is ~4x plus
 //! snapshot-cadence overhead. Tables are printed for slope inspection with
-//! `cargo test --test disk_scaling -- --nocapture`.
+//! `cargo test --test disk_scaling -- --nocapture`. The point-update test
+//! measures one ordinary operation at a time, outside snapshot boundaries.
 
 use chronicle::{
     RecordInput, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, TreeEntry,
@@ -262,4 +263,108 @@ fn tree_overwrite_churn_disk_linear() {
         }
     });
     assert_linear("tree_overwrite_churn", &SIZES, &bytes, 5.0);
+}
+
+#[test]
+fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows() {
+    const TARGET: &str = "agent-00000000";
+    // Beyond all operations on either state, so no automatic snapshot falls in a measurement.
+    const SNAPSHOT_EVERY: u64 = 10_000;
+    // Allow a few KiB of framing for a key and a 64-byte hex hash, but not a
+    // copy of the large tree (even just its hashes are >100 KiB).
+    const TREE_BUDGET: u64 = 4 * 1024;
+    let hash = |i: usize| chronicle::Hash::from_bytes(&i.to_le_bytes()).to_hex();
+    let entry = |i| TreeEntry {
+        blob_hash: hash(i),
+        size: 1024,
+        mode: 0o644,
+    };
+
+    for n in [32, 4096] {
+        let dir = TempDir::new().unwrap();
+        let store = create_store(&dir);
+        store
+            .register_state(StateRegistration {
+                id: "tree".into(),
+                strategy: StateStrategy::Tree {
+                    delta_snapshot_every: SNAPSHOT_EVERY,
+                    full_snapshot_every: 1,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        for i in 0..n {
+            store
+                .tree_set("tree", &format!("agent-{i:08}"), &entry(i))
+                .unwrap();
+        }
+        assert_eq!(store.tree_list("tree", None).unwrap().len(), n);
+        assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(entry(0)));
+
+        let before_set = store.stats().unwrap().total_size_bytes;
+        let replacement = entry(10_000);
+        store.tree_set("tree", TARGET, &replacement).unwrap();
+        let after_set = store.stats().unwrap();
+        let set_growth = after_set.total_size_bytes.saturating_sub(before_set);
+        // pins treeSet.14: replacing one existing checkpoint writes only entry-sized data.
+        assert!(
+            set_growth <= TREE_BUDGET,
+            "set in {n}-key tree grew by {set_growth} bytes"
+        );
+        // pins treeSet.14: all keys and their replacements use just the one registered tree.
+        assert_eq!(after_set.state_slot_count, 1);
+        assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(replacement));
+
+        let before_remove = store.stats().unwrap().total_size_bytes;
+        store.tree_remove("tree", TARGET).unwrap();
+        let after_remove = store.stats().unwrap();
+        let remove_growth = after_remove.total_size_bytes.saturating_sub(before_remove);
+        // pins treeRemove.11: one eviction does not write the fleet-wide map.
+        assert!(
+            remove_growth <= TREE_BUDGET,
+            "remove in {n}-key tree grew by {remove_growth} bytes"
+        );
+        // pins treeRemove.11: the eviction leaves just the checkpoint tree registered.
+        assert_eq!(after_remove.state_slot_count, 1);
+        assert_eq!(store.tree_get("tree", TARGET).unwrap(), None);
+        assert_eq!(store.tree_list("tree", None).unwrap().len(), n - 1);
+
+        store
+            .register_state(StateRegistration {
+                id: "log".into(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: SNAPSHOT_EVERY,
+                    full_snapshot_every: 1,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        for i in 0..n {
+            let item = serde_json::to_vec(&json!({"body": hash(i)})).unwrap();
+            store
+                .update_state("log", StateOperation::Append(item))
+                .unwrap();
+        }
+        assert_eq!(store.get_state_len("log").unwrap(), Some(n));
+        let edited = serde_json::to_vec(&json!({"body": hash(10_000)})).unwrap();
+        let edit_record = store
+            .update_state(
+                "log",
+                StateOperation::Edit {
+                    index: 0,
+                    new_value: edited.clone(),
+                },
+            )
+            .unwrap();
+        // Measure the returned record itself (all fields), not total bytes for
+        // appends, edits and snapshot consolidation together.
+        let record_bytes = rmp_serde::to_vec(&edit_record).unwrap().len();
+        // pins editStateItem.14: the edit record scales with the one replacement, not log length.
+        assert!(
+            record_bytes <= 4 * edited.len() + 1024,
+            "edit in {n}-item log returned a {record_bytes}-byte record"
+        );
+        assert_eq!(store.get_state_item("log", 0).unwrap(), Some(edited));
+        assert_eq!(store.get_state_len("log").unwrap(), Some(n));
+    }
 }

@@ -204,6 +204,29 @@ fn open_or_create_refuses_a_directory_holding_other_files_and_writes_nothing() {
 }
 
 #[test]
+fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+
+    // Leave the valid MANIFEST and lock alone. Open takes the lock before
+    // opening the log; a directory there obstructs that open even as root.
+    let log = path.join("records.log");
+    let saved = dir.path().join("saved-log");
+    fs::rename(&log, &saved).unwrap();
+    fs::create_dir(&log).unwrap();
+    let failed = Store::open_or_create(config(&path));
+    assert!(failed.is_err(), "opened a store with an obstructed log");
+
+    fs::remove_dir(&log).unwrap();
+    fs::rename(saved, log).unwrap();
+    // pins openOrCreate.15: the failed factory leaves no lock for the caller to close.
+    let store = Store::open_or_create(config(&path)).expect("immediate reopen after repairing the log");
+    let messages = store.get_state("messages").unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&messages).unwrap(), serde_json::json!([{"n": 1}]));
+}
+
+#[test]
 fn open_or_create_creates_beside_a_finder_ds_store() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("volume");

@@ -252,7 +252,56 @@ try {
   assert.equal(sideBatch.firstOrdinal, 1 + entries.length, 'the side branch does not hold the main batch');
   assert.deepEqual(idSide.getStateItemJson('win', sideBatch.firstOrdinal + 1), stamp({ id: 's2' }, sideBatch.record));
   assert.equal(store.getStateLen('win'), 2 + entries.length, 'main is unchanged');
+  {
+    const peer = store.view('id-side');
+    const cachedLen = idSide.getStateLen('win');
+    const cachedHead = idSide.stateHeadOffset('win');
+    const mainHead = store.stateHeadOffset('win');
+    // sideBatch took the third-op snapshot. Two intervening writes make
+    // this writer's next batch the third operation again.
+    peer.appendManyToStateJson('win', [{ id: 'peer-1' }, { id: 'peer-2' }]);
+    peer.appendToStateJson('win', { id: 'peer-3' });
+    const interveningHead = peer.stateHeadOffset('win');
+    const pre = idSide.stateHeadOffset('win');
+    // pins stateHeadOffset.6: before writing, see the head the intervening writer left.
+    assert.notEqual(pre, cachedHead);
+    assert.equal(pre, interveningHead);
+
+    const rows = [{ id: 's3' }, { id: 's4' }];
+    const landed = idSide.appendManyToStateJsonWithIdentity('win', rows, 'by', 'at');
+    const post = idSide.stateHeadOffset('win');
+    // pins appendManyToStateJsonWithIdentity.6: on return both side handles see the change, main does not.
+    assert.notEqual(post, pre);
+    assert.equal(peer.stateHeadOffset('win'), post);
+    assert.equal(store.stateHeadOffset('win'), mainHead);
+    // pins appendManyToStateJsonWithIdentity.11: the ordinal counts all three peer items, not the two writes.
+    assert.equal(landed.firstOrdinal, cachedLen + 3);
+    assert.deepEqual(peer.getStateItemJson('win', landed.firstOrdinal), stamp({ id: 's3' }, landed.record));
+
+    const updateOf = (id) => JSON.parse(store.getStateUpdateJson(id));
+    const latest = updateOf(store.getRecordIdsByType('state_update').at(-1));
+    assert.equal(latest.state_id, 'win');
+    assert.equal(latest.global_sequence, idSide.currentSequence());
+    assert.ok('DeltaSnapshot' in latest.operation || 'Snapshot' in latest.operation, 'the batch took its due snapshot');
+    const next = peer.appendToStateJson('win', { id: 'after-snapshot' });
+    // pins stateHeadOffset.6: the chain's public predecessor links witness both checks, including the snapshot head.
+    assert.equal(pre, updateOf(landed.record.id).prev_update_offset);
+    assert.notEqual(post, latest.prev_update_offset, 'post is not the batch record that preceded the snapshot');
+    assert.equal(post, updateOf(next.id).prev_update_offset);
+  }
   ok('on a view, an identity batch counts and stamps on the view\'s branch');
+
+  {
+    const observed = () => ({
+      sequence: store.currentSequence(), head: store.currentBranch().head,
+      revision: store.stateHeadOffset('win'), count: store.getStateLen('win'), items: store.getStateJson('win'),
+    });
+    const prior = observed();
+    // pins appendToStateJsonWithIdentity.8: the single form synchronously throws, leaving the log and populated state alone.
+    assert.throws(() => store.appendToStateJsonWithIdentity('win', ['not an object'], 'by', 'at'));
+    assert.deepEqual(observed(), prior);
+  }
+  ok('A refused single stamped append does not advance the log');
 
   const before = store.getStateJson('win');
   store.close();
@@ -261,6 +310,153 @@ try {
   assert.equal(idManifest(), 2);
   store.close();
   ok('the stamped items read back after a reopen');
+
+  // --- inherited stamps and independent presentations ------------------------
+  {
+    const windowPath = path.join(dir, 'sibling-windows');
+    store = JsStore.openOrCreate({ path: windowPath });
+    store.registerState({ id: 'window', strategy: 'append_log' });
+    const seed = { id: 'seed-row' };
+    const shared = [{ id: 'red' }, { id: 'blue' }];
+    const inherited = store.appendToStateJsonWithIdentity('window', { ...seed }, 'by', 'at');
+    const sharedWrite = store.appendManyToStateJsonWithIdentity('window', structuredClone(shared), 'by', 'at');
+    // Identical row IDs on the two siblings: only the presentation record
+    // distinguishes one insertion from the other at this ordinal.
+    const row = { id: 'green' };
+    const batchRows = [{ retract: 'red' }, { id: 'yellow' }];
+    const names = ['left', 'right'];
+    for (const name of names) store.createBranch(name);
+    const writes = names.map((name) => {
+      const view = store.view(name);
+      const single = view.appendToStateJsonWithIdentity('window', { ...row }, 'by', 'at');
+      const batch = view.appendManyToStateJsonWithIdentity('window', structuredClone(batchRows), 'by', 'at');
+      assert.equal(batch.firstOrdinal, 4);
+      return { name, single, batch: batch.record };
+    });
+    assert.equal(writes[0].single.sequence, writes[1].single.sequence);
+    assert.equal(writes[0].batch.sequence, writes[1].batch.sequence);
+    // pins appendManyToStateJsonWithIdentity.12: even at that same ordinal and sequence the returned batch IDs differ.
+    assert.notEqual(writes[0].batch.id, writes[1].batch.id);
+
+    const checkWindows = () => {
+      const writingRecord = (write) => {
+        const record = store.getRecord(write.id);
+        assert.equal(typeof record.id, 'string');
+        assert.equal(typeof record.sequence, 'number');
+        assert.equal(record.id, write.id);
+        assert.equal(record.sequence, write.sequence);
+        return record;
+      };
+      const prefixBatch = writingRecord(sharedWrite.record);
+      const prefix = [stamp(seed, writingRecord(inherited)), ...shared.map((item) => stamp(item, prefixBatch))];
+      const [left, right] = writes.map(({ name, single, batch }) => {
+        const view = store.view(name);
+        const batchRecord = writingRecord(batch);
+        const tail = [stamp(row, writingRecord(single)), ...batchRows.map((item) => stamp(item, batchRecord))];
+        const read = (start, limit) => decode(view.getStateSlice('window', start, limit));
+        const sharedSlice = read(0, 3), divergentSlice = read(3, 3), batchSlice = read(4, 2);
+        const full = view.getStateJson('window');
+        // pins appendManyToStateJsonWithIdentity.7: both full and sliced reads retain each stamped batch row in place.
+        assert.deepEqual(full, [...prefix, ...tail]);
+        assert.deepEqual(divergentSlice, tail);
+        // pins getStateSlice.8: stamps at each slice boundary and on batch peers are those of their writing records.
+        assert.deepEqual(sharedSlice, prefix);
+        assert.deepEqual(batchSlice, tail.slice(1));
+        return { full, sharedSlice, divergentSlice, batchSlice };
+      });
+      // pins getStateSlice.8: equality of the first sliced by recognizes the shared prefix, not independent presentations.
+      assert.equal(left.sharedSlice[0].by, right.sharedSlice[0].by);
+      assert.notEqual(left.divergentSlice[0].by, right.divergentSlice[0].by);
+      assert.notEqual(left.batchSlice[0].by, right.batchSlice[0].by);
+      // pins appendToStateJsonWithIdentity.7: the inherited single retains its by, the two new singles have distinct IDs/stamps.
+      assert.deepEqual([left.full[0].by, right.full[0].by], [inherited.id, inherited.id]);
+      assert.notEqual(writes[0].single.id, writes[1].single.id);
+      assert.notEqual(left.full[3].by, right.full[3].by);
+      // pins appendManyToStateJsonWithIdentity.12: an inherited batch keeps its by while independent batch stamps diverge.
+      assert.deepEqual([left.full[1].by, right.full[1].by], [sharedWrite.record.id, sharedWrite.record.id]);
+      assert.notEqual(left.full[4].by, right.full[4].by);
+    };
+    checkWindows();
+    store.close();
+    store = JsStore.open({ path: windowPath });
+    checkWindows();
+    store.close();
+  }
+  ok('Slices share prefix record stamps but distinguish independent sibling presentations');
+
+  // --- single-write payloads and quarantine ledger references ----------------
+  {
+    const ledgerPath = path.join(dir, 'quarantine');
+    const messages = 'agent/messages';
+    const ledger = 'agent/autobio:compression-refusal-quarantine-events';
+    store = JsStore.openOrCreate({ path: ledgerPath });
+    for (const id of [messages, ledger]) store.registerState({ id, strategy: 'append_log' });
+    const message = {
+      participant: 'user', timestamp: 100,
+      content: [
+        { type: 'text', text: 'Page two' },
+        { type: 'blob_ref', ref: { hash: 'ab'.repeat(32), originalType: 'image', mediaType: 'image/png' } },
+      ],
+      metadata: { source: { id: 'scan', sequence: 99 } },
+      bodyGroupId: 'pages', shardIndex: 1, shardCount: 2, currentResolution: 0, lockedByAgent: false,
+    };
+    const messageWrite = store.appendToStateJsonWithIdentity(messages, structuredClone(message), 'id', 'sequence');
+    const expectedMessage = { ...message, id: messageWrite.id, sequence: messageWrite.sequence };
+    // pins appendToStateJsonWithIdentity.3: the complete message keeps its nested blob reference and shard metadata.
+    assert.deepEqual(store.getStateItemJson(messages, 0), expectedMessage);
+
+    const expectedEvents = [];
+    const writeEvent = (event) => {
+      const record = store.appendToStateJsonWithIdentity(ledger, structuredClone(event), 'eventId', 'sequence');
+      // pins appendToStateJsonWithIdentity.6: synchronous result is the whole writing record, not just its stamps.
+      assert.equal(typeof record.id, 'string');
+      assert.equal(typeof record.sequence, 'number');
+      assert.equal(record.recordType, 'state_update');
+      assert.deepEqual(record, store.getRecord(record.id));
+      const item = store.getStateItemJson(ledger, expectedEvents.length);
+      // pins appendToStateJsonWithIdentity.4: these arguments select eventId and sequence on the top-level object.
+      assert.deepEqual([item.eventId, item.sequence], [record.id, record.sequence]);
+      // pins appendToStateJsonWithIdentity.15: each stamped event can supply a nonempty ID for a later ledger write.
+      assert.ok(item.eventId.length > 0);
+      expectedEvents.push({ ...event, eventId: record.id, sequence: record.sequence });
+      return record;
+    };
+    const key = 'chunk/family';
+    const exhaustion = (created) => ({
+      kind: 'exhausted', key, created,
+      record: { key, created, chunkSourceHash: 'chunk', sourceIds: [messageWrite.id],
+        plan: [{ parentId: 'root', childIds: ['a', 'b'], requestHash: 'bounded' }] },
+      outcomes: [{ curveLabel: 'canonical', requestHash: 'bounded', outcome: 'admission_rejected' }],
+    });
+    const first = writeEvent(exhaustion(101));
+    writeEvent({ kind: 'clear', key, created: 102, targetClaimId: first.id });
+    const event = exhaustion(103);
+    const second = writeEvent(event);
+    const pending = writeEvent({ kind: 'alert_pending', key, created: 104, targetClaimId: second.id, alertKey: key });
+    writeEvent({ kind: 'checkpoint', key: '__checkpoint__', created: 105, active: [{
+      generationId: second.id, record: event.record, outcomes: event.outcomes,
+      pendingAlert: { eventId: pending.id, alertKey: key }, sentAlertKeys: [],
+    }] });
+    writeEvent({ kind: 'alert_sent', key, created: 106, targetClaimId: second.id, alertKey: key, pendingEventId: pending.id });
+
+    store.close();
+    store = JsStore.open({ path: ledgerPath });
+    const replayed = store.getStateJson(ledger);
+    // pins appendToStateJsonWithIdentity.3: only the requested stamps are added; the nested records, outcomes and checkpoint survive.
+    assert.deepEqual(replayed, expectedEvents);
+    assert.deepEqual(store.getStateJson(messages), [expectedMessage]);
+    const [old, clear, current, alert, checkpoint, sent] = replayed;
+    // pins appendToStateJsonWithIdentity.15: replay keeps the exact old/new generation and acknowledged pending-event IDs.
+    assert.notEqual(old.eventId, current.eventId);
+    assert.notEqual(current.eventId, alert.eventId);
+    assert.equal(clear.targetClaimId, old.eventId);
+    assert.equal(alert.targetClaimId, current.eventId);
+    assert.equal(sent.targetClaimId, current.eventId);
+    assert.equal(sent.pendingEventId, alert.eventId);
+    assert.equal(checkpoint.active[0].pendingAlert.eventId, alert.eventId);
+    store.close();
+  }
+  ok('Quarantine generation links name complete identity writes after replay');
 
   // --- a write whose own snapshot fails --------------------------------------
   // A write that reaches the state's snapshot cadence takes the snapshot
@@ -344,7 +540,7 @@ try {
   store.close();
   ok('the snapshot a failure left due is taken by the next write that can take it');
 
-  console.log('\n✅ All batch tests passed!');
+  console.log(`\n✅ All batch tests passed! (${step} passed, 0 failed, 0 skipped)`);
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

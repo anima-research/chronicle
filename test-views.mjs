@@ -89,6 +89,22 @@ try {
   assert.equal(itemCount(store), 3);
   ok('currentSequence/query/listStates on a view use the pinned branch; sibling sequences overlap, ids do not');
 
+  // --- a head probe is a read, regardless of which handle receives it ---
+  {
+    const heads = () => new Map(store.listBranches().map(({ name, head }) => [name, head]));
+    const before = heads();
+    const count = store.stats().recordCount;
+    const selected = store.currentBranch().id;
+    assert.notEqual(before.get('main'), before.get('a'));
+    for (let i = 0; i < 3; i++) {
+      // pins currentSequence.10: each probe returns its handle's unadvanced head
+      assert.deepEqual([store.currentSequence(), va.currentSequence()], [before.get('main'), before.get('a')]);
+    }
+    // pins currentSequence.10: neither probe writes a record, moves a head, or selects the view
+    assert.deepEqual([store.stats().recordCount, heads(), store.currentBranch().id], [count, before, selected]);
+    ok('Head probes on root and view leave both histories untouched');
+  }
+
   // Auto-snapshots (delta every 5) happened on the views' branches and the
   // values still reconstruct from the log after the caches are bypassed.
   assert.deepEqual(JSON.parse(va.getStateAt('messages', va.currentSequence()).toString()).map((m) => m.text), texts(va));
@@ -130,8 +146,97 @@ try {
     again.editStateItem('messages', 0, Buffer.from(JSON.stringify({ text: 'm0-again' }))); // count-preserving edit
     assert.notEqual(store.stateHeadOffset('messages'), key, 'an edit through the other handle moves the key');
     assert.notEqual(va.stateHeadOffset('messages'), store.stateHeadOffset('messages'), 'branches that diverged differ');
+    // pins view.7: the other already-open handle sees both the edit and the writer's new revision
+    assert.deepEqual(
+      [store.getStateItemJson('messages', 0), store.stateHeadOffset('messages')],
+      [{ text: 'm0-again' }, again.stateHeadOffset('messages')],
+    );
     // Put m0 back so the later steps see the value they expect.
     again.editStateItem('messages', 0, Buffer.from(JSON.stringify({ text: 'm0-main-edit' })));
+
+    const slot = 'agent-one/window';
+    const other = 'agent-two/window';
+    for (const id of [slot, other]) {
+      // On `slot` the seventh write will be a batch followed by a full snapshot.
+      store.registerState({ id, strategy: 'append_log', deltaSnapshotEvery: 7, fullSnapshotEvery: 1 });
+    }
+    const seed = ['first', 'second', 'third'];
+    store.appendManyToStateJson(slot, seed);
+    const seedKey = store.stateHeadOffset(slot);
+    const otherRows = ['other-a', 'other-b', 'other-c', 'other-d'];
+    store.appendManyToStateJson(other, otherRows);
+    const otherKey = store.stateHeadOffset(other);
+    // pins stateHeadOffset.1: one exact qualified ID per synchronous call, even with a shared basename
+    assert.deepEqual([typeof seedKey, typeof otherKey, seedKey !== otherKey, again.stateHeadOffset(slot)],
+      ['number', 'number', true, seedKey]);
+    const peer = store.view(store.createBranch('revision-peer').name);
+    // pins stateHeadOffset.10: a fork still sharing the parent's chain has its key
+    assert.equal(peer.stateHeadOffset(slot), seedKey);
+
+    const update = record => JSON.parse(store.getStateUpdateJson(record.id));
+    const observe = (record, previousKey, value) => {
+      const next = store.stateHeadOffset(slot);
+      assert.equal(again.stateHeadOffset(slot), next);
+      // pins stateHeadOffset.3: the next same-slot write links back to the exact head we sampled
+      assert.equal(update(record).prev_update_offset, previousKey);
+      assert.deepEqual([store.getStateJson(slot), again.getStateJson(slot)], [value, value]);
+      assert.deepEqual([store.stateHeadOffset(other), again.stateHeadOffset(other), store.getStateJson(other)],
+        [otherKey, otherKey, otherRows]);
+      assert.deepEqual([peer.stateHeadOffset(slot), peer.getStateJson(slot)], [seedKey, seed]);
+      return next;
+    };
+    const stamped = again.appendToStateJsonWithIdentity(slot, { text: 'added' }, 'id', 'seq');
+    const stampedKey = observe(stamped, seedKey, [...seed, { text: 'added', id: stamped.id, seq: stamped.sequence }]);
+    // pins appendToStateJsonWithIdentity.10: a single stamped append through the view moves the shared key
+    assert.notEqual(stampedKey, seedKey);
+    const replaced = ['a', 'b', 'c', 'd'];
+    const replacedKey = observe(again.setStateJson(slot, replaced), stampedKey, replaced);
+    // pins setStateJson.11: a same-length replacement through the view changes the root's slot revision
+    assert.notEqual(replacedKey, stampedKey);
+    const sameKey = observe(again.setStateJson(slot, replaced), replacedKey, replaced);
+    // pins stateHeadOffset.3: even an identical-value set has its own chain head
+    assert.notEqual(sameKey, replacedKey);
+    const editKey = observe(again.editStateItem(slot, 0, Buffer.from('"edited"')), sameKey, ['edited', 'b', 'c', 'd']);
+    assert.notEqual(editKey, sameKey);
+    const redactKey = observe(again.redactStateItems(slot, 1, 4), editKey, ['edited']);
+    // pins redactStateItems.6: both live handles see the same changed key immediately after redaction
+    assert.deepEqual([redactKey !== editKey, again.stateHeadOffset(slot)], [true, redactKey]);
+    // pins redactStateItems.1: neither the other qualified slot nor the inherited slot on the fork was redacted
+    assert.deepEqual([store.getStateJson(other), peer.getStateJson(slot)], [otherRows, seed]);
+
+    const preBatch = store.stateHeadOffset(slot); // the intervening writer was `again`
+    const batch = store.appendManyToStateJson(slot, ['tail-1', 'tail-2']).record;
+    const postBatch = store.stateHeadOffset(slot); // sample before any other read or write
+    // pins stateHeadOffset.6: the reader's check just before its write is the actual predecessor it got
+    assert.equal(preBatch, update(batch).prev_update_offset);
+    const latest = JSON.parse(store.getStateUpdateJson(store.getRecordIdsByType('state_update').at(-1)));
+    assert.equal(latest.state_id, slot);
+    assert.ok(latest.operation.Snapshot, 'the batch reached the full-snapshot cadence');
+    // pins stateHeadOffset.3: the kept head is not the batch record to which the generated snapshot links
+    assert.notEqual(postBatch, latest.prev_update_offset);
+    assert.equal(observe(batch, redactKey, ['edited', 'tail-1', 'tail-2']), postBatch);
+    const mainEdit = again.editStateItem(slot, 1, Buffer.from('"main-only"'));
+    // pins stateHeadOffset.6: the immediate post-batch sample is the final (snapshot) record kept
+    assert.equal(update(mainEdit).prev_update_offset, postBatch);
+    const mainKey = observe(mainEdit, postBatch, ['edited', 'main-only', 'tail-2']);
+    peer.editStateItem(slot, 1, Buffer.from('"peer-only"'));
+    const peerKey = peer.stateHeadOffset(slot);
+    assert.deepEqual(peer.getStateJson(slot), ['first', 'peer-only', 'third']);
+    assert.notEqual(peerKey, seedKey, 'the peer no longer shares the inherited key');
+    assert.equal(again.getStateLen(slot), peer.getStateLen(slot));
+    // pins stateHeadOffset.10: divergent window edits of equal-length indexes do not alias
+    assert.notEqual(mainKey, peerKey);
+    store.switchBranch('revision-peer');
+    // pins switchBranch.6: a root revision probe follows checkout in both directions, without a write
+    assert.equal(store.stateHeadOffset(slot), peerKey);
+    store.switchBranch('main');
+    assert.equal(store.stateHeadOffset(slot), mainKey);
+    // After the round trip, independently verify the final samples on each chain.
+    for (const [handle, id, head] of [[again, slot, mainKey], [peer, slot, peerKey], [again, other, otherKey]]) {
+      const next = handle.appendToStateJson(id, 'next');
+      // pins stateHeadOffset.3: the next same-slot update names the independently sampled head
+      assert.equal(update(next).prev_update_offset, head);
+    }
     ok('stateHeadOffset is an exact, handle-independent revision key');
   }
 
@@ -290,7 +395,138 @@ try {
   reopened.close();
   ok('root close() closes every view and releases the lock with views still referenced; view-written branches persist');
 
-  console.log('\n✅ All view tests passed!');
+  // --- a shared cursor on two divergent histories ------------------------
+  {
+    const root = JsStore.openOrCreate({ path: path.join(dir, 'checkout') });
+    const observer = root; // another caller holding the same root, not a branch-bound view
+    root.registerState({ id: 'messages', strategy: 'append_log' });
+    root.registerState({ id: 'cfg/model', strategy: 'snapshot' });
+    root.appendToStateJson('messages', { text: 'inherited' });
+    root.setStateJson('cfg/model', 'source');
+    const target = root.createBranch('recovery');
+    const source = root.view('main');
+    const dest = root.view('recovery');
+    const first = root.appendToStateJson('messages', { text: 'source-1' });
+    assert.equal(dest.appendToStateJson('messages', { text: 'dest-1' }).sequence, first.sequence);
+    root.appendToStateJson('messages', { text: 'source-2' });
+    dest.appendToStateJson('messages', { text: 'dest-2' });
+    const last = dest.setStateJson('cfg/model', 'destination');
+    const sourceId = source.currentBranch().id;
+    const destHead = dest.currentBranch().head;
+    assert.ok(destHead > source.currentBranch().head && destHead > target.branchPoint);
+    const saved = observer.currentBranch();
+    // pins currentBranch.2: before checkout the same observer reports main and reads its state
+    assert.deepEqual([saved.id, saved.name, observer.getStateJson('cfg/model')], [sourceId, 'main', 'source']);
+    const point = h => h.getStateItemJson('messages', 1);
+    // pins getStateItemJson.5: the same root and ordinal read the source before checkout
+    assert.deepEqual(point(observer), { text: 'source-1' });
+
+    root.switchBranch('recovery');
+    // pins switchBranch.2: the very next call on the existing root sees the requested name
+    assert.equal(root.currentBranch().name, 'recovery');
+    // pins isClosed.4: false permits an immediate live branch read rather than the old cached name
+    assert.equal(observer.isClosed(), false);
+    const cachedName = observer.currentBranch().name;
+    assert.equal(cachedName, 'recovery');
+    const fresh = observer.currentBranch();
+    // pins currentBranch.10: a saved result describes its call, while a fresh result describes this one
+    assert.deepEqual([saved.id, saved.name, fresh.id, fresh.name], [sourceId, 'main', target.id, 'recovery']);
+    // pins currentBranch.2: the root reports its new read/write selection, the view its own
+    assert.deepEqual([fresh.id, observer.getStateJson('cfg/model'), source.currentBranch().id, source.getStateJson('cfg/model')],
+      [target.id, 'destination', sourceId, 'source']);
+    // pins getStateItemJson.5: the same ordinal now resolves to the divergent destination item
+    assert.deepEqual(point(observer), { text: 'dest-1' });
+    // pins switchBranch.5: checkout exposes the destination's independently observed latest head and state
+    assert.deepEqual([root.currentSequence(), root.getStateJson('cfg/model')], [destHead, 'destination']);
+    // pins currentSequence.2: even the non-message tail write is included on the switched non-main root
+    assert.deepEqual([observer.currentSequence(), fresh.head], [last.sequence, last.sequence]);
+    const history = h => h.getStateJsonAt('messages', first.sequence).map(m => m.text);
+    // pins getStateJsonAt.2: the identical past sequence resolves independently on both views and the switched root
+    assert.deepEqual([history(source), history(dest), history(observer)],
+      [['inherited', 'source-1'], ['inherited', 'dest-1'], ['inherited', 'dest-1']]);
+
+    observer.redactStateItems('messages', 0, 1);
+    // pins switchBranch.7: the root's removal took effect on the recovery fork
+    assert.deepEqual(texts(dest), ['dest-1', 'dest-2']);
+    source.appendToStateJson('messages', { text: 'through-source-view' });
+    // pins switchBranch.4: the other root reference followed checkout, but the old view still writes and reads main
+    assert.deepEqual([observer.currentBranch().id, texts(observer), source.currentBranch().name, texts(source)],
+      [target.id, ['dest-1', 'dest-2'], 'main', ['inherited', 'source-1', 'source-2', 'through-source-view']]);
+    root.switchBranch('main');
+    // pins switchBranch.7: switching back recovers the unremoved inherited row and the pinned write
+    assert.deepEqual(texts(observer), ['inherited', 'source-1', 'source-2', 'through-source-view']);
+    root.close();
+    const closed = observer.isClosed();
+    // pins isClosed.4: true is the signal to use only the caller's last known name
+    assert.equal(closed, true);
+    assert.equal(closed ? cachedName : observer.currentBranch().name, 'recovery');
+    ok('A checkout changes the shared cursor, not saved branch objects or pinned views');
+  }
+
+  // --- same-branch updates and checkout on an already warmed reader -----
+  {
+    const reader = JsStore.openOrCreate({ path: path.join(dir, 'warm-reader') });
+    const ids = ['messages', 'agent/messages'];
+    const rows = (...texts) => texts.map(text => ({ text }));
+    const initial = [rows('bare-0', 'bare-1'), rows('qualified-0', 'qualified-1')];
+    for (const [i, id] of ids.entries()) {
+      reader.registerState({ id, strategy: 'append_log' });
+      reader.appendManyToStateJson(id, initial[i]);
+    }
+    const writer = reader.view('main');
+    const divergent = reader.view(reader.createBranch('divergent').name);
+    // Match the final lengths on main but not the contents, including the tail of either slot.
+    const onFork = [rows('fork-0', 'fork-1', 'fork-2'), rows('fq-0', 'fq-1', 'fq-2', 'fq-3')];
+    for (const [i, id] of ids.entries()) divergent.setStateJson(id, onFork[i]);
+
+    const held = new Map(); // previous (offset, value) for each slot on this reader
+    const checkReads = model => {
+      // pins getStateItemJson.2: bare and slash-qualified names resolve to distinct rows at ordinal zero
+      assert.deepEqual(ids.map(id => reader.getStateItemJson(id, 0)), model.map(list => list[0]));
+      for (const [i, id] of ids.entries()) {
+        const expected = model[i];
+        const len = reader.getStateLen(id);
+        // pins getStateLen.11: stable on an unchanged list, updated on this reader after the writer's appends
+        assert.deepEqual([len, reader.getStateLen(id)], [expected.length, expected.length]);
+        const slice = JSON.parse(reader.getStateSlice(id, 1, len - 1).toString());
+        // pins getStateItemJson.8: every edited point and newly appended suffix item is immediately readable
+        assert.deepEqual(expected.map((_, ordinal) => reader.getStateItemJson(id, ordinal)), expected);
+        const before = reader.stateHeadOffset(id);
+        const full = reader.getStateJson(id);
+        const after = reader.stateHeadOffset(id);
+        const repeat = reader.getStateJson(id);
+        // pins getStateJson.17: a full read does not change the revision, and repeated reads at that revision agree
+        assert.deepEqual([after, reader.stateHeadOffset(id), repeat], [before, before, full]);
+        const cached = held.get(id);
+        // pins getStateJson.17: reusing a held full value on an equal key cannot hide an intervening change
+        assert.deepEqual(cached && cached.key === before ? cached.value : repeat, expected);
+        held.set(id, { key: after, value: structuredClone(full) });
+        // pins getStateJson.2: the warmed full read agrees with the current branch model, not an older mirror
+        assert.deepEqual(full, expected);
+        // pins getStateSlice.3: the named slot's decoded slice tracks its current length and whole-state read
+        assert.deepEqual(slice, full.slice(1, len));
+      }
+    };
+    checkReads(initial);
+    const beforeEdit = reader.stateHeadOffset('messages');
+    writer.editStateItem('messages', 0, Buffer.from(JSON.stringify({ text: 'edited' })));
+    const edited = reader.getStateItemJson('messages', 0);
+    const editKey = reader.stateHeadOffset('messages');
+    // pins view.7: the already-open reader sees the count-preserving edit and the same new key as the writer
+    assert.deepEqual([edited, editKey !== beforeEdit, editKey], [{ text: 'edited' }, true, writer.stateHeadOffset('messages')]);
+    writer.redactStateItems('messages', 1, 2);
+    // pins getStateJson.2: even before a suffix lands, a warmed full read sees the edit and removal
+    assert.deepEqual(reader.getStateJson('messages'), rows('edited'));
+    const suffixes = [rows('bare-tail-0', 'bare-tail-1'), rows('qualified-tail-0', 'qualified-tail-1')];
+    for (const [i, id] of ids.entries()) writer.appendManyToStateJson(id, suffixes[i]);
+    checkReads([[...rows('edited'), ...suffixes[0]], [...initial[1], ...suffixes[1]]]);
+    reader.switchBranch('divergent');
+    checkReads(onFork);
+    reader.close();
+    ok('A warmed root sees same-branch edits and suffix writes before following a divergent checkout');
+  }
+
+  console.log(`\n✅ All view tests passed! (${step} passed, 0 failed, 0 skipped)`);
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }

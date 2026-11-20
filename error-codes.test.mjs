@@ -1,5 +1,6 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -77,11 +78,31 @@ test("the store's errors carry their kind", () => {
     ErrorCode.InvalidSequence,
     /^Invalid sequence: Seq\(\d+\) \(head is Seq\(\d+\)\)$/,
   );
-  store.setState('notes', Buffer.from('not json'));
+  const foreign = Buffer.from([0xff, 0, 0x61]);
+  store.setState('notes', foreign);
+  // pins getStateJson.19: foreign snapshot bytes fail the JSON read before the raw probe.
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  const raw = store.getState('notes');
+  // pins getState.3: the raw read of even a non-JSON snapshot returns a Buffer.
+  assert.ok(Buffer.isBuffer(raw));
+  // pins getState.3: preserve all its bytes, including invalid UTF-8.
+  assert.deepEqual(raw, foreign);
+  // pins getStateJson.19: the probe of the same ID identifies unparseable content, not an empty index.
+  assert.throws(() => JSON.parse(raw.toString('utf8')), SyntaxError);
   throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
   store.registerState({ id: 'items', strategy: 'append_log' });
   store.appendToState('items', Buffer.from('not json'));
+  // pins getStateJson.6: a failure reconstructing the full log throws synchronously, not a miss.
+  assert.throws(() => store.getStateJson('items'));
+  // pins getState.2: the raw probe's own failure reaches the caller before getState returns.
+  assert.throws(() => store.getState('items'), (error) => {
+    // pins getStateJson.19: the raw probe after the failed JSON read identifies an unreadable chain.
+    // pins getState.5: WindowIndex recognizes the raw failure by its prefix, space included.
+    assert.match(error.message, /^Deserialization error: /);
+    return true;
+  });
+  // pins getStateTail.8: the unreadable tail isn't reported as an empty history.
+  assert.throws(() => store.getStateTail('items', 1));
   throwsCoded(() => store.getStateItemJson('items', 0), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.getStateItemsJson('items', [0]), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.deleteBranch('main'), ErrorCode.InvalidOperation, 'Invalid operation: Cannot delete main branch');
@@ -188,7 +209,35 @@ test("batched appends, and create or openOrCreate where something is already the
 test('a second open of a store in use is Locked', () => {
   const { store, dir } = freshStore();
   throwsCoded(() => JsStore.open({ path: dir }), ErrorCode.Locked, 'Store is locked by another process');
-  store.close();
+
+  const probeFromChild = () => execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { ErrorCode, JsStore } from './index.js';
+    const [held, independent] = process.argv.slice(1);
+    // pins open.7: an inspection open cannot share the live parent's lock.
+    assert.throws(() => JsStore.open({ path: held }), { code: ErrorCode.Locked });
+    // pins openOrCreate.4: no independent writer on the held path, even in another process.
+    assert.throws(() => JsStore.openOrCreate({ path: held }), { code: ErrorCode.Locked });
+    const other = JsStore.openOrCreate({ path: independent });
+    const payload = Buffer.from('independent write');
+    const record = other.append('note', payload);
+    // pins openOrCreate.4: another store remains writable while the parent holds its lock.
+    assert.deepEqual(other.getRecord(record.id).payload, payload);
+    other.close();
+  `, dir, join(dir, '..', 'other')], { cwd: import.meta.dirname, timeout: 30_000 });
+
+  try {
+    probeFromChild();
+  } finally {
+    store.close();
+  }
+  // Releasing the writer admits an inspector, which must take the lock too.
+  const inspector = JsStore.open({ path: dir });
+  try {
+    probeFromChild();
+  } finally {
+    inspector.close();
+  }
 });
 
 const owners = [['the root', (store) => store], ['a view', (store) => store.view('main')]];
@@ -438,7 +487,25 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
 
   const content = randomBytes(100_000);
   const hash = createHash('sha256').update(content).digest('hex');
-  mkdirSync(join(dir, 'blobs', hash.slice(0, 2), hash), { recursive: true });
+  const shard = join(dir, 'blobs', hash.slice(0, 2));
+  const destination = join(shard, hash);
+
+  // A file in place of the shard obstructs the path at the OS level. The
+  // directory at the destination below is refused by Chronicle itself.
+  writeFileSync(shard, 'not a directory');
+  const osError = thrownBy(() => writeFileSync(destination, content));
+  const systemFailure = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
+  const posixMessage = new RegExp(`^IO error: .*\\(os error ${Math.abs(osError.errno)}\\)$`, 's');
+  const hasErrnoCode = typeof systemFailure.code === 'string' && /^E[A-Z0-9]+$/.test(systemFailure.code);
+  // pins storeBlob.9: workspace uses a conventional errno code first, else the full POSIX diagnostic.
+  assert.ok(
+    hasErrnoCode ? systemFailure.code === osError.code :
+      process.platform !== 'win32' && systemFailure instanceof Error && posixMessage.test(systemFailure.message),
+    `expected ${osError.code} or ${posixMessage}, got ${systemFailure.code}: ${systemFailure.message}`,
+  );
+  rmSync(shard);
+
+  mkdirSync(destination, { recursive: true });
   const failed = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
   assert.equal(failed.code, ErrorCode.Io);
   for (const chunked of [false, true]) {
@@ -469,8 +536,19 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
   for (const [i, content] of contents.entries()) {
     hashes.push(await store.storeBlobAsync(content, 'application/octet-stream', { chunked: i < 3 }));
   }
-  store.close();
   const blobFile = (hash) => join(dir, 'blobs', hash.slice(0, 2), hash);
+  const otherWholeFile = readFileSync(blobFile(hashes[3]));
+  const coldCases = [
+    ['truncated', (path, saved) => writeFileSync(path, saved.subarray(0, -1))],
+    ['bad format', (path) => writeFileSync(path, 'not a blob file')],
+    ['wrong digest', (path) => writeFileSync(path, otherWholeFile)],
+    ['missing', (path) => rmSync(path)],
+  ].map(([kind, damage]) => {
+    const content = Buffer.from(kind);
+    const hash = store.storeBlob(content, 'text/plain');
+    return { kind, content, hash, damage };
+  });
+  store.close();
   const firstChunk = (hash) => {
     const list = readFileSync(blobFile(hash));
     const at = 19 + list.readUInt16LE(5);
@@ -491,7 +569,40 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
   throwsCoded(() => reopened.getBlob(hashes[1]), ErrorCode.InvalidFormat, /is damaged: its checksum doesn't match/);
   throwsCoded(() => reopened.getBlob(hashes[2]), ErrorCode.InvalidFormat, /names the chunk [0-9a-f]{64}, which isn't stored/);
   throwsCoded(() => reopened.getBlob(hashes[3]), ErrorCode.ChecksumMismatch, /.+/);
+  writeFileSync(blobFile(hashes[3]), otherWholeFile);
+  // pins getBlob.14: repair after a read error needs no intervening store call or reopen.
+  assert.deepEqual(reopened.getBlob(hashes[3]), contents[3]);
+
+  for (const { kind, content, hash, damage } of coldCases) {
+    const path = blobFile(hash);
+    const good = readFileSync(path);
+    damage(path, good);
+    if (kind === 'missing') {
+      // pins getBlob.14: start the retry from an observed miss on this handle.
+      assert.equal(reopened.getBlob(hash), null);
+    } else {
+      // pins getBlob.12: a cold read of each damaged whole file throws, never a partial hit or miss.
+      assert.throws(() => reopened.getBlob(hash), (error) => {
+        // pins isClosed.5: the catch-path probe doesn't replace the read error and reports an open store.
+        assert.equal(reopened.isClosed(), false, kind);
+        const reason = error instanceof Error ? error.message : String(error);
+        // pins getBlob.12: workspace has a printable reason for the unreadable copy.
+        assert.match(reason, /[^\s\p{C}]/u, kind);
+        return true;
+      }, kind);
+    }
+    writeFileSync(path, good);
+    // pins getBlob.14: external restoration suffices on the same handle, after a miss or an error.
+    assert.deepEqual(reopened.getBlob(hash), content, kind);
+  }
+
   reopened.close();
+  // pins getBlob.13: read the same valid hash after close and catch the synchronous refusal.
+  assert.throws(() => reopened.getBlob(coldCases.at(-1).hash), () => {
+    // pins isClosed.5: the same catch-path probe now reports closure, without throwing instead.
+    assert.equal(reopened.isClosed(), true);
+    return true;
+  });
 });
 
 test('opening a store that is not there is InvalidFormat', () => {

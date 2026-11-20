@@ -128,6 +128,9 @@ fn crash_writer() {
     };
     let path = Path::new(&path);
     let scenario = std::env::var("CHRONICLE_CRASH_SCENARIO").unwrap();
+    if let Some(point) = scenario.strip_prefix("checkpoint/") {
+        crash_from_checkpoint(path, point);
+    }
     if scenario == "reopen" {
         let store = Store::open(config(path)).unwrap();
         assert_eq!(store.get_state_len("items").unwrap(), Some(10));
@@ -932,4 +935,481 @@ fn generic_appends_cannot_forge_internal_state_updates() {
     let store = open_store(dir.path()).unwrap();
     assert_eq!(store.stats().unwrap().record_count, 0);
     assert_eq!(value(&store, "items"), Value::Null);
+}
+
+const TABLE: &str = "mcpl/coalescing";
+const JOURNAL: &str = "mcpl/coalescing-journal";
+
+fn journal_items() -> [Value; 2] {
+    [
+        json!({"subject": "z", "record": null, "seq": 401}),
+        json!({"subject": "a", "record": {"subject": "a"}, "seq": 402}),
+    ]
+}
+
+fn compacted_table() -> Value {
+    json!({"version": 1, "subjects": [{"subject": "a"}], "receipts": [], "journal": 402})
+}
+
+fn chunk(id: usize, marked: bool) -> Value {
+    let mut row = json!({"id": id, "compressed": marked});
+    if marked {
+        row["summaryId"] = json!("s");
+    }
+    row
+}
+
+fn entry(hash: &str, size: u64, mode: u32) -> TreeEntry {
+    TreeEntry {
+        blob_hash: hash.into(),
+        size,
+        mode,
+    }
+}
+
+fn old_entry() -> TreeEntry {
+    entry("old", 20, 0o600)
+}
+
+fn adopted_entry() -> TreeEntry {
+    entry("adopted", 300, 0o755)
+}
+
+// Only in crash_writer, never in the process running the tests: let the
+// log grow by a byte, then have the kernel refuse the rest of the write.
+#[cfg(unix)]
+fn interrupt_next_append(path: &Path) {
+    let limit = (std::fs::metadata(path.join("records.log")).unwrap().len() + 1) as libc::rlim_t;
+    let rlimit = libc::rlimit {
+        rlim_cur: limit,
+        rlim_max: limit,
+    };
+    // SAFETY: ignore the size-limit signal in this disposable writer; the
+    // initialized rlimit lives through the system call.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit), 0);
+    }
+}
+
+const TYPED_RECORDS: [(&str, &str); 5] = [
+    ("round", "prefix"),
+    ("journal", "received"),
+    ("round", "accepted one"),
+    ("journal", "applied"),
+    ("round", "accepted two"),
+];
+
+fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
+    let store = open_store(path).unwrap();
+    store.set_auto_snapshot(false);
+    match point {
+        "restore-source" => {
+            assert_eq!(store.current_branch().name, "child");
+            store.switch_branch("source").unwrap();
+            store.sync().unwrap();
+        }
+        "watermark" | "cleared" => {
+            for item in journal_items() {
+                append(&store, JOURNAL, item);
+            }
+            set(&store, TABLE, compacted_table());
+            if point == "cleared" {
+                set(&store, JOURNAL, json!([]));
+            }
+        }
+        point if point.starts_with("mark-") => {
+            let count: usize = point[5..].parse().unwrap();
+            append(&store, "summaries", json!({"id": "s", "sources": [0, 2]}));
+            for index in [0, 2].into_iter().take(count) {
+                store
+                    .update_state(
+                        "chunks",
+                        StateOperation::Edit {
+                            index,
+                            new_value: serde_json::to_vec(&chunk(index, true)).unwrap(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        point if point.starts_with("adopt-") => {
+            let (op, boundary) = point[6..].split_once('-').unwrap();
+            assert_eq!(store.current_branch().name, "workspace");
+            assert_eq!(store.tree_get("files", "tool").unwrap(), Some(old_entry()));
+            if boundary != "before" {
+                #[cfg(unix)]
+                if boundary == "failed" {
+                    interrupt_next_append(path);
+                }
+                let result = match op {
+                    "set" => store.tree_set("files", "tool", &adopted_entry()),
+                    "remove" => store.tree_remove("files", "tool"),
+                    other => panic!("unknown adoption {other}"),
+                };
+                if boundary == "failed" {
+                    result.unwrap_err();
+                } else {
+                    result.unwrap();
+                }
+                let got = store.tree_get("files", "tool").unwrap();
+                if op == "set" {
+                    // pins treeSet.10: immediate readback is a complete old or new tuple.
+                    assert_eq!(
+                        got,
+                        Some(if boundary == "failed" {
+                            old_entry()
+                        } else {
+                            adopted_entry()
+                        })
+                    );
+                } else {
+                    // pins treeRemove.8: a refused removal still reads present; a landed one absent.
+                    assert_eq!(
+                        got,
+                        if boundary == "failed" {
+                            Some(old_entry())
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+            // No separate completion append on any path.
+        }
+        "redact" | "redact-refused" => {
+            let mut rows = value(&store, "messages");
+            #[cfg(unix)]
+            if point == "redact-refused" {
+                interrupt_next_append(path);
+            }
+            let result =
+                store.update_state("messages", StateOperation::Redact { start: 1, end: 4 });
+            if point == "redact-refused" {
+                result.unwrap_err();
+            } else {
+                result.unwrap();
+                rows.as_array_mut().unwrap().drain(1..4);
+            }
+            // pins redactStateItems.8: immediate readback exposes the whole splice or the untouched group.
+            assert_eq!(value(&store, "messages"), rows);
+        }
+        "typed-tail" => {
+            let mut ids = Vec::new();
+            for &(kind, text) in &TYPED_RECORDS[1..4] {
+                ids.push(
+                    store
+                        .append(RecordInput::raw(kind, text.as_bytes().to_vec()))
+                        .unwrap()
+                        .id,
+                );
+            }
+            // Model death after the final log append but BEFORE the Store
+            // installs its index entry. No further write through this Store.
+            let branch = store.current_branch();
+            let log = RecordLog::open(path.join("records.log")).unwrap();
+            let (kind, text) = TYPED_RECORDS[4];
+            let (last, _) = log
+                .append(
+                    RecordInput::raw(kind, text.as_bytes().to_vec()),
+                    branch.id,
+                    branch.head.next(),
+                )
+                .unwrap();
+            ids.push(last.id);
+            std::fs::write(
+                path.join("tail-ids.json"),
+                serde_json::to_vec(&ids).unwrap(),
+            )
+            .unwrap();
+        }
+        other => panic!("unknown checkpoint crash point {other}"),
+    }
+    std::process::exit(73);
+}
+
+#[test]
+fn a_switch_back_to_source_survives_a_barrier_without_drop() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    // Don't use the default branch as the source: resetting the cursor
+    // to the default at open is not a successful restoration.
+    let source = store.create_branch("source", None).unwrap().id;
+    store.switch_branch("source").unwrap();
+    let child = store.create_branch("child", None).unwrap().id;
+    store.switch_branch("child").unwrap();
+    drop(store);
+
+    let store = open_store(dir.path()).unwrap();
+    // pins switchBranch.12: a clean reopen preserves the selected child.
+    assert_eq!(store.current_branch().id, child);
+    store.switch_branch("source").unwrap();
+    drop(store);
+    let store = open_store(dir.path()).unwrap();
+    // pins switchBranch.12: after switching back, a clean reopen starts at the source.
+    assert_eq!(store.current_branch().id, source);
+
+    store.switch_branch("child").unwrap();
+    drop(store);
+    crash(dir.path(), "checkpoint/restore-source");
+    let store = open_store(dir.path()).unwrap();
+    // pins switchBranch.13: sync covers restoration without Drop and keeps the original child.
+    assert_eq!(
+        (
+            store.current_branch().id,
+            store.get_branch("child").map(|b| b.id)
+        ),
+        (source, Some(child))
+    );
+}
+
+#[test]
+fn interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix() {
+    for point in ["watermark", "cleared"] {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(config(dir.path())).unwrap();
+        register(&store, TABLE, StateStrategy::Snapshot);
+        register(&store, JOURNAL, log_strategy());
+        set(
+            &store,
+            TABLE,
+            json!({"version": 1, "subjects": [{"subject": "z"}], "receipts": [], "journal": 400}),
+        );
+        drop(store);
+        crash(dir.path(), &format!("checkpoint/{point}"));
+
+        let store = open_store(dir.path()).unwrap();
+        let journal = value(&store, JOURNAL);
+        if point == "watermark" {
+            // pins appendToStateJson.15: keep the caller's seq numbers paired with items in log order.
+            assert_eq!(journal, json!(journal_items()));
+        }
+        // pins setStateJson.12: the published watermark coexists with the old journal until the clear lands.
+        assert_eq!(
+            (value(&store, TABLE), journal),
+            (
+                compacted_table(),
+                if point == "watermark" {
+                    json!(journal_items())
+                } else {
+                    json!([])
+                }
+            ),
+            "{point}"
+        );
+    }
+
+    for marks in 0..=2 {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(config(dir.path())).unwrap();
+        store.set_auto_snapshot(false);
+        register(&store, "summaries", log_strategy());
+        register(&store, "chunks", log_strategy());
+        for i in 0..3 {
+            append(&store, "chunks", chunk(i, false));
+        }
+        drop(store);
+        crash(dir.path(), &format!("checkpoint/mark-{marks}"));
+
+        let store = open_store(dir.path()).unwrap();
+        // pins editStateItem.12: the summary survives with exactly the completed prefix of source marks.
+        assert_eq!(
+            (value(&store, "summaries"), value(&store, "chunks")),
+            (
+                json!([{"id": "s", "sources": [0, 2]}]),
+                json!([chunk(0, marks >= 1), chunk(1, false), chunk(2, marks == 2)]),
+            ),
+            "after {marks} marks"
+        );
+    }
+}
+
+#[test]
+fn an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence() {
+    for op in ["set", "remove"] {
+        for boundary in ["before", "failed", "after"] {
+            if boundary == "failed" && !cfg!(unix) {
+                continue; // The partial-write fault uses a Unix file-size limit.
+            }
+            let dir = TempDir::new().unwrap();
+            let store = Store::create(config(dir.path())).unwrap();
+            store.set_auto_snapshot(false);
+            register(
+                &store,
+                "files",
+                StateStrategy::Tree {
+                    delta_snapshot_every: 2,
+                    full_snapshot_every: 2,
+                },
+            );
+            let main = store.current_branch().id;
+            let other = entry("main", 9, 0o644);
+            store.tree_set("files", "tool", &other).unwrap();
+            let workspace = store.create_branch("workspace", None).unwrap().id;
+            store.switch_branch("workspace").unwrap();
+            store.tree_set("files", "tool", &old_entry()).unwrap();
+            let intent = store
+                .append(
+                    RecordInput::json("agreement", &json!({"pending": op, "path": "tool"}))
+                        .unwrap(),
+                )
+                .unwrap();
+            drop(store);
+            crash(dir.path(), &format!("checkpoint/adopt-{op}-{boundary}"));
+
+            let landed = boundary == "after";
+            let expected = match (op, landed) {
+                (_, false) => Some(old_entry()),
+                ("set", true) => Some(adopted_entry()),
+                ("remove", true) => None,
+                _ => unreachable!(),
+            };
+            // First recovery, then the next open after that reader checkpoints:
+            // no work is deferred to another session.
+            for _ in 0..2 {
+                let store = open_store(dir.path()).unwrap();
+                let got = store.tree_get_on(workspace, "files", "tool").unwrap();
+                // pins treeGet.11: with only the pending intent, the hash/absence is evidence on its branch alone.
+                assert_eq!(
+                    (
+                        store.get_records_by_type("agreement"),
+                        got.as_ref().map(|e| &e.blob_hash),
+                        store.tree_get_on(main, "files", "tool").unwrap()
+                    ),
+                    (
+                        vec![intent.id],
+                        expected.as_ref().map(|e| &e.blob_hash),
+                        Some(other.clone())
+                    ),
+                    "{op}-{boundary}"
+                );
+                let head = store.get_branch_by_id(workspace).unwrap().head;
+                let expected_head = if landed {
+                    intent.sequence.next()
+                } else {
+                    intent.sequence
+                };
+                if op == "set" {
+                    // pins treeSet.10: readback agrees with the committed prefix, including size and mode.
+                    assert_eq!((got, head), (expected.clone(), expected_head), "{boundary}");
+                } else {
+                    // pins treeRemove.8: only a committed removal reads as absence.
+                    assert_eq!((got, head), (expected.clone(), expected_head), "{boundary}");
+                }
+            }
+            if op == "remove" && boundary == "before" {
+                // The target is still present. Take its backing records away
+                // after open but before this reader has looked up the tree.
+                let store = open_store(dir.path()).unwrap();
+                let log = dir.path().join("records.log");
+                let intact = std::fs::read(&log).unwrap();
+                std::fs::write(&log, []).unwrap();
+                let read = store.tree_get_on(workspace, "files", "tool");
+                std::fs::write(&log, intact).unwrap();
+                // pins treeRemove.8: surface an unreadable tree, never report it as a landed removal.
+                // A store with the full entry already cached need not read the damaged log.
+                assert!(match read {
+                    Err(_) => true,
+                    Ok(entry) => entry == Some(old_entry()),
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn a_torn_shard_redaction_never_recovers_part_of_the_selected_group() {
+    let rows = [
+        json!({"id": "before"}),
+        json!({"bodyGroupId": "g", "shard": 0}),
+        json!({"bodyGroupId": "g", "shard": 1}),
+        json!({"bodyGroupId": "g", "shard": 2}),
+        json!({"id": "after"}),
+    ];
+    for point in ["intact", "torn", "refused"] {
+        if point == "refused" && !cfg!(unix) {
+            continue;
+        }
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(config(dir.path())).unwrap();
+        store.set_auto_snapshot(false);
+        register(&store, "messages", log_strategy());
+        for row in &rows {
+            append(&store, "messages", row.clone());
+        }
+        let before = store.get_records_by_type("state_update").len();
+        drop(store);
+        crash(
+            dir.path(),
+            if point == "refused" {
+                "checkpoint/redact-refused"
+            } else {
+                "checkpoint/redact"
+            },
+        );
+        if point == "torn" {
+            // Model loss of the end of the last append, without decoding its framing.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join("records.log"))
+                .unwrap();
+            file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        }
+        let store = open_store(dir.path()).unwrap();
+        let expected = if point == "intact" {
+            json!([rows[0], rows[4]])
+        } else {
+            json!(rows)
+        };
+        // pins redactStateItems.8: one complete update removes all shards; its torn tail removes none.
+        assert_eq!(
+            (
+                value(&store, "messages"),
+                store.get_records_by_type("state_update").len()
+            ),
+            (expected, before + usize::from(point == "intact")),
+            "{point}"
+        );
+    }
+}
+
+#[test]
+fn open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    let (kind, text) = TYPED_RECORDS[0];
+    let prefix = store
+        .append(RecordInput::raw(kind, text.as_bytes().to_vec()))
+        .unwrap();
+    drop(store);
+    crash(dir.path(), "checkpoint/typed-tail");
+    let mut ids = vec![prefix.id];
+    let tail: Vec<RecordId> =
+        serde_json::from_slice(&std::fs::read(dir.path().join("tail-ids.json")).unwrap()).unwrap();
+    ids.extend(tail);
+    assert_eq!(ids.len(), TYPED_RECORDS.len());
+
+    let store = Store::open_or_create(config(dir.path())).unwrap();
+    for kind in ["round", "journal"] {
+        let expected: Vec<_> = TYPED_RECORDS
+            .iter()
+            .zip(&ids)
+            .filter(|((ty, _), _)| *ty == kind)
+            .map(|(_, id)| *id)
+            .collect();
+        // pins openOrCreate.16: recovered by-type IDs include each complete record once, in append order.
+        assert_eq!(store.get_records_by_type(kind), expected, "{kind}");
+    }
+    for (id, (kind, text)) in ids.into_iter().zip(TYPED_RECORDS) {
+        let record = store.get_record(id).unwrap().unwrap();
+        // pins openOrCreate.16: even the previously unindexed ID resolves to the right typed payload.
+        assert_eq!(
+            (
+                record.id,
+                record.record_type.as_str(),
+                record.payload.as_slice()
+            ),
+            (id, kind, text.as_bytes())
+        );
+    }
 }

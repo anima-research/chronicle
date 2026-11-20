@@ -5690,6 +5690,11 @@ mod tests {
         let items: Vec<u64> =
             serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
         assert_eq!(items, (0..150).collect::<Vec<u64>>());
+        // pins registerState.16: the earlier slot is still registered when initialization resumes.
+        assert!(matches!(
+            store.register_state(registration("items")),
+            Err(StoreError::StateExists(_))
+        ));
         store.register_state(registration("other")).unwrap();
         store.sync().unwrap();
     }

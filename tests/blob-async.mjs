@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import test from 'node:test';
 import { JsStore } from '../index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'chronicle-blob-async-'));
@@ -20,6 +21,128 @@ const varied = (len, seed) => {
 };
 
 try {
+  await test('Synchronous blob keys address exact bytes independently of MIME or provenance', (t) => {
+    const syncPath = join(dir, 'sync-blobs');
+    let store = JsStore.openOrCreate({ path: syncPath });
+    t.after(() => store.close());
+    const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
+    const bytes = Buffer.from([0xfb, 0xff]);
+    const expectedKey = digest(bytes);
+    const key = store.storeBlob(bytes, 'application/vnd.rookery.media');
+    const retained = store.getBlob(key);
+    // pins storeBlob.1: fresh Buffer bytes round-trip with a caller-defined media type.
+    assert.deepEqual(retained, bytes);
+    // pins storeBlob.7: both synchronous writes return the independently hashed bytes alone.
+    assert.deepEqual([key, store.storeBlob(bytes, 'image/jpeg')], [expectedKey, expectedKey]);
+    // pins getBlob.6: binary bytes encode with the standard base64 alphabet and padding.
+    assert.equal(retained.toString('base64'), '+/8=');
+
+    const emptyKey = store.storeBlob(Buffer.alloc(0), 'application/octet-stream');
+    // pins getBlob.2: zero bytes are still a complete Buffer hit.
+    assert.deepEqual(store.getBlob(emptyKey), Buffer.alloc(0));
+    // pins getBlob.3: an ordinary miss is exactly null.
+    assert.equal(store.getBlob(digest('never stored')), null);
+
+    const json = '{\n  "bird": "Mésange 🪶",\n  "count": 3\n}\n';
+    const saved = store.getBlob(store.storeBlob(Buffer.from(json), 'application/json'));
+    // pins getBlob.5: default and explicit UTF-8 decodings preserve the authored JSON text.
+    assert.deepEqual([saved.toString(), saved.toString('utf8'), saved.toString('utf-8')], [json, json, json]);
+
+    const nextKey = store.storeBlob(Buffer.from([0x12, 0x34]), 'application/octet-stream');
+    writeFileSync(join(dir, 'materialized'), store.getBlob(nextKey));
+    // pins getBlob.11: a retained read survives another same-size read and intervening I/O.
+    assert.deepEqual(retained, Buffer.from([0xfb, 0xff]));
+
+    const request = { prompt: 'draft' };
+    const provenanceKey = digest(JSON.stringify(request));
+    request.prompt = 'revised';
+    const preimage = Buffer.from(JSON.stringify(request));
+    const actualKey = digest(preimage);
+    store.storeBlob(preimage, 'application/json'); // No reference published, return value discarded.
+    store.close();
+    store = JsStore.open({ path: syncPath });
+    // pins storeBlob.12: cold external lookup finds the actual request bytes, not the stale preimage.
+    assert.deepEqual([store.getBlob(actualKey), store.getBlob(provenanceKey)], [preimage, null]);
+
+    for (const invalidType of [undefined, null, 42]) {
+      // pins storeBlob.13: the synchronous API must refuse a non-string media type.
+      assert.throws(() => store.storeBlob(Buffer.from('untyped media'), invalidType));
+    }
+  });
+
+  await test('References on distinct branches resolve the same shared bytes after rebind', () => {
+    const branchPath = join(dir, 'shared-blobs');
+    const source = JsStore.openOrCreate({ path: branchPath });
+    const original = Buffer.from('original file bytes');
+    let key, sourceId, childId;
+    try {
+      source.createBranch('child', 'main');
+      const child = source.view('child');
+      key = source.storeBlob(original, 'text/plain');
+      // pins view.8: a non-main view can read bytes newly stored by its source.
+      assert.deepEqual(child.getBlob(key), original);
+      const other = Buffer.from('child-only write');
+      const otherKey = child.storeBlob(other, 'text/plain');
+      // pins getBlob.10: source resolves a different branch's write by hash alone.
+      assert.deepEqual(source.getBlob(otherKey), other);
+
+      sourceId = source.appendJson('file-version', { path: 'first.txt', blobHash: key }).id;
+      childId = child.appendJson('file-version', { path: 'second.txt', blobHash: key }).id;
+      assert.notEqual(sourceId, childId);
+      child.close();
+    } finally {
+      source.close();
+    }
+
+    const reopened = JsStore.open({ path: branchPath });
+    try {
+      const rebound = reopened.view('child');
+      // pins view.8: even the first read through a fresh view resolves the original source key.
+      assert.deepEqual(rebound.getBlob(key), original);
+      for (const [handle, id] of [[reopened, sourceId], [rebound, childId]]) {
+        const { blobHash } = JSON.parse(handle.getRecord(id).payload.toString());
+        assert.equal(blobHash, key);
+        // pins getBlob.8: each distinct persisted reference still resolves to the same bytes.
+        assert.deepEqual(handle.getBlob(blobHash), original);
+      }
+      rebound.close();
+    } finally {
+      reopened.close();
+    }
+  });
+
+  await test('openOrCreate honors the supplied blob read-cache capacity', () => {
+    for (const capacity of [1, 2]) {
+      const at = join(dir, `cache-${capacity}`);
+      const offline = `${at}-offline`;
+      if (process.platform === 'win32') {
+        // Move a junction rather than a directory with open files on Windows.
+        symlinkSync(mkdtempSync(join(dir, 'backing-')), at, 'junction');
+      }
+      const handle = JsStore.openOrCreate({ path: at, blobCacheSize: capacity });
+      try {
+        const contents = ['oldest', 'middle', 'newest'].map((s) => Buffer.from(s));
+        const keys = contents.map((b) => handle.storeBlob(b, 'text/plain'));
+        for (const [i, key] of keys.entries()) assert.deepEqual(handle.getBlob(key), contents[i]);
+
+        // Take the configured path offline, without depending on any files inside it.
+        renameSync(at, offline);
+        try {
+          const reads = keys.map((key) => {
+            try { return handle.getBlob(key); }
+            catch { return null; } // An uncached read may fail while storage is unavailable.
+          });
+          // pins openOrCreate.17: exactly the configured number of recent reads remain available.
+          assert.deepEqual(reads, capacity === 1 ? [null, null, contents[2]] : [null, contents[1], contents[2]]);
+        } finally {
+          renameSync(offline, at);
+        }
+      } finally {
+        handle.close();
+      }
+    }
+  });
+
   let store = JsStore.openOrCreate({ path });
 
   for (const [i, chunked] of [false, true].entries()) {
