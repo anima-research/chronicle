@@ -585,6 +585,25 @@ await import(${JSON.stringify(pathToFileURL(join(tools, 'state-digests.mjs')).hr
       const after = JsStore.open({ path });
       assert.equal(after.currentBranch().name, 'main', 'a check stopped partway should leave the store on the branch it found');
       after.close();
+      // What an open repaired goes to stderr, so a check after a run doesn't differ from the check before it for that.
+      const check = (store, prelude = '') => spawnSync(process.execPath, ['--input-type=module', '-e', `
+import { createRequire } from 'node:module';
+const { JsStore } = createRequire(import.meta.url)(${JSON.stringify(MODULE)});
+${prelude}
+process.argv = [process.argv[0], 'state-digests.mjs', ${JSON.stringify(store)}];
+await import(${JSON.stringify(pathToFileURL(join(tools, 'state-digests.mjs')).href)});`], { encoding: 'utf8', env: { ...process.env, CHRONICLE_MODULE: MODULE } });
+      const torn = join(scratch, 'digest-torn');
+      cpSync(path, torn, { recursive: true });
+      writeFileSync(join(torn, 'records.log'), Buffer.concat([readFileSync(join(torn, 'records.log')), Buffer.from('REC\0torn')]));
+      const [first, second] = [check(torn), check(torn)];
+      assert.equal(first.status, 0, `the check of a store with a torn tail exited ${first.status}:\n${first.stderr}`);
+      assert.ok(first.stderr.includes('This open repaired the store') && !second.stderr.includes('This open repaired'),
+        `the first check of a store with a torn tail should say on stderr that its open repaired it, and the second shouldn't:\n${first.stderr}\n${second.stderr}`);
+      assert.equal(first.stdout, second.stdout, 'the digest should be the same whether or not the open repaired the store');
+      const old = check(path, 'JsStore.prototype.recovery = () => ({ truncatedAt: 100, droppedBytes: 8, validRecords: 3 });');
+      assert.equal(old.status, 0, `the check with the recovery report of chronicle 0.4.0 exited ${old.status}:\n${old.stderr}`);
+      assert.ok(old.stderr.includes('droppedBytes=8 undecodable=- onMissingBranches=- unregistered=-'),
+        `the check should print the fields that a 0.4.0 report lacks as -:\n${old.stderr}`);
       const sideHead = headOffsets(path).find(({ branch, state }) => branch === 'side' && state === WHOLE).offset;
       const sideSet = updates(path).find(({ record }) => record === sideHead);
       const broken = copyWithPayload(path, 'digest-broken', sideSet, (payload) => {
@@ -650,6 +669,7 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
         'the premise: the deleted branch left five sets in the log and no head in state.bin');
       const leftoverBytes = new Map(leftovers.map((update) => [update.id, payloadOf(path, update)]));
       const idAt = new Map(updates(path).map(({ record, id }) => [record, id]));
+      const beforeById = new Map(updates(path).map((update) => [update.id, update]));
       const unchanged = filesOf(path);
       const dry = compact(path, '--state', WHOLE);
       assert.equal(dry.status, 0, `the dry run exited ${dry.status}:\n${dry.out}${dry.err}`);
@@ -683,6 +703,14 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       assert.ok(leftovers.length > 0 && leftovers.some(({ prev }) => prev !== null && after.get(idAt.get(prev))?.record !== prev),
         'the premise: the run moves a record that an update of the deleted branch links to');
       for (const [id, bytes] of leftoverBytes) assert.ok(payloadOf(path, after.get(id)).equals(bytes), `the deleted branch's update ${id} should keep its bytes`);
+      // Each head of the named state links to the new offset of the update it linked to, or to nothing where that went.
+      const relinked = savedHeads(path).filter(({ state }) => state === WHOLE);
+      for (const { offset } of relinked) {
+        const head = [...after.values()].find(({ record }) => record === offset);
+        const before = beforeById.get(head.id);
+        const linked = before.prev === null ? undefined : after.get(idAt.get(before.prev));
+        assert.equal(head.prev, linked ? linked.record : null, `the head ${head.id} of ${WHOLE} should link to ${linked ? `the new offset of ${linked.id}` : 'nothing'}`);
+      }
       console.log(`ok: compact-set-states.py applies to a store with branches, keeps the ${headIds.size} sets its heads name and the 5 that no head reaches, counts both and a record that names a dropped one, keeps the bytes of a deleted branch's updates, and state-digests.mjs reads it the same`);
     },
 
@@ -892,6 +920,11 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       const crossed = copyWithPayload(base, 'refuse-crossed', walked,
         (payload) => withLink(payload, updates(base).find(({ state }) => state === WHOLE).record));
       refuses(crossed, 'a link to an update of another state', 'where no state update of messages is');
+      if (process.getuid?.() !== 0) {
+        const readOnly = copyOf('refuse-lock-read-only');
+        chmodSync(join(readOnly, 'LOCK'), 0o444);
+        refuses(readOnly, 'a store whose LOCK this user can\'t write, as chronicle can\'t either', 'could not open LOCK');
+      }
       const unlocked = copyOf('refuse-no-lock');
       rmSync(join(unlocked, 'LOCK'));
       refuses(unlocked, 'a store with no LOCK', 'LOCK is missing');
@@ -1117,6 +1150,21 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
         assert.deepEqual(status === 0 ? trio(filesOf(store)) : filesOf(store), status === 0 ? trio(formed) : unchanged,
           status === 0 ? `--go-back on ${name} should put back the old files` : `--go-back on ${name} should change no file`);
       }
+      // The old index deleted by hand after a finished run: going back goes on, and says that the store has no index.
+      const lost = join(scratch, 'finished-index-lost');
+      cpSync(base, lost, { recursive: true });
+      const lostFiles = filesOf(lost);
+      assert.ok(lostFiles['state-indexes.bin'], 'the premise: the store has a state-indexes.bin');
+      assert.equal(compact(lost, '--state', WHOLE, '--apply').status, 0, 'the run on a store whose old index goes should finish');
+      rmSync(join(lost, 'state-indexes.bin.pre-compact'));
+      digest(lost, 'a store whose old index was deleted after its run');
+      const lostBack = compact(lost, '--go-back');
+      assert.equal(lostBack.status, 0, `--go-back after the old index was deleted exited ${lostBack.status}:\n${lostBack.out}${lostBack.err}`);
+      assert.ok(lostBack.out.includes('The old state-indexes.bin was not there, so the store has no field index now'),
+        `--go-back should say that the store has no field index now:\n${lostBack.out}`);
+      const lostLeft = filesOf(lost);
+      assert.ok(!lostLeft['state-indexes.bin'] && lostLeft['records.log'] === lostFiles['records.log'] && lostLeft['state.bin'] === lostFiles['state.bin'],
+        '--go-back after the old index was deleted should put back records.log and state.bin, and leave no state-indexes.bin');
       const bare = join(scratch, 'finished-no-index');
       cpSync(base, bare, { recursive: true });
       rmSync(join(bare, 'state-indexes.bin'));
@@ -1128,7 +1176,7 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
       const bareBack = filesOf(bare);
       assert.deepEqual(trio(bareBack), trio(bareFiles), '--go-back should put back records.log and state.bin, and remove a state-indexes.bin made since the run, where the store had none');
       assert.deepEqual(Object.keys(bareBack).sort(), Object.keys(bareFiles).sort(), '--go-back on a store that had no state-indexes.bin should leave no file of the run');
-      console.log('ok: --go-back after a finished run puts back the old files after a check and after a reorder of a strategy\'s map, removes a state-indexes.bin made since where there was none, keeps an empty branch made and selected since, and refuses after a registration, a changed strategy or a write');
+      console.log('ok: --go-back after a finished run puts back the old files after a check and after a reorder of a strategy\'s map, says that the store has no field index where its old one was deleted, removes a state-indexes.bin made since where there was none, keeps an empty branch made and selected since, and refuses after a registration, a changed strategy or a write');
     },
 
     'going back stopped, and old files missing': () => {
@@ -1205,10 +1253,10 @@ import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
 tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
 write_file = tool.write_file
-def tearing(path, chunks, like):
-    if 'compact-run' not in path: return write_file(path, chunks, like)
+def tearing(path, chunks, like, made=None):
+    if 'compact-run' not in path: return write_file(path, chunks, like, made)
     data = b''.join(chunks)
-    write_file(path, [data[:len(data) // 2]], like)
+    write_file(path, [data[:len(data) // 2]], like, made)
     os._exit(9)
 tool.write_file = tearing
 sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--state', '${WHOLE}', '--apply']))`, torn], { encoding: 'utf8', cwd: tools });

@@ -9,8 +9,9 @@
 // content. It exits 1 when a read fails.
 //
 // Two limits. chronicle's API lists only registered states, so a state with no registration isn't read. And the check
-// opens the store as its host does: that open saves state.bin and branches.bin, and it cuts off a torn tail of the log,
-// which the recovery line then shows.
+// opens the store as its host does: that open saves state.bin and branches.bin, and it cuts off a torn tail of the log.
+// What an open repaired is said on stderr, outside the digest, since only the first open after an unclean stop has
+// anything to repair, and a check after a run would differ from the check before it for that reason alone.
 //
 // Usage: CHRONICLE_MODULE=<path to @animalabs/chronicle> node state-digests.mjs <store-dir> [--state <pattern> ...]
 import { createHash } from 'node:crypto';
@@ -52,12 +53,15 @@ const read = (what) => {
     return `ERROR ${error.code ?? 'read failed'}`;
   }
 };
+// A binding before 0.5.0 reports truncatedAt, droppedBytes and validRecords alone, so a field it lacks prints as -.
 const recovery = store.recovery();
-out.push(recovery
-  ? `recovery\tdroppedBytes=${recovery.droppedBytes} undecodable=${recovery.undecodableStateUpdates} `
-    + `onMissingBranches=${recovery.updatesOnMissingBranches} unregistered=`
-    + `${recovery.unregisteredStates.map(({ id, updates }) => `${id}:${updates}`).sort().join(',') || '-'}`
-  : 'recovery\tnone');
+const field = (value) => value ?? '-';
+if (recovery) {
+  console.error('This open repaired the store, so it was not closed cleanly: '
+    + `droppedBytes=${field(recovery.droppedBytes)} undecodable=${field(recovery.undecodableStateUpdates)} `
+    + `onMissingBranches=${field(recovery.updatesOnMissingBranches)} unregistered=`
+    + `${recovery.unregisteredStates?.map(({ id, updates }) => `${id}:${updates}`).sort().join(',') || '-'}`);
+}
 const stats = store.stats();
 out.push(`blobs=${stats.blobCount} branches=${stats.branchCount} stateSlots=${stats.stateSlotCount}`);
 const found = store.currentBranch().name;

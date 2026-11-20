@@ -13,7 +13,9 @@ copied. A state update that the walk reaches is rewritten where its
 `prev_update_offset` must change: it then holds the new offset and gets a new
 checksum. Every record that the walk does not reach is copied byte for byte,
 whatever it holds, for a named state too. state.bin gets the new offsets, and
-every counter in it stays as chronicle wrote it.
+every counter in it stays as chronicle wrote it. chronicle uses a counter to
+time a state's next snapshot, so a named state's next snapshot can come at
+another point; no read uses a counter.
 
 What is lost: the old values of each named state. A read of a named state at an
 older sequence can give nothing, and a branch made later at an older point can
@@ -23,6 +25,8 @@ agent-framework's push coalescer table, `mcpl/coalescing`
 gone after the run, and the caller registers it again; state-indexes.bin is kept
 as state-indexes.bin.pre-compact. Other reads that change:
   * a state update whose link changed holds the new offset in its payload;
+  * the offset of a record that stays can move, so a stateHeadOffset or a
+    cursor kept by offset from before the run names another place;
   * a record that stays and names a dropped update in caused_by or linked_to
     still names it, and a read of that id gives nothing (the dry run counts
     such records);
@@ -34,7 +38,9 @@ as state-indexes.bin.pre-compact. Other reads that change:
     sequence where the branch has no record;
   * a record typed state_update that no head reaches, such as a deleted
     branch's update, keeps its bytes, so its link can name an offset that
-    holds another record now. No read of a live state reaches it. The old
+    holds another record now. No read of a live state reaches it, and
+    tools/chain-report.py, which reads every update's link, can show a wrong
+    chain for it. The old
     values of a named state that no head reaches stay, and no later run frees
     them (the dry run counts them).
 
@@ -111,13 +117,16 @@ records.log, state.bin and state-indexes.bin back, with the blocked file in
 place while it does, only while records.log and state.bin are as the run left
 them, and it leaves branches.bin as it is. Where state.bin is the blocked file,
 it puts the old files back. Where the swap had not begun, it removes the run's
-files and changes no live file. A going back that stops can be run again. Once
+files and changes no live file. A going back that stops can be run again. A
+field index registered since the run is gone after a going back, and where
+the old state-indexes.bin is not there, the store has no field index
+afterwards, which --go-back says. Once
 the host has written, it refuses: undoing the run then loses every write since,
 and this tool does not do it.
 
 The tool needs free space for the new log, the size of what it keeps, a file
 system with hard links, and memory of a few hundred bytes for each record of the
-log.
+log and a few times the size of the largest record.
 
 Usage:
     compact-set-states.py <store-dir> --state <pattern> [--state <pattern> ...] [--apply]
@@ -333,6 +342,12 @@ def read_update(rec, enc, payload):
             at = value_end
 
 
+# What chronicle's open does with a log that stops being whole (src/records/log.rs, scan_log).
+DAMAGE = ('chronicle\'s open cuts off the log from there when no valid record follows, and says how many bytes it '
+          'dropped. It refuses to open the store when a valid record follows. The check before a run is such an open: '
+          'run it, and then this tool. A store that the check can\'t open needs a repair that this tool doesn\'t make.')
+
+
 def scan_log(path):
     recs = []
     size = os.path.getsize(path)
@@ -340,14 +355,12 @@ def scan_log(path):
         def need(n):
             b = f.read(n)
             if len(b) != n:
-                raise Refusal('records.log is torn at offset %d. tools/trim-records-log.py reports the torn tail, and '
-                              'its --apply cuts it off.' % (f.tell() - len(b)))
+                raise Refusal('records.log is torn at offset %d. %s' % (f.tell() - len(b), DAMAGE))
             return b
         while f.tell() < size:
             start = f.tell()
             if need(4) != MAGIC:
-                raise Refusal('records.log has no record at offset %d. tools/trim-records-log.py reports where the log '
-                              'stops being whole, and its --apply cuts off everything from there.' % start)
+                raise Refusal('records.log stops being whole at offset %d, where no record starts. %s' % (start, DAMAGE))
             ver = need(1)[0]
             if ver != 1: raise Refusal('the record at offset %d of records.log has version %d, which this tool does not read.' % (start, ver))
             need(1)
@@ -361,9 +374,7 @@ def scan_log(path):
                 count = struct.unpack('<H', need(2))[0]
                 refs += struct.unpack('<%dQ' % count, need(8 * count))
             if struct.unpack('<I', need(4))[0] != zlib.crc32(payload) & 0xFFFFFFFF:
-                raise Refusal('the record at offset %d of records.log fails its checksum, so chronicle reads nothing past '
-                              'it. The store needs a repair first. tools/trim-records-log.py reports the record, and its '
-                              '--apply cuts off it and every record after it.' % start)
+                raise Refusal('the record at offset %d of records.log fails its checksum. %s' % (start, DAMAGE))
             rec = Rec(start, f.tell() - start, rid, branch, refs or None)
             if rtype == b'state_update':
                 rec.payload_at = payload_at
@@ -499,7 +510,8 @@ def what_the_run_left(log_inode, log_size, index):
 def take_lock(store):
     """The lock chronicle takes on LOCK (src/store.rs, acquire_lock)."""
     try:
-        fd = os.open(os.path.join(store, 'LOCK'), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # For writing, as chronicle opens it: on NFS an exclusive flock is a POSIX lock, which needs that.
+        fd = os.open(os.path.join(store, 'LOCK'), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise Refusal('LOCK is missing. Open and close the store once with its host, which creates it, and run again.')
     except OSError as error:
@@ -559,8 +571,11 @@ def read_manifest(store):
     raise Refusal('MANIFEST names store version %d, which this tool does not read.' % data[4])
 
 
-def write_file(path, chunks, like):
+def write_file(path, chunks, like, made=None):
+    """Write a new file at path, which must not exist. Once the file exists, its path goes on made, the list of what
+    a failed run removes, so a path that someone else made first is never removed."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if made is not None: made.append(path)
     with os.fdopen(fd, 'wb') as f:
         for chunk in chunks: f.write(chunk)
         f.flush()
@@ -742,24 +757,30 @@ def compact(files, patterns, apply, state_bin):
                     if r.offset in drop: continue
                     src.seek(r.offset); raw = src.read(r.length)
                     yield relinked(raw, r, links[r.offset]) if r.offset in links else raw
-        made.append(files.new_log); write_file(files.new_log, records(), log_stat)
+        write_file(files.new_log, records(), log_stat, made)
         if os.path.getsize(files.new_log) != new_size: raise RuntimeError('the new log is not the size its plan says')
-        made.append(files.new_sb); write_file(files.new_sb, [state_bin_bytes([new_heads, index[1]])], sb_stat)
-        made.append(files.blocked); write_file(files.blocked, [blocked_state_bin(files.store)], sb_stat)
+        write_file(files.new_sb, [state_bin_bytes([new_heads, index[1]])], sb_stat, made)
+        write_file(files.blocked, [blocked_state_bin(files.store)], sb_stat, made)
         # The record is written whole beside its name and then renamed, so a record under its name is complete.
         left = what_the_run_left(os.stat(files.new_log).st_ino, new_size, [new_heads, index[1]])
-        left['state-indexes.bin'] = os.path.exists(files.indexes)
-        made.append(files.marker + '.new'); write_file(files.marker + '.new', [json.dumps(left).encode('utf-8')], sb_stat)
+        left['state-indexes.bin'] = os.stat(files.indexes).st_ino if os.path.exists(files.indexes) else None
+        write_file(files.marker + '.new', [json.dumps(left).encode('utf-8')], sb_stat, made)
         made.append(files.marker); os.replace(files.marker + '.new', files.marker)
         sync_dir(os.path.dirname(files.marker))
         for path in (files.log, files.sb):
-            made.append(path + '.pre-compact'); os.link(path, path + '.pre-compact')
+            os.link(path, path + '.pre-compact'); made.append(path + '.pre-compact')
         for directory in {os.path.dirname(files.log), os.path.dirname(files.sb)}: sync_dir(directory)
     except BaseException as error:
+        stayed = []
         for path in made:
-            if os.path.lexists(path): os.remove(path)
-        raise Refusal('could not write the new files and the old files\' second names (%s: %s).'
-                      % (type(error).__name__, error))
+            try:
+                if os.path.lexists(path): os.remove(path)
+            except OSError:
+                stayed.append(path)
+        raise Refusal('could not write the new files and the old files\' second names (%s: %s).%s'
+                      % (type(error).__name__, error, ' %s could not be removed. They are files of this run, '
+                                                        'and the store\'s own files are as they were, so they can be '
+                                                        'removed by hand.' % ', '.join(stayed) if stayed else ''))
 
     steps = [('put the blocked file in place of state.bin', files.blocked, files.sb)]
     if os.path.exists(files.indexes):
@@ -774,10 +795,13 @@ def compact(files, patterns, apply, state_bin):
             raise Stopped('the swap stopped after it %s (%s: %s). %s'
                           % (done, type(error).__name__, error, go_back_text(files.store)))
         done = step
+    kept = [path + '.pre-compact' for path in (files.log, files.sb)] + (
+        [files.indexes + '.pre-compact'] if left['state-indexes.bin'] is not None else [])
     print('done: records.log is %s. The old files are %s, and the run\'s record is %s.'
-          % (human(os.path.getsize(files.log)), ', '.join(files.found(files.kept)), files.marker))
+          % (human(new_size), ', '.join(kept), files.marker))
     print('Check with state-digests.mjs and compare with the check from before. If they differ, run --go-back before '
-          'the host starts. Once the host has run well, delete them to free the space.')
+          'the host starts. Once the host has run well, delete %s and %s to free the space.'
+          % (', '.join(kept), files.marker))
 
 
 def go_back(store):
@@ -809,19 +833,16 @@ def go_back(store):
                                   'store is equal to the check from before the run, delete %s.'
                                   % (' and '.join(missing), ', '.join(run_files)))
                 if blocked:
-                    said = ('went back: the files of the store are as they were before the run, and no file of the run '
-                            'is left.')
+                    said = 'went back: records.log and state.bin are as they were before the run, and no file of the run is left.'
                 else:
                     changed = run_changed(files, left)
                     if changed:
                         raise Refusal('%s has changed since the run finished, so going back would lose what changed. '
                                       'Undoing the run is then outside what this tool does.' % changed)
                     steps.append(('block', files.sb))
-                    said = ('went back after a finished run: records.log, state.bin and state-indexes.bin are as they '
-                            'were before it, and no file of the run is left. branches.bin is as it is now.')
-                # A state-indexes.bin that the store had is put back. One made since a store with none is removed.
-                indexes = 'put back' if left['state-indexes.bin'] else 'put back or remove'
-                steps += [(indexes, files.indexes), ('put back', files.log), ('put back', files.sb)]
+                    said = ('went back after a finished run: records.log and state.bin are as they were before it, and '
+                            'no file of the run is left. branches.bin is as it is now.')
+                steps += [('indexes', files.indexes), ('put back', files.log), ('put back', files.sb)]
             else:
                 if other(old_log, files.log):
                     raise Refusal('records.log is not the log that the run wrote, and %s is another file than '
@@ -831,9 +852,8 @@ def go_back(store):
                     if not os.path.lexists(old_sb):
                         raise Refusal('state.bin is the blocked file, and the old state.bin, %s, is not there to put '
                                       'back.' % old_sb)
-                    steps = [('put back', files.indexes), ('put back', files.sb)]
-                    said = ('went back: the files of the store are as they were before the run, and no file of the run '
-                            'is left.')
+                    steps = [('indexes', files.indexes), ('put back', files.sb)]
+                    said = 'went back: records.log and state.bin are as they were before the run, and no file of the run is left.'
                 else:
                     said = ('removed the files of the run, whose swap had not begun or had been undone. No file of the '
                             'store changed.')
@@ -846,7 +866,9 @@ def go_back(store):
                     os.replace(files.blocked, live)
                 elif os.path.lexists(old):
                     os.replace(old, live)
-                elif step == 'put back or remove' and os.path.lexists(live):
+                elif step == 'indexes' and os.path.lexists(live) and os.lstat(live).st_ino != left['state-indexes.bin']:
+                    # A state-indexes.bin that the store had keeps its inode, also when an earlier going back put it
+                    # back. Any other is one made since the run, and goes.
                     os.remove(live)
                 else:
                     continue
@@ -858,6 +880,12 @@ def go_back(store):
         except BaseException as error:
             raise Stopped('going back stopped (%s: %s). Run compact-set-states.py %s --go-back again, with the host '
                           'stopped.' % (type(error).__name__, error, store))
+        if steps and left['state-indexes.bin'] is not None:
+            if os.path.lexists(files.indexes) and os.lstat(files.indexes).st_ino == left['state-indexes.bin']:
+                said += ' state-indexes.bin is as it was before the run, too.'
+            else:
+                said += (' The old state-indexes.bin was not there, so the store has no field index now, and a caller '
+                         'registers its indexes again.')
         print(said)
     locked(store, act)
 
@@ -868,7 +896,7 @@ def read_record(marker):
     except ValueError:
         left = None
     if not (isinstance(left, dict) and isinstance(left.get('records.log'), list) and len(left['records.log']) == 2
-            and isinstance(left.get('state-indexes.bin'), bool)):
+            and 'state-indexes.bin' in left and (left['state-indexes.bin'] is None or is_count(left['state-indexes.bin']))):
         raise Refusal('%s is not the record of a run that this tool reads.' % marker)
     return left
 
