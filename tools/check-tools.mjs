@@ -1236,6 +1236,24 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
       assert.ok(reusedBack.out.includes('The old state-indexes.bin was not there') && !filesOf(reused)['state-indexes.bin']
         && filesOf(reused)['records.log'] === reusedFiles['records.log'],
         `--go-back should remove an index whose bytes are not the old one's, whatever its inode, and say so:\n${reusedBack.out}`);
+      // The index unreadable as going back ends: it stops, and a second going back finishes.
+      const unread = join(scratch, 'finished-index-unread');
+      cpSync(base, unread, { recursive: true });
+      const unreadFiles = filesOf(unread);
+      assert.equal(compact(unread, '--state', WHOLE, '--apply').status, 0, 'the run on a store whose index is unread at the end should finish');
+      const unreadBack = spawnSync(PYTHON, ['-c', `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+def index_print(path): raise tool.Refusal('could not read %s (an I/O error).' % path)
+tool.index_print = index_print
+sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, unread], { encoding: 'utf8', cwd: tools });
+      assert.equal(unreadBack.status, 3, `--go-back that can't read the index at its end exited ${unreadBack.status}:\n${unreadBack.stdout}${unreadBack.stderr}`);
+      assert.ok(unreadBack.stdout.includes('going back stopped (could not read') && !unreadBack.stdout.includes('No file of the store changed'),
+        `--go-back that can't read the index at its end should say that it stopped:\n${unreadBack.stdout}`);
+      const unreadAgain = compact(unread, '--go-back');
+      assert.equal(unreadAgain.status, 0, `--go-back again exited ${unreadAgain.status}:\n${unreadAgain.out}${unreadAgain.err}`);
+      assert.deepEqual(filesOf(unread), unreadFiles, '--go-back again should leave every file as before the run');
       const bare = join(scratch, 'finished-no-index');
       cpSync(base, bare, { recursive: true });
       rmSync(join(bare, 'state-indexes.bin'));

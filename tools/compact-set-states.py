@@ -900,15 +900,19 @@ def go_back(store):
                 else:
                     continue
                 sync_dir(os.path.dirname(live))
+            # Whether the store's own index is back, read while the record is still there to run again from.
+            index_back = (steps and left['state-indexes.bin'] is not None and os.path.lexists(files.indexes)
+                          and index_print(files.indexes) == left['state-indexes.bin'])
             # What is left: the staging files, second names of the live files, and a state.bin.pre-compact that a
             # host made stale by saving state.bin since a stop before the swap. The record goes last.
             for path in files.found(files.staging + (old_log, old_sb, files.marker)):
                 os.remove(path); sync_dir(os.path.dirname(path))
         except BaseException as error:
-            raise Stopped('going back stopped (%s: %s). Run compact-set-states.py %s --go-back again, with the host '
-                          'stopped.' % (type(error).__name__, error, store))
+            why = str(error) if isinstance(error, Refusal) else '%s: %s' % (type(error).__name__, error)
+            raise Stopped('going back stopped (%s). Run compact-set-states.py %s --go-back again, with the host '
+                          'stopped.' % (why, store))
         if steps and left['state-indexes.bin'] is not None:
-            if os.path.lexists(files.indexes) and index_print(files.indexes) == left['state-indexes.bin']:
+            if index_back:
                 said += ' state-indexes.bin is as it was before the run, too.'
             else:
                 said += (' The old state-indexes.bin was not there, so the store has no field index now, and a caller '
