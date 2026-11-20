@@ -44,7 +44,9 @@ const env = { ...process.env };
 delete env.LD_PRELOAD;
 
 function straceProblem() {
-  const probe = spawnSync('strace', ['-o', '/dev/null', 'true'], { encoding: 'utf8' });
+  const probe = spawnSync('strace', ['-f', '-y', '-o', '/dev/null', '-e', `trace=${CALLS}`, '-e', 'inject=fsync:error=EIO:when=1', 'true'],
+    { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  if (probe.error?.code === 'ETIMEDOUT') return 'strace did not trace true within 10 s';
   if (probe.error) return `strace is not on the path (${probe.error.code})`;
   if (probe.status !== 0) return `strace may not trace here: ${probe.stderr.trim().split('\n')[0]}`;
   return null;
@@ -202,7 +204,13 @@ function child(command, args, cwd) {
     let timedOut = false;
     const bound = setTimeout(() => {
       timedOut = true;
-      process.kill(-proc.pid, 'SIGKILL');
+      try {
+        process.kill(-proc.pid, 'SIGKILL');
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error;
+      }
+      proc.stdout.destroy();
+      proc.stderr.destroy();
     }, 20_000);
     const out = [];
     const err = [];
@@ -242,12 +250,12 @@ async function traced(scenario, extra, inject) {
     text = readFileSync(record, 'utf8');
   } catch {}
   const store = join(root, 'store');
-  return { dir, root, store, copy: join(outside, 'copy'), result, out, text, inject };
+  return { dir, root, store, copy: join(outside, 'copy'), thrown: join(outside, 'thrown'), result, out, text, inject };
 }
 
 function brokenRun(run) {
   if (run.result.spawnError) return `the writer did not start: ${run.result.spawnError}`;
-  if (run.result.timedOut) return 'the writer did not end within 20 s';
+  if (run.result.timedOut) return 'the traced run did not end and close its output within 20 s';
   if (run.result.signal) return `the writer ended by ${run.result.signal}`;
   if (run.result.status !== 0 || run.out === null) {
     const tail = run.result.stderr.trim().split('\n').slice(-3).join(' | ');
@@ -323,13 +331,15 @@ async function aimAll(scenario, clean, extra) {
 
 async function reopened(scenario, extra, runs) {
   if (scenario.kind === 'cold') return { each: runs.map(() => ({})) };
-  const paths = runs.flatMap(run => (scenario.kind === 'close' ? [run.store] : [run.copy, run.store]));
+  const layout = runs.map(run => (scenario.kind === 'close' ? ['store']
+    : ['copy', 'store', ...(run.out && !run.out.call.ok ? ['thrown'] : [])]));
+  const paths = runs.flatMap((run, index) => layout[index].map(where => run[where]));
   const result = await child(process.execPath, [WRITER, 'reopen', scenario.name, extra[0] ?? '-', ...paths], base);
   if (result.status !== 0) throw new Error(`the reopening process ended with status ${result.status}: ${result.stderr.trim().split('\n').slice(-3).join(' | ')}`);
   const { answers, old } = JSON.parse(result.stdout);
   return {
     old,
-    each: runs.map(() => (scenario.kind === 'close' ? { store: answers.shift() } : { copy: answers.shift(), store: answers.shift() })),
+    each: layout.map(wheres => Object.fromEntries(wheres.map(where => [where, answers.shift()]))),
   };
 }
 
@@ -410,7 +420,7 @@ function judge(scenario, clean, run, reopen) {
   if (!out.call.ok && out.call.code !== 'DurabilityLost' && errnoCode(out.call) !== errno) {
     problems.get('the errno').push({
       text: `the call threw without ${errno}: ${shown(out.call)}`,
-      wordsAfterOsError: /\(os error \d+\)./s.test(out.call.message),
+      wordsAfterOsError: out.call.error && Number(/\(os error (\d+)\)./s.exec(out.call.message)?.[1]) === constants.errno[errno],
     });
   }
   const returned = out.call.ok && scenario.kind !== 'close';
@@ -422,7 +432,7 @@ function judge(scenario, clean, run, reopen) {
     whole('the reads', 'the reads after sync', out.syncReads, false);
     oneState('the reads', 'the reads after sync', out.syncReads);
   }
-  if (!out.call.ok && OLD_AFTER_THROW.has(scenario.name)) {
+  if (!out.call.ok && OLD_AFTER_THROW.has(out.method)) {
     for (const [what, reads] of [['the reads after the call', out.reads[0]], ['the second reads after the call', out.reads[1]]]) {
       for (const [name, read] of Object.entries(reads)) {
         if (read.ok && !isDeepStrictEqual(read.value, old[name].value)) {
@@ -462,11 +472,18 @@ function judge(scenario, clean, run, reopen) {
   problems.get('the barrier').push(...barrierProblems(run, run.store, barriers));
   const closing = scenario.kind === 'close' ? out.call : out.close;
   const closedReads = scenario.kind === 'close' ? out.reads[0] : out.closedReads;
-  if (!closing.ok) {
+  const closedCode = Object.values(clean.out.closedReads ?? clean.out.reads[0]).find(read => !read.ok)?.code;
+  if (closing.ok) {
+    if (!out.isClosed.ok || out.isClosed.value !== true) add('close and isClosed', `after close returned, isClosed gave ${shown(out.isClosed)}`);
+    for (const [name, read] of Object.entries(closedReads)) {
+      if (read.ok || read.code !== closedCode) {
+        add('close and isClosed', `after close returned, ${name} gave ${shown(read)}, not a throw as on a closed handle`);
+      }
+    }
+  } else {
     if (!out.isClosed.ok || typeof out.isClosed.value !== 'boolean') {
       add('close and isClosed', `after close threw, isClosed gave ${shown(out.isClosed)}`);
     } else {
-      const closedCode = Object.values(clean.out.closedReads ?? clean.out.reads[0]).find(read => !read.ok)?.code;
       for (const [name, read] of Object.entries(closedReads)) {
         if (out.isClosed.value && (read.ok || read.code !== closedCode)) {
           add('close and isClosed', `after close threw and isClosed answered true, ${name} gave ${shown(read)}, not a throw as on a closed handle`);
@@ -480,15 +497,16 @@ function judge(scenario, clean, run, reopen) {
   const handleReads = scenario.kind === 'close' ? [out.old] : [out.reads[0], out.reads[1], out.retryReads, out.syncReads].filter(Boolean);
   const atBarrier = Object.fromEntries(Object.keys(handleReads[0]).map(name => [name,
     handleReads.map(reads => reads[name]).filter(read => read.ok).at(-1) ?? handleReads.at(-1)[name]]));
-  const before = { copy: barriers.filter(barrier => barrier !== 'close'), store: barriers };
+  const before = { copy: barriers.filter(barrier => barrier !== 'close'), store: barriers, thrown: [] };
   const lastRead = {
+    thrown: name => (out.reads[1][name].ok ? out.reads[1][name] : out.reads[0][name]),
     copy: name => out.syncReads[name],
     store: scenario.kind === 'close'
       ? name => (out.reads[1][name].ok ? out.reads[1][name] : out.old[name])
       : name => (out.closedReads[name].ok ? out.closedReads[name] : out.syncReads[name]),
   };
   for (const [where, answer] of Object.entries(reopen)) {
-    const which = where === 'copy' ? 'the copy' : 'the closed store';
+    const which = { copy: 'the copy', store: 'the closed store', thrown: 'the copy made after the throw' }[where];
     if (!answer.opened.ok) {
       add('the reopen', `${which} did not open: ${answer.opened.message}`);
       continue;

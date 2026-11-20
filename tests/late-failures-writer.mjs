@@ -5,7 +5,8 @@ import { JsStore } from '../index.js';
 const message = (text, n) => ({ channel: 'general', text, n });
 const entry = blobHash => ({ blobHash, size: 4, mode: 0o644 });
 const utf8 = buffer => (buffer === null || buffer === undefined ? null : buffer.toString('utf8'));
-const plain = items => (items === null ? null : items.map(({ id, sequence, ...rest }) => rest));
+const stamped = (id, sequence) => typeof id === 'string' && id !== '' && Number.isSafeInteger(sequence) && sequence >= 0;
+const plain = items => (items === null ? null : items.map(({ id, sequence, ...rest }) => ({ ...rest, stamped: stamped(id, sequence) })));
 const payloads = (s, type) => s.getRecordIdsByType(type).map(id => JSON.parse(utf8(s.getRecord(id).payload)));
 const branchNames = s => s.listBranches().map(({ name }) => name).sort();
 const stateList = s => s.listStates().map(({ id, strategy }) => `${id} ${strategy}`).sort();
@@ -41,7 +42,8 @@ function threeWrites(s) {
   s.appendToStateJson('messages', message('new', 1));
 }
 
-const longCall = (s, i) => (i % 2 === 0
+const longMethod = i => (i % 2 === 0 ? 'appendJson' : 'appendToStateJson');
+const longCall = (s, i) => (longMethod(i) === 'appendJson'
   ? s.appendJson('journal', { n: i })
   : s.appendToStateJson('messages', message('long', i)));
 
@@ -258,6 +260,7 @@ function run([name, root, outside, index]) {
     : kind === 'sync' ? () => s.sync()
     : kind === 'close' ? () => s.close()
     : () => write.call(s, f);
+  out.method = kind === 'long' ? longMethod(Number(index)) : name;
   out.old = readAll(reads, s, f);
   out.call = step('call', call);
   if (kind === 'close') {
@@ -268,6 +271,10 @@ function run([name, root, outside, index]) {
   }
   out.reads = [readAll(reads, s, f), readAll(reads, s, f)];
   mark('reads');
+  if (!out.call.ok) {
+    copyTree(path, join(outside, 'thrown'));
+    mark('thrown-copied');
+  }
   const gaveOld = !out.call.ok && Object.entries(out.reads[0]).every(([key, read]) => read.ok && out.old[key].ok
     && JSON.stringify(read.value) === JSON.stringify(out.old[key].value));
   if (gaveOld) {
