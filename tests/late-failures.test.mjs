@@ -228,7 +228,6 @@ function child(command, args, cwd) {
 }
 
 let base;
-let escaped = false;
 let counter = 0;
 
 async function traced(scenario, extra, inject) {
@@ -494,16 +493,16 @@ function judge(scenario, clean, run, reopen) {
       }
     }
   }
-  const handleReads = scenario.kind === 'close' ? [out.old] : [out.reads[0], out.reads[1], out.retryReads, out.syncReads].filter(Boolean);
-  const atBarrier = Object.fromEntries(Object.keys(handleReads[0]).map(name => [name,
-    handleReads.map(reads => reads[name]).filter(read => read.ok).at(-1) ?? handleReads.at(-1)[name]]));
+  const lastGiven = (name, batches) => {
+    const reads = batches.filter(Boolean).map(batch => batch[name]);
+    return reads.filter(read => read.ok).at(-1) ?? reads.at(-1);
+  };
+  const handleReads = scenario.kind === 'close' ? [out.old] : [out.reads[0], out.reads[1], out.retryReads, out.syncReads];
   const before = { copy: barriers.filter(barrier => barrier !== 'close'), store: barriers, thrown: [] };
   const lastRead = {
-    thrown: name => (out.reads[1][name].ok ? out.reads[1][name] : out.reads[0][name]),
-    copy: name => out.syncReads[name],
-    store: scenario.kind === 'close'
-      ? name => (out.reads[1][name].ok ? out.reads[1][name] : out.old[name])
-      : name => (out.closedReads[name].ok ? out.closedReads[name] : out.syncReads[name]),
+    thrown: name => lastGiven(name, out.reads),
+    copy: name => lastGiven(name, handleReads),
+    store: name => lastGiven(name, scenario.kind === 'close' ? [out.old, ...out.reads] : [...handleReads, out.closedReads]),
   };
   for (const [where, answer] of Object.entries(reopen)) {
     const which = { copy: 'the copy', store: 'the closed store', thrown: 'the copy made after the throw' }[where];
@@ -523,7 +522,7 @@ function judge(scenario, clean, run, reopen) {
       }
     }
     for (const [name, read] of Object.entries(answer.reads)) {
-      const handle = atBarrier[name];
+      const handle = lastGiven(name, handleReads);
       if (!read.ok) {
         add('the reopen', `${which}, opened again, threw for ${name}: ${read.message}`);
       } else if (passed && handle.ok && !isDeepStrictEqual(read.value, handle.value)) {
@@ -586,29 +585,38 @@ async function scenarioResult(scenario) {
 }
 
 const notLinux = process.platform !== 'linux' && 'the record of system calls comes from strace, which is for Linux';
-const missing = notLinux ? null : straceProblem();
+function escapedProblem() {
+  let dir = tmpdir();
+  try {
+    dir = realpathSync(dir);
+  } catch {}
+  return /[\x00-\x1f\x7f-\uffff"\\<>]/.test(dir)
+    ? `the temporary directory ${JSON.stringify(dir)} has characters that strace escapes in its record, and the harness reads paths unescaped`
+    : null;
+}
+const missing = notLinux ? null : straceProblem() ?? escapedProblem();
 const skip = notLinux || (missing !== null && !process.env.CI && missing);
 
 if (skip) {
   test('A refused request in the middle of a call leaves the caller a throw or a whole value', { skip }, () => {});
 } else if (missing !== null) {
-  test('strace can trace the writer', () => assert.fail(missing));
+  test('strace can trace the writer here', () => assert.fail(missing));
 } else {
   base = realpathSync(mkdtempSync(join(tmpdir(), 'chronicle-late-failures-')));
   after(() => rmSync(base, { recursive: true, force: true }));
-  escaped = /[\x00-\x1f\x7f-\uffff"\\<>]/.test(base)
-    && `the path ${JSON.stringify(base)} has characters that strace escapes in its record, and the harness reads paths unescaped`;
   const scenarios = JSON.parse(spawnSync(process.execPath, [WRITER, 'list'], { encoding: 'utf8' }).stdout);
-  const results = new Map(escaped ? [] : scenarios.map(scenario => [scenario.name,
+  const results = new Map(scenarios.map(scenario => [scenario.name,
     scenarioResult(scenario).catch(error => ({ failure: error.stack }))]));
   for (const scenario of scenarios) {
     const title = scenario.kind === 'cold'
       ? `${scenario.name} on a store opened again throws the errno of a refused read, and the same call again gives the true value`
       : `A refused request in ${scenario.kind === 'long' ? 'an append of a long run without a barrier' : scenario.name} leaves a throw or a return, whole values and a store that opens again`;
     test(title, async t => {
-      if (escaped) assert.fail(escaped);
       const result = await results.get(scenario.name);
       if (result.failure) assert.fail(result.failure);
+      const lost = TODOS.filter(each => each.scenario === scenario.name && each.point !== undefined
+        && !result.points.some(point => point.id === each.point));
+      assert.deepEqual(lost.map(({ point, rule }) => `${point}, ${rule}`), [], 'a todo names a fault point that the call no longer has');
       if (result.points.length === 0) {
         t.skip(scenario.kind === 'cold' ? 'in a clean run, the read makes no read request at or under the store'
           : 'in a clean run, the call makes no request at or under the store that is a fault point');
