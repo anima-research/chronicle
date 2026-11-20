@@ -535,7 +535,7 @@ def relinked(raw, rec, link):
 # ── the run ────────────────────────────────────────────────────────────────
 
 def locked(store, act):
-    lock, created = take_lock(store, os.stat(os.path.join(store, 'records.log')))
+    lock, created = take_lock(store, os.stat(resolve(store, 'records.log')))
     try:
         return act()
     finally:

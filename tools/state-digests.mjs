@@ -56,6 +56,9 @@ function globToRegExp(glob) {
 
 const { JsStore } = require(resolve(mod));
 const sha = (value) => createHash('sha256').update(value).digest('hex').slice(0, 16);
+// The binding frees a Buffer that it returned only when the event loop turns, so the check turns it after each read
+// that returns bytes, and holds one record at a time.
+const turn = () => new Promise((done) => setImmediate(done));
 const bytes = (raw) => (raw == null ? 'absent' : `${sha(raw)} bytes=${raw.length}`);
 
 const store = JsStore.open({ path });
@@ -87,7 +90,8 @@ try {
     let count = 0;
     let from = 0;
     for (;;) {
-      const page = store.query({ fromSequence: from, limit: 2000 });
+      const page = store.query({ fromSequence: from, limit: 1 });
+      await turn();
       if (page.length === 0) break;
       for (const record of page) {
         if (record.recordType === 'state_update') continue;
@@ -108,6 +112,7 @@ try {
         ? `tree ${sha(JSON.stringify(store.treeList(id)))}`
         : `${strategy} ${bytes(store.getState(id))} items=${store.getStateLen(id) ?? '-'}`));
       out.push(`  ${branch}\t${id}\t${value}`);
+      await turn();
       if (strategy !== 'tree' && !named(id)) {
         const history = [];
         for (let k = 1; k <= 8; k++) {
@@ -116,6 +121,7 @@ try {
             const raw = store.getStateAt(id, at);
             return raw == null ? 'absent' : sha(raw);
           }));
+          await turn();
         }
         out.push(`  ${branch}\t${id}\tat eight sequences ${history.join(' ')}`);
       }

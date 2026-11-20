@@ -7,7 +7,7 @@ import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readd
 import { tmpdir } from 'node:os';
 import { crc32 } from 'node:zlib';
 import { dirname, join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { JsStore } from '../index.js';
 
 const tools = dirname(fileURLToPath(import.meta.url));
@@ -548,6 +548,38 @@ try {
       console.log('ok: state-digests.mjs reads every branch and the history of each state, prints no content, leaves the branch it found, tells absent from null, and exits non-zero on a failed read');
     },
 
+    "the check's memory": () => {
+      if (!existsSync('/proc/self/status')) {
+        console.log("skip: the check's memory case reads its peak from /proc/self/status");
+        return;
+      }
+      const writeStore = (name, size) => {
+        const path = join(scratch, name);
+        const store = JsStore.create({ path });
+        store.registerState({ id: WHOLE, strategy: 'snapshot' });
+        const value = 'x'.repeat(size);
+        for (let n = 0; n < 3000; n++) store.setStateJson(WHOLE, { n, value });
+        store.close();
+        return path;
+      };
+      // VmHWM, since getrusage's maxrss carries over from the parent across exec.
+      const peak = (path) => {
+        const run = spawnSync(process.execPath, ['--input-type=module', '-e', `
+process.argv = [process.argv[0], 'state-digests.mjs', ${JSON.stringify(path)}];
+await import(${JSON.stringify(pathToFileURL(join(tools, 'state-digests.mjs')).href)});
+const { readFileSync } = await import('node:fs');
+console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\\s+(\\d+)/)[1]);`], { encoding: 'utf8', env: { ...process.env, CHRONICLE_MODULE: MODULE } });
+        assert.equal(run.status, 0, `state-digests.mjs on ${path} exited ${run.status}:\n${run.stderr}`);
+        return Number(run.stderr.match(/peak (\d+)/)[1]) * 1024;
+      };
+      const large = writeStore('memory-large', 100 << 10);
+      const log = statSync(join(large, 'records.log')).size;
+      const grown = peak(large) - peak(writeStore('memory-small', 16));
+      assert.ok(grown < log / 2, `state-digests.mjs should hold one read at a time: on a log of ${Math.round(log / 2 ** 20)} MB its peak memory grew ${Math.round(grown / 2 ** 20)} MB over a small store's`);
+      rmSync(large, { recursive: true });
+      console.log(`ok: state-digests.mjs on a log of ${Math.round(log / 2 ** 20)} MB peaks ${Math.round(grown / 2 ** 20)} MB above its peak on a small store`);
+    },
+
     'branches': () => {
       const { path } = branchedStore('branches');
       const kinds = new Set(updates(path).filter(({ state }) => state === 'messages').map(({ kind }) => kind));
@@ -721,6 +753,9 @@ try {
       symlinkSync(join(scratch, 'elsewhere-LOCK'), join(linkedLock, 'LOCK'));
       refuses(linkedLock, 'a LOCK that is a symbolic link', 'LOCK is a symbolic link');
       refuses(copyOf('refuse-unnamed'), 'patterns that name no state', 'that --state nothing-* names', ['nothing-*']);
+      const empty = join(scratch, 'refuse-no-log');
+      mkdirSync(empty);
+      refuses(empty, 'a directory with no records.log', 'records.log is missing');
 
       const json = fixture(join(scratch, 'refuse-json'));
       const before = JsStore.open({ path: json });
