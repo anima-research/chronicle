@@ -1031,6 +1031,27 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--state', '${WHOLE}']
       assert.equal(replayed.getStateLen('messages'), 52, 'the premise: this build replays the appended JSON update');
       replayed.close();
       refuses(json, 'a JSON update that needs a new link', `offset ${appended} needs a new link, and it is in the JSON form`);
+      // A named state whose chain reaches a Set in the JSON form: refused, with the way to run on the other states.
+      const jsonSet = fixture(join(scratch, 'refuse-json-set'));
+      const setWriter = JsStore.open({ path: jsonSet });
+      setWriter.registerState({ id: WHOLE, strategy: 'snapshot' });
+      setWriter.setStateJson(WHOLE, { n: 0 });
+      const setSequence = setWriter.currentSequence();
+      setWriter.close();
+      const wholeUpdates = updates(jsonSet).filter(({ state }) => state === WHOLE);
+      const jsonSetAt = appendRecord(jsonSet, wholeUpdates[0], setSequence + 1, Buffer.from(JSON.stringify({
+        record_id: 0, global_sequence: setSequence + 1, state_id: WHOLE, prev_update_offset: wholeUpdates.at(-1).record,
+        operation: { Set: [...Buffer.from(JSON.stringify({ n: 1 }))] }, timestamp: Date.now() * 1000,
+      })), { encoding: 0 });
+      rmSync(join(jsonSet, 'state.bin'));
+      const setReplayed = JsStore.open({ path: jsonSet });
+      setReplayed.registerState({ id: 'messages', strategy: 'append_log' });
+      setReplayed.registerState({ id: WHOLE, strategy: 'snapshot' });
+      assert.deepEqual(setReplayed.getStateJson(WHOLE), { n: 1 }, 'the premise: this build replays the appended JSON Set');
+      setReplayed.setStateJson(WHOLE, { n: 2 });
+      setReplayed.close();
+      refuses(jsonSet, 'a named state whose chain reaches a JSON Set',
+        `the update of ${WHOLE} at offset ${jsonSetAt} is in the JSON form, and this tool does not read whether an update in that form sets a whole value. So it frees no old value of ${WHOLE}. To run on the other states, give --state patterns that do not match ${WHOLE}.`);
     },
 
     'the old form': () => {
@@ -1130,6 +1151,53 @@ sys.exit(code)`, store, String(stopAfter), how], { encoding: 'utf8', cwd: tools 
         assert.ok(run.stdout.includes(says), `a run that fails after step ${k} should say "${says}":\n${run.stdout}`);
         if (status === 1) assert.deepEqual(filesOf(store), original, 'a run that fails before its swap should leave every file as it was');
       }
+      // A system that doesn't sync directories, as chronicle allows (src/atomic_file.rs): a run and a going back finish.
+      const nodirsync = join(scratch, 'stops-no-dir-sync');
+      cpSync(base, nodirsync, { recursive: true });
+      const withoutDirSync = (...args) => spawnSync(PYTHON, ['-c', `
+import errno, importlib.util, os, stat, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+real = os.fsync
+def fsync(fd):
+    if stat.S_ISDIR(os.fstat(fd).st_mode): raise OSError(errno.EINVAL, 'Invalid argument')
+    real(fd)
+os.fsync = fsync
+sys.exit(tool.main(['compact-set-states.py'] + sys.argv[1:]))`, nodirsync, ...args], { encoding: 'utf8', cwd: tools });
+      // A file's sync that fails stays an error, as in chronicle: the run refuses, and no file of the store changes.
+      const nofilesync = join(scratch, 'stops-no-file-sync');
+      cpSync(base, nofilesync, { recursive: true });
+      const noFileSyncRun = spawnSync(PYTHON, ['-c', `
+import errno, importlib.util, os, stat, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+real = os.fsync
+def fsync(fd):
+    if stat.S_ISREG(os.fstat(fd).st_mode): raise OSError(errno.EINVAL, 'Invalid argument')
+    real(fd)
+os.fsync = fsync
+sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--state', '${WHOLE}', '--apply']))`, nofilesync], { encoding: 'utf8', cwd: tools });
+      assert.equal(noFileSyncRun.status, 1, `a run whose file sync fails exited ${noFileSyncRun.status}:\n${noFileSyncRun.stdout}${noFileSyncRun.stderr}`);
+      assert.deepEqual(filesOf(nofilesync), original, 'a run whose file sync fails should change no file of the store');
+      const unsyncedRunOk = withoutDirSync('--state', WHOLE, '--apply');
+      assert.equal(unsyncedRunOk.status, 0, `a run where directories don't sync exited ${unsyncedRunOk.status}:\n${unsyncedRunOk.stdout}${unsyncedRunOk.stderr}`);
+      const unsyncedBack = withoutDirSync('--go-back');
+      assert.equal(unsyncedBack.status, 0, `a going back where directories don't sync exited ${unsyncedBack.status}:\n${unsyncedBack.stdout}${unsyncedBack.stderr}`);
+      assert.deepEqual(filesOf(nodirsync), original, 'a going back where directories don\'t sync should leave every file as before the run');
+      if (process.getuid?.() !== 0) {
+        // A store directory that its user can write and search but not read: chronicle saves without the sync there.
+        const unreadableDir = join(scratch, 'stops-unreadable-dir');
+        cpSync(base, unreadableDir, { recursive: true });
+        const dirMode = statSync(unreadableDir).mode & 0o777;
+        chmodSync(unreadableDir, 0o300);
+        const dirRun = compact(unreadableDir, '--state', WHOLE, '--apply');
+        const dirBack = compact(unreadableDir, '--go-back');
+        chmodSync(unreadableDir, dirMode);
+        assert.equal(dirRun.status, 0, `a run in a directory that its user can't read exited ${dirRun.status}:\n${dirRun.out}${dirRun.err}`);
+        assert.equal(dirBack.status, 0, `a going back in a directory that its user can't read exited ${dirBack.status}:\n${dirBack.out}${dirBack.err}`);
+        assert.deepEqual(filesOf(unreadableDir), original, 'a going back in a directory that its user can\'t read should leave every file as before the run');
+      }
+      console.log('ok: a run and a going back finish where directories don\'t sync, and where the store\'s directory can\'t be read, as chronicle saves there');
       // A rename that lands and a directory sync after it that fails: the stopped line names the step that landed.
       const unsynced = join(scratch, 'stops-unsynced');
       cpSync(base, unsynced, { recursive: true });

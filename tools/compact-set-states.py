@@ -6,7 +6,8 @@ every write keeps every earlier value on disk. A read of a state walks back from
 its head along `prev_update_offset` and stops at the first `Set` or `Snapshot`.
 The tool walks the links from each head in state.bin, for every state, to each
 chain's end. A state that a --state pattern names must be such a state: each
-update of it that the walk reaches must be a Set or a Snapshot. Of it, this tool keeps
+update of it that the walk reaches must be a Set or a Snapshot, in the named
+MessagePack form that chronicle writes. Of it, this tool keeps
 what a read reads, the update that each head in state.bin names, and it drops
 the other updates of that state that the walk reaches. Every other record is
 copied. A state update that the walk reaches is rewritten where its
@@ -87,7 +88,8 @@ state.bin.pre-compact, by a hard link. Up to here the store's own files are as
 they were. Then the blocked file takes state.bin's place, state-indexes.bin moves
 to state-indexes.bin.pre-compact, the new log takes records.log's place, and the
 new state.bin takes the blocked one's place. So a run that stops at any point
-leaves a store that opens as before, or one that open refuses.
+leaves a store that opens as before, or one that open refuses, or, after the
+last rename, the store that the run made.
 
 On a host:
   First, do all of this once on a copy of the store that can be thrown away, to
@@ -133,9 +135,11 @@ field index afterwards, which --go-back says. Once
 the host has written, it refuses: undoing the run then loses every write since,
 and this tool does not do it.
 
-The tool needs free space for the new log, the size of what it keeps, a file
-system with hard links, and memory of a few hundred bytes for each record of the
-log and a few times the size of the largest record.
+The tool needs free space for the new log, the size of what it keeps, and for
+the new state.bin and the run's record, which can be on another file system. It
+needs a file system with hard links, and memory of a few hundred bytes for each
+record of the log, a few times the size of the largest record, and the size of
+state-indexes.bin, which it reads whole.
 
 Usage:
     compact-set-states.py <store-dir> --state <pattern> [--state <pattern> ...] [--apply]
@@ -605,9 +609,19 @@ def write_file(path, chunks, like, made=None):
 
 
 def sync_dir(path):
-    fd = os.open(path, os.O_RDONLY)
-    try: os.fsync(fd)
-    finally: os.close(fd)
+    """Sync a directory, as chronicle syncs one (src/atomic_file.rs, sync_directory_at): a directory that can't be
+    opened for reading (EACCES, EPERM) or a system that doesn't sync directories (EBADF, EINVAL) goes without it."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM): return
+        raise
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        if error.errno not in (errno.EBADF, errno.EINVAL): raise
+    finally:
+        os.close(fd)
 
 
 def human(n):
@@ -661,9 +675,15 @@ def plan(recs, heads, patterns, branches):
     named = lambda sid: any(pattern_matches(p, sid) for p in patterns)
     for r in recs:
         if r.offset in reached and named(r.sid) and not r.whole:
-            raise Refusal('%s is not a state whose every update is a whole value: its update at offset %d is %s. This '
-                          'tool frees only the old values of a state that each update sets whole, with Set or Snapshot.'
-                          % (r.sid, r.offset, 'a %s' % r.op if r.form == 'map' else 'in the %s form' % FORMS[r.form]))
+            if r.form != 'map':
+                raise Refusal('the update of %s at offset %d is in the %s form, and this tool does not read whether an '
+                              'update in that form sets a whole value. So it frees no old value of %s. To run on the '
+                              'other states, give --state patterns that do not match %s.'
+                              % (r.sid, r.offset, FORMS[r.form], r.sid, r.sid))
+            raise Refusal('%s is not a state whose every update is a whole value: its update at offset %d is a %s. This '
+                          'tool frees only the old values of a state that each update sets whole, with Set or Snapshot. '
+                          'To run on the other states, give --state patterns that do not match %s.'
+                          % (r.sid, r.offset, r.op, r.sid))
     # chronicle's read of a whole value stops at the head where it starts, so of a named state each head's record
     # stays, and the other updates that the walk reaches go.
     keep = {head[HEAD] for key, head in heads if named(key[1])}
