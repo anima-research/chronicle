@@ -6,9 +6,9 @@ import { join, posix } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { readTrace } from './durability-trace.mjs';
+import { quoted, readTrace, resolved } from './durability-trace.mjs';
 
-const CALLS = '%file,%desc,mmap,munmap,msync,sync,syncfs,io_uring_setup,io_uring_enter,io_uring_register';
+const CALLS = '%file,%desc,mmap,munmap,msync,sync,syncfs,io_uring_setup,io_uring_enter,io_uring_register,io_setup,io_submit';
 const WRITER = fileURLToPath(new URL('./late-failures-writer.mjs', import.meta.url));
 const WRITES = new Set(['write', 'pwrite64', 'writev', 'pwritev', 'pwritev2']);
 const READS = new Set(['read', 'pread64', 'readv', 'preadv', 'preadv2']);
@@ -20,9 +20,12 @@ const BY_DESCRIPTOR = new Set([...WRITES, ...READS, ...SYNCS]);
 const NOT_MEASURED = 'The instrument does not measure';
 const UNREADABLE_ERRNO = 'The error for a refused sync of the directories that hold a blob has words after its OS error, so a caller cannot read the errno.';
 const TODOS = [
-  ['storeBlob', 'fsync 1', 'the errno', UNREADABLE_ERRNO],
-  ['storeBlob', 'fsync 3', 'the errno', UNREADABLE_ERRNO],
-  ['storeBlob', 'fsync 3', 'the barrier', "After a refused sync of a blob's directory, sync and close return while the blob's name is not synced."],
+  { scenario: 'storeBlob', point: 'fsync 1', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: () => true },
+  { scenario: 'storeBlob', point: 'fsync 3', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: () => true },
+  {
+    scenario: 'storeBlob', point: 'fsync 3', rule: 'the barrier', owns: problem => problem.nameInRefused === true,
+    todo: "After a refused sync of a blob's directory, sync and close return while the blob's name is not synced.",
+  },
 ];
 
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
@@ -69,15 +72,7 @@ function splitArgs(body) {
   return { args, rest: body.slice(i + 1) };
 }
 
-const unquoted = arg => (typeof arg === 'string' && arg.startsWith('"') ? arg.slice(1, arg.lastIndexOf('"')).replace(/\\(.)/g, '$1') : null);
 const decorated = arg => /^(?:-?\d+|AT_FDCWD)<(.*)>$/s.exec(arg ?? '')?.[1] ?? null;
-const pathAt = (dirArg, pathArg, cwd) => {
-  const path = unquoted(pathArg);
-  if (path === null) return null;
-  if (path.startsWith('/')) return posix.normalize(path);
-  const dir = dirArg === null ? cwd : decorated(dirArg);
-  return dir === null ? null : posix.normalize(posix.join(dir, path));
-};
 
 function describe(tid, body, cwd) {
   const name = /^(\w+)\(/.exec(body)[1];
@@ -86,16 +81,16 @@ function describe(tid, body, cwd) {
     tid, name, text: body,
     ok: !/^\s*=\s*(-1|\?)/.test(rest),
     injected: /\(INJECTED\)/.test(rest),
-    mark: args.map(unquoted).map(path => /^\/chronicle-mark\/(.+)$/.exec(path ?? '')?.[1]).find(Boolean) ?? null,
+    mark: args.map(quoted).map(path => /^\/chronicle-mark\/(.+)$/.exec(path ?? '')?.[1]).find(Boolean) ?? null,
     paths: [],
   };
   if (BY_DESCRIPTOR.has(name)) call.paths = [decorated(args[0])];
-  else if (name === 'rename') call.paths = [pathAt(null, args[0], cwd), pathAt(null, args[1], cwd)];
-  else if (name === 'renameat' || name === 'renameat2') call.paths = [pathAt(args[0], args[1], cwd), pathAt(args[2], args[3], cwd)];
+  else if (name === 'rename') call.paths = [resolved(null, args[0], cwd), resolved(null, args[1], cwd)];
+  else if (name === 'renameat' || name === 'renameat2') call.paths = [resolved(args[0], args[1], cwd), resolved(args[2], args[3], cwd)];
   else if (name === 'open' || name === 'creat' || name === 'mkdir' || name === 'unlink' || name === 'rmdir') {
-    call.paths = [pathAt(null, args[0], cwd)];
+    call.paths = [resolved(null, args[0], cwd)];
   } else if (['openat', 'openat2', 'mkdirat', 'unlinkat', 'statx', 'newfstatat'].includes(name)) {
-    call.paths = [pathAt(args[0], args[1], cwd)];
+    call.paths = [resolved(args[0], args[1], cwd)];
   }
   call.flags = name === 'creat' ? 'O_CREAT' : name === 'open' ? args[1] ?? '' : name.startsWith('openat') ? args[2] ?? '' : '';
   return call;
@@ -186,14 +181,21 @@ async function pooled(work) {
 
 function child(command, args, cwd) {
   return pooled(() => new Promise(resolve => {
-    const proc = spawn(command, args, { cwd, env, timeout: 20_000 });
+    const started = Date.now();
+    const proc = spawn(command, args, { cwd, env, detached: true });
+    let timedOut = false;
+    const bound = setTimeout(() => {
+      timedOut = true;
+      process.kill(-proc.pid, 'SIGKILL');
+    }, 20_000);
     const out = [];
     const err = [];
     proc.stdout.on('data', chunk => out.push(chunk));
     proc.stderr.on('data', chunk => err.push(chunk));
-    proc.on('close', (status, signal) => resolve({
-      status, signal, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8'),
-    }));
+    proc.on('close', (status, signal) => {
+      clearTimeout(bound);
+      resolve({ status, signal, timedOut, ms: Date.now() - started, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') });
+    });
   }));
 }
 
@@ -223,7 +225,8 @@ async function traced(scenario, extra, inject) {
 }
 
 function brokenRun(run) {
-  if (run.result.signal) return `the writer ended by ${run.result.signal}${run.result.signal === 'SIGTERM' ? ', since it did not end within 20 s' : ''}`;
+  if (run.result.timedOut) return 'the writer did not end within 20 s';
+  if (run.result.signal) return `the writer ended by ${run.result.signal}`;
   if (run.result.status !== 0 || run.out === null) {
     const tail = run.result.stderr.trim().split('\n').slice(-3).join(' | ');
     return `the writer ended with status ${run.result.status}: ${tail}`;
@@ -268,6 +271,7 @@ async function aimAll(scenario, clean, extra) {
   const misses = new Map(points.map(point => [point.id, []]));
   const aims = new Map(points.map(point => [point.id, point.when]));
   let aimed = 0;
+  let slowest = 0;
   const kept = new Set();
   for (let round = 0; round < 3; round++) {
     const open = points.filter(point => counted.get(point.id).length === 0);
@@ -276,6 +280,7 @@ async function aimAll(scenario, clean, extra) {
     const runs = await Promise.all(open.map(point => traced(scenario, extra,
       { name: point.name, errno: errnoOf(point.name), when: aims.get(point.id) })));
     const found = runs.map(run => hit(run, clean));
+    slowest = Math.max(slowest, ...runs.map(run => run.result.ms));
     if (round === 0) {
       for (const name of new Set(open.map(point => point.name))) {
         const ofName = open.flatMap((point, index) => (point.name === name ? [found[index].id === point.id] : []));
@@ -285,13 +290,13 @@ async function aimAll(scenario, clean, extra) {
     runs.forEach((run, index) => {
       const point = open[index];
       const { id, why, when, request } = found[index];
-      if (id && counted.has(id)) counted.get(id).push({ ...run, errno: errnoOf(request.name) });
+      if (id && counted.has(id)) counted.get(id).push({ ...run, errno: errnoOf(request.name), refused: request.path });
       if (id === point.id) return;
       misses.get(point.id).push(why ?? `it refused ${id}`);
       if (!kept.has(point.name) && when !== null) aims.set(point.id, aims.get(point.id) + point.when - when);
     });
   }
-  return { points, counted, misses, aimed };
+  return { points, counted, misses, aimed, slowest };
 }
 
 async function reopened(scenario, extra, runs) {
@@ -314,22 +319,26 @@ const shown = outcome => (outcome.ok ? JSON.stringify(outcome.value) : `a throw 
 function barrierProblems(run, store, barriers) {
   const trace = readTrace(run.text, { root: run.root, cwd: run.dir, names: [run.root] });
   const found = trace.marks.map(({ name }) => name);
-  if (!isDeepStrictEqual(found, run.out.marks)) return [`${NOT_MEASURED}: the record's marks are not the writer's marks`];
+  if (!isDeepStrictEqual(found, run.out.marks)) return [{ text: `${NOT_MEASURED}: the record's marks are not the writer's marks` }];
   if (trace.problems.length > 0) {
-    return [`the record cannot be judged: ${trace.problems.slice(0, 3).map(({ why, call }) => `${why}: ${call}`).join(' | ')}`];
+    return [{ text: `the record cannot be judged: ${trace.problems.slice(0, 3).map(({ why, call }) => `${why}: ${call}`).join(' | ')}` }];
   }
   const problems = [];
   for (const barrier of barriers) {
     const mark = trace.marks.find(({ name }) => name === `${barrier}-end`);
-    const files = mark.files.filter(path => isUnder(path, store)).map(path => posix.relative(store, path));
-    const names = mark.names.filter(path => isUnder(path, store) && path !== store).map(path => posix.relative(store, path));
-    if (files.length + names.length > 0) {
-      problems.push(`${barrier} returned before the store asked to put these on disk: files [${files.join(', ')}], names [${names.join(', ')}]`);
+    for (const path of mark.files.filter(each => isUnder(each, store))) {
+      problems.push({ text: `${barrier} returned before the store asked to put the file ${posix.relative(store, path)} on disk` });
+    }
+    for (const path of mark.names.filter(each => isUnder(each, store) && each !== store)) {
+      problems.push({
+        text: `${barrier} returned before the store asked to put the name ${posix.relative(store, path)} on disk`,
+        nameInRefused: posix.dirname(path) === run.refused,
+      });
     }
   }
-  const renames = trace.unsyncedRenames.filter(({ from, to }) => isUnder(from, store) || isUnder(to, store))
-    .map(({ from, to }) => `${posix.relative(store, from)} -> ${posix.relative(store, to)}`);
-  if (renames.length > 0) problems.push(`the store renamed files before it asked to put them on disk: ${renames.join(', ')}`);
+  for (const { from, to } of trace.unsyncedRenames.filter(each => isUnder(each.from, store) || isUnder(each.to, store))) {
+    problems.push({ text: `the store renamed ${posix.relative(store, from)} to ${posix.relative(store, to)} before it asked to put it on disk` });
+  }
   return problems;
 }
 
@@ -339,12 +348,12 @@ function judge(scenario, clean, run, reopen) {
   const problems = new Map(RULES.map(rule => [rule, []]));
   const broken = brokenRun(run);
   if (broken) {
-    problems.get('the call').push(broken);
+    problems.get('the call').push({ text: broken });
     return problems;
   }
   const { out } = run;
   const errno = run.errno;
-  const add = (rule, problem) => problems.get(rule).push(problem);
+  const add = (rule, text) => problems.get(rule).push({ text });
   if (scenario.kind === 'cold') {
     if (out.call.ok) add('the call', `the read returned ${JSON.stringify(out.call.value)}, and it did not throw`);
     else if (errnoCode(out.call) !== errno) add('the errno', `the read threw without ${errno}: ${out.call.message}`);
@@ -356,6 +365,14 @@ function judge(scenario, clean, run, reopen) {
   const old = clean.out.old;
   const fresh = scenario.kind === 'close' ? clean.out.old : clean.out.reads[0];
   const oldOrNew = (name, value) => isDeepStrictEqual(value, old[name].value) || isDeepStrictEqual(value, fresh[name].value);
+  const oneState = (rule, what, reads) => {
+    const given = Object.entries(reads).filter(([, read]) => read.ok);
+    const asOld = given.filter(([name, read]) => isDeepStrictEqual(read.value, old[name].value)).map(([name]) => name);
+    const asNew = given.filter(([name, read]) => isDeepStrictEqual(read.value, fresh[name].value)).map(([name]) => name);
+    if (asOld.length < given.length && asNew.length < given.length) {
+      add(rule, `${what} are no one state: ${given.map(([name]) => `${name} ${asNew.includes(name) ? 'new' : asOld.includes(name) ? 'old' : 'neither'}`).join(', ')}`);
+    }
+  };
   const whole = (rule, what, reads, mustBeNew) => {
     for (const [name, read] of Object.entries(reads)) {
       if (!read.ok) {
@@ -365,18 +382,25 @@ function judge(scenario, clean, run, reopen) {
       }
     }
   };
-  if (!out.call.ok && out.call.code === 'Io' && errnoCode(out.call) !== errno) {
-    add('the errno', `the call threw an I/O error without ${errno}: ${out.call.message}`);
+  if (!out.call.ok && out.call.code !== 'DurabilityLost' && errnoCode(out.call) !== errno) {
+    add('the errno', `the call threw without ${errno}: ${shown(out.call)}`);
   }
   const returned = out.call.ok && scenario.kind !== 'close';
   whole('the reads', 'the reads after the call', out.reads[0], returned);
   whole('the reads', 'the second reads after the call', out.reads[1], returned);
+  oneState('the reads', 'the reads after the call', out.reads[0]);
+  oneState('the reads', 'the second reads after the call', out.reads[1]);
+  if (out.syncReads) {
+    whole('the reads', 'the reads after sync', out.syncReads, false);
+    oneState('the reads', 'the reads after sync', out.syncReads);
+  }
   for (const name of Object.keys(out.reads[0])) {
     if (!isDeepStrictEqual(out.reads[0][name], out.reads[1][name])) {
       add('the reads', `two reads of ${name} disagree: ${shown(out.reads[0][name])} and ${shown(out.reads[1][name])}`);
     }
   }
   if (out.retry?.ok) whole('the second try', 'the reads after the same call again', out.retryReads, true);
+  if (out.retryReads) oneState('the second try', 'the reads after the same call again', out.retryReads);
   const barriers = [];
   if (scenario.kind === 'sync' || scenario.kind === 'close') {
     if (out.call.ok) barriers.push('call');
@@ -417,6 +441,7 @@ function judge(scenario, clean, run, reopen) {
       continue;
     }
     const passed = before[where].length > 0;
+    oneState('the reopen', `${which}'s reads, opened again,`, answer.reads);
     for (const [name, read] of Object.entries(answer.reads)) {
       const handle = atBarrier[name];
       if (!read.ok) {
@@ -462,14 +487,18 @@ async function scenarioResult(scenario) {
   const problem = cleanProblem(scenario, clean);
   if (problem) return { failure: problem };
   Object.assign(clean, requestsOfCall(clean.text, clean.store, clean.dir));
+  const marks = clean.all.filter(({ mark }) => mark).map(({ mark }) => mark);
+  if (!isDeepStrictEqual(marks, clean.out.marks)) {
+    return { failure: `${NOT_MEASURED}: the clean run's record shows the marks [${marks.join(', ')}], not the writer's [${clean.out.marks.join(', ')}]` };
+  }
   if (scenario.kind === 'long' && clean.requests.every(({ name }) => WRITES.has(name) || name === 'lseek')) {
     return { failure: `the clean run's append ${extra[0]} shows no request that is no write and no seek` };
   }
-  const { points, counted, misses, aimed } = await aimAll(scenario, clean, extra);
+  const { points, counted, misses, aimed, slowest } = await aimAll(scenario, clean, extra);
   const runs = [...counted.values()].flat();
   const answers = await reopened(scenario, extra, [clean, ...runs]);
   const cleanAnswer = answers.shift();
-  return { clean, points, counted, misses, aimed, answers: new Map(runs.map((run, index) => [run, answers[index]])), cleanAnswer, extra };
+  return { clean, points, counted, misses, aimed, slowest: Math.max(slowest, clean.result.ms), answers: new Map(runs.map((run, index) => [run, answers[index]])), cleanAnswer, extra };
 }
 
 const notLinux = process.platform !== 'linux' && 'the record of system calls comes from strace, which is for Linux';
@@ -498,7 +527,7 @@ if (skip) {
           : 'in a clean run, the call makes no request at or under the store that is a fault point');
         return;
       }
-      t.diagnostic(`${result.points.length} fault points, ${result.aimed} aimed runs`);
+      t.diagnostic(`${result.points.length} fault points, ${result.aimed} aimed runs, the slowest traced run ${result.slowest} ms`);
       if (scenario.kind !== 'cold') {
         const reopenProblems = Object.entries(result.cleanAnswer).filter(([, answer]) => !answer.opened.ok
           || !isDeepStrictEqual(answer.reads, result.clean.out.syncReads ?? result.clean.out.old));
@@ -512,17 +541,22 @@ if (skip) {
             assert.fail(`${NOT_MEASURED}: three aimed runs did not refuse ${point.id} (${at}): ${result.misses.get(point.id).join('; ')}`);
           }
           const judged = runs.map(run => [run, judge(scenario, result.clean, run, result.answers.get(run))]);
-          const holds = rules => {
+          const todos = TODOS.filter(each => each.scenario === scenario.name && each.point === point.id);
+          const ownedBy = (rule, problem) => todos.find(each => each.rule === rule && each.owns(problem));
+          const holds = keep => {
             for (const [run, problems] of judged) {
-              const found = rules.flatMap(rule => problems.get(rule));
+              const found = RULES.flatMap(rule => problems.get(rule).filter(problem => keep(rule, problem)).map(({ text }) => text));
               const gave = run.out ? `, the call gave ${shown(run.out.call)}` : '';
               assert.deepEqual(found, [], `With ${point.id} (${at}) refused${gave}: ${found.join(' | ')}`);
             }
           };
-          const todos = TODOS.filter(([name, id]) => name === scenario.name && id === point.id);
-          if (todos.length === 0) return holds(RULES);
-          for (const [, , rule, todo] of todos) await t.test(rule, { todo }, () => holds([rule]));
-          await t.test('the other rules', () => holds(RULES.filter(rule => !todos.some(([, , todoRule]) => todoRule === rule))));
+          if (todos.length === 0) return holds(() => true);
+          for (const each of todos) await t.test(each.rule, { todo: each.todo }, () => holds((rule, problem) => ownedBy(rule, problem) === each));
+          await t.test('the other rules', () => {
+            const stale = todos.filter(each => judged.every(([, problems]) => !problems.get(each.rule).some(problem => ownedBy(each.rule, problem) === each)));
+            assert.deepEqual(stale.map(({ rule }) => rule), [], `The todo no longer fails here: ${stale.map(({ todo }) => todo).join(' | ')}`);
+            holds((rule, problem) => !ownedBy(rule, problem));
+          });
         });
       }
     });

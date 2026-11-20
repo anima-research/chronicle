@@ -64,7 +64,7 @@ function splitCall(text) {
   return { name: text.slice(0, open), args, rest, ok: ret !== '?' && !ret.startsWith('-1') };
 }
 
-function quoted(arg) {
+export function quoted(arg) {
   if (typeof arg !== 'string' || !arg.startsWith('"')) return null;
   let out = '';
   for (let i = 1; i < arg.length; i++) {
@@ -101,7 +101,7 @@ function describedPath(arg, cwd) {
   return normal(match[1]);
 }
 
-function resolved(dirArg, pathArg, cwd) {
+export function resolved(dirArg, pathArg, cwd) {
   const path = quoted(pathArg);
   if (path === null) return null;
   if (path.startsWith('/')) return normal(path);
