@@ -64,6 +64,7 @@ test('Toggling automatic snapshots acts immediately without losing disabled-peri
     } else if (exit === 'compact') {
       const beforeCompaction = mark(store);
       const headBefore = store.stateHeadOffset(id);
+      assert.ok(store.listStates().find((state) => state.id === id)?.opsSinceSnapshot > 0);
       const compacted = store.compactState(id);
       const headAfter = store.stateHeadOffset(id);
       const bytes = operations(store, id, beforeCompaction).at(-1)?.Snapshot;

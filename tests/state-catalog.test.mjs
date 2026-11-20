@@ -300,7 +300,7 @@ test('The head after a lone edit or removal is the sequence of the record that i
   store.setAutoSnapshot(false);
   store.registerState(log('messages'));
   for (const text of ['a', 'b', 'c']) store.appendToStateJson('messages', { text });
-  const written = (record) => [record.sequence, store.getRecord(record.id).sequence, store.currentSequence(), store.currentSequence()];
+  const written = (record) => [record.sequence, store.getRecord(record.id).sequence, store.currentSequence(), store.currentBranch().head];
   const beforeEdit = store.currentSequence();
   const edit = store.editStateItem('messages', 1, Buffer.from(JSON.stringify({ text: 'B' })));
   assert.deepEqual(written(edit), Array(4).fill(beforeEdit + 1));

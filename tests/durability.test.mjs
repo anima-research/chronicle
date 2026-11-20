@@ -16,7 +16,7 @@ const inside = (paths, dir) => paths.filter(path => path === dir || path.startsW
 const relative = (paths, dir) => paths.map(path => posix.relative(dir, path)).sort();
 
 function straceProblem() {
-  const probe = spawnSync('strace', ['--kill-on-exit', '-o', '/dev/null', 'true'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
+  const probe = spawnSync('strace', ['--kill-on-exit', '-f', '-y', '-o', '/dev/null', '-e', `trace=${CALLS}`, 'true'], { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' });
   if (probe.error?.code === 'ETIMEDOUT') return 'strace did not trace true within 10 s';
   if (probe.error) return `strace is not on the path (${probe.error.code})`;
   if (probe.status !== 0) return `strace may not trace here: ${probe.stderr.trim().split('\n')[0]}`;
@@ -46,6 +46,9 @@ function traceWriter() {
   if (child.status !== 0) {
     const stderr = child.stderr.trim().split('\n').slice(-5).join(' | ');
     return { labels, failure: `the writer under strace ended with status ${child.status}: ${stderr}` };
+  }
+  if (barriers === null) {
+    return { labels, failure: `the writer's first line is not its list of barriers: ${JSON.stringify(firstLine.slice(0, 200))}` };
   }
   const trace = readTrace(readFileSync(record, 'utf8'), { root, cwd: process.cwd(), names: [root, control] });
   const expected = ['begin', ...CONTROL_MARKS,

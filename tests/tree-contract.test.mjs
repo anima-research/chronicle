@@ -332,8 +332,9 @@ test('A pre-record write failure leaves every valid batch target unchanged',
     assert.ifError(child.error);
     assert.equal(child.status, 0, child.stderr || `child signal: ${child.signal}`);
     const result = JSON.parse(child.stdout);
-    const efbig = /^IO error: .*\(os error (\d+)\)$/s.exec(result.threw?.message ?? '');
-    assert.deepEqual([result.threw?.error, Number(efbig?.[1]), result.seq, result.hits.map(fields)],
+    const errno = result.threw?.code === 'EFBIG' ? osConstants.errno.EFBIG
+      : Number(/^IO error: .*\(os error (\d+)\)$/s.exec(result.threw?.message ?? '')?.[1]);
+    assert.deepEqual([result.threw?.error, errno, result.seq, result.hits.map(fields)],
       [true, osConstants.errno.EFBIG, seq, [first, second, null]], JSON.stringify(result.threw));
     f.store = JsStore.open({ path: dir });
     const hits = () => ops.map(op => point(f.store, FILES, op.path));

@@ -22,7 +22,7 @@ function fixture(t) {
 }
 
 const refused = file => error => error instanceof Error && error.code === ErrorCode.Io
-  && error.message.includes('cannot save checkpoint') && error.message.includes(file);
+  && /cannot save checkpoint|cannot rename the new checkpoint over/.test(error.message) && error.message.includes(file);
 const unreadable = error => error instanceof Error && error.code === ErrorCode.Io;
 
 function withBlockedCheckpoint(path, file, run) {

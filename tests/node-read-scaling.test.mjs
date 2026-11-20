@@ -87,6 +87,7 @@ test('Warm point, page and suffix conversion do not scale with the untouched pre
   const [small, large] = interleaved(fixtures);
   const floor = 3_000;
   for (const [key, name] of [['point', 'point'], ['slice', 'suffix'], ['window', 'page']]) {
+    assert.ok(least(small, key) > 0, `the CPU clock counted no time for the ${name} batch`);
     assert.ok(least(large, key) < 6 * least(small, key) + floor,
       `${name} batch grew from ${least(small, key)} to ${least(large, key)} µs CPU`);
   }
@@ -127,6 +128,7 @@ test("The current branch's ID costs the same with a long history or many branche
   t.after(() => fixtures.forEach((fixture) => fixture.close()));
   const [small, deep, wide] = interleaved(fixtures).map((samples) => least(samples));
   const floor = 3_000;
+  assert.ok(small > 0, 'the CPU clock counted no time for 2,000 reads');
   assert.ok(deep < 3 * small + floor && wide < 3 * small + floor,
     `2,000 reads took ${small} µs CPU, ${deep} with a long history, ${wide} with many branches`);
 });

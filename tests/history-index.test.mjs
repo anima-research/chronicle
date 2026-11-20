@@ -242,6 +242,7 @@ test('A narrow time query through the binding costs the same over a long history
   for (let round = 0; round < 5; ++round) fixtures.forEach((fixture, i) => times[i].push(fixture.sample()));
   const [small, large] = times.map(samples => Math.min(...samples));
   const floor = 3_000;
+  assert.ok(small > 0, 'the CPU clock counted no time for 96 narrow queries');
   assert.ok(large < 3 * small + floor, `96 narrow queries took ${small} µs CPU over 256 messages, ${large} over 32,768`);
 });
 

@@ -172,15 +172,15 @@ fails that check until `tools/chronicle_payload.py` lists it, in `READ` once
 the tools read it, or in `NOT_READ` with its reason.
 
 On Linux, `tests/durability.test.mjs` and `tests/late-failures.test.mjs`
-record the store's system calls with `strace`. Without a working `strace` on
-the `PATH`, both are skipped, unless `CI` is set, when they fail. On other
-systems they are skipped.
+record the store's system calls with `strace`. Where `strace` is missing, or
+can't run with the options that a test uses, that test is skipped, unless `CI`
+is set to a non-empty value, when it fails. On other systems both are skipped.
 
 ```bash
 npm ci                                          # strict lockfile install
 cargo test                                      # Rust suite
 npx napi build --platform --features napi-bindings   # native module (debug)
-npm test                                        # node smoke test (test.mjs), release scripts' tests
+npm test                                        # node test scripts, node --test suites, tools check
 npm run build                                   # release build of the above
 ```
 
