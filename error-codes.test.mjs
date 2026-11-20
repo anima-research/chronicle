@@ -509,7 +509,8 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
 
 const errnoNames = new Map();
 for (const [name, number] of Object.entries(constants.errno)) if (!errnoNames.has(number)) errnoNames.set(number, name);
-function workspaceErrno({ code, message }) {
+function workspaceErrno({ error, code, message }) {
+  if (!error) return undefined;
   if (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) return code;
   const os = /^IO error: .*\(os error (\d+)\)$/s.exec(message);
   return os === null ? undefined : errnoNames.get(Number(os[1]));
@@ -527,7 +528,7 @@ test('a blob write that the system refuses carries its errno as workspace reads 
     try {
       store.storeBlob(Buffer.alloc(1 << 20, 0x5a), 'application/octet-stream');
     } catch (error) {
-      outcome = { code: error.code, message: error.message };
+      outcome = { error: error instanceof Error, code: error.code, message: error.message };
     }
     store.close();
     process.stdout.write(JSON.stringify(outcome));

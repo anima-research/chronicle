@@ -1,4 +1,3 @@
-//! Targeted wall-clock probes for anomalies surfaced by benches/performance.rs.
 //! Not part of the normal test run — execute with:
 //!   cargo test --release --test perf_probe -- --ignored --nocapture
 

@@ -319,14 +319,14 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         let (set, set_written) = bytes_written(|| store.tree_set("tree", TARGET, &replacement));
         set.unwrap();
         let after_set = store.stats().unwrap();
-        assert!(set_written <= TREE_BUDGET, "set in {n}-key tree wrote {set_written} bytes");
+        assert!(set_written > 0 && set_written <= TREE_BUDGET, "set in {n}-key tree wrote {set_written} bytes");
         assert_eq!(after_set.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), Some(replacement));
 
         let (removed, remove_written) = bytes_written(|| store.tree_remove("tree", TARGET));
         removed.unwrap();
         let after_remove = store.stats().unwrap();
-        assert!(remove_written <= TREE_BUDGET, "remove in {n}-key tree wrote {remove_written} bytes");
+        assert!(remove_written > 0 && remove_written <= TREE_BUDGET, "remove in {n}-key tree wrote {remove_written} bytes");
         assert_eq!(after_remove.state_slot_count, 1);
         assert_eq!(store.tree_get("tree", TARGET).unwrap(), None);
         assert_eq!(store.tree_list("tree", None).unwrap().len(), n - 1);
@@ -360,7 +360,7 @@ fn ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows(
         });
         edit.unwrap();
         assert!(
-            edit_written <= 4 * edited.len() as u64 + 1024,
+            edit_written > 0 && edit_written <= 4 * edited.len() as u64 + 1024,
             "edit in {n}-item log wrote {edit_written} bytes"
         );
         assert_eq!(store.get_state_item("log", 0).unwrap(), Some(edited));

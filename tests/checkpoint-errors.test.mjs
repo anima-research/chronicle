@@ -125,7 +125,7 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
   const store = f.create();
   store.registerState({ id: 'work', strategy: 'snapshot' });
   store.setStateJson('work', 'target work');
-  const target = store.createBranch('target');
+  store.createBranch('target');
   store.createBranch('source');
   const source = store.switchBranch('source');
   store.setStateJson('work', 'source work');
@@ -152,12 +152,29 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
 
   withBlockedCheckpoint(f.path, 'branches.bin', () => {
     assert.throws(() => store.switchBranch('target'));
-    assert.deepEqual(selected(), [target.name, target.id]);
-    assert.equal(store.getStateJson('work'), 'target work');
   });
-  store.setStateJson('work', 'on landed target');
-  assert.equal(store.view('target').getStateJson('work'), 'on landed target');
   assert.equal(sourceView.getStateJson('work'), 'after refused switch');
+});
+
+test('A switch whose saved branch list cannot be written leaves the source selected and writable', {
+  todo: 'switchBranch selects the target before it saves the branch list, and keeps the target selected when that save fails.',
+}, t => {
+  const f = fixture(t);
+  const store = f.create();
+  store.registerState({ id: 'work', strategy: 'snapshot' });
+  store.setStateJson('work', 'target work');
+  const target = store.createBranch('target');
+  const source = store.createBranch('source');
+  store.switchBranch(source.name);
+  store.setStateJson('work', 'source work');
+  withBlockedCheckpoint(f.path, 'branches.bin', () => {
+    assert.throws(() => store.switchBranch(target.name));
+    assert.deepEqual([store.currentBranch().name, store.currentBranch().id], [source.name, source.id]);
+    assert.equal(store.getStateJson('work'), 'source work');
+  });
+  store.setStateJson('work', 'written on the source');
+  assert.deepEqual([store.view(source.name).getStateJson('work'), store.view(target.name).getStateJson('work')],
+    ['written on the source', 'target work']);
 });
 
 test('Registration and retuning report non-duplicate refusals at the call', t => {
