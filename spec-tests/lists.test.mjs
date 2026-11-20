@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ErrorCode, freshStore, refuses } from './support.mjs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ErrorCode, JsStore, freshStore, refuses } from './support.mjs';
 
 function listStore(...items) {
   const { store } = freshStore();
@@ -177,6 +179,28 @@ test('A76 a second registerStateFieldIndex for an index that is there and curren
   assert.equal(store.currentSequence(), before);
   assert.deepEqual(store.queryStateIndexRange('list', '/t', {}), [1, 2, 5, 0, 6]);
   store.close();
+});
+
+test('A76 a second registerStateFieldIndex for a current index reads none of the changes of the list', () => {
+  const { store, dir } = freshStore();
+  const marker = 'Q'.repeat(64);
+  store.registerState({ id: 'list', strategy: 'append_log' });
+  store.appendToStateJson('list', { t: 1, marker });
+  store.appendToStateJson('list', { t: 2 });
+  store.registerStateFieldIndex('list', '/t', 'number');
+  store.close();
+  const reopened = JsStore.open({ path: dir });
+  const log = join(dir, 'records.log');
+  const bytes = readFileSync(log);
+  const at = bytes.indexOf(Buffer.from(marker));
+  assert.ok(at > 0, 'the first change is in the log');
+  bytes[at + 10] = 'R'.charCodeAt(0);
+  writeFileSync(log, bytes);
+  reopened.registerStateFieldIndex('list', '/t', 'number');
+  assert.deepEqual(reopened.queryStateIndexRange('list', '/t', {}), [0, 1]);
+  // The control: an index that must be built reads the damaged change.
+  refuses(() => reopened.registerStateFieldIndex('list', '/u', 'number'), ErrorCode.ChecksumMismatch, /^Checksum mismatch/);
+  reopened.close();
 });
 
 test('A78 T18 queryStateIndexEq takes offset and limit', () => {
