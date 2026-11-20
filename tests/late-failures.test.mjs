@@ -23,6 +23,7 @@ const OLD_AFTER_THROW = new Set(['setStateJson', 'appendToStateJson', 'treeSet',
   'createBranchWithStates', 'createBranchAtWithStates', 'switchBranch']);
 const NEW_BRANCH_AFTER_THROW = 'When a refused request makes the call throw, the handle already shows the new branch.';
 const newAfterThrow = problem => problem.newAfterThrow === true;
+const wordsAfterOsError = problem => problem.wordsAfterOsError === true;
 const TODOS = [
   { scenario: 'createBranchWithStates', rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
   { scenario: 'createBranchAtWithStates', rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
@@ -30,8 +31,8 @@ const TODOS = [
     scenario: 'switchBranch', rule: 'the reads', owns: newAfterThrow,
     todo: 'When a refused request makes switchBranch throw, the handle has already switched to the target.',
   },
-  { scenario: 'storeBlob', point: 'fsync 1', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: () => true },
-  { scenario: 'storeBlob', point: 'fsync 3', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: () => true },
+  { scenario: 'storeBlob', point: 'fsync 1', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: wordsAfterOsError },
+  { scenario: 'storeBlob', point: 'fsync 3', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: wordsAfterOsError },
   {
     scenario: 'storeBlob', point: 'fsync 3', rule: 'the barrier', owns: problem => problem.nameInRefused === true,
     todo: "After a refused sync of a blob's directory, sync and close return while the blob's name is not synced.",
@@ -396,7 +397,10 @@ function judge(scenario, clean, run, reopen) {
     }
   };
   if (!out.call.ok && out.call.code !== 'DurabilityLost' && errnoCode(out.call) !== errno) {
-    add('the errno', `the call threw without ${errno}: ${shown(out.call)}`);
+    problems.get('the errno').push({
+      text: `the call threw without ${errno}: ${shown(out.call)}`,
+      wordsAfterOsError: /\(os error \d+\)./s.test(out.call.message),
+    });
   }
   const returned = out.call.ok && scenario.kind !== 'close';
   whole('the reads', 'the reads after the call', out.reads[0], returned);
