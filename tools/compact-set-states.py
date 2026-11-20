@@ -432,9 +432,9 @@ class Files:
         if os.path.exists(self.indexes) and not stat.S_ISREG(os.stat(self.indexes).st_mode):
             raise Refusal('%s is not a regular file.' % self.indexes)
         self.new_log, self.new_sb, self.blocked = self.log + '.compact', self.sb + '.compact', self.sb + '.blocked'
-        self.staging = (self.new_log, self.new_sb, self.blocked)
-        self.kept = tuple(path + '.pre-compact' for path in (self.log, self.sb, self.indexes))
         self.marker = self.sb + '.compact-run'
+        self.staging = (self.new_log, self.new_sb, self.blocked, self.marker + '.new')
+        self.kept = tuple(path + '.pre-compact' for path in (self.log, self.sb, self.indexes))
 
     def found(self, paths):
         return [path for path in paths if os.path.lexists(path)]
@@ -476,12 +476,23 @@ def earlier_run(files, state_bin):
                       % (', '.join(kept), 'is' if len(kept) == 1 else 'are', finished_text(files, kept)))
 
 
+def canonical(value):
+    """The value with each map's entries in the order of their encoded keys. chronicle writes some maps of state.bin
+    from a Rust HashMap, such as a Struct strategy's fields, and their order changes from one save to the next."""
+    if isinstance(value, MpMap):
+        return MpMap(sorted(((key, canonical(item)) for key, item in value), key=lambda entry: mp_encode(entry[0])))
+    if isinstance(value, list):
+        return [canonical(item) for item in value]
+    return value
+
+
 def what_the_run_left(log_inode, log_size, index):
     """What --go-back checks after a finished run, before it overwrites records.log and state.bin: the log by inode
     and size, since a write only adds to it, and state.bin's strategies and each head's branch, state and offsets.
-    Counters and the number of a head's fields are left out, so a save by another release still matches."""
+    Counters and the number of a head's fields are left out, so a save by another release still matches, and the
+    strategies are compared with each map's entries in one order."""
     heads = sorted([key[0], key[1], head[HEAD], head[LAST_DELTA], head[LAST_FULL]] for key, head in index[0])
-    strategies = sorted([sid, mp_encode(strategy).hex()] for sid, strategy in index[1])
+    strategies = sorted([sid, mp_encode(canonical(strategy)).hex()] for sid, strategy in index[1])
     return {'records.log': [log_inode, log_size], 'heads': heads, 'strategies': strategies}
 
 
@@ -735,10 +746,12 @@ def compact(files, patterns, apply, state_bin):
         if os.path.getsize(files.new_log) != new_size: raise RuntimeError('the new log is not the size its plan says')
         made.append(files.new_sb); write_file(files.new_sb, [state_bin_bytes([new_heads, index[1]])], sb_stat)
         made.append(files.blocked); write_file(files.blocked, [blocked_state_bin(files.store)], sb_stat)
-        made.append(files.marker)
+        # The record is written whole beside its name and then renamed, so a record under its name is complete.
         left = what_the_run_left(os.stat(files.new_log).st_ino, new_size, [new_heads, index[1]])
         left['state-indexes.bin'] = os.path.exists(files.indexes)
-        write_file(files.marker, [json.dumps(left).encode('utf-8')], sb_stat)
+        made.append(files.marker + '.new'); write_file(files.marker + '.new', [json.dumps(left).encode('utf-8')], sb_stat)
+        made.append(files.marker); os.replace(files.marker + '.new', files.marker)
+        sync_dir(os.path.dirname(files.marker))
         for path in (files.log, files.sb):
             made.append(path + '.pre-compact'); os.link(path, path + '.pre-compact')
         for directory in {os.path.dirname(files.log), os.path.dirname(files.sb)}: sync_dir(directory)

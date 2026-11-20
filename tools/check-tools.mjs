@@ -241,6 +241,16 @@ for key, head in index[0]:
 sys.stdout.buffer.write(tool.state_bin_bytes(index))`, sb));
 }
 
+// state.bin with its strategies changed by `edit`, Python over `strategies`, the MessagePack map of each state's.
+function withStrategies(store, edit) {
+  const sb = join(store, 'state.bin');
+  writeFileSync(sb, toolPython(`
+index = tool.read_state_bin(open(sys.argv[1], 'rb').read())
+strategies = index[1]
+${edit}
+sys.stdout.buffer.write(tool.state_bin_bytes(index))`, sb));
+}
+
 // Each head this build reads, on a copy, since an open saves state.bin.
 function headOffsets(store) {
   const copy = join(scratch, 'heads');
@@ -1086,6 +1096,27 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
       const reader = JsStore.open({ path: branched });
       assert.equal(reader.currentBranch().name, 'later', 'an empty branch made since the run should stay selected after --go-back');
       reader.close();
+      // A Struct strategy's fields are a Rust HashMap, which a save writes in any order. The binding registers no
+      // Struct, so the store gets one by hand, and a reorder stands for the save.
+      const struct = "('form', tool.MpMap([('Struct', tool.MpMap([('fields', tool.MpMap([('a', 'Snapshot'), ('b', 'Snapshot'), ('c', 'Snapshot')]))]))]))";
+      const fields = "dict(strategies)['form'][0][1][0][1]";
+      for (const [name, edit, status, says] of [
+        ['finished-reordered', `${fields}.reverse()`, 0, 'went back after a finished run'],
+        ['finished-restrategized', `${fields}[1] = ('b', tool.MpMap([('Delta', tool.MpMap([('snapshot_every', 5)]))]))`, 1, 'state.bin has changed'],
+      ]) {
+        const store = join(scratch, name);
+        cpSync(base, store, { recursive: true });
+        withStrategies(store, `strategies.append(${struct})`);
+        const formed = filesOf(store);
+        assert.equal(compact(store, '--state', WHOLE, '--apply').status, 0, `the run on ${name} should finish`);
+        withStrategies(store, edit);
+        const unchanged = filesOf(store);
+        const back = compact(store, '--go-back');
+        assert.equal(back.status, status, `--go-back on ${name} exited ${back.status}:\n${back.out}${back.err}`);
+        assert.ok(back.out.includes(says), `--go-back on ${name} should say "${says}":\n${back.out}`);
+        assert.deepEqual(status === 0 ? trio(filesOf(store)) : filesOf(store), status === 0 ? trio(formed) : unchanged,
+          status === 0 ? `--go-back on ${name} should put back the old files` : `--go-back on ${name} should change no file`);
+      }
       const bare = join(scratch, 'finished-no-index');
       cpSync(base, bare, { recursive: true });
       rmSync(join(bare, 'state-indexes.bin'));
@@ -1097,7 +1128,7 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
       const bareBack = filesOf(bare);
       assert.deepEqual(trio(bareBack), trio(bareFiles), '--go-back should put back records.log and state.bin, and remove a state-indexes.bin made since the run, where the store had none');
       assert.deepEqual(Object.keys(bareBack).sort(), Object.keys(bareFiles).sort(), '--go-back on a store that had no state-indexes.bin should leave no file of the run');
-      console.log('ok: --go-back after a finished run puts back the old files after a check, removes a state-indexes.bin made since where there was none, keeps an empty branch made and selected since, and refuses after a registration or a write');
+      console.log('ok: --go-back after a finished run puts back the old files after a check and after a reorder of a strategy\'s map, removes a state-indexes.bin made since where there was none, keeps an empty branch made and selected since, and refuses after a registration, a changed strategy or a write');
     },
 
     'going back stopped, and old files missing': () => {
@@ -1166,6 +1197,26 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
         }
         console.log(`ok: --go-back after ${where}, with either old file deleted by hand, refuses and changes no file`);
       }
+      // A stop inside the write of the run's record: half its bytes are written, and the run is killed.
+      const torn = join(scratch, 'back-torn-record');
+      cpSync(base, torn, { recursive: true });
+      const tearing = spawnSync(PYTHON, ['-c', `
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+write_file = tool.write_file
+def tearing(path, chunks, like):
+    if 'compact-run' not in path: return write_file(path, chunks, like)
+    data = b''.join(chunks)
+    write_file(path, [data[:len(data) // 2]], like)
+    os._exit(9)
+tool.write_file = tearing
+sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--state', '${WHOLE}', '--apply']))`, torn], { encoding: 'utf8', cwd: tools });
+      assert.equal(tearing.status, 9, `the run killed inside the write of its record exited ${tearing.status}:\n${tearing.stdout}${tearing.stderr}`);
+      const tornBack = compact(torn, '--go-back');
+      assert.equal(tornBack.status, 0, `--go-back after a stop inside the write of the run's record exited ${tornBack.status}:\n${tornBack.out}${tornBack.err}`);
+      assert.deepEqual(filesOf(torn), original, '--go-back after a stop inside the write of the run\'s record should leave every file as before the run, and none of the run');
+      console.log('ok: --go-back after a stop inside the write of the run\'s record leaves every file as before the run');
       const finished = left.finished('back-finished-to-copy');
       const copy = join(scratch, 'back-finished-copy');
       cpSync(finished, copy, { recursive: true });
