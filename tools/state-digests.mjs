@@ -4,14 +4,15 @@
 // the raw bytes of each registered state's value (a tree state by its entries), and eight reads of each state that is
 // no tree, at sequences spread over the branch. Give it the --state patterns that compact-set-states.py gets, and it
 // leaves out the reads at those sequences for the states they name, whose old values the tool frees. So the two
-// outputs of a run that went right are equal. It prints names, counts and digests, and no content. It exits 1 when a
-// read fails.
+// outputs of a run that went right are equal. It also prints the store's current branch, and reads each branch
+// through a view where the binding has one, so it switches none. It prints names, counts and digests, and no
+// content. It exits 1 when a read fails.
 //
 // Two limits. chronicle's API lists only registered states, so a state with no registration isn't read. And the check
 // opens the store as its host does: that open saves state.bin and branches.bin, and it cuts off a torn tail of the log,
 // which the recovery line then shows.
 //
-// Usage: CHRONICLE_MODULE=<path to @animalabs/chronicle> node state-digests.mjs <store-dir> [--state <glob> ...]
+// Usage: CHRONICLE_MODULE=<path to @animalabs/chronicle> node state-digests.mjs <store-dir> [--state <pattern> ...]
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
@@ -23,35 +24,14 @@ const [path, ...rest] = process.argv.slice(2);
 const patterns = [];
 for (let i = 0; i < rest.length; i += 2) {
   if (rest[i] !== '--state' || rest[i + 1] === undefined) { console.error(`unknown argument ${rest[i]}`); process.exit(2); }
-  patterns.push(globToRegExp(rest[i + 1]));
+  patterns.push(patternToRegExp(rest[i + 1]));
 }
-if (!path) { console.error('usage: node state-digests.mjs <store-dir> [--state <glob> ...]'); process.exit(2); }
+if (!path) { console.error('usage: node state-digests.mjs <store-dir> [--state <pattern> ...]'); process.exit(2); }
 const named = (id) => patterns.some((pattern) => pattern.test(id));
 
-// The glob matching of Python's fnmatch.fnmatchcase, which compact-set-states.py uses: `*` and `?` match `/` too.
-function globToRegExp(glob) {
-  let out = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === '*') out += '.*';
-    else if (c === '?') out += '.';
-    else if (c === '[') {
-      let j = i + 1;
-      if (glob[j] === '!') j++;
-      if (glob[j] === ']') j++;
-      while (j < glob.length && glob[j] !== ']') j++;
-      if (j >= glob.length) {
-        out += '\\[';
-        continue;
-      }
-      let body = glob.slice(i + 1, j).replace(/\\/g, '\\\\');
-      if (body[0] === '!') body = `^${body.slice(1)}`;
-      else if (body[0] === '^') body = `\\${body}`;
-      out += `[${body}]`;
-      i = j;
-    } else out += c.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
-  }
-  return new RegExp(`^(?:${out})$`, 's');
+// A pattern is literal text in which each * stands for any text, as in compact-set-states.py.
+function patternToRegExp(pattern) {
+  return new RegExp(`^${pattern.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 's');
 }
 
 const { JsStore } = require(resolve(mod));
@@ -81,16 +61,21 @@ out.push(recovery
 const stats = store.stats();
 out.push(`blobs=${stats.blobCount} branches=${stats.branchCount} stateSlots=${stats.stateSlotCount}`);
 const found = store.currentBranch().name;
+out.push(`current\t${found}`);
+const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 const branches = store.listBranches().map((branch) => branch.name).sort();
+// A view reads a branch without switching the store's current branch, which a save would keep. A binding before
+// 0.5.0 has no view, so the check switches there, and switches back at the end.
+const pinned = typeof store.view === 'function';
 try {
   for (const branch of branches) {
-    store.switchBranch(branch);
+    const on = pinned ? store.view(branch) : (store.switchBranch(branch), store);
     const records = createHash('sha256');
     const types = new Set();
     let count = 0;
     let from = 0;
     for (;;) {
-      const page = store.query({ fromSequence: from, limit: 1 });
+      const page = on.query({ fromSequence: from, limit: 1 });
       await turn();
       if (page.length === 0) break;
       for (const record of page) {
@@ -105,12 +90,12 @@ try {
       if (last < from) throw new Error('a query by sequence did not advance');
       from = last + 1;
     }
-    const top = store.currentSequence();
+    const top = on.currentSequence();
     out.push(`branch ${branch}\tsequence=${top}\trecords=${count}\t${records.digest('hex').slice(0, 16)}\ttypes=${types.size}`);
-    for (const { id, strategy } of store.listStates().sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    for (const { id, strategy } of on.listStates().sort(byId)) {
       const value = read(() => (strategy === 'tree'
-        ? `tree ${sha(JSON.stringify(store.treeList(id)))}`
-        : `${strategy} ${bytes(store.getState(id))} items=${store.getStateLen(id) ?? '-'}`));
+        ? `tree ${sha(JSON.stringify(on.treeList(id)))}`
+        : `${strategy} ${bytes(on.getState(id))} items=${on.getStateLen(id) ?? '-'}`));
       out.push(`  ${branch}\t${id}\t${value}`);
       await turn();
       if (strategy !== 'tree' && !named(id)) {
@@ -118,7 +103,7 @@ try {
         for (let k = 1; k <= 8; k++) {
           const at = Math.floor((top * k) / 8);
           history.push(read(() => {
-            const raw = store.getStateAt(id, at);
+            const raw = on.getStateAt(id, at);
             return raw == null ? 'absent' : sha(raw);
           }));
           await turn();
@@ -128,7 +113,7 @@ try {
     }
   }
 } finally {
-  store.switchBranch(found);
+  if (!pinned) store.switchBranch(found);
   store.close();
 }
 console.log(out.join('\n'));
