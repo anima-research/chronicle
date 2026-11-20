@@ -34,7 +34,7 @@ The package is the Rust crate `chronicle` with its Node binding. Together they a
 - **View.** A caller's way to act on one named branch, whatever the current branch is.
 - **The caller's branch.** The branch that a caller's request acts on. For a request through a view, it is the view's branch. For any other request, it is the current branch.
 - **Refused.** The store does not do what was asked, changes nothing, and tells the caller why.
-- **Fails.** The store reports an error. A request that fails can leave a change behind, and the item says which.
+- **Fails.** The store reports an error. Three items say that a failed request leaves something behind: F70, A4 and D1. After a crash, the store holds each record whole or not at all (F65).
 - **An answer that depends on a branch.** The records of a branch, its head, and each read of a state. An answer can cover every branch. Such an answer does not depend on a branch. These are such answers: a read of a record by its ID, the records of a type, and the answers about links.
 
 ## Functional items
