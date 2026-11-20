@@ -133,8 +133,11 @@ impl BlobStorage {
     /// them, where the system syncs directories and this account may open
     /// them. What an earlier process made there is taken as it is, and so is
     /// what another `BlobStorage` on the same directory makes: a `Store`
-    /// holds one, and its lock refuses a second `Store`, but
-    /// `BlobStorage::new` takes no lock. A sync that fails before the rename
+    /// holds one, and its lock refuses a second `Store` on the same store
+    /// path, but `BlobStorage::new` takes no lock, and two store paths whose
+    /// `blobs` lead to one directory each take their own. A store's blob
+    /// directory belongs to that store alone (see
+    /// [`Store::create`](crate::Store::create)). A sync that fails before the rename
     /// returns an error with nothing stored; one that fails after it returns
     /// an error with the blob in place. Either way, storing the blob again
     /// through this `BlobStorage` tries the sync again.
@@ -772,13 +775,13 @@ impl BlobStorage {
         }
     }
 
-    /// List all blob hashes.
+    /// List all blob hashes, from the shard directories only.
     pub fn list(&self) -> Result<Vec<Hash>> {
         let mut hashes = Vec::new();
 
         for entry in fs::read_dir(&self.path)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
+            if Self::is_shard(&entry.file_name()) && entry.file_type()?.is_dir() {
                 for blob_entry in fs::read_dir(entry.path())? {
                     let blob_entry = blob_entry?;
                     let filename = blob_entry.file_name();
@@ -800,7 +803,7 @@ impl BlobStorage {
 
         for entry in fs::read_dir(&self.path)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
+            if Self::is_shard(&entry.file_name()) && entry.file_type()?.is_dir() {
                 for blob_entry in fs::read_dir(entry.path())? {
                     let blob_entry = blob_entry?;
                     total += blob_entry.metadata()?.len();
@@ -809,6 +812,16 @@ impl BlobStorage {
         }
 
         Ok(total)
+    }
+
+    /// Whether a name in the blob directory is a shard's: two lowercase hex
+    /// digits, as `Hash::shard_prefix` writes. Anything else there (what a
+    /// fresh volume's root holds, where one is mounted at `blobs/`) isn't
+    /// listed or counted, so a `lost+found` this account can't read doesn't
+    /// fail them.
+    fn is_shard(name: &std::ffi::OsStr) -> bool {
+        name.to_str()
+            .is_some_and(|name| name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
     }
 
     /// Get the shard directory for a hash.
