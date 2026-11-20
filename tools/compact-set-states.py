@@ -10,12 +10,14 @@ update of it that the walk reaches must be a Set or a Snapshot. Of it, this tool
 what a read reads, the update that each head in state.bin names, and it drops
 the other updates of that state that the walk reaches. Every other record is
 copied. A state update that the walk reaches is rewritten where its
-`prev_update_offset` must change: it then holds the new offset and gets a new
-checksum. Every record that the walk does not reach is copied byte for byte,
+`prev_update_offset` must change: it then holds the new offset, or no link
+where the update it linked to was dropped, and gets a new checksum. Every record that the walk does not reach is copied byte for byte,
 whatever it holds, for a named state too. state.bin gets the new offsets, and
-every counter in it stays as chronicle wrote it. chronicle uses a counter to
+every count in a head stays as chronicle wrote it. getStateLen reads a head's
+item count, which still describes the value at that head. The other counts
 time a state's next snapshot, so a named state's next snapshot can come at
-another point; no read uses a counter.
+another point. listStates returns one of them as opsSinceSnapshot, which for a
+named state can still count updates that the run dropped.
 
 What is lost: the old values of each named state. A read of a named state at an
 older sequence can give nothing, and a branch made later at an older point can
@@ -24,7 +26,8 @@ agent-framework's push coalescer table, `mcpl/coalescing`
 (anima-research/agent-framework#1028). A field index that a caller registered is
 gone after the run, and the caller registers it again; state-indexes.bin is kept
 as state-indexes.bin.pre-compact. Other reads that change:
-  * a state update whose link changed holds the new offset in its payload;
+  * a state update whose link changed holds the new offset in its payload, or
+    no link where the update it linked to was dropped;
   * the offset of a record that stays can move, so a stateHeadOffset or a
     cursor kept by offset from before the run names another place;
   * a record that stays and names a dropped update in caused_by or linked_to
@@ -59,11 +62,11 @@ It refuses, and changes nothing, when:
     same state,
   * a record typed state_update lies after the newest head on a branch that
     branches.bin holds, unless the tool parses it and finds no state_id or no
-    operation: state.bin is then older than the log, and only chronicle's open
-    settles whether it replays the record (from chronicle 0.5.0, an open and a
-    close of the store clear it, and the check before a run is one; with
-    0.4.0, which replays nothing at open, or a record that chronicle does not
-    decode, a write of any state and a close clear it),
+    operation: it may be a state update that state.bin does not have yet, and
+    only chronicle's open settles that (from chronicle 0.5.0, an open and a
+    close of the store apply such an update, and the check before a run is
+    one; with 0.4.0, which replays nothing at open, or a record that chronicle
+    does not decode, a write of any state and a close clear it),
   * branches.bin is not a branch index that it reads,
   * state.bin names an offset where its record is not, or a state update links
     to an offset where no record is,
@@ -111,7 +114,8 @@ A --state pattern is literal text in which each * stands for any text.
 --go-back, with the host stopped, finds where the run is from the run's record,
 state.bin.compact-run, which the run writes before the old files get their
 second names and which --go-back removes last. The record holds the new log's
-inode. Where records.log is the new log, going back needs both old files, and
+inode, and the old state-indexes.bin by its size and SHA-256. Where
+records.log is the new log, going back needs both old files, and
 it refuses without them. After a run that finished, it puts the old
 records.log, state.bin and state-indexes.bin back, with the blocked file in
 place while it does, only while records.log and state.bin are as the run left
@@ -133,10 +137,12 @@ Usage:
     compact-set-states.py <store-dir> --go-back
 
 Python 3.9+, Unix. Exit 0: done, a dry run, or nothing to do; 1: refused, and
-nothing changed; 2: usage; 3: stopped during the swap (run --go-back).
+no file of the store changed; 2: usage; 3: stopped during the swap (run
+--go-back).
 """
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -355,7 +361,7 @@ def scan_log(path):
         def need(n):
             b = f.read(n)
             if len(b) != n:
-                raise Refusal('records.log is torn at offset %d. %s' % (f.tell() - len(b), DAMAGE))
+                raise Refusal('records.log is torn: its last record, at offset %d, is not whole. %s' % (start, DAMAGE))
             return b
         while f.tell() < size:
             start = f.tell()
@@ -410,7 +416,8 @@ def read_state_bin(data):
     # rmp_serde::to_vec: StateIndex = [heads: map{[branch, state_id] -> [fields]}, strategies: map]
     if not (isinstance(index, list) and len(index) == 2 and isinstance(index[0], MpMap)
             and all(isinstance(key, list) and len(key) == 2 and is_count(key[0]) and isinstance(key[1], str)
-                    and head_is_whole(head) for key, head in index[0])):
+                    and head_is_whole(head) for key, head in index[0])
+            and isinstance(index[1], MpMap) and all(isinstance(key, str) for key, _ in index[1])):
         raise Refusal('state.bin does not hold the state index this tool reads.')
     return index
 
@@ -510,10 +517,11 @@ def what_the_run_left(log_inode, log_size, index):
 def take_lock(store):
     """The lock chronicle takes on LOCK (src/store.rs, acquire_lock)."""
     try:
-        # For writing, as chronicle opens it: on NFS an exclusive flock is a POSIX lock, which needs that.
-        fd = os.open(os.path.join(store, 'LOCK'), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # For writing alone, as chronicle opens it: on NFS an exclusive flock is a POSIX lock, which needs that.
+        fd = os.open(os.path.join(store, 'LOCK'), os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        raise Refusal('LOCK is missing. Open and close the store once with its host, which creates it, and run again.')
+        raise Refusal('LOCK is missing. Make sure that no host has the store open. Then run the check, whose open '
+                      'creates LOCK, and run again.')
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise Refusal('LOCK is a symbolic link, which chronicle refuses too. Move it aside.')
@@ -523,9 +531,11 @@ def take_lock(store):
         raise Refusal('LOCK is not a regular file, which chronicle refuses too. Move it aside.')
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as error:
         os.close(fd)
-        raise Refusal('LOCK is locked: the store is open. Stop its host first.')
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            raise Refusal('LOCK is locked: the store is open. Stop its host first.')
+        raise Refusal('could not lock LOCK (%s).' % error)
     return fd
 
 
@@ -605,13 +615,13 @@ def plan(recs, heads, patterns, branches):
     for r in recs:
         if r.offset > newest_head and r.shaped and r.branch in branches:
             raise Refusal('the record at offset %d lies after the newest head in state.bin, on branch %d, which '
-                          'branches.bin holds, and it may be a state update. So state.bin is older than records.log, and '
-                          'only chronicle\'s open settles whether it replays that record. With chronicle 0.5.0 or later, '
-                          'open and close the store once with its host (the check before a run does that), and run '
-                          'again. chronicle 0.4.0 replays nothing at open, and no release applies a record that it does '
-                          'not decode: there the refusal ends once the host has written any state and closed the store, '
-                          'since the record then lies before the newest head, where no head reaches it, and it is '
-                          'copied.' % (r.offset, r.branch))
+                          'branches.bin holds, and it may be a state update that state.bin does not have yet. Only '
+                          'chronicle\'s open settles that. Open and close the store once with its host, which the check '
+                          'before a run does, and run again: chronicle 0.5.0 or later then applies such an update. If '
+                          'this refusal comes again, chronicle did not apply the record: 0.4.0 replays nothing at open, '
+                          'and no release applies a record that it does not decode. The refusal then ends once the host '
+                          'has written any state and closed the store. The record then lies before the newest head, '
+                          'where no head reaches it, and it is copied.' % (r.offset, r.branch))
     for key, head in heads:
         branch, sid = key[0], key[1]
         at = by_offset.get(head[HEAD])
@@ -689,8 +699,13 @@ def locked(store, act):
 
 
 def read_bytes(path):
-    with open(path, 'rb') as f:
-        return f.read()
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Refusal('could not read %s (%s).' % (path, error))
 
 
 def run(store, patterns, apply):
@@ -763,7 +778,7 @@ def compact(files, patterns, apply, state_bin):
         write_file(files.blocked, [blocked_state_bin(files.store)], sb_stat, made)
         # The record is written whole beside its name and then renamed, so a record under its name is complete.
         left = what_the_run_left(os.stat(files.new_log).st_ino, new_size, [new_heads, index[1]])
-        left['state-indexes.bin'] = os.stat(files.indexes).st_ino if os.path.exists(files.indexes) else None
+        left['state-indexes.bin'] = index_print(files.indexes) if os.path.exists(files.indexes) else None
         write_file(files.marker + '.new', [json.dumps(left).encode('utf-8')], sb_stat, made)
         made.append(files.marker); os.replace(files.marker + '.new', files.marker)
         sync_dir(os.path.dirname(files.marker))
@@ -790,11 +805,12 @@ def compact(files, patterns, apply, state_bin):
     done = 'wrote the new files'
     for step, source, target in steps:
         try:
-            os.replace(source, target); sync_dir(os.path.dirname(target))
+            os.replace(source, target)
+            done = step
+            sync_dir(os.path.dirname(target))
         except BaseException as error:
             raise Stopped('the swap stopped after it %s (%s: %s). %s'
                           % (done, type(error).__name__, error, go_back_text(files.store)))
-        done = step
     kept = [path + '.pre-compact' for path in (files.log, files.sb)] + (
         [files.indexes + '.pre-compact'] if left['state-indexes.bin'] is not None else [])
     print('done: records.log is %s. The old files are %s, and the run\'s record is %s.'
@@ -826,6 +842,17 @@ def go_back(store):
             blocked = read_bytes(files.sb).startswith(BLOCKED)
             if log_is_new:
                 missing = [old for old, live in ((old_log, files.log), (old_sb, files.sb)) if not other(old, live)]
+                if missing and blocked:
+                    there = os.path.lexists(files.new_sb)
+                    raise Refusal('records.log is the log that the run wrote, state.bin is the blocked file, and %s, the '
+                                  'old file that going back puts in its place, is not there. So there is nothing to go '
+                                  'back to, and chronicle can\'t open the store as it is. %s'
+                                  % (' and '.join(missing),
+                                     'The run\'s new state.bin is still at %s, and it belongs to this records.log: '
+                                     'renaming it to state.bin finishes the run. Then check the store before a host '
+                                     'starts.' % files.new_sb if there else
+                                     'The run\'s new state.bin is not there either. The store needs a repair that this '
+                                     'tool doesn\'t make.'))
                 if missing:
                     run_files = files.found(files.staging + files.kept + (files.marker,))
                     raise Refusal('records.log is the log that the run wrote, and %s, the old file that going back puts '
@@ -866,9 +893,9 @@ def go_back(store):
                     os.replace(files.blocked, live)
                 elif os.path.lexists(old):
                     os.replace(old, live)
-                elif step == 'indexes' and os.path.lexists(live) and os.lstat(live).st_ino != left['state-indexes.bin']:
-                    # A state-indexes.bin that the store had keeps its inode, also when an earlier going back put it
-                    # back. Any other is one made since the run, and goes.
+                elif step == 'indexes' and os.path.lexists(live) and index_print(live) != left['state-indexes.bin']:
+                    # A state-indexes.bin with the bytes of the store's own is the store's own, also when an earlier
+                    # going back put it back. Any other is one made since the run, and goes.
                     os.remove(live)
                 else:
                     continue
@@ -881,7 +908,7 @@ def go_back(store):
             raise Stopped('going back stopped (%s: %s). Run compact-set-states.py %s --go-back again, with the host '
                           'stopped.' % (type(error).__name__, error, store))
         if steps and left['state-indexes.bin'] is not None:
-            if os.path.lexists(files.indexes) and os.lstat(files.indexes).st_ino == left['state-indexes.bin']:
+            if os.path.lexists(files.indexes) and index_print(files.indexes) == left['state-indexes.bin']:
                 said += ' state-indexes.bin is as it was before the run, too.'
             else:
                 said += (' The old state-indexes.bin was not there, so the store has no field index now, and a caller '
@@ -890,13 +917,21 @@ def go_back(store):
     locked(store, act)
 
 
+def index_print(path):
+    """A state-indexes.bin by its bytes: their count and SHA-256."""
+    data = read_bytes(path)
+    return [len(data), hashlib.sha256(data).hexdigest()]
+
+
 def read_record(marker):
     try:
         left = json.loads(read_bytes(marker))
     except ValueError:
         left = None
     if not (isinstance(left, dict) and isinstance(left.get('records.log'), list) and len(left['records.log']) == 2
-            and 'state-indexes.bin' in left and (left['state-indexes.bin'] is None or is_count(left['state-indexes.bin']))):
+            and 'state-indexes.bin' in left and (left['state-indexes.bin'] is None or (
+                isinstance(left['state-indexes.bin'], list) and len(left['state-indexes.bin']) == 2
+                and is_count(left['state-indexes.bin'][0]) and isinstance(left['state-indexes.bin'][1], str)))):
         raise Refusal('%s is not the record of a run that this tool reads.' % marker)
     return left
 
@@ -928,7 +963,7 @@ def main(argv):
         if back: go_back(store)
         else: run(store, patterns, apply)
     except Refusal as refusal:
-        print('refusing: %s Nothing in the store changed.' % refusal); return 1
+        print('refusing: %s No file of the store changed.' % refusal); return 1
     except Stopped as stopped:
         print('stopped: %s' % stopped); return 3
     return 0

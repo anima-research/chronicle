@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { crc32 } from 'node:zlib';
 import { dirname, join, relative } from 'node:path';
@@ -183,7 +183,7 @@ function refuses(store, label, says, patterns = [WHOLE]) {
   const run = compact(store, ...patterns.flatMap((p) => ['--state', p]), '--apply');
   assert.equal(run.status, 1, `compact-set-states.py on ${label} exited ${run.status}:\n${run.out}${run.err}`);
   assert.ok(run.out.includes(says), `compact-set-states.py on ${label} should say "${says}":\n${run.out}${run.err}`);
-  assert.ok(run.out.includes('Nothing in the store changed.'), `compact-set-states.py on ${label} should say that nothing changed:\n${run.out}`);
+  assert.ok(run.out.includes('No file of the store changed.'), `compact-set-states.py on ${label} should say that no file of the store changed:\n${run.out}`);
   assert.deepEqual(filesOf(store), before, `compact-set-states.py changed a file of ${label} as it refused`);
   console.log(`ok: compact-set-states.py refuses ${label}, exit 1, and changes no file`);
 }
@@ -228,7 +228,7 @@ function blockedStateBin(store) {
 function savedHeads(store) {
   return JSON.parse(toolPython(`
 index = tool.read_state_bin(open(os.path.join(sys.argv[1], 'state.bin'), 'rb').read())
-print(json.dumps([{'branch': key[0], 'state': key[1], 'offset': head[0]} for key, head in index[0]]))`, store).toString());
+print(json.dumps([{'branch': key[0], 'state': key[1], 'offset': head[0], 'fields': len(head)} for key, head in index[0]]))`, store).toString());
 }
 
 // state.bin with each head changed by `edit`, a line of Python over `head` and `key`.
@@ -886,7 +886,7 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       writer.setStateJson(WHOLE, { late: true });
       writer.close();
       writeFileSync(join(stale, 'state.bin'), saved);
-      refuses(stale, 'a state.bin older than its log', 'older than records.log');
+      refuses(stale, 'a state.bin older than its log', 'a state update that state.bin does not have yet');
       for (const name of ['records.log.compact', 'state.bin.compact', 'state.bin.blocked', 'records.log.pre-compact', 'state.bin.pre-compact', 'state-indexes.bin.pre-compact']) {
         const earlier = copyOf(`refuse-${name}`);
         writeFileSync(join(earlier, name), 'left');
@@ -902,6 +902,10 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
         return payload;
       }, { checksum: 'kept' });
       refuses(corrupt, 'a record that fails its checksum', `the record at offset ${moved.record} of records.log fails its checksum`);
+      const tornLog = copyOf('refuse-torn');
+      const lastRecord = JSON.parse(toolPython(`print(json.dumps(tool.scan_log(os.path.join(sys.argv[1], 'records.log'))[-1].offset))`, tornLog).toString());
+      truncateSync(join(tornLog, 'records.log'), statSync(join(tornLog, 'records.log')).size - 3);
+      refuses(tornLog, 'a log whose last record is torn', `its last record, at offset ${lastRecord}, is not whole`);
       const short = copyOf('refuse-short-index');
       writeFileSync(join(short, 'state.bin'), Buffer.from('STI\0'));
       refuses(short, 'a state.bin cut short', 'state.bin is not a whole state index');
@@ -924,7 +928,42 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
         const readOnly = copyOf('refuse-lock-read-only');
         chmodSync(join(readOnly, 'LOCK'), 0o444);
         refuses(readOnly, 'a store whose LOCK this user can\'t write, as chronicle can\'t either', 'could not open LOCK');
+        const writeOnly = copyOf('lock-write-only');
+        chmodSync(join(writeOnly, 'LOCK'), 0o200);
+        const dry = compact(writeOnly, '--state', WHOLE);
+        assert.equal(dry.status, 0, `the dry run on a store whose LOCK this user can write and not read exited ${dry.status}:\n${dry.out}${dry.err}`);
+        console.log('ok: compact-set-states.py takes a LOCK that its user can write and not read, as chronicle does');
       }
+      const strategiesNil = copyOf('refuse-strategies');
+      writeFileSync(join(strategiesNil, 'state.bin'), toolPython(`
+index = tool.read_state_bin(open(sys.argv[1], 'rb').read())
+index[1] = None
+sys.stdout.buffer.write(tool.state_bin_bytes(index))`, join(strategiesNil, 'state.bin')));
+      refuses(strategiesNil, 'a state.bin whose strategies are not a map', 'state.bin does not hold the state index this tool reads');
+      if (process.getuid?.() !== 0) {
+        const unreadable = copyOf('refuse-unreadable-branches');
+        const readable = filesOf(unreadable);
+        const mode = statSync(join(unreadable, 'branches.bin')).mode & 0o777;
+        chmodSync(join(unreadable, 'branches.bin'), 0o000);
+        const unreadableRun = compact(unreadable, '--state', WHOLE, '--apply');
+        chmodSync(join(unreadable, 'branches.bin'), mode);
+        assert.equal(unreadableRun.status, 1, `the tool on a branches.bin that its user can't read exited ${unreadableRun.status}:\n${unreadableRun.out}${unreadableRun.err}`);
+        assert.ok(unreadableRun.out.includes('could not read') && unreadableRun.out.includes('No file of the store changed.'),
+          `the tool should refuse a branches.bin that its user can't read:\n${unreadableRun.out}${unreadableRun.err}`);
+        assert.deepEqual(filesOf(unreadable), readable, 'the tool changed a file of a store whose branches.bin it could not read');
+      }
+      const nolock = copyOf('refuse-no-locks');
+      const nolockRun = spawnSync(PYTHON, ['-c', `
+import errno, importlib.util, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+def flock(fd, operation): raise OSError(errno.ENOLCK, 'No locks available')
+tool.fcntl.flock = flock
+sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--state', '${WHOLE}']))`, nolock], { encoding: 'utf8', cwd: tools });
+      assert.equal(nolockRun.status, 1, `the tool whose flock fails with ENOLCK exited ${nolockRun.status}:\n${nolockRun.stdout}${nolockRun.stderr}`);
+      assert.ok(nolockRun.stdout.includes('could not lock LOCK') && !nolockRun.stdout.includes('the store is open'),
+        `a flock that fails for another reason than a lock held should be named as such:\n${nolockRun.stdout}`);
+      console.log('ok: compact-set-states.py refuses a state.bin whose strategies are not a map, a file it can\'t read, and a flock that fails, each by what it is');
       const unlocked = copyOf('refuse-no-lock');
       rmSync(join(unlocked, 'LOCK'));
       refuses(unlocked, 'a store with no LOCK', 'LOCK is missing');
@@ -981,6 +1020,7 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       const before = digestOfCopy(legacy, 'a store whose heads have five fields');
       const run = compact(legacy, '--state', WHOLE, '--apply');
       assert.equal(run.status, 0, `compact-set-states.py on a store whose heads have five fields exited ${run.status}:\n${run.out}${run.err}`);
+      assert.deepEqual([...new Set(savedHeads(legacy).map(({ fields }) => fields))], [5], 'each head should keep its five fields in the tool\'s state.bin');
       assert.equal(digest(legacy, 'a store whose heads had five fields, after the tool'), before, 'a store whose heads have five fields should read the same after the tool');
       console.log('ok: compact-set-states.py applies to a store whose heads have the five fields of earlier releases, and it reads the same');
     },
@@ -1057,7 +1097,7 @@ sys.exit(code)`, store, String(stopAfter), how], { encoding: 'utf8', cwd: tools 
       const reader = JsStore.open({ path: written });
       assert.deepEqual(reader.getStateJson(WHOLE), { late: true }, '--go-back after a stop before the blocked file should keep a write made since');
       reader.close();
-      for (const [k, status, says] of [[1, 1, 'Nothing in the store changed.'], [beforeTheBlock + 2, 3, '--go-back']]) {
+      for (const [k, status, says] of [[1, 1, 'No file of the store changed.'], [beforeTheBlock + 2, 3, '--go-back']]) {
         const store = join(scratch, `raise-${k}`);
         cpSync(base, store, { recursive: true });
         const run = harness(store, k, 'raise');
@@ -1065,6 +1105,24 @@ sys.exit(code)`, store, String(stopAfter), how], { encoding: 'utf8', cwd: tools 
         assert.ok(run.stdout.includes(says), `a run that fails after step ${k} should say "${says}":\n${run.stdout}`);
         if (status === 1) assert.deepEqual(filesOf(store), original, 'a run that fails before its swap should leave every file as it was');
       }
+      // A rename that lands and a directory sync after it that fails: the stopped line names the step that landed.
+      const unsynced = join(scratch, 'stops-unsynced');
+      cpSync(base, unsynced, { recursive: true });
+      const unsyncedRun = spawnSync(PYTHON, ['-c', `
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+store = sys.argv[1]
+real = tool.sync_dir
+def sync_dir(path):
+    if os.path.exists(os.path.join(store, 'records.log.pre-compact')) and not os.path.exists(os.path.join(store, 'state.bin.compact')):
+        raise OSError(errno.EIO, 'the sync failed')
+    real(path)
+tool.sync_dir = sync_dir
+sys.exit(tool.main(['compact-set-states.py', store, '--state', '${WHOLE}', '--apply']))`, unsynced], { encoding: 'utf8', cwd: tools });
+      assert.equal(unsyncedRun.status, 3, `a run whose last sync fails exited ${unsyncedRun.status}:\n${unsyncedRun.stdout}${unsyncedRun.stderr}`);
+      assert.ok(unsyncedRun.stdout.includes('the swap stopped after it put the new state.bin in place of the blocked file'),
+        `a run whose sync fails after its last rename should name that rename as done:\n${unsyncedRun.stdout}`);
       console.log(`ok: a run stopped after each of its ${steps} steps leaves a store that open refuses or that reads as before, the next run refuses it, and --go-back restores it, and keeps a write made since a stop before the swap`);
     },
 
@@ -1165,6 +1223,19 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
       const lostLeft = filesOf(lost);
       assert.ok(!lostLeft['state-indexes.bin'] && lostLeft['records.log'] === lostFiles['records.log'] && lostLeft['state.bin'] === lostFiles['state.bin'],
         '--go-back after the old index was deleted should put back records.log and state.bin, and leave no state-indexes.bin');
+      // An index with the old one's inode and other bytes, as when a check's new index reuses the freed inode.
+      const reused = join(scratch, 'finished-index-reused');
+      cpSync(base, reused, { recursive: true });
+      const reusedFiles = filesOf(reused);
+      assert.equal(compact(reused, '--state', WHOLE, '--apply').status, 0, 'the run on a store whose index is changed in place should finish');
+      const oldIndex = join(reused, 'state-indexes.bin.pre-compact');
+      writeFileSync(oldIndex, Buffer.concat([readFileSync(oldIndex), Buffer.from('changed')]));
+      renameSync(oldIndex, join(reused, 'state-indexes.bin'));
+      const reusedBack = compact(reused, '--go-back');
+      assert.equal(reusedBack.status, 0, `--go-back with another index at the old inode exited ${reusedBack.status}:\n${reusedBack.out}${reusedBack.err}`);
+      assert.ok(reusedBack.out.includes('The old state-indexes.bin was not there') && !filesOf(reused)['state-indexes.bin']
+        && filesOf(reused)['records.log'] === reusedFiles['records.log'],
+        `--go-back should remove an index whose bytes are not the old one's, whatever its inode, and say so:\n${reusedBack.out}`);
       const bare = join(scratch, 'finished-no-index');
       cpSync(base, bare, { recursive: true });
       rmSync(join(bare, 'state-indexes.bin'));
@@ -1219,6 +1290,7 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
         const counted = make(`back-${where.replaceAll(' ', '-')}-count`);
         const back = stoppedTool(counted, 0, '--go-back');
         assert.equal(back.status, 0, `--go-back after ${where} exited ${back.status}:\n${back.out}${back.err}`);
+        assert.ok(back.steps > 0, `the premise: --go-back after ${where} takes steps`);
         for (let k = 1; k <= back.steps; k++) {
           const store = make(`back-${where.replaceAll(' ', '-')}-${k}`);
           const stopped = stoppedTool(store, k, '--go-back');
@@ -1236,6 +1308,10 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
           const refused = compact(store, '--go-back');
           assert.equal(refused.status, 1, `--go-back after ${where} with ${gone} deleted exited ${refused.status}:\n${refused.out}${refused.err}`);
           assert.ok(refused.out.includes('nothing to go back to'), `--go-back after ${where} with ${gone} deleted should say why:\n${refused.out}`);
+          if (where === 'the new log in place') {
+            assert.ok(refused.out.includes('state.bin.compact, and it belongs to this records.log') && !refused.out.includes('delete'),
+              `--go-back with state.bin blocked and ${gone} deleted should name the new state.bin, and no deletion:\n${refused.out}`);
+          }
           assert.deepEqual(filesOf(store), unchanged, `--go-back after ${where} with ${gone} deleted should change no file`);
           if (where === 'finished') {
             const copy = join(scratch, `back-open-${gone}`);
@@ -1245,6 +1321,23 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
         }
         console.log(`ok: --go-back after ${where}, with either old file deleted by hand, refuses and changes no file`);
       }
+      // A going back after a finished run that stopped with state.bin blocked, and then the old state.bin deleted.
+      let stranded;
+      for (let k = 1; ; k++) {
+        assert.ok(k < 10, 'the premise: a going back after a finished run blocks state.bin within its first steps');
+        stranded = left.finished(`back-stranded-${k}`);
+        assert.equal(stoppedTool(stranded, k, '--go-back').status, 9, `the going back on back-stranded-${k} should be killed`);
+        if (blocked(stranded)) break;
+      }
+      assert.ok(!existsSync(join(stranded, 'state.bin.compact')), 'the premise: no new state.bin is staged');
+      rmSync(join(stranded, 'state.bin.pre-compact'));
+      const strandedFiles = filesOf(stranded);
+      const strandedBack = compact(stranded, '--go-back');
+      assert.equal(strandedBack.status, 1, `--go-back on a blocked store with no old state.bin exited ${strandedBack.status}:\n${strandedBack.out}${strandedBack.err}`);
+      assert.ok(strandedBack.out.includes('The run\'s new state.bin is not there either') && !strandedBack.out.includes('delete'),
+        `--go-back on a blocked store with no old state.bin should say that the store needs a repair, and name no deletion:\n${strandedBack.out}`);
+      assert.deepEqual(filesOf(stranded), strandedFiles, '--go-back on a blocked store with no old state.bin should change no file');
+      console.log('ok: --go-back on a blocked state.bin with an old file gone names the staged new state.bin where it is there, and otherwise a repair, and no deletion');
       // A stop inside the write of the run's record: half its bytes are written, and the run is killed.
       const torn = join(scratch, 'back-torn-record');
       cpSync(base, torn, { recursive: true });

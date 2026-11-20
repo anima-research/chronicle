@@ -20,8 +20,10 @@
   refuses an open store, a store with no `LOCK`, a `MANIFEST` that names a
   version or feature it doesn't read, a named state that is not whole-value,
   a record typed as a state change after the newest head on a live branch,
-  where `state.bin` is older than the log (from chronicle 0.5.0 an open and
-  a close clear that, and with 0.4.0 a write of any state and a close), a
+  which may be an update that `state.bin` doesn't have yet (from chronicle
+  0.5.0 an open and a close apply such an update, and with 0.4.0, or for a
+  record that chronicle doesn't decode, a write of any state and a close
+  clear it), a
   torn log, a record that fails its checksum, a state change in the JSON or
   the positional form that would need a new link, and the files of an
   earlier run. It follows a linked `records.log`, `state.bin` or
