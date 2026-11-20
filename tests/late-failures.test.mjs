@@ -95,7 +95,10 @@ function describe(tid, body, cwd) {
     mark: args.map(quoted).map(path => /^\/chronicle-mark\/(.+)$/.exec(path ?? '')?.[1]).find(Boolean) ?? null,
     paths: [],
   };
-  if (BY_DESCRIPTOR.has(name)) call.paths = [decorated(args[0])];
+  if (BY_DESCRIPTOR.has(name)) {
+    call.paths = [decorated(args[0])];
+    call.undecorated = call.paths[0] === null && /^\d+$/.test(args[0] ?? '');
+  }
   else if (name === 'rename') call.paths = [resolved(null, args[0], cwd), resolved(null, args[1], cwd)];
   else if (name === 'renameat' || name === 'renameat2') call.paths = [resolved(args[0], args[1], cwd), resolved(args[2], args[3], cwd)];
   else if (name === 'open' || name === 'creat' || name === 'mkdir' || name === 'unlink' || name === 'rmdir') {
@@ -146,6 +149,7 @@ function requestsOfCall(text, store, cwd) {
     call.main = call.tid === all[0].tid;
     if (call.mark === 'call-begin') inCall = true;
     if (call.mark === 'call-end') inCall = false;
+    call.inCall = inCall;
     const [path, target] = call.paths;
     const made = OPENS.has(call.name) && call.ok && call.flags.includes('O_CREAT') && !existing.has(path);
     if (inCall && (isUnder(path, store) || isUnder(target, store))) {
@@ -160,7 +164,8 @@ function requestsOfCall(text, store, cwd) {
     }
     if (call.ok && (call.name === 'unlink' || call.name === 'unlinkat' || call.name === 'rmdir')) existing.delete(path);
   }
-  return { all, requests };
+  const undecorated = all.filter(call => call.undecorated && call.inCall);
+  return { all, requests, undecorated };
 }
 
 function faultPoints(requests, kind) {
@@ -203,6 +208,10 @@ function child(command, args, cwd) {
     const err = [];
     proc.stdout.on('data', chunk => out.push(chunk));
     proc.stderr.on('data', chunk => err.push(chunk));
+    proc.on('error', error => {
+      clearTimeout(bound);
+      resolve({ status: null, signal: null, timedOut, spawnError: error.message, ms: Date.now() - started, stdout: '', stderr: '' });
+    });
     proc.on('close', (status, signal) => {
       clearTimeout(bound);
       resolve({ status, signal, timedOut, ms: Date.now() - started, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') });
@@ -211,6 +220,7 @@ function child(command, args, cwd) {
 }
 
 let base;
+let escaped = false;
 let counter = 0;
 
 async function traced(scenario, extra, inject) {
@@ -236,6 +246,7 @@ async function traced(scenario, extra, inject) {
 }
 
 function brokenRun(run) {
+  if (run.result.spawnError) return `the writer did not start: ${run.result.spawnError}`;
   if (run.result.timedOut) return 'the writer did not end within 20 s';
   if (run.result.signal) return `the writer ended by ${run.result.signal}`;
   if (run.result.status !== 0 || run.out === null) {
@@ -425,8 +436,22 @@ function judge(scenario, clean, run, reopen) {
       add('the reads', `two reads of ${name} disagree: ${shown(out.reads[0][name])} and ${shown(out.reads[1][name])}`);
     }
   }
+  if (out.retry && !out.retry.ok && !(out.call.code === 'DurabilityLost' && out.retry.code === 'DurabilityLost')) {
+    add('the second try', `the same call again threw: ${shown(out.retry)}`);
+  }
   if (out.retry?.ok) whole('the second try', 'the reads after the same call again', out.retryReads, true);
   if (out.retryReads) oneState('the second try', 'the reads after the same call again', out.retryReads);
+  const unbroken = out.retry ? [['the reads after the same call again', out.retryReads], ['the reads after sync', out.syncReads]]
+    : [['the reads after the call', out.reads[0]], ['the second reads after the call', out.reads[1]], ['the reads after sync', out.syncReads]];
+  const joined = Object.fromEntries(unbroken.filter(([, reads]) => reads).flatMap(([what, reads]) => Object.entries(reads)
+    .map(([name, read]) => [`${name} in ${what}`, read])));
+  const asOf = key => key.slice(0, key.indexOf(' in '));
+  const given = Object.entries(joined).filter(([, read]) => read.ok);
+  const asOldAll = given.filter(([key, read]) => isDeepStrictEqual(read.value, old[asOf(key)].value));
+  const asNewAll = given.filter(([key, read]) => isDeepStrictEqual(read.value, fresh[asOf(key)].value));
+  if (asOldAll.length < given.length && asNewAll.length < given.length) {
+    add('the reads', `the handle's reads ${out.retry ? 'from the second try on' : 'after the call'} are no one state: ${given.map(([key]) => `${key} ${asNewAll.some(([each]) => each === key) ? 'new' : asOldAll.some(([each]) => each === key) ? 'old' : 'neither'}`).join(', ')}`);
+  }
   const barriers = [];
   if (scenario.kind === 'sync' || scenario.kind === 'close') {
     if (out.call.ok) barriers.push('call');
@@ -452,7 +477,9 @@ function judge(scenario, clean, run, reopen) {
       }
     }
   }
-  const atBarrier = scenario.kind === 'close' ? out.old : out.syncReads;
+  const handleReads = scenario.kind === 'close' ? [out.old] : [out.reads[0], out.reads[1], out.retryReads, out.syncReads].filter(Boolean);
+  const atBarrier = Object.fromEntries(Object.keys(handleReads[0]).map(name => [name,
+    handleReads.map(reads => reads[name]).filter(read => read.ok).at(-1) ?? handleReads.at(-1)[name]]));
   const before = { copy: barriers.filter(barrier => barrier !== 'close'), store: barriers };
   const lastRead = {
     copy: name => out.syncReads[name],
@@ -522,6 +549,9 @@ async function scenarioResult(scenario) {
   const problem = cleanProblem(scenario, clean);
   if (problem) return { failure: problem };
   Object.assign(clean, requestsOfCall(clean.text, clean.store, clean.dir));
+  if (clean.undecorated.length > 0) {
+    return { failure: `${NOT_MEASURED}: in the clean run, the call makes requests whose descriptors the record does not name: ${clean.undecorated.slice(0, 3).map(({ text }) => text).join(' | ')}` };
+  }
   const marks = clean.all.filter(({ mark }) => mark).map(({ mark }) => mark);
   if (!isDeepStrictEqual(marks, clean.out.marks)) {
     return { failure: `${NOT_MEASURED}: the clean run's record shows the marks [${marks.join(', ')}], not the writer's [${clean.out.marks.join(', ')}]` };
@@ -548,14 +578,17 @@ if (skip) {
 } else {
   base = realpathSync(mkdtempSync(join(tmpdir(), 'chronicle-late-failures-')));
   after(() => rmSync(base, { recursive: true, force: true }));
+  escaped = /[\x00-\x1f\x7f-\uffff"\\<>]/.test(base)
+    && `the path ${JSON.stringify(base)} has characters that strace escapes in its record, and the harness reads paths unescaped`;
   const scenarios = JSON.parse(spawnSync(process.execPath, [WRITER, 'list'], { encoding: 'utf8' }).stdout);
-  const results = new Map(scenarios.map(scenario => [scenario.name,
+  const results = new Map(escaped ? [] : scenarios.map(scenario => [scenario.name,
     scenarioResult(scenario).catch(error => ({ failure: error.stack }))]));
   for (const scenario of scenarios) {
     const title = scenario.kind === 'cold'
       ? `${scenario.name} on a store opened again throws the errno of a refused read, and the same call again gives the true value`
       : `A refused request in ${scenario.kind === 'long' ? 'an append of a long run without a barrier' : scenario.name} leaves a throw or a return, whole values and a store that opens again`;
     test(title, async t => {
+      if (escaped) assert.fail(escaped);
       const result = await results.get(scenario.name);
       if (result.failure) assert.fail(result.failure);
       if (result.points.length === 0) {
