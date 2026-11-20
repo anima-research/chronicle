@@ -1146,6 +1146,19 @@ fn contending_single_identity_writers_each_stamp_their_own_one_record() {
         sequences(side.id),
         ((side_before.0 + 1)..=(side_before.0 + ROUNDS as u64)).collect::<Vec<_>>()
     );
+    for branch in [main.id, side.id] {
+        let mut taken: Vec<(u64, u64)> = writes
+            .iter()
+            .map(|(Wrote::Stamped(r, _) | Wrote::Plain(r, _))| r)
+            .filter(|r| r.branch == branch)
+            .map(|r| (r.sequence.0, r.id.0))
+            .collect();
+        taken.sort_unstable();
+        assert!(
+            taken.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "IDs follow the order of the sequences on each branch: {taken:?}"
+        );
+    }
 
     let mut stamped_writes: Vec<_> = writes
         .iter()

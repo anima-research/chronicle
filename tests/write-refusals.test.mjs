@@ -16,12 +16,14 @@ function freshPath(t) {
   return join(parent, 'store');
 }
 
+const refusedIo = error => error instanceof Error && error.code === 'Io';
+
 function withPendingCheckpoint(store, path, tryWrites) {
   const saved = `${path}-saved`;
   renameSync(path, saved);
   try {
     writeFileSync(path, 'not a directory');
-    assert.throws(() => store.registerState({ id: 'pending', strategy: 'snapshot' }));
+    assert.throws(() => store.registerState({ id: 'pending', strategy: 'snapshot' }), refusedIo);
     tryWrites();
   } finally {
     rmSync(path, { force: true });
@@ -151,11 +153,11 @@ test('Pre-record I/O refusals preserve whole branch-local JSON values', posix, t
     const revision = side.stateHeadOffset('unfold');
     const sequence = side.currentSequence();
     withPendingCheckpoint(root, path, () => {
-      assert.throws(() => side.setStateJson(binding, after));
+      assert.throws(() => side.setStateJson(binding, after), refusedIo);
       assert.equal(side.currentBranch().name, 'side');
-      assert.throws(() => side.setStateJson('unfold', unfolded));
-      assert.throws(() => side.setState('receipt', Buffer.from('replacement')));
-      assert.throws(() => side.appendToStateJson('log', { message: 'three' }));
+      assert.throws(() => side.setStateJson('unfold', unfolded), refusedIo);
+      assert.throws(() => side.setState('receipt', Buffer.from('replacement')), refusedIo);
+      assert.throws(() => side.appendToStateJson('log', { message: 'three' }), refusedIo);
     });
     assert.deepEqual(root.view('side').getStateJson(binding), before);
     assert.deepEqual([side.getStateJson('unfold'), side.stateHeadOffset('unfold'), side.currentSequence()],
