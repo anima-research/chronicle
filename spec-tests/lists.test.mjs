@@ -95,9 +95,13 @@ test('A43 N9 getStateSlice gives the JSON text of an array of the items, each wi
   const store = listStore();
   store.appendToState('list', Buffer.from('{ "z" : 1,  "a" : {"y":2,"b":3} }'));
   store.appendToStateJson('list', { m: 1, c: [{ x: 1, d: 2 }] });
-  const slice = store.getStateSlice('list', 0, 2);
-  assert.deepEqual(JSON.parse(slice.toString()), [{ z: 1, a: { y: 2, b: 3 } }, { m: 1, c: [{ x: 1, d: 2 }] }]);
-  assert.deepEqual(JSON.parse(slice.toString()).map((item) => JSON.stringify(item)), ['{"z":1,"a":{"y":2,"b":3}}', '{"m":1,"c":[{"x":1,"d":2}]}']);
+  store.appendToState('list', Buffer.from('{"10":1,"2":2}'));
+  const text = store.getStateSlice('list', 0, 3).toString();
+  assert.deepEqual(JSON.parse(text), [{ z: 1, a: { y: 2, b: 3 } }, { m: 1, c: [{ x: 1, d: 2 }] }, { 10: 1, 2: 2 }]);
+  const at = (key) => text.indexOf(`"${key}"`);
+  for (const keys of [['z', 'a', 'y', 'b'], ['m', 'c', 'x', 'd'], ['10', '2']]) {
+    assert.deepEqual(keys.map(at), keys.map(at).toSorted((x, y) => x - y), `${keys} in ${text}`);
+  }
   store.close();
 });
 

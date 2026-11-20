@@ -131,7 +131,7 @@ test('D1 a new store\'s MANIFEST is RST\\0 and version 1', () => {
   assert.deepEqual(manifest(dir), Buffer.from('RST\0\x01', 'latin1'));
 });
 
-test('D1 just before its first change of several items, the store writes version 2 with feature bit 0 set, as 64 bits with the lowest byte first', () => {
+test('D1 after its first change of several items, the store holds version 2 with feature bit 0 set, as 64 bits with the lowest byte first', () => {
   const { store, dir } = freshStore();
   store.registerState({ id: 'list', strategy: 'append_log' });
   store.appendManyToStateJson('list', [1, 2]);
@@ -330,29 +330,34 @@ test('D9 openOrCreate creates a store beside LOCK, blobs and a name that starts 
   }
 });
 
-test("D9 a save replaces the file that a link at state.bin leads to, in that file's own directory, the store writes the log through a link at records.log, and both links stay", { skip: process.platform === 'win32' && 'makes a symbolic link' }, () => {
+test("D9 a save replaces the file that a link at MANIFEST, state.bin, state-indexes.bin or branches.bin leads to, in that file's own directory, the store writes the log through a link at records.log, and each link stays", { skip: process.platform === 'win32' && 'makes a symbolic link' }, () => {
   const { store, dir } = freshStore();
   store.registerState({ id: 'list', strategy: 'append_log' });
+  store.registerStateFieldIndex('list', '/n', 'number');
+  store.appendToStateJson('list', { n: 0 });
   store.close();
   const elsewhere = `${dir}-elsewhere`;
   mkdirSync(elsewhere);
-  for (const name of ['state.bin', 'records.log']) {
+  const saved = ['MANIFEST', 'state.bin', 'state-indexes.bin', 'branches.bin'];
+  for (const name of [...saved, 'records.log']) {
     renameSync(join(dir, name), join(elsewhere, name));
     symlinkSync(join(elsewhere, name), join(dir, name));
   }
   const reopened = JsStore.open({ path: dir });
-  const before = (name) => statSync(join(elsewhere, name), { bigint: true });
-  const [states, log] = [before('state.bin'), before('records.log')];
-  reopened.appendToStateJson('list', 1);
+  const now = (name) => statSync(join(elsewhere, name), { bigint: true });
+  const before = Object.fromEntries([...saved, 'records.log'].map((name) => [name, now(name)]));
+  reopened.appendManyToStateJson('list', [{ n: 1 }, { n: 2 }]);
+  reopened.createBranch('side');
   reopened.sync();
   reopened.close();
-  for (const name of ['state.bin', 'records.log']) assert.ok(lstatSync(join(dir, name)).isSymbolicLink(), name);
-  assert.notEqual(before('state.bin').ino, states.ino);
-  assert.equal(before('records.log').ino, log.ino);
-  assert.ok(before('records.log').size > log.size);
+  for (const name of [...saved, 'records.log']) assert.ok(lstatSync(join(dir, name)).isSymbolicLink(), name);
+  for (const name of saved) assert.notEqual(now(name).ino, before[name].ino, name);
+  assert.equal(now('records.log').ino, before['records.log'].ino);
+  assert.ok(now('records.log').size > before['records.log'].size);
   assert.deepEqual(readdirSync(elsewhere).filter((name) => name.startsWith('.chronicle-checkpoint-')), []);
   const again = JsStore.open({ path: dir });
-  assert.deepEqual(again.getStateJson('list'), [1]);
+  assert.deepEqual(again.getStateJson('list'), [{ n: 0 }, { n: 1 }, { n: 2 }]);
+  assert.deepEqual(again.queryStateIndexRange('list', '/n', { gte: 1 }), [1, 2]);
   again.close();
 });
 
@@ -415,6 +420,12 @@ test('N5 the built index.d.ts exports JsStore, ErrorCode and the types of chroni
   assert.deepEqual(
     declared.map(({ kind, name }) => `${kind} ${name}`).sort(),
     ['class JsStore', 'enum ErrorCode', ...types.map(([, name]) => `interface ${name}`)].sort(),
+  );
+  const codes = spec.match(/^\*\*E1\. The codes\.\*\* [^\n]*/m)[0].match(/one of these \d+ texts: (.*?)\.( |$)/)[1].match(/`(\w+)`/g).map((code) => code.slice(1, -1));
+  assert.equal(codes.length, 23);
+  assert.deepEqual(
+    membersOf(declared.find(({ name }) => name === 'ErrorCode').body.replace(/,/g, '\n')),
+    codes.map((code) => `${code} = '${code}'`).sort(),
   );
   const methods = [...spec.matchAll(/^\*\*A\d+\. `(\w+)`\.\*\* `([^`]+)`/gm)];
   assert.equal(methods.length, 79);

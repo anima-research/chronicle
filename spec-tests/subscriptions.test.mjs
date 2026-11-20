@@ -51,6 +51,16 @@ test('A63 T21 with no bufferSize, 1,000 events can wait for a subscription, and 
   store.close();
 });
 
+test('A63 with no config, 1,000 events can wait for a subscription, and a catch-up that would queue one more is refused', () => {
+  const { store } = freshStore();
+  const id = store.subscribe();
+  for (let n = 0; n < 1000; n++) store.catchUpSubscription(id);
+  assert.equal(store.subscriptionCount(), 1);
+  refuses(() => store.catchUpSubscription(id), ErrorCode.SubscriptionDropped, 'Subscription was dropped');
+  assert.equal(store.subscriptionCount(), 0);
+  store.close();
+});
+
 test('A63 T21 with no maxSnapshotBytes, a catch-up sends a state of 10 MiB whole, and cuts a state one byte larger', () => {
   const { store } = freshStore();
   store.registerState({ id: 'whole', strategy: 'snapshot' });
@@ -157,6 +167,29 @@ test.todo('A65 L7 a catch-up sends a followed state whose bytes are no JSON with
   const snapshot = snapshotsOf(store, 'not json');
   assert.equal(snapshot?.eventType, 'state_snapshot');
   assert.ok(snapshot.data !== null || snapshot.truncated === true, JSON.stringify(snapshot));
+  store.close();
+});
+
+test("N9 an event's data keeps the order of keys as written, in a record's payload and in a cut list of a catch-up", () => {
+  const { store } = freshStore();
+  const order = (text, keys) => {
+    const at = keys.map((key) => text.indexOf(`"${key}"`));
+    assert.deepEqual(at, at.toSorted((x, y) => x - y), `${keys} in ${text}`);
+    assert.ok(at.every((index) => index >= 0), text);
+  };
+  const id = caughtUp(store, { filter: { includeRecords: true } });
+  store.append('note', Buffer.from('{"zz":1,"10":2,"aa":3}'));
+  assert.equal(store.pollSubscription(id).eventType, 'caught_up');
+  const event = store.pollSubscription(id);
+  assert.equal(event.eventType, 'record');
+  order(event.data, ['zz', '10', 'aa']);
+  store.registerState({ id: 'list', strategy: 'append_log' });
+  for (let n = 0; n < 4; n++) store.appendToState('list', Buffer.from(`{"zz":${n},"10":${n},"aa":${n}}`));
+  const cut = store.subscribe({ fromSequence: store.currentSequence(), maxSnapshotBytes: 60, filter: { includeStateChanges: true, stateIds: ['list'] } });
+  store.catchUpSubscription(cut);
+  const snapshot = store.pollSubscription(cut);
+  assert.equal(JSON.parse(snapshot.data).truncated, true);
+  order(snapshot.data.slice(snapshot.data.indexOf('"data"')), ['zz', '10', 'aa']);
   store.close();
 });
 

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { ErrorCode, JsStore, freshStore, refuses, refusesInAForm } from './support.mjs';
+import { ErrorCode, JsStore, freshDir, freshStore, refuses, refusesInAForm } from './support.mjs';
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const blobFile = (dir, hash) => join(dir, 'blobs', hash.slice(0, 2), hash);
@@ -218,15 +218,12 @@ test('A55 T16 with no limit, query answers at most 10,000 records', () => {
 
 test.todo('A55 L10 a query whose fromSequence is after its toSequence answers no records', () => {
   const script = `
-    import { mkdtempSync } from 'node:fs';
-    import { tmpdir } from 'node:os';
-    import { join } from 'node:path';
     import { JsStore } from ${JSON.stringify(new URL('../index.js', import.meta.url).href)};
-    const store = JsStore.openOrCreate({ path: join(mkdtempSync(join(tmpdir(), 'chronicle-spec-')), 'store') });
+    const store = JsStore.openOrCreate({ path: ${JSON.stringify(freshDir())} });
     for (const n of [1, 2, 3]) store.appendJson('note', { n });
     process.stdout.write(JSON.stringify(store.query({ fromSequence: 2, toSequence: 1 })));
   `;
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 60_000 });
   assert.equal(child.status, 0, child.stderr);
   assert.equal(child.stdout, '[]');
 });

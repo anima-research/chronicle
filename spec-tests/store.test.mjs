@@ -86,7 +86,7 @@ const STORE_WIDE = new Set([
   'view', 'recovery', 'snapshotFailures', 'getRecord', 'getRecords', 'getStateUpdateJson', 'getRecordIdsByType',
   'storeBlob', 'storeBlobAsync', 'getBlob', 'createBranchAtWithStates', 'createBranchAt', 'switchBranch', 'listBranches',
   'deleteBranch', 'registerState', 'updateStateStrategy', 'setAutoSnapshot', 'autoSnapshotEnabled', 'stats', 'getEffects',
-  'getLinksTo', 'sync', 'subscribe', 'unsubscribe', 'catchUpSubscription', 'subscriptionCount',
+  'getLinksTo', 'sync', 'subscribe', 'unsubscribe', 'subscriptionCount',
 ]);
 
 function filesOf(dir) {
@@ -263,7 +263,7 @@ test.todo('N8 L4 on a closed handle, a read of items with an index below zero, o
   }
 });
 
-test('N8 A6 through a view whose branch is deleted, each method that depends on a branch throws BranchNotFound, apart from a read of an item with an index below zero (L4)', () => {
+test('N8 A6 through a view whose branch is deleted, each method that depends on a branch throws BranchNotFound, apart from a read of items with an index below zero or with no index (L4)', () => {
   const { store } = populated();
   store.createBranch('gone');
   const view = store.view('gone');
@@ -292,6 +292,18 @@ test('E1 E2 a damaged blob stored whole is ChecksumMismatch, "Checksum mismatch:
   writeFileSync(file, bytes);
   const reopened = JsStore.open({ path: dir });
   refuses(() => reopened.getBlob(hash), ErrorCode.ChecksumMismatch, /^Checksum mismatch: expected .+, got .+$/);
+  reopened.close();
+});
+
+test('E1 E2 a blob whose file holds another valid blob is HashMismatch, "Hash mismatch: expected …, got …"', () => {
+  const { store, dir } = freshStore();
+  const first = store.storeBlob(Buffer.alloc(1000, 1), 'application/octet-stream');
+  const second = store.storeBlob(Buffer.alloc(1000, 2), 'application/octet-stream');
+  store.close();
+  const fileOf = (hash) => join(dir, 'blobs', hash.slice(0, 2), hash);
+  writeFileSync(fileOf(first), readFileSync(fileOf(second)));
+  const reopened = JsStore.open({ path: dir });
+  refuses(() => reopened.getBlob(first), ErrorCode.HashMismatch, /^Hash mismatch: expected .+, got .+$/);
   reopened.close();
 });
 
@@ -328,67 +340,63 @@ test.todo('A2 L9 open throws Corruption for a record whose type is damaged, with
   refuses(() => JsStore.open({ path: dir }), ErrorCode.Corruption, /^Corruption detected: /);
 });
 
-function blobCacheCase(dir, open, others) {
-  const blobs = join(dir, 'blobs');
-  const fileOf = (hash) => join(blobs, hash.slice(0, 2), hash);
-  return (target, extra) => {
-    const store = open();
-    const good = readFileSync(fileOf(target));
-    assert.equal(store.getBlob(target).length, 1000);
-    const damaged = Buffer.from(good);
-    damaged[damaged.length - 5] ^= 0xff;
-    writeFileSync(fileOf(target), damaged);
-    for (const hash of others.slice(0, extra)) store.getBlob(hash);
-    let kept;
-    try {
-      kept = store.getBlob(target).length === 1000;
-    } catch (error) {
-      assert.equal(error.code, ErrorCode.ChecksumMismatch);
-      kept = false;
-    }
-    store.close();
-    writeFileSync(fileOf(target), good);
-    return kept;
+function keepsTarget(store, dir, target, others, extra) {
+  const file = join(dir, 'blobs', target.slice(0, 2), target);
+  const good = readFileSync(file);
+  assert.equal(store.getBlob(target).length, 1000);
+  const damaged = Buffer.from(good);
+  damaged[damaged.length - 5] ^= 0xff;
+  writeFileSync(file, damaged);
+  for (const hash of others.slice(0, extra)) store.getBlob(hash);
+  let kept;
+  try {
+    kept = store.getBlob(target).length === 1000;
+  } catch (error) {
+    assert.equal(error.code, ErrorCode.ChecksumMismatch);
+    kept = false;
+  }
+  writeFileSync(file, good);
+  return kept;
+}
+
+function cacheWays(config, count) {
+  const fill = (store) => ({
+    target: store.storeBlob(Buffer.alloc(1000, 1), 'application/octet-stream'),
+    others: Array.from({ length: count }, (_, n) => store.storeBlob(Buffer.from(`other ${n}`), 'text/plain')),
+  });
+  const existing = freshDir();
+  const made = JsStore.create({ path: existing });
+  const blobs = fill(made);
+  made.close();
+  const fresh = (open) => () => {
+    const dir = freshDir();
+    const store = open(dir);
+    return { store, dir, ...fill(store) };
+  };
+  const reopen = (open) => () => ({ store: open(existing), dir: existing, ...blobs });
+  return {
+    'create': fresh((dir) => JsStore.create({ path: dir, ...config })),
+    'openOrCreate, creating': fresh((dir) => JsStore.openOrCreate({ path: dir, ...config })),
+    'open': reopen((dir) => JsStore.open({ path: dir, ...config })),
+    'openOrCreate, opening': reopen((dir) => JsStore.openOrCreate({ path: dir, ...config })),
   };
 }
 
-test('A1 A2 A3 T10 with blobCacheSize left out, the open store keeps the last 1,000 blobs that it read in its memory', () => {
-  const { store, dir } = freshStore();
-  const target = store.storeBlob(Buffer.alloc(1000, 1), 'application/octet-stream');
-  const others = Array.from({ length: 1000 }, (_, n) => store.storeBlob(Buffer.from(`other ${n}`), 'text/plain'));
-  store.close();
-  const read = blobCacheCase(dir, () => JsStore.open({ path: dir }), others);
-  assert.equal(read(target, 999), true);
-  assert.equal(read(target, 1000), false);
+test('A1 A2 A3 T10 with blobCacheSize left out, each way to open a store keeps the last 1,000 blobs that it read in its memory', () => {
+  for (const [way, open] of Object.entries(cacheWays({}, 1000))) {
+    const { store, dir, target, others } = open();
+    assert.equal(keepsTarget(store, dir, target, others, 999), true, way);
+    assert.equal(keepsTarget(store, dir, target, others, 1000), false, way);
+    store.close();
+  }
 });
 
 test('A1 A2 A3 T10 with blobCacheSize 0, each way to open a store keeps one blob in its memory', () => {
-  for (const [name, open] of [
-    ['create', (dir) => JsStore.create({ path: dir, blobCacheSize: 0 })],
-    ['open', (dir) => JsStore.open({ path: dir, blobCacheSize: 0 })],
-    ['openOrCreate', (dir) => JsStore.openOrCreate({ path: dir, blobCacheSize: 0 })],
-  ]) {
-    const dir = freshDir();
-    const store = name === 'create' ? open(dir) : JsStore.create({ path: dir });
-    const target = store.storeBlob(Buffer.alloc(1000, 2), 'application/octet-stream');
-    const other = store.storeBlob(Buffer.from('other'), 'text/plain');
-    if (name === 'create') {
-      store.getBlob(target);
-      const file = join(dir, 'blobs', target.slice(0, 2), target);
-      const good = readFileSync(file);
-      const damaged = Buffer.from(good);
-      damaged[damaged.length - 5] ^= 0xff;
-      writeFileSync(file, damaged);
-      assert.equal(store.getBlob(target).length, 1000, name);
-      store.getBlob(other);
-      refuses(() => store.getBlob(target), ErrorCode.ChecksumMismatch, /^Checksum mismatch: /);
-      store.close();
-      continue;
-    }
+  for (const [way, open] of Object.entries(cacheWays({ blobCacheSize: 0 }, 1))) {
+    const { store, dir, target, others } = open();
+    assert.equal(keepsTarget(store, dir, target, others, 0), true, way);
+    assert.equal(keepsTarget(store, dir, target, others, 1), false, way);
     store.close();
-    const read = blobCacheCase(dir, () => open(dir), [other]);
-    assert.equal(read(target, 0), true, name);
-    assert.equal(read(target, 1), false, name);
   }
 });
 
@@ -548,6 +556,22 @@ function poisoned() {
   return { store, dir };
 }
 
+test('A9 T9 the failures are kept for each state on each branch, and an entry leaves alone when a later change of its state on its branch finds no short cut due', () => {
+  const { store } = freshStore();
+  for (const id of ['a', 'b']) store.registerState({ id, strategy: 'append_log', deltaSnapshotEvery: 2, fullSnapshotEvery: 10 });
+  store.createBranch('side');
+  const side = store.view('side');
+  for (const [handle, id] of [[store, 'a'], [side, 'a'], [store, 'b']]) {
+    handle.appendToState(id, Buffer.from('not json'));
+    handle.appendToStateJson(id, 1);
+  }
+  const entries = () => store.snapshotFailures().map(({ stateId, branch, failures }) => `${stateId} ${branch} ${failures}`).sort();
+  assert.deepEqual(entries(), ['a main 1', 'a side 1', 'b main 1']);
+  store.editStateItem('a', 0, Buffer.from('1'));
+  assert.deepEqual(entries(), ['a side 1', 'b main 1']);
+  store.close();
+});
+
 test('A9 an entry leaves when a later change finds that no short cut is due', () => {
   const { store } = poisoned();
   store.appendToStateJson('s', { n: 1 });
@@ -577,7 +601,7 @@ test('A52 T6 stats reports the whole store, the same from a view', () => {
   store.close();
 });
 
-test('A62 D3 D5 sync saves the tables of states and branches that changed, each as a new file in place of the old, and replaces neither when nothing changed', () => {
+test('A62 D3 D5 sync saves the tables of states and branches that changed, each as a new file in place of the old, and a second sync with nothing changed since replaces neither', () => {
   const { store, dir } = freshStore();
   const files = () => ({ states: statSync(join(dir, 'state.bin'), { bigint: true }).ino, branches: statSync(join(dir, 'branches.bin'), { bigint: true }).ino });
   store.registerState({ id: 'list', strategy: 'append_log' });
