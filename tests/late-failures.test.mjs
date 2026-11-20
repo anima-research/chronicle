@@ -300,12 +300,15 @@ async function aimAll(scenario, clean, extra) {
 }
 
 async function reopened(scenario, extra, runs) {
-  if (scenario.kind === 'cold') return runs.map(() => ({}));
+  if (scenario.kind === 'cold') return { each: runs.map(() => ({})) };
   const paths = runs.flatMap(run => (scenario.kind === 'close' ? [run.store] : [run.copy, run.store]));
   const result = await child(process.execPath, [WRITER, 'reopen', scenario.name, extra[0] ?? '-', ...paths], base);
   if (result.status !== 0) throw new Error(`the reopening process ended with status ${result.status}: ${result.stderr.trim().split('\n').slice(-3).join(' | ')}`);
-  const answers = JSON.parse(result.stdout);
-  return runs.map(() => (scenario.kind === 'close' ? { store: answers.shift() } : { copy: answers.shift(), store: answers.shift() }));
+  const { answers, old } = JSON.parse(result.stdout);
+  return {
+    old,
+    each: runs.map(() => (scenario.kind === 'close' ? { store: answers.shift() } : { copy: answers.shift(), store: answers.shift() })),
+  };
 }
 
 function errnoCode(failure) {
@@ -442,6 +445,15 @@ function judge(scenario, clean, run, reopen) {
     }
     const passed = before[where].length > 0;
     oneState('the reopen', `${which}'s reads, opened again,`, answer.reads);
+    if (answer.probe) {
+      const [oldProbe, newProbe] = [clean.probeOld.value, clean.answer.copy.probe.value];
+      const shows = `${which}, opened again, shows ${shown(answer.probe)} operations since a snapshot after five appends`;
+      if (!answer.probe.ok || ![oldProbe, newProbe].includes(answer.probe.value)) {
+        add('the reopen', `${shows}, which is neither the old cadence's ${oldProbe} nor the new cadence's ${newProbe}`);
+      } else if (passed && (out.call.ok || out.retry?.ok) && answer.probe.value !== newProbe) {
+        add('the reopen', `${shows}: the call returned and ${before[where].join(' and ')} returned, yet the new cadence's count is ${newProbe}`);
+      }
+    }
     for (const [name, read] of Object.entries(answer.reads)) {
       const handle = atBarrier[name];
       if (!read.ok) {
@@ -496,8 +508,9 @@ async function scenarioResult(scenario) {
   }
   const { points, counted, misses, aimed, slowest } = await aimAll(scenario, clean, extra);
   const runs = [...counted.values()].flat();
-  const answers = await reopened(scenario, extra, [clean, ...runs]);
+  const { old: probeOld, each: answers } = await reopened(scenario, extra, [clean, ...runs]);
   const cleanAnswer = answers.shift();
+  Object.assign(clean, { answer: cleanAnswer, probeOld });
   return { clean, points, counted, misses, aimed, slowest: Math.max(slowest, clean.result.ms), answers: new Map(runs.map((run, index) => [run, answers[index]])), cleanAnswer, extra };
 }
 
@@ -532,6 +545,11 @@ if (skip) {
         const reopenProblems = Object.entries(result.cleanAnswer).filter(([, answer]) => !answer.opened.ok
           || !isDeepStrictEqual(answer.reads, result.clean.out.syncReads ?? result.clean.out.old));
         assert.deepEqual(reopenProblems.map(([where]) => where), [], 'without a fault, a store opened again reads what the handle last read');
+        const { probeOld, answer } = result.clean;
+        if (probeOld) {
+          assert.ok(probeOld.ok && answer.copy.probe.ok && probeOld.value !== answer.copy.probe.value,
+            `${NOT_MEASURED}: the probe gives ${shown(probeOld)} without the call and ${shown(answer.copy.probe)} after it`);
+        }
       }
       for (const point of result.points) {
         await t.test(`with ${point.id} of the call refused`, async t => {

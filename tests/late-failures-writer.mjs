@@ -119,6 +119,10 @@ const writes = {
   updateStateStrategy: {
     call: s => s.updateStateStrategy({ id: 'messages', strategy: 'append_log', deltaSnapshotEvery: 5, fullSnapshotEvery: 2 }),
     reads: { strategy: strategyOf, messages },
+    probe: s => {
+      for (let n = 0; n < 5; n++) s.appendToStateJson('messages', message('probe', n));
+      return s.listStates().find(({ id }) => id === 'messages').opsSinceSnapshot;
+    },
   },
 };
 
@@ -264,7 +268,7 @@ function run([name, root, outside, index]) {
   }
   out.reads = [readAll(reads, s, f), readAll(reads, s, f)];
   mark('reads');
-  const gaveOld = Object.entries(out.reads[0]).every(([key, read]) => read.ok && out.old[key].ok
+  const gaveOld = !out.call.ok && Object.entries(out.reads[0]).every(([key, read]) => read.ok && out.old[key].ok
     && JSON.stringify(read.value) === JSON.stringify(out.old[key].value));
   if (gaveOld) {
     out.retry = step('retry', call);
@@ -285,16 +289,25 @@ function run([name, root, outside, index]) {
 function reopen([name, index, ...paths]) {
   const scenario = scenarios.find(item => item.name === name);
   const reads = scenario.kind === 'long' ? longReads : scenario.kind === 'write' ? writes[name].reads : threeReads;
-  return paths.map(path => {
+  const probe = writes[name]?.probe;
+  const answers = paths.map(path => {
     const f = {};
     if (name === 'storeBlob') f.fresh = freshHash(`${path}-scratch`);
     let s = null;
     const opened = attempt(() => { s = JsStore.open({ path }); });
     if (!opened.ok) return { opened };
     const result = { opened, reads: readAll(reads, s, f) };
+    if (probe) result.probe = attempt(() => probe(s));
     s.close();
     return result;
   });
+  if (!probe) return { answers };
+  const s = JsStore.create({ path: `${paths[0]}-without-the-call` });
+  base(s, {});
+  s.sync();
+  const old = attempt(() => probe(s));
+  s.close();
+  return { answers, old };
 }
 
 if (process.argv[2] === 'list') process.stdout.write(JSON.stringify(scenarios));
