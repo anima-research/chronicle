@@ -247,7 +247,7 @@ if (process.argv[2] === '--crash-writer') {
     }
   });
 
-  test('An unawaited repair barrier is complete before close and mixed references recover after process death', posix, t => {
+  test('Mixed references and a repair that one sync covers recover after the writer dies without a close', posix, t => {
     const path = setup(t, root => {
       for (const id of [messages, presentations, audit]) root.registerState({ id, strategy: 'append_log' });
       for (const id of [framework, summaries]) root.registerState({ id, strategy: 'snapshot' });

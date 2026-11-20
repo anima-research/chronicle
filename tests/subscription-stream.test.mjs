@@ -185,17 +185,29 @@ test('An explicit branch name selects the live records of that branch', {
   assert.deepEqual(drain(store, named).map(recordId), [onWork.id]);
 });
 
-test('An explicit branch name selects the replayed and live states of that branch', {
-  todo: "A state subscription ignores the branch name: a catch-up replays the value on the handle's branch, and live changes come from every branch.",
-}, t => {
+function stateBranches(t) {
   const store = freshStore(t);
   setSnapshot(store, 'mood', 'base');
   store.createBranch('work');
   const work = store.view('work');
   work.setStateJson('mood', 'on work');
   store.setStateJson('mood', 'on main');
-  const named = watchSnapshots(store, { filter: { includeStateChanges: true, stateIds: ['mood'], branch: 'work' } });
+  return { store, work, filter: { includeStateChanges: true, stateIds: ['mood'], branch: 'work' } };
+}
+
+test('An explicit branch name selects the replayed states of that branch', {
+  todo: "A state subscription ignores the branch name at a catch-up: it replays the value on the handle's branch.",
+}, t => {
+  const { store, filter } = stateBranches(t);
+  const named = watchSnapshots(store, { filter });
   assert.deepEqual(replaySnapshots(store, named).map(snapshot => snapshot.data), ['on work']);
+});
+
+test('An explicit branch name selects the live state changes of that branch', {
+  todo: 'A state subscription ignores the branch name for live changes: they come from every branch.',
+}, t => {
+  const { store, work, filter } = stateBranches(t);
+  const named = store.subscribe({ filter });
   work.setStateJson('mood', 'work again');
   store.setStateJson('mood', 'main again');
   work.close();

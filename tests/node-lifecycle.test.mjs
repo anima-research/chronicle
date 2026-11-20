@@ -92,6 +92,7 @@ test('Liveness is sampled on the handle that is about to read', async (t) => {
   assert.equal(held.isClosed(), false);
   const probe = nextTurn().then(() => {
     assert.equal(held.isClosed(), true);
+    assert.throws(() => held.getRecord(record.id), /closed/);
   });
   root.close();
   await probe;

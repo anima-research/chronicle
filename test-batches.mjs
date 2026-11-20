@@ -186,8 +186,10 @@ try {
   store.registerState({ id: 'log', strategy: 'append_log' });
   store.appendToStateJson('log', { n: 0 });
   store.close();
+  const versionOne = fs.readFileSync(path.join(reopenPath, 'MANIFEST'));
   store = JsStore.openOrCreate({ path: reopenPath });
   assert.equal(reopenedManifest(), 1, 'openOrCreate on an existing version-1 store leaves MANIFEST version 1');
+  assert.deepEqual(fs.readFileSync(path.join(reopenPath, 'MANIFEST')), versionOne, 'openOrCreate leaves the whole MANIFEST as it was');
   store.appendManyToStateJson('log', [{ n: 1 }, { n: 2 }]);
   assert.equal(reopenedManifest(), 2, 'the first batch after the reopen marks the MANIFEST');
   store.close();

@@ -456,10 +456,9 @@ fn cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content() {
         "getStateIndexValueCounts cost grew {content:.2}x with message content"
     );
     let index = probe_growth("getStateIndexValueCounts", &small, &deep, counts, check_counts);
-    let index_ratio = deep.messages as f64 / small.messages as f64;
     assert!(
-        index < FLAT * index_ratio,
-        "getStateIndexValueCounts cost grew {index:.2}x for {index_ratio:.0}x the index"
+        index < FLAT,
+        "getStateIndexValueCounts cost grew {index:.2}x with 64x the messages under the same two values"
     );
 
     let id_keys = |p: &ProbeStore| -> Vec<(String, Vec<u32>)> {

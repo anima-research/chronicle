@@ -203,12 +203,9 @@ test('A fresh registration takes its cadence fields with no retune', (t) => {
   store.registerState(appendLog(context, 50, 10));
   for (let i = 0; i < 5000; i++) store.appendToStateJsonWithIdentity(messages, { n: i }, 'id', 'sequence');
   for (let i = 0; i < 500; i++) store.appendToStateJson(context, { n: i });
-  const firsts = (id) => {
-    const { boundaries } = appendSchedule(operationKinds(store, id));
-    return [boundaries[0], boundaries.find(([, kind]) => kind === 'Snapshot')];
-  };
-  assert.deepEqual(firsts(messages), [[50, 'DeltaSnapshot'], [5000, 'Snapshot']]);
-  assert.deepEqual(firsts(context), [[50, 'DeltaSnapshot'], [500, 'Snapshot']]);
+  const deltas = (count) => Array.from({ length: count }, (_, i) => [50 * (i + 1), 'DeltaSnapshot']);
+  assert.deepEqual(appendSchedule(operationKinds(store, messages)), { writes: 5000, boundaries: [...deltas(99), [5000, 'Snapshot']] });
+  assert.deepEqual(appendSchedule(operationKinds(store, context)), { writes: 500, boundaries: [...deltas(9), [500, 'Snapshot']] });
 });
 
 test('An ordinary append writes a record whose size does not grow with the log', (t) => {
