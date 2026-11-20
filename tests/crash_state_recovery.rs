@@ -24,9 +24,13 @@ fn config(path: &Path) -> StoreConfig {
 /// store open here among them, so a store this process closed a moment ago
 /// can still be locked for that moment.
 fn open_store(path: &Path) -> chronicle::Result<Store> {
+    retry_locked(|| Store::open(config(path)))
+}
+
+fn retry_locked(open: impl Fn() -> chronicle::Result<Store>) -> chronicle::Result<Store> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match Store::open(config(path)) {
+        match open() {
             Err(StoreError::Locked) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5))
             }
@@ -992,6 +996,14 @@ fn interrupt_next_append(path: &Path) {
     }
 }
 
+fn refused_by_the_size_limit(error: StoreError) {
+    match error {
+        #[cfg(unix)]
+        StoreError::Io(cause) if cause.raw_os_error() == Some(libc::EFBIG) => {}
+        other => panic!("expected the file-size limit's EFBIG, got {other}"),
+    }
+}
+
 const TYPED_RECORDS: [(&str, &str); 5] = [
     ("round", "prefix"),
     ("journal", "received"),
@@ -1048,7 +1060,7 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
                     other => panic!("unknown adoption {other}"),
                 };
                 if boundary == "failed" {
-                    result.unwrap_err();
+                    refused_by_the_size_limit(result.unwrap_err());
                 } else {
                     result.unwrap();
                 }
@@ -1083,7 +1095,7 @@ fn crash_from_checkpoint(path: &Path, point: &str) -> ! {
             let result =
                 store.update_state("messages", StateOperation::Redact { start: 1, end: 4 });
             if point == "redact-refused" {
-                result.unwrap_err();
+                refused_by_the_size_limit(result.unwrap_err());
             } else {
                 result.unwrap();
                 rows.as_array_mut().unwrap().drain(1..4);
@@ -1386,7 +1398,7 @@ fn a_torn_layout_after_writer_death_leaves_the_one_before_it_and_its_id_is_issue
         .set_len(len - 1)
         .unwrap();
 
-    let store = Store::open(config(dir.path())).unwrap();
+    let store = open_store(dir.path()).unwrap();
     let kept = store.get_record(intact).unwrap().unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&kept.payload).unwrap(),
@@ -1442,25 +1454,27 @@ fn open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death() {
     ids.push(last.id);
     assert_eq!(ids.len(), TYPED_RECORDS.len());
 
-    let store = Store::open_or_create(config(dir.path())).unwrap();
-    for kind in ["round", "journal"] {
-        let expected: Vec<_> = TYPED_RECORDS
-            .iter()
-            .zip(&ids)
-            .filter(|((ty, _), _)| *ty == kind)
-            .map(|(_, id)| *id)
-            .collect();
-        assert_eq!(store.get_records_by_type(kind), expected, "{kind}");
-    }
-    for (id, (kind, text)) in ids.into_iter().zip(TYPED_RECORDS) {
-        let record = store.get_record(id).unwrap().unwrap();
-        assert_eq!(
-            (
-                record.id,
-                record.record_type.as_str(),
-                record.payload.as_slice()
-            ),
-            (id, kind, text.as_bytes())
-        );
+    for _ in 0..2 {
+        let store = retry_locked(|| Store::open_or_create(config(dir.path()))).unwrap();
+        for kind in ["round", "journal"] {
+            let expected: Vec<_> = TYPED_RECORDS
+                .iter()
+                .zip(&ids)
+                .filter(|((ty, _), _)| *ty == kind)
+                .map(|(_, id)| *id)
+                .collect();
+            assert_eq!(store.get_records_by_type(kind), expected, "{kind}");
+        }
+        for (id, (kind, text)) in ids.iter().zip(TYPED_RECORDS) {
+            let record = store.get_record(*id).unwrap().unwrap();
+            assert_eq!(
+                (
+                    record.id,
+                    record.record_type.as_str(),
+                    record.payload.as_slice()
+                ),
+                (*id, kind, text.as_bytes())
+            );
+        }
     }
 }

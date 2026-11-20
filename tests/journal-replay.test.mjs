@@ -237,5 +237,6 @@ test('A repaired-away ID has the ordinary JS null miss until reissued', (t) => {
   assert.equal(store.getRecord(listedMark), null);
   const payload = { compileId: 'replacement', text: 'new acceptance' };
   const replacement = store.appendJson(layout, payload);
-  assert.deepEqual(readEntry(store, listedMark), replacement.id === listedMark ? { id: replacement.id, payload } : null);
+  assert.equal(replacement.id, listedMark);
+  assert.deepEqual(readEntry(store, listedMark), { id: listedMark, payload });
 });

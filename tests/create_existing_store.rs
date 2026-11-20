@@ -214,7 +214,13 @@ fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
     fs::rename(&log, &saved).unwrap();
     fs::create_dir(&log).unwrap();
     let failed = Store::open_or_create(config(&path));
-    assert!(failed.is_err(), "opened a store with an obstructed log");
+    match &failed {
+        Err(StoreError::Io(_cause)) => {
+            #[cfg(unix)]
+            assert_eq!(_cause.raw_os_error(), Some(libc::EISDIR), "{_cause}");
+        }
+        other => panic!("got {:?}", other.as_ref().err().map(|e| e.to_string())),
+    }
 
     fs::remove_dir(&log).unwrap();
     fs::rename(saved, log).unwrap();
@@ -231,10 +237,11 @@ fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
     fs::write(path.join("blobs"), b"").unwrap();
     let failed = Store::open_or_create(config(&path));
     assert!(
-        matches!(failed, Err(StoreError::Io(_))),
+        matches!(&failed, Err(StoreError::Io(cause)) if cause.kind() == std::io::ErrorKind::AlreadyExists),
         "got {:?}",
-        failed.err().map(|e| e.to_string())
+        failed.as_ref().err().map(|e| e.to_string())
     );
+    assert!(path.join("LOCK").exists(), "the failed create never took the lock");
 
     fs::remove_file(path.join("blobs")).unwrap();
     let store = Store::open_or_create(config(&path)).expect("immediate create after removing the file");

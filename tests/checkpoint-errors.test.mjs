@@ -21,6 +21,10 @@ function fixture(t) {
   return { path, create: () => keep(JsStore.create({ path })), open: () => keep(JsStore.open({ path })) };
 }
 
+const refused = file => error => error instanceof Error && error.code === ErrorCode.Io
+  && error.message.includes('cannot save checkpoint') && error.message.includes(file);
+const unreadable = error => error instanceof Error && error.code === ErrorCode.Io;
+
 function withBlockedCheckpoint(path, file, run) {
   const target = join(path, file);
   const saved = `${target}.before-test`;
@@ -78,7 +82,7 @@ function journalWriter(path) {
       store.sync();
       reachedAppend = true;
       store.appendJson(layout, { fold: 'proposed' });
-    });
+    }, refused('state.bin'));
     assert.equal(reachedAppend, false, 'the barrier threw, not the append');
     assert.deepEqual(store.getRecordIdsByType(layout), prefix);
     assert.deepEqual(store.getRecordIdsByType(layout).map(id => readEntry(store, id)), old);
@@ -92,7 +96,7 @@ function journalWriter(path) {
   store.setStateJson('queue', newQueue);
   store.registerStateFieldIndex('acceptances', '/id', 'string');
   withBlockedCheckpoint(path, 'state.bin', () => {
-    assert.throws(() => store.sync());
+    assert.throws(() => store.sync(), refused('state.bin'));
     assert.deepEqual(readEntry(store, accepted.id), accepted);
     assert.deepEqual(store.getRecordIdsByType(layout), [...prefix, accepted.id]);
     assert.deepEqual(store.getRecordIdsByType(receipt.type), [receipt.id]);
@@ -142,8 +146,8 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
   assert.equal(sourceView.getStateJson('work'), 'after missing name');
 
   withBlockedCheckpoint(f.path, 'state.bin', () => {
-    assert.throws(() => store.registerState({ id: 'pending', strategy: 'snapshot' }));
-    assert.throws(() => store.switchBranch('target'));
+    assert.throws(() => store.registerState({ id: 'pending', strategy: 'snapshot' }), refused('state.bin'));
+    assert.throws(() => store.switchBranch('target'), refused('state.bin'));
     assert.deepEqual(selected(), [source.name, source.id]);
     assert.equal(store.getStateJson('work'), 'after missing name');
   });
@@ -151,7 +155,7 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
   assert.equal(sourceView.getStateJson('work'), 'after refused switch');
 
   withBlockedCheckpoint(f.path, 'branches.bin', () => {
-    assert.throws(() => store.switchBranch('target'));
+    assert.throws(() => store.switchBranch('target'), refused('branches.bin'));
   });
   assert.equal(sourceView.getStateJson('work'), 'after refused switch');
 });
@@ -168,7 +172,7 @@ test('A switch whose saved branch list cannot be written leaves the source selec
   store.switchBranch(source.name);
   store.setStateJson('work', 'source work');
   withBlockedCheckpoint(f.path, 'branches.bin', () => {
-    assert.throws(() => store.switchBranch(target.name));
+    assert.throws(() => store.switchBranch(target.name), refused('branches.bin'));
     assert.deepEqual([store.currentBranch().name, store.currentBranch().id], [source.name, source.id]);
     assert.equal(store.getStateJson('work'), 'source work');
   });
@@ -183,7 +187,7 @@ test('Registration and retuning report non-duplicate refusals at the call', t =>
   const nonDuplicate = e => !String(e.message).includes('State already exists');
   assert.throws(() => store.registerState({ id: 17, strategy: 'snapshot' }), nonDuplicate);
   withBlockedCheckpoint(first.path, 'state.bin', () => {
-    assert.throws(() => store.registerState({ id: 'blocked', strategy: 'snapshot' }), nonDuplicate);
+    assert.throws(() => store.registerState({ id: 'blocked', strategy: 'snapshot' }), e => nonDuplicate(e) && refused('state.bin')(e));
   });
   store.close();
   assert.throws(() => store.registerState({ id: 'closed', strategy: 'snapshot' }), nonDuplicate);
@@ -196,7 +200,7 @@ test('Registration and retuning report non-duplicate refusals at the call', t =>
   log.appendToStateJson('rows', 'after mismatch');
   assert.deepEqual(log.getStateJson('rows'), ['original', 'after mismatch']);
   withBlockedCheckpoint(second.path, 'state.bin', () => {
-    assert.throws(() => log.updateStateStrategy({ id: 'rows', strategy: 'append_log', deltaSnapshotEvery: 51 }));
+    assert.throws(() => log.updateStateStrategy({ id: 'rows', strategy: 'append_log', deltaSnapshotEvery: 51 }), refused('state.bin'));
   });
   log.appendToStateJson('rows', 'after repair');
   assert.deepEqual(log.getStateJson('rows'), ['original', 'after mismatch', 'after repair']);
@@ -219,19 +223,19 @@ test('Temporary damage to a cold record causes real read errors, not absent data
 
   const store = f.open();
   withUnreadableRecords(f.path, () => {
-    assert.throws(() => store.getRecord(mark.id));
-    assert.throws(() => store.getStateItemJson('ended-log', 0));
-    assert.throws(() => store.getStateJson(binding));
+    assert.throws(() => store.getRecord(mark.id), unreadable);
+    assert.throws(() => store.getStateItemJson('ended-log', 0), unreadable);
+    assert.throws(() => store.getStateJson(binding), unreadable);
     assert.equal(store.currentBranch().name, 'session');
-    assert.throws(() => store.getState(binding), e => !e.message.startsWith('Deserialization error: '));
+    assert.throws(() => store.getState(binding), e => unreadable(e) && !e.message.startsWith('Deserialization error: '));
   });
   assert.deepEqual(JSON.parse(store.getState(binding).toString('utf8')), bound);
   assert.deepEqual(readEntry(store, mark.id), mark);
   assert.deepEqual(store.getStateItemJson('ended-log', 0), ended);
 
   withBlockedCheckpoint(f.path, 'state.bin', () => {
-    assert.throws(() => store.registerState({ id: 'pending', strategy: 'snapshot' }));
-    assert.throws(() => store.setStateJson(binding, { compileId: 'new-compile' }));
+    assert.throws(() => store.registerState({ id: 'pending', strategy: 'snapshot' }), refused('state.bin'));
+    assert.throws(() => store.setStateJson(binding, { compileId: 'new-compile' }), refused('state.bin'));
     assert.equal(store.currentBranch().name, 'session');
   });
 });
@@ -285,9 +289,9 @@ test('Close consumes the root even when its final barrier throws', t => {
   store.setStateJson('work', 'dirty state head');
   withBlockedCheckpoint(f.path, 'state.bin', () => {
     let syncError, closeError;
-    assert.throws(() => store.sync(), e => { syncError = e; return true; });
+    assert.throws(() => store.sync(), e => { syncError = e; return refused('state.bin')(e); });
     assert.equal(store.isClosed(), false);
-    assert.throws(() => store.close(), e => { closeError = e; return true; });
+    assert.throws(() => store.close(), e => { closeError = e; return refused('state.bin')(e); });
     assert.equal(store.isClosed(), true);
     assert.deepEqual([store.isClosed(), view.isClosed()], [true, true]);
     assert.ok(Object.values(ErrorCode).includes(syncError.code), `sync threw ${syncError.code}`);
@@ -303,13 +307,13 @@ test('Close consumes the root even when its final barrier throws', t => {
   assert.throws(() => view.currentBranch());
 });
 
-test('Close runs its own barrier after an earlier sync failed, and succeeds once the fault clears', t => {
+test('Close succeeds once a fault that failed an earlier sync clears, and the value is there after a reopen', t => {
   const f = fixture(t);
   const store = f.create();
   store.registerState({ id: 'work', strategy: 'snapshot' });
   store.setStateJson('work', 'dirty state head');
   withBlockedCheckpoint(f.path, 'state.bin', () => {
-    assert.throws(() => store.sync());
+    assert.throws(() => store.sync(), refused('state.bin'));
   });
   assert.doesNotThrow(() => store.close());
   assert.equal(store.isClosed(), true);
@@ -323,7 +327,7 @@ test('Close reports the failure of its own barrier when no sync failed before it
   store.registerState({ id: 'work', strategy: 'snapshot' });
   store.setStateJson('work', 'dirty state head');
   withBlockedCheckpoint(f.path, 'state.bin', () => {
-    assert.throws(() => store.close(), e => e instanceof Error && Object.values(ErrorCode).includes(e.code));
+    assert.throws(() => store.close(), refused('state.bin'));
     assert.equal(store.isClosed(), true);
   });
   assert.equal(f.open().isClosed(), false);

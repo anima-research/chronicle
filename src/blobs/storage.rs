@@ -1636,9 +1636,11 @@ mod tests {
             readback(&reopened(&dir)),
             "after a retry that gave {retry:?}"
         );
-        if let Ok(Some(bytes)) = immediate {
-            assert_eq!(bytes, content);
+        if immediate.is_err() {
+            storage.store(&content, "application/json").unwrap();
         }
+        assert_eq!(readback(&storage), Ok(Some(content.clone())));
+        assert_eq!(readback(&reopened(&dir)), Ok(Some(content)));
     }
 
     #[test]

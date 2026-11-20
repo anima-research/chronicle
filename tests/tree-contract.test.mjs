@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { constants as osConstants, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { JsStore } from '../index.js';
 
@@ -320,8 +320,8 @@ test('A pre-record write failure leaves every valid batch target unchanged',
       const store = JsStore.open({ path: dir });
       store.setAutoSnapshot(false);
       const ops = JSON.parse(serialized);
-      let threw = false;
-      try { store.treeBatch(tree, ops); } catch { threw = true; }
+      let threw = null;
+      try { store.treeBatch(tree, ops); } catch (error) { threw = { error: error instanceof Error, code: error.code, message: error.message }; }
       const observation = { threw, seq: store.currentSequence(), hits: ops.map(op => store.treeGet(tree, op.path)) };
       try { store.close(); } catch {}
       process.stdout.write(JSON.stringify(observation));
@@ -332,7 +332,9 @@ test('A pre-record write failure leaves every valid batch target unchanged',
     assert.ifError(child.error);
     assert.equal(child.status, 0, child.stderr || `child signal: ${child.signal}`);
     const result = JSON.parse(child.stdout);
-    assert.deepEqual([result.threw, result.seq, result.hits.map(fields)], [true, seq, [first, second, null]]);
+    const efbig = /^IO error: .*\(os error (\d+)\)$/s.exec(result.threw?.message ?? '');
+    assert.deepEqual([result.threw?.error, Number(efbig?.[1]), result.seq, result.hits.map(fields)],
+      [true, osConstants.errno.EFBIG, seq, [first, second, null]], JSON.stringify(result.threw));
     f.store = JsStore.open({ path: dir });
     const hits = () => ops.map(op => point(f.store, FILES, op.path));
     assert.deepEqual(hits(), [first, second, null]);

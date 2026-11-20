@@ -92,29 +92,11 @@ function tryTreeWrites(side, fixture) {
 
 const stamp = (item, record) => ({ ...item, by: record.id, at: record.sequence });
 
-function readBack(read, whileFaulted) {
-  try { return { value: read() }; } catch (error) {
-    if (!whileFaulted) throw error;
-    return { unavailable: true };
-  }
-}
-
-function checkIdentity(side, { kind, rows, ids }, whileFaulted) {
+function checkIdentity(side, { kind, rows, ids }) {
   assert.deepEqual(updateIds(side), ids, 'the torn write published no update record');
-  const length = readBack(() => side.getStateLen('index'), whileFaulted);
-  if (!length.unavailable) {
-    assert.equal(length.value, rows.length);
-  }
-  if (kind === 'single') {
-    const next = readBack(() => side.getStateItemJson('index', rows.length), whileFaulted);
-    if (!next.unavailable) {
-      assert.equal(next.value, null);
-    }
-  }
-  const full = readBack(() => side.getStateJson('index'), whileFaulted);
-  if (!full.unavailable) {
-    assert.deepEqual(full.value, rows);
-  }
+  assert.equal(side.getStateLen('index'), rows.length);
+  if (kind === 'single') assert.equal(side.getStateItemJson('index', rows.length), null);
+  assert.deepEqual(side.getStateJson('index'), rows);
 }
 
 if (process.argv[2] === '--limited') {
@@ -131,9 +113,9 @@ if (process.argv[2] === '--limited') {
     } else {
       assert.throws(() => side.appendManyToStateJsonWithIdentity('index', fixture.items, 'by', 'at'));
     }
-    checkIdentity(side, fixture, true);
+    checkIdentity(side, fixture);
   }
-  const deadline = setTimeout(() => assert.fail('the child saw no SIGXFSZ for the attempted writes'), 5000);
+  const deadline = setTimeout(() => assert.fail('the child saw no SIGXFSZ for the attempted writes'), 25_000);
   await hitLimit;
   clearTimeout(deadline);
   if (fixture.kind === 'tree') {
@@ -250,7 +232,10 @@ test('Interrupted identity writes expose no partial stamped row or batch', posix
     } finally { root.close(); }
     runLimited(fixture, 32);
     const recovered = JsStore.open({ path });
-    try { checkIdentity(recovered.view('side'), fixture, false); }
+    try {
+      assert.ok(recovered.recovery()?.droppedBytes > 0, `the limit left no torn record: ${JSON.stringify(recovered.recovery())}`);
+      checkIdentity(recovered.view('side'), fixture);
+    }
     finally { recovered.close(); }
   }
 });

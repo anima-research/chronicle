@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { constants as osConstants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import { ErrorCode, JsStore } from '../index.js';
@@ -333,7 +333,7 @@ test('A selective fork whose own checkpoint fails throws', {
 }, t => {
   for (const fork of Object.values(forks)) {
     const { thrown } = forkUnderFailedCheckpoint(t, fork);
-    assert.equal(thrown?.code, ErrorCode.Io);
+    assert.deepEqual([thrown?.code, /\(os error (\d+)\)$/.exec(thrown?.message ?? '')?.[1]], [ErrorCode.Io, String(osConstants.errno.ENOTDIR)]);
   }
 });
 
@@ -343,7 +343,7 @@ for (const [kind, method] of [['live', 'createBranchWithStates'], ['past', 'crea
     todo: `${method} keeps the child it allocated when its own checkpoint fails: the name stays taken, and a retry throws BranchExists.`,
   }, t => {
     const { fixture, row, names, original, thrown, during, retry } = forkUnderFailedCheckpoint(t, forks[kind]);
-    assert.equal(thrown?.code, ErrorCode.Io);
+    assert.deepEqual([thrown?.code, /\(os error (\d+)\)$/.exec(thrown?.message ?? '')?.[1]], [ErrorCode.Io, String(osConstants.errno.ENOTDIR)]);
     assert.deepEqual(during, original);
     assert.deepEqual(names(), original);
     const child = retry();
