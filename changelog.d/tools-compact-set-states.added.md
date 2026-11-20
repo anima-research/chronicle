@@ -20,8 +20,8 @@
   change's. The tool changes nothing unless `--apply` follows, and it
   refuses an open store, a store with no `LOCK`, a `MANIFEST` that names a
   version or feature it doesn't read, a named state that is not whole-value,
-  a record typed as a state change after the newest head on a live branch
-  that has a `state_id` and an operation, which may be an update that
+  a record typed as a state change that has a `state_id` and an operation,
+  after the newest head on a live branch, which may be an update that
   `state.bin` doesn't have yet (from chronicle 0.5.0 an open of the store
   applies such an update when its link matches the head of its state, and
   refuses to open the store when it does not, and with 0.4.0, or for a
