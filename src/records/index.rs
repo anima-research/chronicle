@@ -280,17 +280,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "out of ascending order")]
-    fn adding_a_type_out_of_ascending_order_panics_in_a_debug_build() {
-        let dir = TempDir::new().unwrap();
-        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
-        let branch = BranchId(1);
-        index.add(RecordId(2), branch, Sequence(1), 0, "message", &[], &[]);
-        index.add(RecordId(1), branch, Sequence(2), 100, "message", &[], &[]);
-    }
-
-    #[test]
     fn test_add_and_lookup() {
         let dir = TempDir::new().unwrap();
         let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();

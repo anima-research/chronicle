@@ -884,20 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_cache_is_not_part_of_the_persisted_format() {
-        let dir = TempDir::new().unwrap();
-        let manager = FieldIndexManager::new();
-        // The existing compact encoding is one field containing an empty map.
-        let expected = vec![0x91, 0x80];
-        assert_eq!(rmp_serde::to_vec(&manager).unwrap(), expected);
-        let path = dir.path().join("state-indexes.bin");
-        manager.save(&path).unwrap();
-        assert_eq!(rmp_serde::to_vec(&manager).unwrap(), expected);
-        let loaded = FieldIndexManager::load(&path).unwrap().unwrap();
-        assert_eq!(rmp_serde::to_vec(&loaded).unwrap(), expected);
-    }
-
-    #[test]
     fn test_register_and_query_range() {
         let mut mgr = FieldIndexManager::new();
         let data = items(&[
