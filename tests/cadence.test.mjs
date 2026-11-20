@@ -194,3 +194,31 @@ test('Explicit tree cadence fields drive keyed snapshot boundaries', (t) => {
   assert.deepEqual(store.treeList(id).sort((a, b) => a.path.localeCompare(b.path)),
     files.map(({ path, entry }) => ({ path, ...entry })));
 });
+
+test('A fresh registration takes its cadence fields with no retune', (t) => {
+  const { store } = freshStore(t);
+  const messages = 'messages';
+  const context = 'context-log';
+  store.registerState(appendLog(messages, 50, 100));
+  store.registerState(appendLog(context, 50, 10));
+  for (let i = 0; i < 5000; i++) store.appendToStateJsonWithIdentity(messages, { n: i }, 'id', 'sequence');
+  for (let i = 0; i < 500; i++) store.appendToStateJson(context, { n: i });
+  const firsts = (id) => {
+    const { boundaries } = appendSchedule(operationKinds(store, id));
+    return [boundaries[0], boundaries.find(([, kind]) => kind === 'Snapshot')];
+  };
+  assert.deepEqual(firsts(messages), [[50, 'DeltaSnapshot'], [5000, 'Snapshot']]);
+  assert.deepEqual(firsts(context), [[50, 'DeltaSnapshot'], [500, 'Snapshot']]);
+});
+
+test('An ordinary append writes a record whose size does not grow with the log', (t) => {
+  const { store } = freshStore(t);
+  const logs = ['log-a', 'log-b'];
+  for (const id of logs) store.registerState(appendLog(id, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
+  for (let i = 0; i < 4; i++) store.appendToStateJson(logs[0], { n: i });
+  for (let i = 0; i < 4096; i++) store.appendToStateJson(logs[1], { n: i });
+  const item = { text: 'the same small item' };
+  const [short, long] = logs.map((id) => store.getRecord(store.appendToStateJson(id, item).id).payload.length);
+  assert.deepEqual(logs.map((id) => operationKinds(store, id).at(-1)), ['Append', 'Append']);
+  assert.ok(Math.abs(long - short) <= 8, `an append to a log of 4 items wrote ${short} bytes, and to a log of 4,096 items ${long}`);
+});

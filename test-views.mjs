@@ -333,6 +333,9 @@ try {
   ]) {
     assert.throws(call, /Branch not found/);
   }
+  assert.throws(() => vb.getState('messages'),
+    (error) => /Branch not found/.test(error.message) && !error.message.startsWith('Deserialization error: '));
+  assert.throws(() => vb.stateHeadOffset('messages'), /Branch not found/);
   assert.equal(vb.pinnedBranch(), 'b');
   assert.ok(vb.listBranches().length > 0, 'store-wide methods still work on that view');
   // A new branch with the same name is a different branch.

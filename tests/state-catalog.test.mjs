@@ -105,6 +105,7 @@ test('Registration inventory is global, exact, read-only and usable by ID after 
       assert.deepEqual(matches(next), order);
       assert.deepEqual(next, fullOrder);
     }
+    assert.equal(handle.getStateJson(missing), null);
     const after = handle.listStates();
     assert.deepEqual(pairsOf(after), pairsOf(registrations));
     assert.equal(after.some((r) => r.id === missing), false);
@@ -116,6 +117,7 @@ test('Registration inventory is global, exact, read-only and usable by ID after 
   assert.deepEqual(idsOf(opened.listStates()).sort(), [...ids].sort());
   for (const branch of ['main', 'draft']) {
     const handle = opened.view(branch);
+    assert.equal(handle.getStateJson(missing), null);
     const rows = handle.listStates();
     assert.deepEqual(pairsOf(rows), pairsOf(registrations));
     assert.equal(rows.find((r) => r.id === missing), undefined);
@@ -143,6 +145,10 @@ test('No record, stored null and other falsy JSON values are different states', 
   assert.equal(store.getStateJson('value/document-text'), '{"is":"just text"}');
   for (const id of ['value/off', 'value/zero', 'value/text', 'value/list']) assert.deepEqual(store.getStateJson(id), scalars[id], id);
   assert.equal(store.getStateJson(counterId), 42);
+  const reader = store.view('main');
+  assert.equal(reader.getStateJson(counterId), 42);
+  const replaced = store.setStateJson(counterId, 43);
+  assert.deepEqual([reader.getStateJson(counterId), store.getStateJsonAt(counterId, replaced.sequence)], [43, 43]);
   assert.deepEqual([store.getStateJson('value/null'), typeof store.stateHeadOffset('value/null'),
     store.getStateJson(emptyId), store.stateHeadOffset(emptyId)], [null, 'number', null, null]);
   for (const id of Object.keys(scalars)) assert.equal(typeof store.stateHeadOffset(id), 'number', id);
@@ -280,4 +286,16 @@ test('Byte and object setters round-trip the same large receipt', (t) => {
   const objectValue = store.getStateJson(fallbackId);
   assert.deepEqual(objectValue, expected);
   assert.deepEqual(objectValue, byteValue);
+});
+
+test('The head after a lone edit or removal is the sequence of the record that it wrote', (t) => {
+  const { store } = freshStore(t);
+  store.setAutoSnapshot(false);
+  store.registerState(log('messages'));
+  for (const text of ['a', 'b', 'c']) store.appendToStateJson('messages', { text });
+  const edit = store.editStateItem('messages', 1, Buffer.from(JSON.stringify({ text: 'B' })));
+  assert.deepEqual([store.currentSequence(), store.currentSequence()], [edit.sequence, edit.sequence]);
+  const removal = store.redactStateItems('messages', 0, 1);
+  assert.deepEqual([store.currentSequence(), store.currentSequence()], [removal.sequence, removal.sequence]);
+  assert.deepEqual(store.getStateJson('messages'), [{ text: 'B' }, { text: 'c' }]);
 });

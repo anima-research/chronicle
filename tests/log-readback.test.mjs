@@ -241,3 +241,29 @@ test('The ended log returns a bounded suffix of complete AgentRecords', (t) => {
   for (const row of records.slice(1)) store.appendToStateJson(ended, structuredClone(row));
   assert.deepEqual(utf8Json(store.getStateTail(ended, 256)), records.slice(-256));
 });
+
+test('The ended log is read from the branch that the root has selected', (t) => {
+  const fixture = freshStore(t);
+  let store = fixture.store;
+  const ended = 'framework/dendrite/ended';
+  registerLogs(store, ended);
+  const shared = endedRecord(0);
+  store.appendToStateJson(ended, structuredClone(shared));
+  const fork = store.createBranch('fork');
+  const onMain = endedRecord(1);
+  const onFork = endedRecord(2);
+  store.appendToStateJson(ended, structuredClone(onMain));
+  store.view(fork.name).appendToStateJson(ended, structuredClone(onFork));
+  const tails = (handle) => {
+    const read = {};
+    for (const name of ['main', fork.name, 'main']) {
+      handle.switchBranch(name);
+      read[name] = utf8Json(handle.getStateTail(ended, 256));
+    }
+    return read;
+  };
+  const expected = { main: [shared, onMain], [fork.name]: [shared, onFork] };
+  assert.deepEqual(tails(store), expected);
+  store = fixture.reopen();
+  assert.deepEqual(tails(store), expected);
+});

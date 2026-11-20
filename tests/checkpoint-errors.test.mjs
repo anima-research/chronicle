@@ -109,6 +109,17 @@ function journalWriter(path) {
 
 if (process.argv[2] === '--journal-writer') journalWriter(process.argv[3]);
 
+function acceptanceWriter(path) {
+  const store = JsStore.create({ path });
+  const receipt = appendEntry(store, 'push.receipt', { occurrence: 17 });
+  const accepted = appendEntry(store, layout, { accepted: 17 });
+  store.sync();
+  writeSync(1, JSON.stringify([receipt, accepted]));
+  process.kill(process.pid, 'SIGKILL');
+}
+
+if (process.argv[2] === '--acceptance-writer') acceptanceWriter(process.argv[3]);
+
 test('The cursor distinguishes selection refusal from selection whose checkpoint failed', t => {
   const f = fixture(t);
   const store = f.create();
@@ -226,6 +237,27 @@ test('Failing a barrier leaves exactly the landed journal suffix and state reada
   }
   assert.deepEqual(recovered.getStateJson('mode'), newMode);
   assert.deepEqual(recovered.getStateJson('queue'), newQueue);
+});
+
+test('A receipt and accepted work synced before the render-start survive alone, and a retry adds one render-start', {
+  skip: process.platform === 'win32' && 'the writer ends itself with SIGKILL, which Windows does not report as a signal',
+}, t => {
+  const f = fixture(t);
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--acceptance-writer', f.path], {
+    encoding: 'utf8', timeout: 30_000,
+  });
+  if (child.error) throw child.error;
+  assert.equal(child.signal, 'SIGKILL', child.stderr);
+  const [receipt, accepted] = JSON.parse(child.stdout);
+  const found = (handle) => ['push.receipt', layout, 'push.render-start']
+    .map((type) => handle.getRecordIdsByType(type).map((id) => readEntry(handle, id)));
+  let store = f.open();
+  assert.deepEqual(found(store), [[receipt], [accepted], []]);
+  const start = appendEntry(store, 'push.render-start', { request: 'render-17' });
+  store.sync();
+  store.close();
+  store = f.open();
+  assert.deepEqual(found(store), [[receipt], [accepted], [start]]);
 });
 
 test('Close consumes the root even when its final barrier throws', t => {

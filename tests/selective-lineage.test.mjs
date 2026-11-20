@@ -455,3 +455,42 @@ test('A head can anchor even an empty window', t => {
   assert.equal(again.createBranchAt('at-anchor', saved.branch, saved.anchor).branchPoint, saved.anchor);
   assert.throws(() => again.createBranchAt('past-anchor', saved.branch, saved.anchor + 1));
 });
+
+test('A redaction on a historical child leaves the source with that row and its rows after the cut', t => {
+  const { store } = fresh(t);
+  logs(store, MSG);
+  const source = store.createBranch('source');
+  store.switchBranch(source.name);
+  const first = stamped(store, MSG, { text: 'inherited' });
+  const second = stamped(store, MSG, { text: 'also inherited' });
+  const cut = store.currentSequence();
+  const later = stamped(store, MSG, { text: 'after the cut' });
+  const child = store.createBranchAt('past', source.name, cut);
+  store.switchBranch(child.name);
+  store.redactStateItems(MSG, 0, 1);
+  assert.deepEqual(store.getStateJson(MSG), [second]);
+  store.switchBranch(source.name);
+  assert.deepEqual(store.getStateJson(MSG), [first, second, later]);
+});
+
+test('A selective historical fork cut at a message append has the message and not its presentation', t => {
+  const { store } = fresh(t);
+  logs(store, MSG, WIN);
+  const row = stamped(store, MSG, { text: 'cut here' });
+  const shown = present(store, { id: row.id });
+  const child = store.view(store.createBranchAtWithStates('at-message', 'main', row.sequence, { stateIds: [MSG, WIN] }).name);
+  assert.deepEqual([child.getStateJson(MSG), child.getStateJson(WIN)], [[row], null]);
+  assert.deepEqual(store.getStateJson(WIN), [shown]);
+});
+
+test('A selective fork ignores a requested state that was never written and an ID that was never registered', t => {
+  const { store } = fresh(t);
+  logs(store, MSG, WIN);
+  const row = stamped(store, MSG, { text: 'only messages' });
+  const index = 'ada/preimage-index';
+  const registered = store.listStates().map(({ id }) => id).sort();
+  const child = store.view(store.createBranchWithStates('legacy', 'main', { stateIds: [MSG, WIN, index] }).name);
+  assert.deepEqual([child.getStateJson(MSG), child.getStateJson(WIN), child.stateHeadOffset(WIN)], [[row], null, null]);
+  assert.deepEqual(child.listStates().map(({ id }) => id).sort(), registered);
+  assert.equal(child.getStateJson(index), null);
+});

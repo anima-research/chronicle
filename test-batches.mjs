@@ -180,6 +180,19 @@ try {
 
   store.close();
 
+  const reopenPath = path.join(dir, 'reopened-version-1');
+  const reopenedManifest = () => fs.readFileSync(path.join(reopenPath, 'MANIFEST'))[4];
+  store = JsStore.openOrCreate({ path: reopenPath });
+  store.registerState({ id: 'log', strategy: 'append_log' });
+  store.appendToStateJson('log', { n: 0 });
+  store.close();
+  store = JsStore.openOrCreate({ path: reopenPath });
+  assert.equal(reopenedManifest(), 1, 'openOrCreate on an existing version-1 store leaves MANIFEST version 1');
+  store.appendManyToStateJson('log', [{ n: 1 }, { n: 2 }]);
+  assert.equal(reopenedManifest(), 2, 'the first batch after the reopen marks the MANIFEST');
+  store.close();
+  ok('openOrCreate opens a version-1 store without moving it to version 2, and the first batch marks it');
+
   // --- appendManyToStateJsonWithIdentity -----------------------------------
   // A fresh store, so the MANIFEST mark can be watched from the start.
   const idPath = path.join(dir, 'identity');
@@ -216,6 +229,14 @@ try {
     'the one record holds every stamped item',
   );
   ok('appendManyToStateJsonWithIdentity: every item stamped with the one record, items at firstOrdinal + i, MANIFEST marked');
+
+  store.registerState({ id: 'win-resent', strategy: 'append_log' });
+  const held = store.appendToStateJsonWithIdentity('win-resent', { id: 'm0' }, 'by', 'at');
+  const resent = store.appendManyToStateJsonWithIdentity('win-resent', [{ id: 'm0', sequence: held.sequence }, { id: 'm5' }], 'by', 'at');
+  assert.notEqual(resent.record.sequence, held.sequence);
+  assert.deepEqual(store.getStateItemJson('win-resent', resent.firstOrdinal),
+    { id: 'm0', sequence: held.sequence, by: resent.record.id, at: resent.record.sequence });
+  ok('a batch that presents a message the store holds stamps it with the batch\'s record and keeps its own id and sequence');
 
   for (const handle of ['win', 'win-single']) {
     assert.deepEqual(store.queryStateIndexEq(handle, '/id', 'm0', {}), [0], handle);

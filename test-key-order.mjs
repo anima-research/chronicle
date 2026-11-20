@@ -231,6 +231,32 @@ try {
     assert.deepEqual(actual, expected);
   });
 
+  scenario('A lone low surrogate half in summary text reads back as U+FFFD', (store, reopen) => {
+    const slot = 'checkpoints';
+    store.registerState({ id: slot, strategy: 'snapshot' });
+    store.setStateJson(slot, { summary: 'before\udc00after' });
+    assert.equal(store.getStateJson(slot).summary, 'before\ufffdafter');
+    assert.equal(reopen().getStateJson(slot).summary, 'before\ufffdafter');
+  });
+
+  scenario('A number that is not finite is refused at the call or never read back', (store, reopen) => {
+    const values = [Infinity, -Infinity, NaN].flatMap((bad) => [bad, { nested: { bad } }, [1, bad]]);
+    const finite = (value) => JSON.stringify(value, (_, v) => {
+      if (typeof v === 'number' && !Number.isFinite(v)) throw new Error(`a stored ${v}`);
+      return v;
+    });
+    const slots = values.map((value, i) => {
+      const slot = `value/${i}`;
+      store.registerState({ id: slot, strategy: 'snapshot' });
+      let refused = false;
+      try { store.setStateJson(slot, value); } catch { refused = true; }
+      if (!refused) finite(store.getStateJson(slot));
+      return slot;
+    });
+    const reopened = reopen();
+    for (const slot of slots) finite(reopened.getStateJson(slot));
+  });
+
   scenario('Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches', (store, reopen) => {
     const slot = 'agent/context/kvunified:presentation-receipt';
     store.registerState({ id: slot, strategy: 'snapshot' });

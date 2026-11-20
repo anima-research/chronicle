@@ -85,6 +85,9 @@ function tryTreeWrites(side, fixture) {
   assert.throws(() => side.appendJson(journal, { event: 'not published' }), caught);
   assert.equal(errnoCode(cause), 'EFBIG', String(cause));
   assert.deepEqual(side.getRecordIdsByType(journal), journalIds);
+
+  assert.throws(() => side.storeBlob(Buffer.from('a blob over the file-size limit'), 'application/octet-stream'), caught);
+  assert.equal(errnoCode(cause), 'EFBIG', String(cause));
 }
 
 const stamp = (item, record) => ({ ...item, by: record.id, at: record.sequence });

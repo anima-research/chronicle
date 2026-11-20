@@ -268,3 +268,44 @@ test('A failure after a successful fork and switch does not undo either', async 
   assert.equal(named(store.listBranches(), target.name)?.id, target.id);
   assert.deepEqual(store.view(target.name).getStateJson(registration.id), marker);
 });
+
+test('openOrCreate reopens a store on its saved branch before any view or switch', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'chronicle-branch-catalog-'));
+  const path = join(dir, 'store');
+  let store = JsStore.openOrCreate({ path });
+  t.after(() => {
+    try { if (!store.isClosed()) store.close(); } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  store.registerState({ id: 'work', strategy: 'snapshot' });
+  store.setStateJson('work', 'on main');
+  const draft = store.createBranch('draft');
+  store.switchBranch(draft.name);
+  store.setStateJson('work', 'on draft');
+  store.close();
+  store = JsStore.openOrCreate({ path });
+  assert.deepEqual([store.currentBranch().name, store.currentBranch().id, store.getStateJson('work')],
+    [draft.name, draft.id, 'on draft']);
+});
+
+test('createBranchAt behind the head leaves the root on its source and its later rows', (t) => {
+  const { store } = freshStore(t);
+  store.registerState({ id: 'log', strategy: 'append_log' });
+  const source = store.createBranch('source');
+  store.switchBranch(source.name);
+  store.appendToStateJson('log', { n: 0 });
+  const cut = store.currentSequence();
+  store.appendToStateJson('log', { n: 1 });
+  const child = store.createBranchAt('past', source.name, cut);
+  assert.deepEqual([store.currentBranch().name, store.currentBranch().id, store.getStateJson('log')],
+    [source.name, source.id, [{ n: 0 }, { n: 1 }]]);
+  assert.deepEqual(store.view(child.name).getStateJson('log'), [{ n: 0 }]);
+});
+
+test('createBranch with no parent forks the current branch and leaves the root on it', (t) => {
+  const { store } = freshStore(t);
+  const draft = store.createBranch('draft');
+  store.switchBranch(draft.name);
+  const child = store.createBranch('child');
+  assert.deepEqual([store.currentBranch().name, store.currentBranch().id], [draft.name, draft.id]);
+  assert.equal(named(store.listBranches(), child.name).parentId, draft.id);
+});

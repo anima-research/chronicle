@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as nextTurn } from 'node:timers/promises';
@@ -57,6 +57,7 @@ test('Dead handles throw instead of reporting empty inventories, records or revi
     assert.throws(() => handle.getRecord(receipt.id), which);
     assert.throws(() => handle.getStateLen('messages'), which);
     assert.throws(() => handle.stateHeadOffset('messages'), which);
+    assert.throws(() => handle.getState('messages'), (error) => !error.message.startsWith('Deserialization error: '), which);
     assert.throws(() => handle.getRecordIdsByType(receiptType), which);
     assert.throws(() => handle.redactStateItems('messages', 0, 1), which);
     assert.throws(() => handle.subscribe({}), which);
@@ -192,4 +193,54 @@ test('Repair on a stopped copy preserves historical coordinates and leaves the o
 
   const original = keep(JsStore.open({ path: residentPath }));
   assert.deepEqual([original.currentBranch().name, original.currentSequence(), original.getStateJson(slot)], ['work', originalHead, old]);
+});
+
+test('A copy with a torn tail recovers at its own path while the resident stays open and whole', (t) => {
+  const { dir, keep } = workspace(t);
+  const residentPath = join(dir, 'resident');
+  const copyPath = join(dir, 'copy');
+  const resident = keep(JsStore.create({ path: residentPath }));
+  const first = resident.appendJson('journal', { n: 1 });
+  const last = resident.appendJson('journal', { n: 2 });
+  resident.sync();
+  const residentLog = readFileSync(join(residentPath, 'records.log'));
+
+  cpSync(residentPath, copyPath, { recursive: true, verbatimSymlinks: true });
+  const copyLog = join(copyPath, 'records.log');
+  truncateSync(copyLog, statSync(copyLog).size - 1);
+  const copy = keep(JsStore.open({ path: copyPath }));
+  const report = copy.recovery();
+  assert.deepEqual([report?.droppedBytes > 0, report?.validRecords], [true, 1]);
+  assert.deepEqual([copy.getRecord(first.id)?.id, copy.getRecord(last.id)], [first.id, null]);
+  assert.deepEqual(copy.getRecordIdsByType('journal'), [first.id]);
+
+  assert.deepEqual(readFileSync(join(residentPath, 'records.log')), residentLog);
+  assert.deepEqual(resident.getRecordIdsByType('journal'), [first.id, last.id]);
+  assert.equal(resident.getRecord(last.id).id, last.id);
+  resident.close();
+  const reopened = keep(JsStore.open({ path: residentPath }));
+  assert.equal(reopened.recovery(), null);
+  assert.deepEqual(reopened.getRecordIdsByType('journal'), [first.id, last.id]);
+});
+
+test('Clearing a slot whole advances the branch and leaves its earlier rows at the saved sequence', (t) => {
+  const { dir, keep } = workspace(t);
+  const path = join(dir, 'store');
+  const slot = 'window/summaries';
+  const old = [{ id: 'keep', text: 'retained' }, { id: 'drop', text: 'recover this text' }];
+  let store = keep(JsStore.create({ path }));
+  store.registerState({ id: slot, strategy: 'snapshot' });
+  store.setStateJson(slot, old);
+  const cleared = [];
+  for (const empty of [[], null]) {
+    const saved = store.currentSequence();
+    const write = store.setStateJson(slot, empty);
+    assert.deepEqual([store.currentSequence() > saved, write.sequence, store.getStateJson(slot)], [true, store.currentSequence(), empty]);
+    assert.deepEqual(store.getStateJsonAt(slot, saved), old);
+    cleared.push(saved);
+    store.setStateJson(slot, old);
+  }
+  store.close();
+  store = keep(JsStore.open({ path }));
+  for (const saved of cleared) assert.deepEqual(store.getStateJsonAt(slot, saved), old);
 });
