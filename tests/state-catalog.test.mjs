@@ -165,6 +165,13 @@ test('No record, stored null and other falsy JSON values are different states', 
   assert.equal(typeof store.getStateLen('value/null'), 'number');
 });
 
+test('A registered append log that was never written still counts as no items after a reopen', (t) => {
+  const fixture = freshStore(t);
+  fixture.store.registerState(log('default/window'));
+  const reopened = fixture.reopen();
+  assert.deepEqual([reopened.getStateLen('default/window'), reopened.getStateJson('default/window')], [null, null]);
+});
+
 test('A listed populated receipt can be cleared and reused without registration', (t) => {
   const { store } = freshStore(t);
   for (const id of [resolutionsId, receiptId]) store.registerState(snapshot(id));

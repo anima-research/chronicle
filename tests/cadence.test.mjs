@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
@@ -16,7 +16,7 @@ function freshStore(t) {
     }
   });
   store = JsStore.openOrCreate({ path });
-  return { store, reopen() { store = JsStore.open({ path }); return store; } };
+  return { store, path, reopen() { store = JsStore.open({ path }); return store; } };
 }
 
 const appendLog = (id, deltaSnapshotEvery, fullSnapshotEvery) =>
@@ -209,13 +209,22 @@ test('A fresh registration takes its cadence fields with no retune', (t) => {
 });
 
 test('An ordinary append writes a record whose size does not grow with the log', (t) => {
-  const { store } = freshStore(t);
+  const { store, path } = freshStore(t);
+  const storeBytes = () => readdirSync(path, { recursive: true }).reduce((sum, name) => {
+    const stat = statSync(join(path, name));
+    return stat.isFile() ? sum + stat.size : sum;
+  }, 0);
   const logs = ['log-a', 'log-b'];
   for (const id of logs) store.registerState(appendLog(id, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
   for (let i = 0; i < 4; i++) store.appendToStateJson(logs[0], { n: i });
   for (let i = 0; i < 4096; i++) store.appendToStateJson(logs[1], { n: i });
   const item = { text: 'the same small item' };
-  const [short, long] = logs.map((id) => store.getRecord(store.appendToStateJson(id, item).id).payload.length);
+  const [short, long] = logs.map((id) => {
+    const before = storeBytes();
+    const { id: record } = store.appendToStateJson(id, item);
+    return { payload: store.getRecord(record).payload.length, stored: storeBytes() - before };
+  });
   assert.deepEqual(logs.map((id) => operationKinds(store, id).at(-1)), ['Append', 'Append']);
-  assert.ok(Math.abs(long - short) <= 8, `an append to a log of 4 items wrote ${short} bytes, and to a log of 4,096 items ${long}`);
+  assert.ok(short.stored > 0 && Math.abs(long.stored - short.stored) <= 8 && Math.abs(long.payload - short.payload) <= 8,
+    `an append to a log of 4 items stored ${short.stored} bytes with a ${short.payload}-byte record, and to a log of 4,096 items ${long.stored} with ${long.payload}`);
 });

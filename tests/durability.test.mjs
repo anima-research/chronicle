@@ -7,6 +7,7 @@ import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { readTrace } from './durability-trace.mjs';
 
+const WRITER_BOUND_MS = 60_000;
 const CALLS = '%file,%desc,mmap,munmap,msync,sync,syncfs,io_uring_setup,io_uring_enter,io_uring_register,io_setup,io_submit';
 const WRITER = fileURLToPath(new URL('./durability-writer.mjs', import.meta.url));
 const CONTROL_MARKS = ['control-1', 'control-2', 'control-3', 'control-4'];
@@ -15,7 +16,7 @@ const inside = (paths, dir) => paths.filter(path => path === dir || path.startsW
 const relative = (paths, dir) => paths.map(path => posix.relative(dir, path)).sort();
 
 function straceProblem() {
-  const probe = spawnSync('strace', ['-o', '/dev/null', 'true'], { encoding: 'utf8' });
+  const probe = spawnSync('strace', ['--kill-on-exit', '-o', '/dev/null', 'true'], { encoding: 'utf8' });
   if (probe.error) return `strace is not on the path (${probe.error.code})`;
   if (probe.status !== 0) return `strace may not trace here: ${probe.stderr.trim().split('\n')[0]}`;
   return null;
@@ -30,8 +31,11 @@ function traceWriter() {
   const record = join(base, 'record');
   const env = { ...process.env };
   delete env.LD_PRELOAD;
-  const child = spawnSync('strace', ['-f', '-y', '-o', record, '-e', `trace=${CALLS}`, process.execPath, WRITER, root],
-    { env, encoding: 'utf8', maxBuffer: 1 << 26 });
+  const child = spawnSync('strace', ['--kill-on-exit', '-f', '-y', '-o', record, '-e', `trace=${CALLS}`, process.execPath, WRITER, root],
+    { env, encoding: 'utf8', maxBuffer: 1 << 26, timeout: WRITER_BOUND_MS, killSignal: 'SIGKILL' });
+  if (child.error?.code === 'ETIMEDOUT') {
+    return { labels: null, failure: `the writer under strace did not end within ${WRITER_BOUND_MS / 1000} s` };
+  }
   const firstLine = child.stdout.split('\n')[0];
   const barriers = firstLine.startsWith('[') ? JSON.parse(firstLine) : null;
   const labels = barriers === null ? null : barriers.map(({ label }) => label);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -123,4 +123,25 @@ test('openOrCreate honors the supplied blob read-cache capacity, for a new store
       }
     }
   }
+});
+
+test('After a repair of a damaged blob, the handle that repaired it and a reopened store read the same thing', {
+  todo: 'After a get has read a blob, storeBlob returns without rewriting a damaged file of the same length: the handle reads its cached bytes, and a reopened store finds the file damaged.',
+}, (t) => {
+  const path = join(dir, 'repaired-blobs');
+  let store = JsStore.openOrCreate({ path });
+  t.after(() => store.close());
+  const bytes = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 7) % 251));
+  const key = store.storeBlob(bytes, 'application/octet-stream');
+  assert.deepEqual(store.getBlob(key), bytes);
+  const file = join(path, 'blobs', key.slice(0, 2), key);
+  writeFileSync(file, Buffer.alloc(statSync(file).size));
+  assert.equal(store.storeBlob(bytes, 'application/octet-stream'), key);
+  const read = () => {
+    try { return { bytes: store.getBlob(key) }; } catch (error) { return { code: error.code }; }
+  };
+  const repairer = read();
+  store.close();
+  store = JsStore.open({ path });
+  assert.deepEqual(read(), repairer);
 });
