@@ -27,9 +27,6 @@ function traceWriter() {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'chronicle-durability-')));
   after(() => rmSync(base, { recursive: true, force: true }));
   const root = join(base, 'root');
-  if (/[\x00-\x1f\x7f-\uffff"\\<>]/.test(root)) {
-    return { labels: null, failure: `the path ${JSON.stringify(root)} has characters that strace escapes in its record, and the check reads paths unescaped` };
-  }
   const control = join(root, 'control');
   mkdirSync(control, { recursive: true });
   const record = join(base, 'record');
@@ -65,7 +62,9 @@ function traceWriter() {
 }
 
 const notLinux = process.platform !== 'linux' && 'the record of system calls comes from strace, which is for Linux';
-const missing = notLinux ? null : straceProblem();
+const escaped = /[\x00-\x1f\x7f-\uffff"\\<>]/.test(realpathSync(tmpdir()))
+  && `the temporary directory ${JSON.stringify(realpathSync(tmpdir()))} has characters that strace escapes in its record, and the check reads paths unescaped`;
+const missing = notLinux ? null : escaped || straceProblem();
 const skip = notLinux || (missing !== null && !process.env.CI && missing);
 const run = skip ? null : missing !== null ? { labels: null, failure: missing } : traceWriter();
 

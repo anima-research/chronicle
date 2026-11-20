@@ -311,6 +311,7 @@ test('The snapshot byte cap includes the delimiters of a replayed JSON array', {
 }, t => {
   const snapshot = cutArray(t, ['é', 'é'], 9);
   assert.ok(jsonBytes(snapshot.data) <= 9, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of 9`);
+  assert.deepEqual(snapshot.data, ['é']);
 });
 
 test('The default queue holds a thousand events and cleanup also removes overflowed IDs', t => {
