@@ -585,7 +585,7 @@ await import(${JSON.stringify(pathToFileURL(join(tools, 'state-digests.mjs')).hr
       const after = JsStore.open({ path });
       assert.equal(after.currentBranch().name, 'main', 'a check stopped partway should leave the store on the branch it found');
       after.close();
-      // What an open repaired goes to stderr, so a check after a run doesn't differ from the check before it for that.
+      // What the open reports goes to stderr, so a check after a run doesn't differ from the check before it for that.
       const check = (store, prelude = '') => spawnSync(process.execPath, ['--input-type=module', '-e', `
 import { createRequire } from 'node:module';
 const { JsStore } = createRequire(import.meta.url)(${JSON.stringify(MODULE)});
@@ -597,8 +597,8 @@ await import(${JSON.stringify(pathToFileURL(join(tools, 'state-digests.mjs')).hr
       writeFileSync(join(torn, 'records.log'), Buffer.concat([readFileSync(join(torn, 'records.log')), Buffer.from('REC\0torn')]));
       const [first, second] = [check(torn), check(torn)];
       assert.equal(first.status, 0, `the check of a store with a torn tail exited ${first.status}:\n${first.stderr}`);
-      assert.ok(first.stderr.includes('This open repaired the store') && !second.stderr.includes('This open repaired'),
-        `the first check of a store with a torn tail should say on stderr that its open repaired it, and the second shouldn't:\n${first.stderr}\n${second.stderr}`);
+      assert.ok(/This open reported: droppedBytes=[1-9]/.test(first.stderr) && !second.stderr.includes('This open reported'),
+        `the first check of a store with a torn tail should report the dropped bytes on stderr, and the second shouldn't:\n${first.stderr}\n${second.stderr}`);
       assert.equal(first.stdout, second.stdout, 'the digest should be the same whether or not the open repaired the store');
       const old = check(path, 'JsStore.prototype.recovery = () => ({ truncatedAt: 100, droppedBytes: 8, validRecords: 3 });');
       assert.equal(old.status, 0, `the check with the recovery report of chronicle 0.4.0 exited ${old.status}:\n${old.stderr}`);

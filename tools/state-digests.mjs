@@ -10,8 +10,8 @@
 //
 // Two limits. chronicle's API lists only registered states, so a state with no registration isn't read. And the check
 // opens the store as its host does: that open saves state.bin and branches.bin, and it cuts off a torn tail of the log.
-// What an open repaired is said on stderr, outside the digest, since only the first open after an unclean stop has
-// anything to repair, and a check after a run would differ from the check before it for that reason alone.
+// What the open reports goes to stderr, outside the digest. A repair shows at the first open after an unclean stop
+// alone, so a check after a run would differ from the check before it for that reason alone.
 //
 // Usage: CHRONICLE_MODULE=<path to @animalabs/chronicle> node state-digests.mjs <store-dir> [--state <pattern> ...]
 import { createHash } from 'node:crypto';
@@ -57,10 +57,12 @@ const read = (what) => {
 const recovery = store.recovery();
 const field = (value) => value ?? '-';
 if (recovery) {
-  console.error('This open repaired the store, so it was not closed cleanly: '
+  console.error('This open reported: '
     + `droppedBytes=${field(recovery.droppedBytes)} undecodable=${field(recovery.undecodableStateUpdates)} `
     + `onMissingBranches=${field(recovery.updatesOnMissingBranches)} unregistered=`
-    + `${recovery.unregisteredStates?.map(({ id, updates }) => `${id}:${updates}`).sort().join(',') || '-'}`);
+    + `${recovery.unregisteredStates?.map(({ id, updates }) => `${id}:${updates}`).sort().join(',') || '-'}. `
+    + 'Dropped bytes, or updates of unregistered states, mean that the store was not closed cleanly, and that this '
+    + 'open repaired it.');
 }
 const stats = store.stats();
 out.push(`blobs=${stats.blobCount} branches=${stats.branchCount} stateSlots=${stats.stateSlotCount}`);
