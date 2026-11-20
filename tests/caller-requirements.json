@@ -165,11 +165,10 @@
   },
   "getStateJson.15": {
    "sentence": "After a write throws, a successful reread reports what actually landed, not what the caller attempted or an assumed rollback. Unfold uses structural equality to decide which state to keep in memory; the window index must see the whole identity-stamped batch or none of it, or be able to report that read-back also failed.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/write-refusals.test.mjs"
-   ],
-   "note": "Pinned: after an identity write or batch torn before publication, a successful reread in the writing process and after a reopen gives the rows from before, never a partial batch. No test has a write that throws after it landed, because no fault can be injected after publication."
+   ]
   },
   "getStateJson.16": {
    "sentence": "Use the same JSON round-trip representation as the write and point-read paths. In particular undefined object fields are omitted and lone surrogate halves in string values come back as U+FFFD; differences between the full read and the point read in stringification, including key order, break request hashes, and differences from storedCanonicalJson make a landed write look absent.",
@@ -222,11 +221,10 @@
   },
   "setStateJson.5": {
    "sentence": "A completed set participates in a subsequent `store.sync()` durability barrier: a successful sync must cover it before the caller acknowledges the change, consumes retry work, or writes a repair receipt. Success of the set alone need not mean fsync, and failure of the later sync does not undo the logged write.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/checkpoint-errors.test.mjs"
-   ],
-   "note": "Pinned: a failed later sync doesn't undo the completed set. The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "setStateJson.12": {
    "sentence": "Coalescing compaction needs independently ordered slot replacements: the table contains the caller’s journal watermark before the marked journal is emptied. An interruption between these writes may leave the new table and the old journal together; replay skips entries already covered by the watermark.",
@@ -258,11 +256,10 @@
   },
   "setStateJson.9": {
    "sentence": "Preserve caller-supplied own object keys even when a channel or agent name is also an `Object.prototype` member, such as `constructor`. The readers distinguish an actual stored override, generation or destination from an inherited property.",
-   "status": "differs",
+   "status": "pinned",
    "tests": [
     "test-key-order.mjs"
-   ],
-   "note": "getStateJson reads an own `__proto__` key back as nothing: the binding assigns each key of the object it builds, and the `__proto__` setter ignores a number. The stored bytes keep the key. A todo test in test-key-order.mjs shows it. `constructor` and the other Object.prototype names are pinned."
+   ]
   },
   "setStateJson.14": {
    "sentence": "Accept records constructed with missing optional members. In particular, an undefined optional checkpoint `data` member must not become a real snapshot that hides the node’s `patch` on reconstruction; unnamed pins likewise must be writable.",
@@ -478,12 +475,11 @@
   },
   "sync.9": {
    "sentence": "After `setStateJson` changes the host mode or prose lock, success must preserve the new choice across a crash; a throw is not a rollback and does not rule out the write reaching disk. Store-only quiesce/resume fails on that throw, whereas the recovery-file host-mode path and the prose-lock path log the failure.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/checkpoint-errors.test.mjs",
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "That a throw is no rollback of the replacement on the live handle is pinned. The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "sync.8": {
    "sentence": "Delivered or imported messages and notices must be durable before the framework forgets its obligation to deliver them: pruning a deferred queue, settling interrupted agents, releasing held mail, or ending a tune-out. On a throw the recovery obligation stays; finding a copy in memory is not a substitute for syncing it.",
@@ -515,7 +511,7 @@
    "tests": [
     "tests/checkpoint-errors.test.mjs"
    ],
-   "note": "Pinned: a sync retried after a failed checkpoint returns normally, and after the retry and the death of the writing process each receipt, acceptance and start is there once. No test shows that the retry itself made the work durable: with this store the records are in the log before the retry, so they survive the death of the process without it, and no test shows what survives a loss of power. No test retries after a failed fsync of the record log, which nothing outside the store can cause. After one, the store refuses every sync until it is reopened (DurabilityLost), so that failure can't be retried in place."
+   "note": "A retry of a failed sync on the same work is pinned. The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
   },
   "sync.10": {
    "sentence": "Compression and merge retries need their progress in named state to survive before proceeding: the next provider call must not repay a recorded answer after a crash, and reopening must not undo a counted attempt, the end of a failure run, or a quarantine.",
@@ -764,11 +760,10 @@
   },
   "storeBlob.4": {
    "sentence": "Keep the bytes available for the lifetime of their persisted references, including after reopening the store or returning to a branch that holds a reference. When a caller syncs the referencing state as a durability barrier, the blob it names must survive with it; this does not require a separate fsync on every blob call.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "That the bytes stay available after reopening, and after a return to a branch that holds the reference, is pinned. The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "storeBlob.7": {
    "sentence": "For media references, plain mint preimages and workspace file versions, the key must equal the full lowercase 64-hex SHA-256 of the supplied bytes alone, independent of MIME type. Callers share that identity with existing media blobs, independently hashed request JSON, disk observations, write receipts and recovery reads.",
@@ -800,11 +795,10 @@
   },
   "storeBlob.9": {
    "sentence": "For workspace tools to give errno-specific diagnoses and remedies, a system write error must expose a Node-style errno code or, on POSIX, an Error message of the form `IO error: … (os error N)`. Unrecognized errors still propagate with their own text; the workspace does not treat every message ending in an OS number as an I/O error.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "error-codes.test.mjs"
-   ],
-   "note": "Pinned on POSIX: a failure looking at the blob's path and a failure writing its bytes. No test makes the sync of the blob's directory fail after the rename, which nothing outside the store can cause. The store's message for that failure puts advice after the OS error ('…; storing it again tries the sync again'), so workspace's end-anchored match would not read its errno. No test runs on Windows: the errno checks are POSIX only."
+   ]
   },
   "storeBlob.14": {
    "sentence": "After a repair attempt, readback under the old hash must reveal whether the blob is actually readable, even if `storeBlob` threw after writing or returned without replacing a damaged file. The caller tolerates either repair outcome: it reports restored or unstored based on readback and can serve the independently verified disk bytes in either case.",
@@ -843,11 +837,10 @@
   },
   "appendToStateJson.15": {
    "sentence": "Keep the coalescer's own `seq` on each journal item unchanged. The next table stores the last such number, and restore applies only items above it, in log order; the record's store-assigned sequence is no substitute for this watermark.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/crash_state_recovery.rs"
-   ],
-   "note": "tests/crash_state_recovery.rs hands each journal item to the core as bytes and shows that the core keeps each item's own seq, in log order, through an interrupted prefix. No test sends caller-chosen seq values through JsStore.appendToStateJson, which builds the item's bytes in the binding (src/napi.rs), so a binding that rewrote a supplied seq with the store's sequence would pass. That test belongs in a Node file."
+   ]
   },
   "appendToStateJson.13": {
    "sentence": "A successful later `sync()` must cover the preceding appends and make them recoverable after a crash. The guard does not submit original results before that barrier, and the coalescer does not acknowledge acceptance or start a render before its commit barrier.",
@@ -1557,11 +1550,10 @@
   },
   "editStateItem.13": {
    "sentence": "The backfill requires a per-slot edit rather than a whole-array Set: even the bytes of unrelated slots stay intact, and the edit does not resurrect entries that a whole-array Set on an append log could bring back.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/log-readback.test.mjs"
-   ],
-   "note": "Pinned: the two edits add just their per-slot Edit records and no Set, the records that hold the unrelated items stay as written, the bytes the store gives for those items don't change, and replay doesn't bring back a redacted item. No test covers the readback of bytes that a byte setter stored in another serialization than the store's own. The store gives every item of an append log in its own serialization after any write (an append, or an edit of another item) and after a reopen, and no caller writes such bytes to an append log."
+   ]
   },
   "editStateItem.14": {
    "sentence": "For a module’s accumulating log, the edit record is proportional to the replacement item’s size, not to the size of the accumulated log. Snapshot consolidation is separate from the point edit.",
@@ -2119,11 +2111,10 @@
   },
   "appendToStateJsonWithIdentity.11": {
    "sentence": "A throw during or after a write is not proof that nothing landed. Once the same branch can be read, its state must reveal either no new item or the complete stamped item: message recovery checks the pre-append ordinal and body group, and window recovery discards its cache and reloads the index.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/write-refusals.test.mjs"
-   ],
-   "note": "Pinned: a write torn before its record is published reads back with no new item, in the writing process and after a reopen. No test has a write that throws after its whole record landed, because no fault can be injected after publication."
+   ]
   },
   "appendToStateJsonWithIdentity.15": {
    "sentence": "A quarantine event’s `eventId` is a nonempty string usable as an exact reference in a later ledger append. An alert or clear must match the intended exhaustion generation, and an `alert_sent` must still be able to name the pending event it acknowledges after replay.",
@@ -2731,11 +2722,10 @@
   },
   "createBranchWithStates.13": {
    "sentence": "Creation failure is signaled by throwing, with no new branch left for the caller to clean up: the call is outside the child-setup `try`. In particular, an already-used name fails rather than returning or replacing the branch that owns it.",
-   "status": "differs",
+   "status": "pinned",
    "tests": [
     "tests/selective-lineage.test.mjs"
-   ],
-   "note": "When the publication of the new child fails, the store throws and keeps the child it allocated. listBranches() lists it at once, the next checkpoint publishes it, a retry under the same name throws BranchExists, and the child is still there after a reopen. A refusal before allocation (an occupied name, an unknown parent) throws and leaves no child, and that part is pinned."
+   ]
   },
   "createBranchAtWithStates.2": {
    "sentence": "Creation completes synchronously under the requested child name, including names containing `/`. On return, `source.view(branch)` can open that exact name and read its initial state without waiting or switching branches.",
@@ -2802,11 +2792,10 @@
   },
   "createBranchAtWithStates.16": {
    "sentence": "A creation failure throws before returning a child and leaves no newly created branch for `derive` to clean up. In particular, a name already in use must fail without adopting, overwriting or deleting the existing branch.",
-   "status": "differs",
+   "status": "pinned",
    "tests": [
     "tests/selective-lineage.test.mjs"
-   ],
-   "note": "When the publication of the new child fails, the store throws and keeps the child it allocated. listBranches() lists it at once, the next checkpoint publishes it, a retry under the same name throws BranchExists, and the child is still there after a reopen. The input refusals before allocation (an occupied name, an unknown parent, a cut past the parent's head) throw and leave no child, and that part is pinned."
+   ]
   },
   "createBranchAtWithStates.17": {
    "sentence": "The synchronous result supplies a string `id` equal to the new branch's `listBranches()` ID and distinct from a later branch created under the same name. If child setup fails, `derive` uses that identity to delete only the branch it created.",
@@ -3007,11 +2996,10 @@
   },
   "updateStateStrategy.3": {
    "sentence": "For the `append_log` slot, subsequent appends use both supplied intervals: `deltaSnapshotEvery` counts appends and `fullSnapshotEvery` counts delta snapshots, not appends. The caller supplies 50 and 100, respectively, for a full snapshot every 5,000 appends.",
-   "status": "differs",
+   "status": "pinned",
    "tests": [
     "tests/cadence.test.mjs"
-   ],
-   "note": "The store takes the first full snapshot after delta × full appends: 5,000 for the caller's 50 and 100. Each later one comes when the appends since the last full reach the larger of that product and the slot's length at the last full. On a growing log that is at 5,000, 10,000, 20,000 and so on, not every 5,000. Pinned: delta snapshots count appends, full snapshots count deltas, and the first full comes at 5,000."
+   ]
   },
   "updateStateStrategy.4": {
    "sentence": "Only scheduling changes. The selected slot remains an append log with its message history intact, usable by the `MessageStore` constructed immediately afterward.",

@@ -360,7 +360,7 @@ try {
       };
       // The stored bytes keep the key, so a loss is in the read.
       assert.equal(text(store.getState(slot)), '{"generations":{"__proto__":7,"general":2}}');
-      // differs from setStateJson.9: an own __proto__ counter should read back as an own number, and the prototype stay Object's.
+      // An own __proto__ counter should read back as an own number, and the prototype stay Object's.
       assert.deepEqual(own(store), [true, 7, 2]);
       store.close();
       store = JsStore.openOrCreate({ path: at });

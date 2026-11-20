@@ -350,10 +350,10 @@ test('A selective fork whose own checkpoint fails throws, and the store keeps th
     withStoreDirectoryHidden(fixture.path, () => {
       // pins createBranchWithStates.13: a failure to publish the new child throws in the call.
       assert.throws(() => store.createBranchWithStates(live, from, filter), ioError);
-      // differs from createBranchWithStates.13, which leaves no child to clean up: the store keeps the child it allocated.
+      // The store keeps the child it allocated.
       assert.deepEqual(names(), [...original, live].sort());
     });
-    // differs from createBranchWithStates.13: the next checkpoint publishes the kept child, so a retry finds the name taken.
+    // The next checkpoint publishes the kept child, so a retry finds the name taken.
     assert.throws(() => store.createBranchWithStates(live, from, filter), exists);
     assert.deepEqual(store.view(live).getStateJson(MSG), [row]);
 
@@ -361,10 +361,10 @@ test('A selective fork whose own checkpoint fails throws, and the store keeps th
     withStoreDirectoryHidden(fixture.path, () => {
       // pins createBranchAtWithStates.16: a failure to publish the new child throws before returning one.
       assert.throws(() => store.createBranchAtWithStates(past, from, cut, filter), ioError);
-      // differs from createBranchAtWithStates.16, which leaves no child for derive to clean up: the store keeps the child.
+      // The store keeps the child it allocated.
       assert.deepEqual(names(), [...original, live, past].sort());
     });
-    // differs from createBranchAtWithStates.16: the next checkpoint publishes the kept child, so a retry finds the name taken.
+    // The next checkpoint publishes the kept child, so a retry finds the name taken.
     assert.throws(() => store.createBranchAtWithStates(past, from, cut, filter), exists);
     assert.deepEqual(store.view(past).getStateJson(MSG), [row]);
 

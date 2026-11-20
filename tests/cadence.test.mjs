@@ -202,9 +202,8 @@ test('After the first full snapshot, a growing log spaces the next by its length
   store.updateStateStrategy(appendLog(id, 5, 2));
   for (let i = 0; i < 80; i++) store.appendToStateJsonWithIdentity(id, { n: i }, 'id', 'sequence');
   const fulls = [10, 20, 40, 80];
-  // differs from updateStateStrategy.3, which reads the cadence as a full snapshot every delta × full appends:
-  // the store takes the first after 10, and each later one when the appends since the last full reach the
-  // slot's length at it, so at 20, 40 and 80 and not at every multiple of 10. Deltas come every 5 appends between.
+  // The store takes the first full snapshot after 10 appends, and each later one when the appends since the last
+  // full reach the slot's length at it, so at 20, 40 and 80. Deltas come every 5 appends between.
   assert.deepEqual(appendSchedule(operationKinds(store, id)), {
     writes: 80,
     boundaries: Array.from({ length: 16 }, (_, i) => 5 * (i + 1))
