@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 // Print a digest of a Chronicle store as its own read gives it, on every branch, so a store can be compared with
-// itself before and after compact-set-states.py, or with a copy, by `diff`. For each branch: every record that is not
-// a state update, each state's value (a tree state by its entries, a value that is not JSON by its bytes), and eight
-// reads of each list state at sequences spread over the branch. It prints names, counts and digests, and no content.
-// It leaves the store on the branch where it found it, and exits 1 when a read fails.
+// itself before and after compact-set-states.py by `diff`. For each branch: every record that is not a state update,
+// the raw bytes of each registered state's value (a tree state by its entries), and eight reads of each state that is
+// no tree, at sequences spread over the branch. Give it the --state patterns that compact-set-states.py gets, and it
+// leaves out the reads at those sequences for the states they name, whose old values the tool frees. So the two
+// outputs of a run that went right are equal. It prints names, counts and digests, and no content. It exits 1 when a
+// read fails.
 //
-// Usage: CHRONICLE_MODULE=<path to @animalabs/chronicle> node state-digests.mjs <store-dir>
+// Two limits. chronicle's API lists only registered states, so a state with no registration isn't read. And the check
+// opens the store as its host does: that open saves state.bin and branches.bin, and it cuts off a torn tail of the log,
+// which the recovery line then shows.
+//
+// Usage: CHRONICLE_MODULE=<path to @animalabs/chronicle> node state-digests.mjs <store-dir> [--state <glob> ...]
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
@@ -13,10 +19,46 @@ import { resolve } from 'node:path';
 const require = createRequire(import.meta.url);
 const mod = process.env.CHRONICLE_MODULE;
 if (!mod) { console.error('set CHRONICLE_MODULE to the @animalabs/chronicle package directory'); process.exit(2); }
+const [path, ...rest] = process.argv.slice(2);
+const patterns = [];
+for (let i = 0; i < rest.length; i += 2) {
+  if (rest[i] !== '--state' || rest[i + 1] === undefined) { console.error(`unknown argument ${rest[i]}`); process.exit(2); }
+  patterns.push(globToRegExp(rest[i + 1]));
+}
+if (!path) { console.error('usage: node state-digests.mjs <store-dir> [--state <glob> ...]'); process.exit(2); }
+const named = (id) => patterns.some((pattern) => pattern.test(id));
+
+// The glob matching of Python's fnmatch.fnmatchcase, which compact-set-states.py uses: `*` and `?` match `/` too.
+function globToRegExp(glob) {
+  let out = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') out += '.*';
+    else if (c === '?') out += '.';
+    else if (c === '[') {
+      let j = i + 1;
+      if (glob[j] === '!') j++;
+      if (glob[j] === ']') j++;
+      while (j < glob.length && glob[j] !== ']') j++;
+      if (j >= glob.length) {
+        out += '\\[';
+        continue;
+      }
+      let body = glob.slice(i + 1, j).replace(/\\/g, '\\\\');
+      if (body[0] === '!') body = `^${body.slice(1)}`;
+      else if (body[0] === '^') body = `\\${body}`;
+      out += `[${body}]`;
+      i = j;
+    } else out += c.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  }
+  return new RegExp(`^(?:${out})$`, 's');
+}
+
 const { JsStore } = require(resolve(mod));
 const sha = (value) => createHash('sha256').update(value).digest('hex').slice(0, 16);
+const bytes = (raw) => (raw == null ? 'absent' : `${sha(raw)} bytes=${raw.length}`);
 
-const store = JsStore.open({ path: process.argv[2] });
+const store = JsStore.open({ path });
 const out = [];
 let failed = 0;
 const read = (what) => {
@@ -28,7 +70,11 @@ const read = (what) => {
   }
 };
 const recovery = store.recovery();
-out.push(`recovery\t${recovery ? `report of ${JSON.stringify(recovery).length} characters` : 'none'}`);
+out.push(recovery
+  ? `recovery\tdroppedBytes=${recovery.droppedBytes} undecodable=${recovery.undecodableStateUpdates} `
+    + `onMissingBranches=${recovery.updatesOnMissingBranches} unregistered=`
+    + `${recovery.unregisteredStates.map(({ id, updates }) => `${id}:${updates}`).sort().join(',') || '-'}`
+  : 'recovery\tnone');
 const stats = store.stats();
 out.push(`blobs=${stats.blobCount} branches=${stats.branchCount} stateSlots=${stats.stateSlotCount}`);
 const found = store.currentBranch().name;
@@ -58,23 +104,18 @@ try {
     const top = store.currentSequence();
     out.push(`branch ${branch}\tsequence=${top}\trecords=${count}\t${records.digest('hex').slice(0, 16)}\ttypes=${types.size}`);
     for (const { id, strategy } of store.listStates().sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      const value = read(() => {
-        if (strategy === 'tree') return `tree ${sha(JSON.stringify(store.treeList(id)))}`;
-        let text;
-        try {
-          text = JSON.stringify(store.getStateJson(id));
-        } catch {
-          const raw = store.getState(id);
-          text = raw ? raw.toString('base64') : 'absent';
-        }
-        return `${strategy} ${sha(text ?? 'undefined')} length=${(text ?? '').length} items=${store.getStateLen(id) ?? '-'}`;
-      });
+      const value = read(() => (strategy === 'tree'
+        ? `tree ${sha(JSON.stringify(store.treeList(id)))}`
+        : `${strategy} ${bytes(store.getState(id))} items=${store.getStateLen(id) ?? '-'}`));
       out.push(`  ${branch}\t${id}\t${value}`);
-      if (strategy === 'append_log') {
+      if (strategy !== 'tree' && !named(id)) {
         const history = [];
         for (let k = 1; k <= 8; k++) {
           const at = Math.floor((top * k) / 8);
-          history.push(read(() => sha(JSON.stringify(store.getStateJsonAt(id, at)) ?? 'undefined')));
+          history.push(read(() => {
+            const raw = store.getStateAt(id, at);
+            return raw == null ? 'absent' : sha(raw);
+          }));
         }
         out.push(`  ${branch}\t${id}\tat eight sequences ${history.join(' ')}`);
       }
