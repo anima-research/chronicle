@@ -173,8 +173,7 @@ test('Event inclusion flags select replay and live classes with bare names and J
   }
   const summaries = [replay[0][0], live[0][0]].map(e => JSON.parse(e.data).record);
   const snap = JSON.parse(replay[1][0].data), change = JSON.parse(live[1][0].data);
-  // differs from pollSubscription.7, whose caller declares camelCase names: the store gives a top-level record
-  // summary and snake_case record and state fields.
+  // The store gives a top-level record summary and snake_case record and state fields.
   assert.deepEqual({
     records: summaries.map(r => [r.id, r.sequence, r.branch, r.record_type, r.timestamp, r.payload_size]),
     snapshot: [snap.state_id, snap.data, snap.sequence, snap.truncated, snap.total_bytes],
@@ -212,7 +211,7 @@ test('An explicit branch name selects the live records of that branch', {
   const work = store.view('work');
   const onWork = work.appendJson('note', 'on work');
   work.close();
-  // differs from subscribe.6: a non-current branch selected by name should get its write and exclude the current branch's.
+  // A non-current branch selected by name should get its write and exclude the current branch's.
   assert.deepEqual(drain(store, named).map(recordId), [onWork.id]);
 });
 
@@ -229,7 +228,7 @@ test('An explicit branch name selects the replayed records of that branch', {
   store.catchUpSubscription(named);
   const events = drain(store, named);
   assert.equal(events.pop()?.eventType, 'caught_up');
-  // differs from subscribe.6: a catch-up through a handle on main should replay the named branch's records, not main's.
+  // A catch-up through a handle on main should replay the named branch's records, not main's.
   assert.deepEqual(events.map(recordId), [onWork.id]);
 });
 
@@ -318,7 +317,7 @@ test('The snapshot byte cap includes the delimiters of a replayed JSON array', {
   todo: 'Array truncation budgets the elements but not the brackets and commas in the delivered snapshot.',
 }, t => {
   const snapshot = cutArray(t);
-  // differs from subscribe.3: marking an array truncated isn't enough if its delivered data still exceeds the byte cap.
+  // Marking an array truncated isn't enough if its delivered data still exceeds the byte cap.
   assert.ok(jsonBytes(snapshot.data) <= 9, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of 9`);
 });
 

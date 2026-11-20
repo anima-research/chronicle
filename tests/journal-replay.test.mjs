@@ -218,9 +218,7 @@ test('Journal lists are growable snapshots with append-only visible suffixes', {
     const now = list();
     // pins appendJson.12: the accepted layout extends exactly the accounted-for prefix by its returned ID.
     assert.deepEqual(now, [...prefix, id]);
-    // The IDs ascend as Numbers too, across a change in their count of digits. The
-    // part of appendJson.12 at 2 ** 53, where two IDs compare equal as Numbers,
-    // has no test: no call makes a record ID that large.
+    // The IDs ascend as Numbers too, across a change in their count of digits.
     assert.ok(increasing(now.map(Number)));
     return id;
   }

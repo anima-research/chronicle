@@ -175,11 +175,11 @@ test('Creation metadata is in epoch microseconds and stays with the identity', (
   // still tells microseconds from milliseconds or seconds by far.
   const slack = 10 * 60 * 1000;
   const selectedMs = Math.floor(selected.created / 1000);
-  // differs from currentBranch.11, which asks for milliseconds: the store gives microseconds since the epoch.
+  // The store gives microseconds since the epoch.
   assert.ok(before - slack <= selectedMs && selectedMs <= after + slack,
     `currentBranch.created = ${selected.created} µs, expected [${before}, ${after}] ms`);
   const listedMs = Math.floor(listed.created / 1000);
-  // differs from listBranches.9, which asks for milliseconds: the store gives the same epoch-microsecond clock.
+  // The listed value is on the same epoch-microsecond clock.
   assert.ok(before - slack <= listedMs && listedMs <= after + slack,
     `listBranches.created = ${listed.created} µs, expected [${before}, ${after}] ms`);
   assert.equal(listed.created, selected.created);

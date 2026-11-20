@@ -164,7 +164,7 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
 
   withBlockedCheckpoint(f.path, 'branches.bin', () => {
     // No retry pending this time: selection succeeds and *its* publication fails.
-    // differs from switchBranch.10, which takes a throw as no move: the store throws after it has moved.
+    // The store throws after it has moved.
     assert.throws(() => store.switchBranch('target'));
     // pins currentBranch.6: the target is inspectable even though the call threw.
     assert.deepEqual(selected(), [target.name, target.id]);

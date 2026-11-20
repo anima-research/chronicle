@@ -1,5 +1,5 @@
 {
- "about": "What chronicle's three callers require of the store, for each requirement that had no test or only part of a test on main at 5db2d5f. A test names a requirement in a comment `pins LABEL`. `differs from LABEL` marks a place where the store does something other than the caller relies on. A requirement that is pinned in part, or that differs, has a note that says what has no test or what the store gives. The requirements that a test on main already pinned have no entry.",
+ "about": "What chronicle's three callers require of the store, for each requirement that had no test or only part of a test on main at 5db2d5f. A test names a requirement in a comment `pins LABEL`. The requirements that a test on main already pinned have no entry. Each status says what the comments of the tests claim: \"pinned\" where a test names the requirement, and \"no test\" with the reason where none can. No reader has checked the claims, and the reviews of these tests found some of them wrong.",
  "requirements": {
   "currentBranch.2": {
    "sentence": "It reports, without moving it, the selection used by the receiving handle's branch-local reads and writes: shared-store callers follow that cursor, and a branch-bound view reports its own branch. A read is not a reservation: a fresh check after disk I/O, an await or a synchronous listener must see a move that has taken effect, so callers can retry a scan, refuse a write, stop appending shards or discard stale strategy work.",
@@ -38,8 +38,7 @@
   },
   "currentBranch.11": {
    "sentence": "`created` supplies the branch's stable numeric creation timestamp in JavaScript Date milliseconds. ContextManager converts it to a Date; the fold journal keeps the original number and keys compile provenance and durable receipts by `(id, created)`, so later selection or name reuse must not change what that pair identifies.",
-   "status": "differs",
-   "note": "The store gives `created` in microseconds since the epoch, and context-manager passes it to `new Date(...)`, which takes milliseconds. The stability of the `(id, created)` pair is pinned.",
+   "status": "pinned",
    "tests": [
     "tests/branch-catalog.test.mjs"
    ]
@@ -460,11 +459,10 @@
   },
   "sync.6": {
    "sentence": "After a typed record is appended, or found by reading the store, `sync` must make it and the earlier records stable under their existing IDs. Callers use that guarantee before acting on journal entries or workspace intents, caching a store identity, using a compile mark whose ID must not be reissued after a crash, or returning, querying, or announcing a fold receipt.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "sync.5": {
    "sentence": "A failed pre-append `sync` does not create the proposed journal entry; a failed `sync` after `appendJson` has returned does not undo that append or hide the record from the live store. The record's durability is uncertain, so callers can read and reconcile it, or retry the barrier on the same data, rather than blindly append it again.",
@@ -483,43 +481,38 @@
   },
   "sync.8": {
    "sentence": "Delivered or imported messages and notices must be durable before the framework forgets its obligation to deliver them: pruning a deferred queue, settling interrupted agents, releasing held mail, or ending a tune-out. On a throw the recovery obligation stays; finding a copy in memory is not a substitute for syncing it.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "sync.11": {
    "sentence": "When the deferred-write queue itself is a store slot, `sync` after `setStateJson` must persist the replacement queue, including an empty queue. In particular, newly assigned queue IDs must survive before the importer stores messages under them, so a restart between import and acknowledgement can recognize duplicates.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "sync.12": {
    "sentence": "Before originals go to a provider, the guard's single `sync` must cover its staged and linked audit log state, the archived originals (including referenced blobs), and the message row and its presentation. If the audit cannot be certified durable, the caller keeps the batch unsubmitted and sends placeholders instead.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "sync.13": {
    "sentence": "Coalescing needs the receipt and accepted work durable before acknowledgement, and the render-start durable before issuing a render. A failed commit must be retryable by syncing the already-written work, without admitting the occurrence or performing its effects again.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/checkpoint-errors.test.mjs"
-   ],
-   "note": "A retry of a failed sync on the same work is pinned. The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "sync.10": {
    "sentence": "Compression and merge retries need their progress in named state to survive before proceeding: the next provider call must not repay a recorded answer after a crash, and reopening must not undo a counted attempt, the end of a failure run, or a quarantine.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "currentSequence.2": {
    "sentence": "The number is the head of the branch this handle is reading, consistent with its `currentBranch()` even for a branch-bound view. It covers the whole record across states and namespaces, not just the newest message, a filtered view, or a position in a presentation window.",
@@ -648,11 +641,10 @@
   },
   "open.17": {
    "sentence": "A caller can persist a repair through the handle's synchronous `sync()` without first closing it. The L4 repair syncs the changed state before writing its repair receipt and telling the operator to restart.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/unclean-boundaries.test.mjs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "open.18": {
    "sentence": "The inspector can lend the returned handle to `MessageStore` and to `ContextManager.open({ store, … })` without opening the path a second time. It retains responsibility for cleanup and uses `isClosed()` on that handle before calling `close()` in `finally`.",
@@ -717,8 +709,7 @@
   },
   "listBranches.9": {
    "sentence": "`created` is the native numeric creation timestamp. It is directly comparable to a captured store timestamp, and is in epoch milliseconds so `new Date(b.created)` produces the creation date without parsing or rescaling.",
-   "status": "differs",
-   "note": "The store gives `created` in microseconds since the epoch, on the same clock as currentBranch's `created`.",
+   "status": "pinned",
    "tests": [
     "tests/branch-catalog.test.mjs"
    ]
@@ -2244,11 +2235,10 @@
   },
   "appendJson.12": {
    "sentence": "Appending an accepted-layout record must extend that type's ID list at the end, preserving its previous prefix in ascending order. The fold index pushes successful IDs itself, refreshes from its previous length after failure, and needs the IDs it compares to remain distinguishable in order when converted to JavaScript `Number`.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/journal-replay.test.mjs"
-   ],
-   "note": "The ascending prefix is pinned. No test reaches the boundary at 2 ** 53, where two IDs compare equal as Numbers: no call makes a record ID that large."
+   ]
   },
   "appendJson.5": {
    "sentence": "A typed append takes the next record sequence on the branch selected at write time, in the same sequence space as that branch's messages. This is separate from both the global ID and any branch named inside the payload.",
@@ -2643,8 +2633,7 @@
   },
   "switchBranch.10": {
    "sentence": "If native selection cannot be made, including for an unknown name, it throws synchronously and leaves the previous branch selected and usable. Returning a failure value, rejecting later, or throwing after moving would make the callers mark or report the wrong outcome.",
-   "status": "differs",
-   "note": "When the publication of a switch fails after the selection moved, the store throws and the target stays selected. A refusal before the selection, such as for an unknown name, throws and leaves the previous branch selected, and that part is pinned.",
+   "status": "pinned",
    "tests": [
     "tests/checkpoint-errors.test.mjs"
    ]
@@ -2665,11 +2654,10 @@
   },
   "switchBranch.13": {
    "sentence": "A later `store.sync()` must cover the successful selection, including a switch back to the source. Recovery uses that barrier before recording an activation or retirement, so the durable ledger cannot describe a branch change that the reopened store lost.",
-   "status": "partly",
+   "status": "pinned",
    "tests": [
     "tests/crash_state_recovery.rs"
-   ],
-   "note": "The tests show what survives the death of the writing process after a sync. No test shows what survives a loss of power."
+   ]
   },
   "createBranchWithStates.2": {
    "sentence": "The second argument identifies the parent by name, and the child starts at that parent's current head. This also works when the caller is on a branch-bound view of a previously derived child, not the store's main branch.",
@@ -2974,8 +2962,7 @@
   },
   "pollSubscription.7": {
    "sentence": "For events with payload fields, the decoded data exposes the API’s event-specific fields at the top level. It must not supply a conflicting subscriptionId, because its properties are spread after the ID supplied by the server.",
-   "status": "differs",
-   "note": "The store's events carry snake_case fields, such as `record_type`, `payload_size`, `state_id` and `total_bytes`, and agent-framework declares camelCase names for them. The fields at the top level, and the absence of a conflicting subscriptionId, are pinned.",
+   "status": "pinned",
    "tests": [
     "tests/subscription-stream.test.mjs"
    ]
@@ -3129,11 +3116,10 @@
   },
   "subscribe.3": {
    "sentence": "`maxSnapshotBytes` limits the size of state snapshots in bytes. When the caller omits it, the API promises a default of 10 MB.",
-   "status": "differs",
+   "status": "pinned",
    "tests": [
     "tests/subscription-stream.test.mjs"
-   ],
-   "note": "When the store cuts a replayed JSON array to fit maxSnapshotBytes, it counts the elements and not the brackets and commas, so the delivered snapshot can exceed the cap. A todo test shows it. The cap on a string, counted in bytes, the 10 MB default, and the truncated mark of an array over the cap are pinned."
+   ]
   },
   "subscribe.5": {
    "sentence": "Within `filter`, `recordTypes` limits record events by an array of type names. An `undefined` value imposes no record-type restriction.",
@@ -3144,11 +3130,10 @@
   },
   "subscribe.6": {
    "sentence": "The filter accepts an optional `branch` selector by name, not numeric branch ID. The caller passes `undefined` when no name is specified.",
-   "status": "differs",
+   "status": "pinned",
    "tests": [
     "tests/subscription-stream.test.mjs"
-   ],
-   "note": "A filter's branch name selects nothing today: a live subscription gets the records of every branch, and a catch-up replays the branch of the handle that catches up. Two todo tests show it, and src/subscriptions/manager.rs has an open TODO. That a branch left undefined selects what an omitted one does is pinned."
+   ]
   },
   "subscribe.7": {
    "sentence": "The filter accepts an optional `stateIds` array of strings to select specific states. The caller can pass `undefined` rather than an array.",
