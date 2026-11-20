@@ -14,6 +14,8 @@ Three programs call chronicle's store: agent-framework, context-manager and conn
 
 A status is that reader's finding at that commit. The test suite does not check it, and a later change to the tests can make it stale.
 
+**Todo tests.** Some tests of the suite are marked todo. Each of them asserts something that the store does not do today. Where a todo test covers a part of a requirement, that part is not pinned, also where the line of the requirement says pinned. `npm test` lists the todo tests.
+
 ## `appendJson`
 
 - `appendJson.1` — **pinned** — Each successful call adds one new record under the exact type string supplied, without replacing older records of that type. The types distinguish entries from checkpoints and store identity from accepted layouts. (3 calling functions)
