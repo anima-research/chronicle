@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Print a digest of a Chronicle store as its own read gives it, on every branch, so a store can be compared with
 // itself before and after compact-set-states.py by `diff`. For each branch: every record that is not a state update,
-// the raw bytes of each registered state's value (a tree state by its entries), and eight reads of each state that is
-// no tree, at sequences spread over the branch. Give it the --state patterns that compact-set-states.py gets, and it
+// the raw bytes of each registered state's value (a tree state by its entries) with the counts that listStates gives
+// for it, and eight reads of each state that is no tree, at sequences spread over the branch. Give it the --state patterns that compact-set-states.py gets, and it
 // leaves out the reads at those sequences for the states they name, whose old values the tool frees. So the two
 // outputs of a run that went right are equal. It also prints the store's current branch, and reads each branch
 // through a view where the binding has one, so it switches none. It prints names, counts and digests, and no
@@ -99,11 +99,11 @@ try {
     }
     const top = on.currentSequence();
     out.push(`branch ${branch}\tsequence=${top}\trecords=${count}\t${records.digest('hex').slice(0, 16)}\ttypes=${types.size}`);
-    for (const { id, strategy } of on.listStates().sort(byId)) {
+    for (const { id, strategy, itemCount, opsSinceSnapshot } of on.listStates().sort(byId)) {
       const value = read(() => (strategy === 'tree'
         ? `tree ${sha(JSON.stringify(on.treeList(id)))}`
         : `${strategy} ${bytes(on.getState(id))} items=${on.getStateLen(id) ?? '-'}`));
-      out.push(`  ${branch}\t${id}\t${value}`);
+      out.push(`  ${branch}\t${id}\t${value}\tcount=${itemCount ?? '-'} ops=${opsSinceSnapshot ?? '-'}`);
       await turn();
       if (strategy !== 'tree' && !named(id)) {
         const history = [];
