@@ -127,9 +127,7 @@ const barriers = [
     store.appendToStateJson('messages', { channel: 'general', text: 'pending' });
     store.treeSet('files', 'd.txt', entry(blobHash));
     store.storeBlob(Buffer.from('last'), 'text/plain');
-    store.switchBranch('main');
-    store.close();
-  }],
+  }, () => store.close()],
   ['sync on a reopened store after appendJson', () => {
     store = JsStore.open({ path });
     store.appendJson('journal', { n: 3 });
@@ -137,13 +135,13 @@ const barriers = [
   }],
   ['close on a reopened store with a write pending', () => {
     store.appendJson('journal', { n: 4 });
-    store.close();
-  }],
+  }, () => store.close()],
 ];
 
-console.log(JSON.stringify(barriers.map(([label]) => label)));
+console.log(JSON.stringify(barriers.map(([label, , barrier]) => ({ label, pending: barrier !== undefined }))));
 mark('begin');
 writeFileSync(join(control, 'first'), 'unsynced');
+writeFileSync(join(control, 'other'), 'unsynced');
 mark('control-1');
 const file = openSync(join(control, 'first'), 'r+');
 fsyncSync(file);
@@ -153,11 +151,14 @@ const directory = openSync(control, 'r');
 fsyncSync(directory);
 closeSync(directory);
 mark('control-3');
-writeFileSync(join(control, 'second'), 'unsynced');
-renameSync(join(control, 'second'), join(control, 'third'));
+renameSync(join(control, 'other'), join(control, 'third'));
 mark('control-4');
-barriers.forEach(([, write], index) => {
+barriers.forEach(([, write, barrier], index) => {
   write();
+  if (barrier) {
+    mark(`pending-${index}`);
+    barrier();
+  }
   mark(`barrier-${index}`);
 });
 mark('end');

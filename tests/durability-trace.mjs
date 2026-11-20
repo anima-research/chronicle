@@ -185,17 +185,25 @@ function joinedCalls(text) {
   return { calls, unfinished: [...pending.values()] };
 }
 
+function descriptor(arg, cwd) {
+  if (arg === 'AT_FDCWD') return { path: cwd };
+  if (/^\d+$/.test(arg ?? '')) return { bare: true };
+  const match = /^(?:-?\d+|AT_FDCWD)<(.*)>$/s.exec(arg ?? '');
+  if (!match) return { path: null };
+  if (match[1].endsWith(' (deleted)')) return { deleted: normal(match[1].slice(0, -' (deleted)'.length)) };
+  return { path: normal(match[1]) };
+}
+
 export function readTrace(text, { root, cwd, names = [root] }) {
   const disk = new Disk(names);
   const marks = [];
   const unsyncedRenames = [];
   const problems = [];
-  const inRoot = path => path !== null && isUnder(path, root);
+  const inRoot = path => typeof path === 'string' && isUnder(path, root);
   const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const rootText = new RegExp(`[<"]${escapedRoot}(?=[/>"]| \\()`);
   const { calls, unfinished } = joinedCalls(text);
   const marksAt = [];
-  const problem = (call, why, at = marks.length) => problems.push({ at, line: call.line, why, call: call.text });
 
   for (const call of calls) {
     marksAt.push(marks.length);
@@ -205,12 +213,20 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       marks.push({ name: markName, files: [...disk.files], names: [...disk.names] });
       continue;
     }
-    if (name === 'io_uring_enter') {
-      problem(call, 'an io_uring_enter, whose requests the record does not show');
+    const anywhere = rootText.test(call.text) || rootText.test(rest);
+    const problem = why => problems.push({ at: marks.length, anywhere, line: call.line, why, call: call.text });
+    const written = arg => {
+      const d = descriptor(arg, cwd);
+      if (d.bare) problem('a descriptor that the record does not name');
+      else if (inRoot(d.deleted)) problem('a descriptor whose file has no name left');
+      return d.path ?? null;
+    };
+    if (name === 'io_uring_enter' || name === 'io_submit') {
+      problem(`an ${name}, whose requests the record does not show`);
       continue;
     }
     if (name === 'chdir' || name === 'fchdir') {
-      problem(call, 'a change of the working directory');
+      problem('a change of the working directory');
       continue;
     }
     if (name in OPENS) {
@@ -218,14 +234,17 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       const [dirIndex, pathIndex, flagIndex] = OPENS[name];
       const path = resolved(dirIndex === null ? null : args[dirIndex], args[pathIndex], cwd);
       if (path === null) {
-        if (rootText.test(call.text)) problem(call, 'an open whose path the record does not resolve');
+        problem('an open whose path the record does not resolve');
         continue;
       }
       if (!inRoot(path)) continue;
       const flags = flagIndex === null ? 'O_CREAT|O_WRONLY|O_TRUNC' : args[flagIndex];
-      if (flags.includes('O_TMPFILE')) problem(call, 'a file opened with O_TMPFILE');
-      else if (flags.includes('O_CREAT') && !disk.exists.has(path)) disk.made(path);
-      else if (flags.includes('O_TRUNC') && disk.exists.has(path)) disk.wrote(path);
+      if (flags.includes('O_TMPFILE')) {
+        problem('a file opened with O_TMPFILE');
+        continue;
+      }
+      if (flags.includes('O_CREAT') && !disk.exists.has(path)) disk.made(path);
+      if (flags.includes('O_TRUNC')) disk.wrote(path);
       continue;
     }
     if (name === 'mkdir' || name === 'mkdirat' || name === 'symlink' || name === 'symlinkat') {
@@ -236,23 +255,14 @@ export function readTrace(text, { root, cwd, names = [root] }) {
         symlink: () => resolved(null, args[1], cwd),
         symlinkat: () => resolved(args[1], args[2], cwd),
       }[name]();
-      if (path === null && rootText.test(call.text)) problem(call, 'a new name that the record does not resolve');
+      if (path === null) problem('a new name that the record does not resolve');
       else if (inRoot(path)) disk.made(path);
       continue;
     }
     if (name === 'link' || name === 'linkat') {
       if (!ok) continue;
-      const emptyPath = name === 'linkat' && quoted(args[1]) === '' && (args[4] ?? '').includes('AT_EMPTY_PATH');
-      const from = name === 'link' ? resolved(null, args[0], cwd)
-        : emptyPath ? describedPath(args[0], cwd) : resolved(args[0], args[1], cwd);
       const to = name === 'link' ? resolved(null, args[1], cwd) : resolved(args[2], args[3], cwd);
-      if (from === null || to === null) {
-        if (rootText.test(call.text)) problem(call, 'a link that the record does not resolve');
-        continue;
-      }
-      if (!inRoot(to)) continue;
-      disk.made(to);
-      if (disk.files.has(from)) disk.wrote(to);
+      if (to === null || inRoot(to) || anywhere) problem('a link, which the model does not follow');
       continue;
     }
     if (name === 'rename' || name === 'renameat' || name === 'renameat2') {
@@ -260,65 +270,77 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       const from = name === 'rename' ? resolved(null, args[0], cwd) : resolved(args[0], args[1], cwd);
       const to = name === 'rename' ? resolved(null, args[1], cwd) : resolved(args[2], args[3], cwd);
       if (from === null || to === null) {
-        if (rootText.test(call.text)) problem(call, 'a rename that the record does not resolve');
+        problem('a rename that the record does not resolve');
         continue;
       }
       if (!inRoot(from) && !inRoot(to)) continue;
       if (inRoot(from) !== inRoot(to) || /RENAME_EXCHANGE|RENAME_WHITEOUT/.test(args[4] ?? '')) {
-        problem(call, 'a rename that the model does not follow');
+        problem('a rename that the model does not follow');
         continue;
       }
-      if (disk.files.has(from)) unsyncedRenames.push({ from, to, at: marks.length, line: call.line });
+      if ([...disk.files].some(file => isUnder(file, from))) {
+        unsyncedRenames.push({ from, to, at: marks.length, line: call.line });
+      }
       disk.renamed(from, to);
       continue;
     }
     if (name === 'unlink' || name === 'unlinkat' || name === 'rmdir') {
       if (!ok) continue;
       const path = name === 'unlinkat' ? resolved(args[0], args[1], cwd) : resolved(null, args[0], cwd);
-      if (path === null && rootText.test(call.text)) problem(call, 'a removal that the record does not resolve');
+      if (path === null) problem('a removal that the record does not resolve');
       else if (inRoot(path)) disk.removed(path);
       continue;
     }
     if (name === 'truncate') {
+      if (!ok) continue;
       const path = resolved(null, args[0], cwd);
-      if (ok && inRoot(path)) disk.wrote(path);
+      if (path === null) problem('a truncation whose path the record does not resolve');
+      else if (inRoot(path)) disk.wrote(path);
       continue;
     }
     if (WRITES_TO_FIRST.has(name) || WRITES_TO_THIRD.has(name)) {
-      const path = describedPath(args[WRITES_TO_FIRST.has(name) ? 0 : 2], cwd);
+      const path = written(args[WRITES_TO_FIRST.has(name) ? 0 : 2]);
       if (ok && inRoot(path)) disk.wrote(path);
       continue;
     }
     if (name === 'fsync' || name === 'fdatasync') {
-      const path = describedPath(args[0], cwd);
+      const path = written(args[0]);
       if (ok && inRoot(path)) {
         if (name === 'fsync') disk.synced(path);
         else disk.datasynced(path);
       }
       continue;
     }
-    if (name === 'sync' || name === 'syncfs') {
+    if (name === 'sync') {
       if (ok) disk.syncedAll();
       continue;
     }
+    if (name === 'syncfs') {
+      const path = written(args[0]);
+      if (ok && inRoot(path)) disk.syncedAll();
+      continue;
+    }
     if (name === 'mmap') {
-      const shared = /MAP_SHARED/.test(args[3] ?? '') && /PROT_WRITE/.test(args[2] ?? '');
-      if (shared && inRoot(describedPath(args[4], cwd))) problem(call, 'a writable shared mapping of a file');
+      if (!/MAP_SHARED/.test(args[3] ?? '')) continue;
+      const d = descriptor(args[4], cwd);
+      if (d.bare || inRoot(d.path) || inRoot(d.deleted)) problem('a shared mapping of a file');
       continue;
     }
     if (NEUTRAL.has(name)) continue;
-    if (rootText.test(call.text) || rootText.test(rest)) problem(call, `a call that the model does not know: ${name}`);
+    if (anywhere) problem(`a call that the model does not know: ${name}`);
   }
 
   marksAt.push(marks.length);
   for (const call of unfinished) {
-    if (rootText.test(call.text)) problem(call, 'a call that did not return', marksAt[call.position]);
+    if (rootText.test(call.text)) {
+      problems.push({ at: marksAt[call.position], anywhere: true, line: call.line, why: 'a call that did not return', call: call.text });
+    }
   }
 
-  const first = marks.length > 0 ? 1 : Infinity;
+  const judged = ({ at }) => marks.length > 0 && at >= 1 && at < marks.length;
   return {
     marks,
-    unsyncedRenames,
-    problems: problems.filter(({ at }) => at >= first && at < marks.length),
+    unsyncedRenames: unsyncedRenames.filter(judged),
+    problems: problems.filter(entry => entry.anywhere || judged(entry)),
   };
 }

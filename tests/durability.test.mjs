@@ -7,7 +7,7 @@ import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { readTrace } from './durability-trace.mjs';
 
-const CALLS = '%file,%desc,mmap,munmap,msync,sync,syncfs,io_uring_setup,io_uring_enter,io_uring_register';
+const CALLS = '%file,%desc,mmap,munmap,msync,sync,syncfs,io_uring_setup,io_uring_enter,io_uring_register,io_setup,io_submit';
 const WRITER = fileURLToPath(new URL('./durability-writer.mjs', import.meta.url));
 const CONTROL_MARKS = ['control-1', 'control-2', 'control-3', 'control-4'];
 
@@ -33,15 +33,17 @@ function traceWriter() {
   const child = spawnSync('strace', ['-f', '-y', '-o', record, '-e', `trace=${CALLS}`, process.execPath, WRITER, root],
     { env, encoding: 'utf8', maxBuffer: 1 << 26 });
   const firstLine = child.stdout.split('\n')[0];
-  const labels = firstLine.startsWith('[') ? JSON.parse(firstLine) : null;
+  const barriers = firstLine.startsWith('[') ? JSON.parse(firstLine) : null;
+  const labels = barriers === null ? null : barriers.map(({ label }) => label);
   if (child.status !== 0) {
     const stderr = child.stderr.trim().split('\n').slice(-5).join(' | ');
     return { labels, failure: `the writer under strace ended with status ${child.status}: ${stderr}` };
   }
   const trace = readTrace(readFileSync(record, 'utf8'), { root, cwd: process.cwd(), names: [root, control] });
-  const expected = ['begin', ...CONTROL_MARKS, ...labels.map((_, index) => `barrier-${index}`), 'end'];
+  const expected = ['begin', ...CONTROL_MARKS,
+    ...barriers.flatMap(({ pending }, index) => pending ? [`pending-${index}`, `barrier-${index}`] : [`barrier-${index}`]), 'end'];
   const found = trace.marks.map(({ name }) => name);
-  const run = { labels, root, control, store: join(root, 'store'), trace, failure: null };
+  const run = { labels, barriers, root, control, store: join(root, 'store'), trace, failure: null };
   if (found.join('\n') !== expected.join('\n')) {
     run.failure = `the record's marks are not the writer's marks, each once and in order: found ${found.join(', ')}`;
   } else if (trace.problems.length > 0) {
@@ -70,25 +72,31 @@ if (skip) {
 } else if (run.labels === null) {
   test('strace records the writer from its start to its end', () => judged());
 } else {
-  test('The record shows a write, an fsync of a file, an fsync of a directory and a rename of a file that was not synced', () => {
+  test('The record shows writes, an fsync of one file, an fsync of a directory and a rename of a file that was not synced', () => {
     judged();
     const notMeasured = 'The instrument does not measure';
-    assert.deepEqual(unsyncedIn(at('control-1'), run.control), { files: ['first'], names: ['first'] },
-      `${notMeasured}: the record does not show a write that was not synced.`);
-    assert.deepEqual(unsyncedIn(at('control-2'), run.control), { files: [], names: ['first'] },
-      `${notMeasured}: the record does not show the fsync of a file. A library that LD_PRELOAD or /etc/ld.so.preload loads can answer fsync inside the C library.`);
-    assert.deepEqual(unsyncedIn(at('control-3'), run.control), { files: [], names: [] },
-      `${notMeasured}: the record does not show the fsync of a directory.`);
+    assert.deepEqual(unsyncedIn(at('control-1'), run.control), { files: ['first', 'other'], names: ['first', 'other'] },
+      `${notMeasured}: the record does not show two writes that were not synced.`);
+    assert.deepEqual(unsyncedIn(at('control-2'), run.control), { files: ['other'], names: ['first', 'other'] },
+      `${notMeasured}: the record does not show the fsync of one file, or the fsync clears more than that file. A library that LD_PRELOAD or /etc/ld.so.preload loads can answer fsync inside the C library.`);
+    assert.deepEqual(unsyncedIn(at('control-3'), run.control), { files: ['other'], names: [] },
+      `${notMeasured}: the record does not show the fsync of a directory, or the fsync clears a file.`);
+    assert.deepEqual(unsyncedIn(at('control-4'), run.control), { files: ['third'], names: ['third'] },
+      `${notMeasured}: the record does not follow a file and its name through a rename.`);
     const renames = run.trace.unsyncedRenames
       .filter(({ from, to }) => inside([from, to], run.control).length === 2)
       .map(({ from, to }) => `${posix.relative(run.control, from)} -> ${posix.relative(run.control, to)}`);
-    assert.deepEqual(renames, ['second -> third'],
+    assert.deepEqual(renames, ['other -> third'],
       `${notMeasured}: the record does not show the rename of a file that was not synced.`);
   });
 
   run.labels.forEach((label, index) => {
     test(`${label} returns after the store asks for each file that it wrote and each name that it made to be put on disk`, () => {
       judged();
+      if (run.barriers[index].pending) {
+        const pending = unsyncedIn(at(`pending-${index}`), run.store);
+        assert.ok(pending.files.length > 0, `Before ${label}, the store had no unsynced file, so the barrier had nothing to do`);
+      }
       const unsynced = unsyncedIn(at(`barrier-${index}`), run.store);
       assert.deepEqual(unsynced, { files: [], names: [] },
         `After ${label}, the store had not asked to put these on disk: files [${unsynced.files.join(', ')}], names [${unsynced.names.join(', ')}]`);
