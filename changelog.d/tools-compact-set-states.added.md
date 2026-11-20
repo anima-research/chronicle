@@ -27,8 +27,8 @@
   `records.log`, `state.bin` or `state-indexes.bin` as chronicle does. A run
   that stops at any point leaves a store that opens as before, or one that
   open refuses, and `--go-back` then undoes the run; after a run that
-  finished it puts the old files back while `records.log` and `state.bin`
-  are as the run left them.
+  finished it puts the old files back while both are there and
+  `records.log` and `state.bin` are as the run left them.
 - `tools/state-digests.mjs` prints digests of what chronicle's read gives on
   every branch of a store, and its current branch, with no content, so a
   store can be compared with itself before and after the tool. Given the

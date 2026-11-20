@@ -198,6 +198,29 @@ ${script}`, ...args], { cwd: tools });
   return run.stdout;
 }
 
+// The tool with each write, sync, link, rename and removal counted, killed after the stopAfter-th (0: never). It
+// prints how many it made when it is not killed.
+function stoppedTool(store, stopAfter, ...args) {
+  const run = spawnSync(PYTHON, ['-c', `
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+stop_after, seen = int(sys.argv[1]), [0]
+def counted(act):
+    def step(*args, **kwargs):
+        result = act(*args, **kwargs)
+        seen[0] += 1
+        if seen[0] == stop_after: os._exit(9)
+        return result
+    return step
+tool.write_file = counted(tool.write_file); tool.sync_dir = counted(tool.sync_dir)
+os.link = counted(os.link); os.replace = counted(os.replace); os.remove = counted(os.remove)
+code = tool.main(['compact-set-states.py'] + sys.argv[2:])
+print('steps %d' % seen[0])
+sys.exit(code)`, String(stopAfter), store, ...args], { encoding: 'utf8', cwd: tools });
+  return { status: run.status, out: run.stdout, err: run.stderr, steps: Number(run.stdout.match(/steps (\d+)/)?.[1]) };
+}
+
 function blockedStateBin(store) {
   return toolPython('sys.stdout.buffer.write(tool.blocked_state_bin(sys.argv[1]))', store);
 }
@@ -738,6 +761,7 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
         ['a state_id and no operation', msgpack(new Map([['state_id', WHOLE], ['hello', 1]])), 1, 'copied'],
         ['no record_id', msgpack(new Map([...update(new Map([['Set', Buffer.from('{}')]]))].filter(([key]) => key !== 'record_id'))), 1, 'refused'],
         ['a payload that does not parse', Buffer.from([0xc1, 0x00]), 1, 'refused'],
+        ['a map with a key that is no string', msgpack(new Map([[[1], 'x'], ['state_id', WHOLE]])), 1, 'refused'],
         ['a set in MessagePack', msgpack(update(new Map([['Set', Buffer.from('{"tail":1}')]]))), 1, 'refused'],
         ['a set in JSON', Buffer.from(JSON.stringify({ record_id: 9, global_sequence: last + 1, state_id: WHOLE, prev_update_offset: tailHead.record,
           operation: { Set: [...Buffer.from('{"tail":2}')] }, timestamp: Date.now() * 1000 })), 2, 'refused'],
@@ -1062,7 +1086,95 @@ sys.exit(tool.main(['compact-set-states.py', sys.argv[1], '--go-back']))`, halfw
       const reader = JsStore.open({ path: branched });
       assert.equal(reader.currentBranch().name, 'later', 'an empty branch made since the run should stay selected after --go-back');
       reader.close();
-      console.log('ok: --go-back after a finished run puts back the old files after a check, keeps an empty branch made and selected since, and refuses after a registration or a write');
+      const bare = join(scratch, 'finished-no-index');
+      cpSync(base, bare, { recursive: true });
+      rmSync(join(bare, 'state-indexes.bin'));
+      const bareFiles = filesOf(bare);
+      assert.equal(compact(bare, '--state', WHOLE, '--apply').status, 0, 'the run on a store with no state-indexes.bin should finish');
+      digest(bare, 'a store with no state-indexes.bin after a run');
+      assert.ok(existsSync(join(bare, 'state-indexes.bin')), 'the premise: the check makes a state-indexes.bin');
+      assert.equal(compact(bare, '--go-back').status, 0, '--go-back on a store that had no state-indexes.bin should go back');
+      const bareBack = filesOf(bare);
+      assert.deepEqual(trio(bareBack), trio(bareFiles), '--go-back should put back records.log and state.bin, and remove a state-indexes.bin made since the run, where the store had none');
+      assert.deepEqual(Object.keys(bareBack).sort(), Object.keys(bareFiles).sort(), '--go-back on a store that had no state-indexes.bin should leave no file of the run');
+      console.log('ok: --go-back after a finished run puts back the old files after a check, removes a state-indexes.bin made since where there was none, keeps an empty branch made and selected since, and refuses after a registration or a write');
+    },
+
+    'going back stopped, and old files missing': () => {
+      const { path: base } = branchedStore('back-stops');
+      const original = filesOf(base);
+      const blocked = (store) => readFileSync(join(store, 'state.bin')).subarray(0, 9).equals(Buffer.from('BLOCKED: '));
+      const count = (name) => {
+        const store = join(scratch, name);
+        cpSync(base, store, { recursive: true });
+        return stoppedTool(store, 0, '--state', WHOLE, '--apply').steps;
+      };
+      const runSteps = count('back-stops-count');
+      // Where the run is left: finished, stopped in the swap with the new log in place and state.bin blocked, or
+      // stopped before the swap with both old files' second names made.
+      const left = {
+        'the second names made': (name) => {
+          const store = join(scratch, name);
+          cpSync(base, store, { recursive: true });
+          assert.equal(stoppedTool(store, runSteps - 8, '--state', WHOLE, '--apply').status, 9, `the run on ${name} should be killed`);
+          assert.ok(!blocked(store) && existsSync(join(store, 'records.log.pre-compact')) && existsSync(join(store, 'state.bin.pre-compact')),
+            `the premise: after step ${runSteps - 8} the old files have second names and the swap has not begun`);
+          return store;
+        },
+        finished: (name) => {
+          const store = join(scratch, name);
+          cpSync(base, store, { recursive: true });
+          assert.equal(compact(store, '--state', WHOLE, '--apply').status, 0, `the run on ${name} should finish`);
+          return store;
+        },
+        'the new log in place': (name) => {
+          const store = join(scratch, name);
+          cpSync(base, store, { recursive: true });
+          assert.equal(stoppedTool(store, runSteps - 2, '--state', WHOLE, '--apply').status, 9, `the run on ${name} should be killed`);
+          assert.ok(blocked(store) && filesOf(store)['records.log'] !== original['records.log'],
+            `the premise: after step ${runSteps - 2} the new log is in place and state.bin is blocked`);
+          return store;
+        },
+      };
+      for (const [where, make] of Object.entries(left)) {
+        const counted = make(`back-${where.replaceAll(' ', '-')}-count`);
+        const back = stoppedTool(counted, 0, '--go-back');
+        assert.equal(back.status, 0, `--go-back after ${where} exited ${back.status}:\n${back.out}${back.err}`);
+        for (let k = 1; k <= back.steps; k++) {
+          const store = make(`back-${where.replaceAll(' ', '-')}-${k}`);
+          const stopped = stoppedTool(store, k, '--go-back');
+          assert.equal(stopped.status, 9, `--go-back after ${where}, stopped after its step ${k}, exited ${stopped.status}:\n${stopped.out}${stopped.err}`);
+          const again = compact(store, '--go-back');
+          assert.equal(again.status, 0, `--go-back again after ${where} and a stop after step ${k} exited ${again.status}:\n${again.out}${again.err}`);
+          assert.deepEqual(filesOf(store), original, `--go-back again after ${where} and a stop after step ${k} should leave every file as before the run, and none of the run`);
+        }
+        console.log(`ok: --go-back after ${where}, stopped after each of its ${back.steps} steps and run again, leaves every file as before the run`);
+        if (where === 'the second names made') continue;
+        for (const gone of ['records.log.pre-compact', 'state.bin.pre-compact']) {
+          const store = make(`back-${where.replaceAll(' ', '-')}-without-${gone}`);
+          rmSync(join(store, gone));
+          const unchanged = filesOf(store);
+          const refused = compact(store, '--go-back');
+          assert.equal(refused.status, 1, `--go-back after ${where} with ${gone} deleted exited ${refused.status}:\n${refused.out}${refused.err}`);
+          assert.ok(refused.out.includes('nothing to go back to'), `--go-back after ${where} with ${gone} deleted should say why:\n${refused.out}`);
+          assert.deepEqual(filesOf(store), unchanged, `--go-back after ${where} with ${gone} deleted should change no file`);
+          if (where === 'finished') {
+            const copy = join(scratch, `back-open-${gone}`);
+            cpSync(store, copy, { recursive: true });
+            JsStore.open({ path: copy }).close();
+          }
+        }
+        console.log(`ok: --go-back after ${where}, with either old file deleted by hand, refuses and changes no file`);
+      }
+      const finished = left.finished('back-finished-to-copy');
+      const copy = join(scratch, 'back-finished-copy');
+      cpSync(finished, copy, { recursive: true });
+      const unchanged = filesOf(copy);
+      const refused = compact(copy, '--go-back');
+      assert.equal(refused.status, 1, `--go-back on a copy of a finished store exited ${refused.status}:\n${refused.out}${refused.err}`);
+      assert.ok(refused.out.includes('as after a copy of the store'), `--go-back on a copy of a finished store should say why:\n${refused.out}`);
+      assert.deepEqual(filesOf(copy), unchanged, '--go-back on a copy of a finished store should change no file');
+      console.log('ok: --go-back on a copy of a finished store refuses and changes no file');
     },
 
     'a linked log and a linked state.bin': () => {

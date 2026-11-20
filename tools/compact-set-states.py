@@ -6,7 +6,7 @@ every write keeps every earlier value on disk. A read of a state walks back from
 its head along `prev_update_offset` and stops at the first `Set` or `Snapshot`.
 The tool walks the links from each head in state.bin, for every state, to each
 chain's end. A state that a --state pattern names must be such a state: each
-update of it that the walk reaches a Set or a Snapshot. Of it, this tool keeps
+update of it that the walk reaches must be a Set or a Snapshot. Of it, this tool keeps
 what a read reads, the update that each head in state.bin names, and it drops
 the other updates of that state that the walk reaches. Every other record is
 copied. A state update that the walk reaches is rewritten where its
@@ -102,14 +102,18 @@ On a host:
      state.bin.compact-run to free the space.
 A --state pattern is literal text in which each * stands for any text.
 
---go-back, with the host stopped, acts by where the run is. Where state.bin is
-the blocked file, it puts the old files back. Where the swap had not begun, it
-removes the run's files and changes no live file. After a run that finished, it
-puts the old records.log, state.bin and state-indexes.bin back, with the blocked
-file in place while it does, only while records.log and state.bin are as the run
-left them, and it leaves branches.bin as it is. Once the host has written, it
-refuses: undoing the run then loses every write since, and this tool does not
-do it.
+--go-back, with the host stopped, finds where the run is from the run's record,
+state.bin.compact-run, which the run writes before the old files get their
+second names and which --go-back removes last. The record holds the new log's
+inode. Where records.log is the new log, going back needs both old files, and
+it refuses without them. After a run that finished, it puts the old
+records.log, state.bin and state-indexes.bin back, with the blocked file in
+place while it does, only while records.log and state.bin are as the run left
+them, and it leaves branches.bin as it is. Where state.bin is the blocked file,
+it puts the old files back. Where the swap had not begun, it removes the run's
+files and changes no live file. A going back that stops can be run again. Once
+the host has written, it refuses: undoing the run then loses every write since,
+and this tool does not do it.
 
 The tool needs free space for the new log, the size of what it keeps, a file
 system with hard links, and memory of a few hundred bytes for each record of the
@@ -298,6 +302,8 @@ def read_update(rec, enc, payload):
             value, form = json.loads(payload, object_pairs_hook=MpMap), 'json'
     except DECODE_ERRORS:
         return
+    if isinstance(value, MpMap) and not all(isinstance(key, str) for key, _ in value):
+        return  # a key that is no string: chronicle's decode may still read the map by field numbers
     rec.shaped = False
     if isinstance(value, MpMap):
         keys = [key for key, _ in value]
@@ -602,7 +608,8 @@ def plan(recs, heads, patterns, branches):
             prior = by_offset.get(r.prev)
             if prior is None or not prior.update or prior.sid != r.sid:
                 raise Refusal('the state update of %s at offset %d links to offset %d, where no state update of %s '
-                              'is, so chronicle\'s read of %s fails there too.' % (r.sid, r.offset, r.prev, r.sid, r.sid))
+                              'is. chronicle links each update to an update of its own state, so records.log is not '
+                              'as chronicle wrote it.' % (r.sid, r.offset, r.prev, r.sid))
             r = prior
     named = lambda sid: any(pattern_matches(p, sid) for p in patterns)
     for r in recs:
@@ -622,8 +629,9 @@ def plan(recs, heads, patterns, branches):
         length = r.length
         if r.update and r.prev is not None and r.offset in reached:
             if r.prev not in drop and r.prev not in new_offset:
-                raise Refusal('the state update of %s at offset %d links to offset %d, where no earlier record is, so '
-                              'chronicle\'s read of %s fails there too.' % (r.sid, r.offset, r.prev, r.sid))
+                raise Refusal('the state update of %s at offset %d links to offset %d, where no earlier record is. '
+                              'chronicle links each update to an earlier one, so records.log is not as chronicle wrote '
+                              'it.' % (r.sid, r.offset, r.prev))
             link = None if r.prev in drop else new_offset[r.prev]
             if link != r.prev:
                 if r.form != 'map':
@@ -728,8 +736,9 @@ def compact(files, patterns, apply, state_bin):
         made.append(files.new_sb); write_file(files.new_sb, [state_bin_bytes([new_heads, index[1]])], sb_stat)
         made.append(files.blocked); write_file(files.blocked, [blocked_state_bin(files.store)], sb_stat)
         made.append(files.marker)
-        write_file(files.marker, [json.dumps(what_the_run_left(os.stat(files.new_log).st_ino, new_size,
-                                                               [new_heads, index[1]])).encode('utf-8')], sb_stat)
+        left = what_the_run_left(os.stat(files.new_log).st_ino, new_size, [new_heads, index[1]])
+        left['state-indexes.bin'] = os.path.exists(files.indexes)
+        write_file(files.marker, [json.dumps(left).encode('utf-8')], sb_stat)
         for path in (files.log, files.sb):
             made.append(path + '.pre-compact'); os.link(path, path + '.pre-compact')
         for directory in {os.path.dirname(files.log), os.path.dirname(files.sb)}: sync_dir(directory)
@@ -761,50 +770,77 @@ def compact(files, patterns, apply, state_bin):
 def go_back(store):
     def act():
         files = Files(store)
+        old_log, old_sb, old_indexes = files.kept
         staging, kept = files.found(files.staging), files.found(files.kept)
-        marker = files.marker if os.path.lexists(files.marker) else None
-        blocked = read_bytes(files.sb).startswith(BLOCKED)
-        if not (blocked or staging or kept or marker):
-            print('No file of a compact-set-states.py run is in %s, so nothing changed.' % store); return
-        if blocked:
-            if not os.path.lexists(files.sb + '.pre-compact'):
-                raise Refusal('state.bin is the blocked file, and the old state.bin, %s.pre-compact, is not there to '
-                              'put back.' % files.sb)
-            steps = [('put back', files.log), ('put back', files.indexes), ('put back', files.sb)]
-            said = 'went back: the files of the store are as they were before the run, and no file of the run is left.'
-        elif staging:
-            steps = [('remove', files.log), ('remove', files.sb)]
-            said = 'removed the files of the run, whose swap had not begun. No file of the store changed.'
+        other = lambda old, live: os.path.lexists(old) and not os.path.samestat(os.lstat(old), os.lstat(live))
+        steps = []
+        if not os.path.lexists(files.marker):
+            # A run writes its record before the old files get their second names, so no live file has changed.
+            if kept:
+                raise Refusal('%s %s in the store, and the record of the run, %s, is not, so --go-back can\'t tell '
+                              'where that run stopped. %s' % (', '.join(kept), 'is' if len(kept) == 1 else 'are',
+                                                             files.marker, finished_text(files, kept)))
+            if not staging:
+                print('No file of a compact-set-states.py run is in %s, so nothing changed.' % store); return
+            said = 'removed the files of a run that stopped before it wrote its record. No file of the store changed.'
         else:
-            if marker is None:
-                raise Refusal('the run that left %s finished, and its record, %s, is not there, so --go-back can\'t '
-                              'tell whether the store changed since. %s' % (', '.join(kept), files.marker,
-                                                                           finished_text(files, kept)))
-            changed = run_changed(files, marker)
-            if changed:
-                raise Refusal('%s has changed since the run finished, so going back would lose what changed. Undoing '
-                              'the run is then outside what this tool does.' % changed)
-            steps = [('block', files.sb), ('put back', files.log), ('put back or remove', files.indexes),
-                     ('put back', files.sb)]
-            said = ('went back after a finished run: records.log, state.bin and state-indexes.bin are as they were '
-                    'before it, and no file of the run is left. branches.bin is as it is now.')
+            left = read_record(files.marker)
+            log_is_new = os.stat(files.log).st_ino == left['records.log'][0]
+            blocked = read_bytes(files.sb).startswith(BLOCKED)
+            if log_is_new:
+                missing = [old for old, live in ((old_log, files.log), (old_sb, files.sb)) if not other(old, live)]
+                if missing:
+                    run_files = files.found(files.staging + files.kept + (files.marker,))
+                    raise Refusal('records.log is the log that the run wrote, and %s, the old file that going back puts '
+                                  'in its place, is not there, so there is nothing to go back to. If the check of the '
+                                  'store is equal to the check from before the run, delete %s.'
+                                  % (' and '.join(missing), ', '.join(run_files)))
+                if blocked:
+                    said = ('went back: the files of the store are as they were before the run, and no file of the run '
+                            'is left.')
+                else:
+                    changed = run_changed(files, left)
+                    if changed:
+                        raise Refusal('%s has changed since the run finished, so going back would lose what changed. '
+                                      'Undoing the run is then outside what this tool does.' % changed)
+                    steps.append(('block', files.sb))
+                    said = ('went back after a finished run: records.log, state.bin and state-indexes.bin are as they '
+                            'were before it, and no file of the run is left. branches.bin is as it is now.')
+                # A state-indexes.bin that the store had is put back. One made since a store with none is removed.
+                indexes = 'put back' if left['state-indexes.bin'] else 'put back or remove'
+                steps += [(indexes, files.indexes), ('put back', files.log), ('put back', files.sb)]
+            else:
+                if other(old_log, files.log):
+                    raise Refusal('records.log is not the log that the run wrote, and %s is another file than '
+                                  'records.log, so the run\'s record, %s, does not belong to these files, as after a copy '
+                                  'of the store.' % (old_log, files.marker))
+                if blocked:
+                    if not os.path.lexists(old_sb):
+                        raise Refusal('state.bin is the blocked file, and the old state.bin, %s, is not there to put '
+                                      'back.' % old_sb)
+                    steps = [('put back', files.indexes), ('put back', files.sb)]
+                    said = ('went back: the files of the store are as they were before the run, and no file of the run '
+                            'is left.')
+                else:
+                    said = ('removed the files of the run, whose swap had not begun or had been undone. No file of the '
+                            'store changed.')
         try:
             for step, live in steps:
                 old = live + '.pre-compact'
                 if step == 'block':
+                    if os.path.lexists(files.blocked): os.remove(files.blocked)
                     write_file(files.blocked, [blocked_state_bin(store)], os.stat(live))
                     os.replace(files.blocked, live)
                 elif os.path.lexists(old):
-                    if step == 'remove' or (os.path.lexists(live) and os.path.samestat(os.lstat(old), os.lstat(live))):
-                        os.remove(old)
-                    else:
-                        os.replace(old, live)
+                    os.replace(old, live)
                 elif step == 'put back or remove' and os.path.lexists(live):
                     os.remove(live)
                 else:
                     continue
                 sync_dir(os.path.dirname(live))
-            for path in files.found(files.staging + (files.marker,)):
+            # What is left: the staging files, second names of the live files, and a state.bin.pre-compact that a
+            # host made stale by saving state.bin since a stop before the swap. The record goes last.
+            for path in files.found(files.staging + (old_log, old_sb, files.marker)):
                 os.remove(path); sync_dir(os.path.dirname(path))
         except BaseException as error:
             raise Stopped('going back stopped (%s: %s). Run compact-set-states.py %s --go-back again, with the host '
@@ -813,12 +849,19 @@ def go_back(store):
     locked(store, act)
 
 
-def run_changed(files, marker):
-    """Which of records.log and state.bin differs from what the finished run left, or None."""
+def read_record(marker):
     try:
         left = json.loads(read_bytes(marker))
     except ValueError:
+        left = None
+    if not (isinstance(left, dict) and isinstance(left.get('records.log'), list) and len(left['records.log']) == 2
+            and isinstance(left.get('state-indexes.bin'), bool)):
         raise Refusal('%s is not the record of a run that this tool reads.' % marker)
+    return left
+
+
+def run_changed(files, left):
+    """Which of records.log and state.bin differs from what the finished run left, or None."""
     log = os.stat(files.log)
     now = what_the_run_left(log.st_ino, log.st_size, read_state_bin(read_bytes(files.sb)))
     if now['records.log'] != left.get('records.log'): return 'records.log'
