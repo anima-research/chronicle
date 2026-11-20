@@ -1,48 +1,75 @@
 #!/usr/bin/env python3
-"""Reclaim records.log space held by superseded whole-state writes.
+"""Free the space in records.log that old values of named states hold.
 
-Chronicle's record log is append-only: a state that is rewritten with `Set`
-(or re-snapshotted) on every write keeps every previous value on disk
-forever, and reconstruction never reads past the newest terminal operation
-(`Set`, `Snapshot`, `Delta`). This tool rewrites `records.log` without the
-records of the named states that lie BEFORE their newest terminal operation,
-re-links the surviving chains, and remaps `state.bin`. Nothing about the
-reconstructed value of any state changes; the states not named are copied
-untouched, record ids and sequences are preserved (the log simply has gaps),
-and `state-indexes.bin` is removed so the store rebuilds it on open.
+Chronicle's record log is append-only: a state that is rewritten with `Set` on
+every write keeps every earlier value on disk. A read of a state walks back from
+its head along `prev_update_offset` and stops at the first `Set` or `Snapshot`.
+For each state that a --state pattern names, this tool keeps what such a walk
+reads, from every head that state.bin holds and from every state update that lies
+after the newest head (open replays those), and drops every other update of that
+state. Every other record is copied. A state update is rewritten only where its
+`prev_update_offset` must change, and then gets a new checksum. state.bin gets
+the new offsets, and every counter in it stays as chronicle wrote it.
 
-Only states whose newest operation (or an operation between it and the head)
-is terminal can be compacted; an append-log state whose history is all
-`Append`s is refused, because every record of it is live.
+What is lost: the old values of each named state. A read of a named state at an
+older sequence gives nothing, and a branch made later at an older point does not
+hold the state. So name only a state whose old values nothing reads, such as
+agent-framework's push coalescer table, `mcpl/coalescing`
+(anima-research/agent-framework#1028). A field index that a caller registered is
+gone after the run, and the caller registers it again; state-indexes.bin is kept
+as state-indexes.bin.pre-compact.
 
-Safety:
-  * refuses while the store is open (flock on LOCK),
-  * refuses a multi-branch store (a child branch's chains walk the parent's
-    records),
-  * refuses when `state.bin` does not agree with the log (head offsets must be
-    the last record of each state: stop the agent cleanly first),
-  * refuses a torn or corrupt log (run trim-records-log.py first),
-  * dry-run by default; `--apply` swaps the files in and keeps the originals
-    as `records.log.pre-compact` / `state.bin.pre-compact` until you delete
-    them.
+It refuses, and changes nothing, when:
+  * the store is open (it can't take the lock on LOCK),
+  * a head in state.bin does not name the last state update of its branch and
+    state, so state.bin is older than records.log (start and stop the store's
+    host once, which saves state.bin),
+  * the log is torn, or a record fails its checksum,
+  * a state update in the JSON form that releases before 0.3.0 wrote needs a
+    new link (the tool rewrites the MessagePack form only),
+  * a file of an earlier run is in the store.
+
+The swap: the tool writes the new records.log and state.bin whole, beside the
+old ones. Then the old log gets a second name, records.log.pre-compact, by a hard
+link, state.bin is copied to state.bin.pre-compact, and state-indexes.bin moves
+to state-indexes.bin.pre-compact. A blocked state.bin, which chronicle refuses
+to open, takes state.bin's place, then the new log takes records.log's place, and
+then the new state.bin takes the blocked one's place. So a run that stops at any
+point leaves a store that opens as before, or one that open refuses.
+
+On a host:
+  1. Update the writer, so it no longer writes what the run frees.
+  2. Stop the host.
+  3. Check:   CHRONICLE_MODULE=<chronicle package> node state-digests.mjs <store-dir> > before.txt
+  4. Run:     compact-set-states.py <store-dir> --state <glob>           (a dry run)
+              compact-set-states.py <store-dir> --state <glob> --apply
+  5. Check:   ... node state-digests.mjs <store-dir> > after.txt
+  6. Compare: diff before.txt after.txt shows nothing.
+  7. Start the host.
+  8. Delete records.log.pre-compact, state.bin.pre-compact and
+     state-indexes.bin.pre-compact to free the space.
+To go back instead, with the host stopped, see go_back() below, or the text of
+a blocked state.bin.
+
+The tool needs free space for the new log, the size of what it keeps, and a
+file system with hard links.
 
 Usage:
     compact-set-states.py <store-dir> --state <glob> [--state <glob> ...] [--apply]
 
-Example (kv-unified presentation receipts, context-manager #148):
-    compact-set-states.py data/sessions/<id> --state 'agents/*/kvunified:presentation-receipt' --apply
-
-Verify with tools/state-digests.mjs before and after; the digests must match.
-Python 3.9+, no dependencies.
+Python 3.9+, no dependencies. Exit 0: done or dry run; 1: refused; 2: usage.
 """
 import fcntl
 import fnmatch
+import json
 import os
+import shutil
+import stat
 import struct
 import sys
 import zlib
 
-TERMINAL_OPS = ('Set', 'Snapshot', 'Delta')
+STARTS = ('Set', 'Snapshot')  # where chronicle's read of a chain stops (src/state/chain_walk.rs)
 
 # ── minimal MessagePack ────────────────────────────────────────────────────
 
@@ -149,114 +176,305 @@ def map_get(m, key):
     return None
 
 
-def map_set(m, key, value):
-    for idx, (k, _) in enumerate(m):
-        if k == key:
-            m[idx] = (k, value); return
-    m.append((key, value))
-
-
 # ── records.log framing ────────────────────────────────────────────────────
 
 MAGIC = b'REC\0'
+MESSAGEPACK = 1  # a record's encoding byte; earlier releases wrote state updates as JSON
+
+
+class Refusal(Exception):
+    pass
 
 
 class Rec:
-    __slots__ = ('offset', 'length', 'branch', 'rtype', 'sid', 'op', 'prev', 'seq')
+    __slots__ = ('offset', 'length', 'branch', 'update', 'json', 'sid', 'op', 'prev', 'payload_at', 'prev_at', 'prev_end')
 
-    def __init__(self, offset, length, branch, rtype, sid, op, prev, seq):
-        self.offset, self.length, self.branch, self.rtype = offset, length, branch, rtype
-        self.sid, self.op, self.prev, self.seq = sid, op, prev, seq
+    def __init__(self, offset, length, branch):
+        self.offset, self.length, self.branch = offset, length, branch
+        self.update = self.json = False
+        self.sid = self.op = self.prev = self.payload_at = self.prev_at = self.prev_end = None
+
+
+def read_update(rec, enc, payload):
+    """Fill in rec as a state update when its payload decodes as one. A record typed
+    state_update that doesn't decode stays an ordinary record, as chronicle keeps it."""
+    try:
+        if enc == MESSAGEPACK:
+            m, end = mp_decode(payload)
+            if end != len(payload) or not isinstance(m, MpMap): return
+            fields = dict(m)
+            at = 1 if payload[0] <= 0x8F else (3 if payload[0] == 0xDE else 5)
+            for key, _ in m:
+                _, value_at = mp_decode(payload, at)
+                _, value_end = mp_decode(payload, value_at)
+                if key == 'prev_update_offset': rec.prev_at, rec.prev_end = value_at, value_end
+                at = value_end
+        else:
+            fields = json.loads(payload)
+            rec.json = True
+        sid, op, prev = fields['state_id'], fields['operation'], fields.get('prev_update_offset')
+        kind = op if isinstance(op, str) else op[0][0] if isinstance(op, MpMap) else next(iter(op))
+    except (ValueError, KeyError, TypeError, IndexError, StopIteration, struct.error, UnicodeDecodeError):
+        rec.json = False; rec.prev_at = rec.prev_end = None
+        return
+    if not isinstance(sid, str) or not (prev is None or isinstance(prev, int)): return
+    if enc == MESSAGEPACK and rec.prev_at is None: return
+    rec.update, rec.sid, rec.op, rec.prev = True, sid, kind, prev
 
 
 def scan_log(path):
-    """Yield Rec for every record; raise on a torn or corrupt log."""
+    recs = []
     size = os.path.getsize(path)
     with open(path, 'rb') as f:
         def need(n):
             b = f.read(n)
-            if len(b) != n: raise ValueError('short read at %d (torn tail?)' % (f.tell() - len(b)))
+            if len(b) != n: raise Refusal('records.log is torn at offset %d; run trim-records-log.py first' % (f.tell() - len(b)))
             return b
         while f.tell() < size:
             start = f.tell()
-            if need(4) != MAGIC: raise ValueError('bad magic at %d' % start)
+            if need(4) != MAGIC: raise Refusal('records.log has no record at offset %d; run trim-records-log.py first' % start)
             ver = need(1)[0]
-            if ver != 1: raise ValueError('unknown record version %d at %d' % (ver, start))
+            if ver != 1: raise Refusal('the record at offset %d of records.log has version %d, which this tool does not read' % (start, ver))
             need(1)
-            _rid, seq, br, _ts = struct.unpack('<QQQq', need(32))
-            tlen = struct.unpack('<H', need(2))[0]; rtype = need(tlen).decode('utf-8')
+            _rid, _seq, branch, _ts = struct.unpack('<QQQq', need(32))
+            rtype = need(struct.unpack('<H', need(2))[0])
             enc = need(1)[0]
-            plen = struct.unpack('<I', need(4))[0]
-            sid = op = prev = None
-            if rtype == 'state_update':
-                if enc != 1: raise ValueError('state_update at %d is not MessagePack (enc=%d)' % (start, enc))
-                payload = need(plen)
-                m, _ = mp_decode(payload)
-                sid = map_get(m, 'state_id'); prev = map_get(m, 'prev_update_offset')
-                opv = map_get(m, 'operation')
-                op = opv if isinstance(opv, str) else opv[0][0]
-            else:
-                f.seek(plen, 1)
-            cbc = struct.unpack('<H', need(2))[0]; need(8 * cbc)
-            ltc = struct.unpack('<H', need(2))[0]; need(8 * ltc)
-            need(4)
-            yield Rec(start, f.tell() - start, br, rtype, sid, op, prev, seq)
-
-
-def read_record_bytes(f, rec):
-    f.seek(rec.offset)
-    return f.read(rec.length)
-
-
-def rewrite_prev(raw, new_prev):
-    """Return the record bytes with payload.prev_update_offset = new_prev and a fresh CRC."""
-    i = 4 + 1 + 1 + 32
-    tlen = struct.unpack_from('<H', raw, i)[0]; i += 2 + tlen
-    i += 1  # encoding
-    plen = struct.unpack_from('<I', raw, i)[0]; pstart = i + 4
-    payload = raw[pstart:pstart + plen]
-    m, end = mp_decode(payload)
-    if end != plen: raise ValueError('payload has trailing bytes')
-    map_set(m, 'prev_update_offset', new_prev)
-    new_payload = mp_encode(m)
-    tail = raw[pstart + plen:len(raw) - 4]  # caused_by + linked_to
-    return (raw[:i] + struct.pack('<I', len(new_payload)) + new_payload + tail
-            + struct.pack('<I', zlib.crc32(new_payload) & 0xFFFFFFFF))
+            payload_at = f.tell() + 4 - start
+            payload = need(struct.unpack('<I', need(4))[0])
+            for _ in range(2): need(8 * struct.unpack('<H', need(2))[0])
+            if struct.unpack('<I', need(4))[0] != zlib.crc32(payload) & 0xFFFFFFFF:
+                raise Refusal('the record at offset %d of records.log fails its checksum' % start)
+            rec = Rec(start, f.tell() - start, branch)
+            if rtype == b'state_update':
+                read_update(rec, enc, payload)
+                rec.payload_at = payload_at
+            recs.append(rec)
+    return recs
 
 
 # ── state.bin ──────────────────────────────────────────────────────────────
 
 STI_MAGIC = b'STI\0'
 STI_VERSION = 2
+HEAD, LAST_DELTA, LAST_FULL = 0, 3, 4  # offsets in a StateChainHead's eight fields
+BLOCKED = b'BLOCKED: '
 
 
 def read_state_bin(path):
     with open(path, 'rb') as f:
-        if f.read(4) != STI_MAGIC: raise ValueError('state.bin: bad magic')
-        if f.read(1)[0] != STI_VERSION: raise ValueError('state.bin: unsupported version')
-        n = struct.unpack('<Q', f.read(8))[0]
-        enc = f.read(n)
-    index, end = mp_decode(enc)
-    if end != n: raise ValueError('state.bin: trailing bytes')
+        data = f.read()
+    if data[:4] != STI_MAGIC: raise Refusal('state.bin is not a state index')
+    if data[4] != STI_VERSION: raise Refusal('state.bin has version %d, which this tool does not read' % data[4])
+    n = struct.unpack_from('<Q', data, 5)[0]
+    index, end = mp_decode(data[13:13 + n])
+    if end != n or len(data) != 13 + n: raise Refusal('state.bin has bytes after its index')
     # rmp_serde::to_vec: StateIndex = [heads: map{[branch, state_id] -> [8 fields]}, strategies: map]
-    if not (isinstance(index, list) and len(index) == 2 and isinstance(index[0], MpMap)):
-        raise ValueError('state.bin: unexpected StateIndex shape')
+    if not (isinstance(index, list) and len(index) == 2 and isinstance(index[0], MpMap)
+            and all(isinstance(h, list) and len(h) == 8 for _, h in index[0])):
+        raise Refusal('state.bin does not hold the state index this tool reads')
     return index
 
 
-def write_state_bin(path, index):
+def state_bin_bytes(index):
     enc = mp_encode(index)
-    tmp = path + '.tmp'
-    with open(tmp, 'wb') as f:
-        f.write(STI_MAGIC); f.write(bytes([STI_VERSION])); f.write(struct.pack('<Q', len(enc))); f.write(enc)
+    return STI_MAGIC + bytes([STI_VERSION]) + struct.pack('<Q', len(enc)) + enc
+
+
+def go_back(store):
+    return ('With the host stopped, in %s: rename records.log.pre-compact to records.log, state.bin.pre-compact to '
+            'state.bin and state-indexes.bin.pre-compact to state-indexes.bin, each that is there, and delete '
+            'records.log.compact, state.bin.compact and state.bin.blocked. The store is then as it was before the run.'
+            % store)
+
+
+def blocked_state_bin(store):
+    """The bytes that stand in for state.bin while the tool swaps the files. They don't begin with STI\\0, so
+    chronicle refuses to open the store."""
+    return BLOCKED + ('compact-set-states.py stopped while it swapped records.log and state.bin, so this store is '
+                      'not whole. Go back: %s\n' % go_back(store)).encode('utf-8')
+
+
+def blocked_text(data):
+    return 'state.bin is the blocked file of a compact-set-states.py run that stopped: ' + data[len(BLOCKED):].decode('utf-8', 'replace').strip()
+
+
+# ── the run ────────────────────────────────────────────────────────────────
+
+LEFT_BY_A_RUN = ('records.log.compact', 'state.bin.compact', 'state.bin.blocked',
+                 'records.log.pre-compact', 'state.bin.pre-compact', 'state-indexes.bin.pre-compact')
+
+
+def earlier_run(store):
+    with open(os.path.join(store, 'state.bin'), 'rb') as f:
+        start = f.read(len(BLOCKED) + 4096)
+    if start.startswith(BLOCKED): raise Refusal(blocked_text(start))
+    found = [name for name in LEFT_BY_A_RUN if os.path.lexists(os.path.join(store, name))]
+    if not found: return
+    unfinished = [name for name in found if not name.endswith('.pre-compact')]
+    if unfinished:
+        raise Refusal('%s from a run that stopped before its swap finished %s in the store. %s'
+                      % (', '.join(unfinished), 'is' if len(unfinished) == 1 else 'are', go_back(store)))
+    raise Refusal('%s from an earlier run %s in the store. If that run finished and its check before and after was '
+                  'equal, delete them to free the space. Otherwise go back: %s'
+                  % (', '.join(found), 'is' if len(found) == 1 else 'are', go_back(store)))
+
+
+def plan(recs, heads, patterns):
+    by_offset = {r.offset: r for r in recs}
+    last = {}
+    for r in recs:
+        if r.update: last[(r.branch, r.sid)] = r
+    for key, head in heads:
+        branch, sid = key[0], key[1]
+        at = by_offset.get(head[HEAD])
+        if at is None or not at.update or at.sid != sid:
+            raise Refusal('state.bin names offset %s as the head of %s on branch %d, and no state update of %s is '
+                          'there' % (head[HEAD], sid, branch, sid))
+        for snapshot in (head[LAST_DELTA], head[LAST_FULL]):
+            if snapshot is not None and snapshot not in by_offset:
+                raise Refusal('state.bin names offset %s as a snapshot of %s on branch %d, and no record is there'
+                              % (snapshot, sid, branch))
+        newest = last.get((branch, sid))
+        if newest is not None and newest.offset != at.offset:
+            raise Refusal('state.bin is older than records.log: its head of %s on branch %d is at offset %d, and the '
+                          'last state update of it there is at offset %d. Start and stop the store\'s host once, '
+                          'which saves state.bin, and run again' % (sid, branch, at.offset, newest.offset))
+    named = lambda sid: any(fnmatch.fnmatchcase(sid, p) for p in patterns)
+    newest_head = max((head[HEAD] for _, head in heads), default=-1)
+    starts = [by_offset[head[HEAD]] for key, head in heads if named(key[1])]
+    starts += [r for r in recs if r.update and r.offset > newest_head and named(r.sid)]
+    keep = set()
+    for r in starts:
+        while r is not None and r.offset not in keep:
+            keep.add(r.offset)
+            if r.op in STARTS or r.prev is None: break
+            prior = by_offset.get(r.prev)
+            if prior is None or not prior.update or prior.sid != r.sid:
+                raise Refusal('the state update of %s at offset %d links to offset %d, where no state update of %s '
+                              'is' % (r.sid, r.offset, r.prev, r.sid))
+            r = prior
+    drop = {r.offset for r in recs if r.update and named(r.sid) and r.offset not in keep}
+
+    new_offset, links, at = {}, {}, 0
+    for r in recs:
+        if r.offset in drop: continue
+        new_offset[r.offset] = at
+        length = r.length
+        if r.update and r.prev is not None:
+            if r.prev not in drop and r.prev not in new_offset:
+                raise Refusal('the state update of %s at offset %d links to offset %d, where no earlier record is'
+                              % (r.sid, r.offset, r.prev))
+            link = None if r.prev in drop else new_offset[r.prev]
+            if link != r.prev:
+                if r.json:
+                    raise Refusal('the JSON state update of %s at offset %d needs a new link, and this tool rewrites '
+                                  'the MessagePack form only' % (r.sid, r.offset))
+                links[r.offset] = link
+                length += len(mp_encode(link)) - (r.prev_end - r.prev_at)
+        at += length
+    return drop, new_offset, links, at
+
+
+def relinked(raw, rec, link):
+    plen_at = rec.payload_at - 4
+    payload = raw[rec.payload_at:rec.payload_at + struct.unpack_from('<I', raw, plen_at)[0]]
+    new = payload[:rec.prev_at] + mp_encode(link) + payload[rec.prev_end:]
+    tail = raw[rec.payload_at + len(payload):-4]  # caused_by and linked_to
+    return raw[:plen_at] + struct.pack('<I', len(new)) + new + tail + struct.pack('<I', zlib.crc32(new) & 0xFFFFFFFF)
+
+
+def write_file(path, chunks, like):
+    with open(path, 'wb') as f:
+        for chunk in chunks: f.write(chunk)
         f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, path)
+    os.chmod(path, stat.S_IMODE(like.st_mode))
+    if (like.st_uid, like.st_gid) != (os.stat(path).st_uid, os.stat(path).st_gid):
+        os.chown(path, like.st_uid, like.st_gid)
 
 
-# ── main ───────────────────────────────────────────────────────────────────
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
 
 def human(n):
     return '%.1f MB' % (n / 1e6)
+
+
+def run(store, patterns, apply):
+    log_path = os.path.join(store, 'records.log'); sb_path = os.path.join(store, 'state.bin')
+    for p in (log_path, sb_path):
+        if not os.path.exists(p): raise Refusal('%s is missing' % p)
+    earlier_run(store)
+    lock = open(os.path.join(store, 'LOCK'), 'a+')
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise Refusal('%s is locked: the store is open. Stop its host first' % os.path.join(store, 'LOCK'))
+
+    print('scanning %s (%s)' % (log_path, human(os.path.getsize(log_path))))
+    recs = scan_log(log_path)
+    index = read_state_bin(sb_path)
+    heads = index[0]
+    drop, new_offset, links, new_size = plan(recs, heads, patterns)
+
+    by_state = {}
+    for r in recs:
+        if r.offset in drop:
+            n, b = by_state.get(r.sid, (0, 0)); by_state[r.sid] = (n + 1, b + r.length)
+    named = sorted({r.sid for r in recs if r.update and any(fnmatch.fnmatchcase(r.sid, p) for p in patterns)})
+    print('%d records, %d branches; %d named state(s):' % (len(recs), len({r.branch for r in recs}), len(named)))
+    for sid in named:
+        n, b = by_state.get(sid, (0, 0))
+        print('  %s: drop %d old value(s), %s' % (sid, n, human(b)))
+    print('would drop %d records, %s of %s' % (len(drop), human(os.path.getsize(log_path) - new_size), human(os.path.getsize(log_path))))
+    if not drop: return
+    if not apply:
+        print('dry run; add --apply to rewrite'); return
+
+    def remap(offset):
+        return None if offset is None or offset in drop else new_offset[offset]
+    new_heads = MpMap()
+    for key, head in heads:
+        h = list(head)
+        h[HEAD], h[LAST_DELTA], h[LAST_FULL] = remap(h[HEAD]), remap(h[LAST_DELTA]), remap(h[LAST_FULL])
+        new_heads.append((key, h))
+
+    log_stat, sb_stat = os.stat(log_path), os.stat(sb_path)
+    new_log, new_sb = log_path + '.compact', sb_path + '.compact'
+    blocked = sb_path + '.blocked'
+    try:
+        def records():
+            with open(log_path, 'rb') as src:
+                for r in recs:
+                    if r.offset in drop: continue
+                    src.seek(r.offset); raw = src.read(r.length)
+                    yield relinked(raw, r, links[r.offset]) if r.offset in links else raw
+        write_file(new_log, records(), log_stat)
+        if os.path.getsize(new_log) != new_size: raise RuntimeError('the new log is not the size its plan says')
+        write_file(new_sb, [state_bin_bytes([new_heads, index[1]])], sb_stat)
+        write_file(blocked, [blocked_state_bin(store)], sb_stat)
+        os.link(log_path, log_path + '.pre-compact')
+    except BaseException as error:
+        for path in (new_log, new_sb, blocked):
+            if os.path.exists(path): os.remove(path)
+        if isinstance(error, OSError):
+            raise Refusal('could not write the new files and the old log\'s second name (%s); nothing in the store '
+                          'changed' % error)
+        raise
+    shutil.copy2(sb_path, sb_path + '.pre-compact')
+    with open(sb_path + '.pre-compact', 'rb+') as f: os.fsync(f.fileno())
+    sync_dir(store)
+    indexes = os.path.join(store, 'state-indexes.bin')
+    if os.path.exists(indexes):
+        os.replace(indexes, indexes + '.pre-compact'); sync_dir(store)
+    os.replace(blocked, sb_path); sync_dir(store)
+    os.replace(new_log, log_path); sync_dir(store)
+    os.replace(new_sb, sb_path); sync_dir(store)
+    print('done: records.log is %s. The old files are records.log.pre-compact, state.bin.pre-compact and '
+          'state-indexes.bin.pre-compact.' % human(os.path.getsize(log_path)))
+    print('Check with state-digests.mjs and compare with the check from before; then delete them to free the space.')
 
 
 def main(argv):
@@ -265,124 +483,15 @@ def main(argv):
     store = argv[1]; patterns = []; apply = False
     i = 2
     while i < len(argv):
-        if argv[i] == '--state': patterns.append(argv[i + 1]); i += 2
+        if argv[i] == '--state' and i + 1 < len(argv): patterns.append(argv[i + 1]); i += 2
         elif argv[i] == '--apply': apply = True; i += 1
         else: print('unknown argument %s' % argv[i]); return 2
     if not patterns:
         print('at least one --state <glob> is required'); return 2
-    log_path = os.path.join(store, 'records.log'); sb_path = os.path.join(store, 'state.bin')
-    for p in (log_path, sb_path):
-        if not os.path.exists(p): print('missing %s' % p); return 2
-
-    # 1. The store must be closed.
-    lock_path = os.path.join(store, 'LOCK')
-    lock = open(lock_path, 'a+')
     try:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print('refusing: %s is locked (the store is open; stop the agent first)' % lock_path); return 1
-
-    # 2. Scan.
-    print('scanning %s (%s)' % (log_path, human(os.path.getsize(log_path))))
-    recs = list(scan_log(log_path))
-    branches = sorted({r.branch for r in recs})
-    if len(branches) > 1:
-        print('refusing: %d branches in the log (%s); compaction is single-branch only' % (len(branches), branches)); return 1
-    by_offset = {r.offset: r for r in recs}
-    last_of_state = {}
-    for r in recs:
-        if r.rtype == 'state_update': last_of_state[(r.branch, r.sid)] = r
-
-    # 3. state.bin must agree with the log.
-    index = read_state_bin(sb_path)
-    heads = index[0]
-    stale = []
-    for key, head in heads:
-        br, sid = key[0], key[1]
-        last = last_of_state.get((br, sid))
-        if last is None or head[0] != last.offset:
-            stale.append((sid, head[0], last.offset if last else None))
-    if stale:
-        print('refusing: state.bin disagrees with the log for %d state(s) (head_offset vs last record):' % len(stale))
-        for sid, h, l in stale[:10]: print('  %s: state.bin=%s log=%s' % (sid, h, l))
-        print('start and stop the agent cleanly (state.bin is written on close), then retry')
-        return 1
-
-    # 4. Choose what to drop: for each matching state, everything before the newest terminal op.
-    drop = set(); report = []; kept_after_terminal = {}
-    for (br, sid), last in sorted(last_of_state.items()):
-        if not any(fnmatch.fnmatchcase(sid, p) for p in patterns): continue
-        chain = []; r = last
-        while r is not None:
-            chain.append(r)
-            r = by_offset.get(r.prev) if r.prev is not None else None
-        chain.reverse()  # oldest -> newest
-        term = max((k for k, c in enumerate(chain) if c.op in TERMINAL_OPS), default=None)
-        if term is None:
-            print('  skip %s: no terminal op in its %d-record chain (nothing is superseded)' % (sid, len(chain))); continue
-        dropped = chain[:term]
-        for c in dropped: drop.add(c.offset)
-        kept_after_terminal[(br, sid)] = len(chain) - term - 1
-        report.append((sid, len(chain), len(dropped), sum(c.length for c in dropped), chain[term].op))
-    total_drop = sum(b for _, _, _, b, _ in report)
-    print('%d records, %d states; %d matching state(s):' % (len(recs), len(last_of_state), len(report)))
-    for sid, n, d, b, op in report:
-        print('  %s: %d records, drop %d before the newest %s (%s)' % (sid, n, d, op, human(b)))
-    print('would drop %d records, %s of %s' % (len(drop), human(total_drop), human(os.path.getsize(log_path))))
-    if not drop:
-        return 0
-    if not apply:
-        print('dry run; add --apply to rewrite'); return 0
-
-    # 5. Rewrite the log.
-    out_path = log_path + '.compact'
-    new_offset = {}
-    chain_prev = {}  # (branch, sid) -> new offset of the previous kept record of that chain
-    with open(log_path, 'rb') as src, open(out_path, 'wb') as dst:
-        for r in recs:
-            if r.offset in drop: continue
-            raw = read_record_bytes(src, r)
-            if r.rtype == 'state_update':
-                if r.prev is None:
-                    new_prev = None
-                elif r.prev in drop:
-                    new_prev = None  # the newest terminal op starts its chain afresh
-                else:
-                    new_prev = new_offset[r.prev]
-                raw = rewrite_prev(raw, new_prev)
-            new_offset[r.offset] = dst.tell()
-            dst.write(raw)
-        dst.flush(); os.fsync(dst.fileno())
-    kept = sum(1 for r in recs if r.offset not in drop)
-    print('wrote %s: %d records, %s' % (out_path, kept, human(os.path.getsize(out_path))))
-
-    # 6. Remap state.bin offsets (head, last delta snapshot, last full snapshot).
-    def remap(off, what, sid):
-        if off is None: return None
-        if off in drop:
-            if what == 'head': raise RuntimeError('head of %s was dropped (bug)' % sid)
-            return None  # a snapshot older than the newest terminal op: no longer needed
-        return new_offset[off]
-    new_heads = MpMap()
-    for key, head in heads:
-        sid = key[1]; h = list(head)
-        h[0] = remap(h[0], 'head', sid); h[3] = remap(h[3], 'delta', sid); h[4] = remap(h[4], 'full', sid)
-        if (key[0], sid) in kept_after_terminal:
-            # ops_since_delta_snapshot: the newest terminal op is now the chain's base.
-            h[1] = kept_after_terminal[(key[0], sid)]
-        new_heads.append((key, h))
-    new_index = [new_heads, index[1]]
-
-    # 7. Swap in. Originals stay as *.pre-compact.
-    os.replace(log_path, log_path + '.pre-compact')
-    os.replace(out_path, log_path)
-    os.replace(sb_path, sb_path + '.pre-compact')
-    write_state_bin(sb_path, new_index)
-    fi = os.path.join(store, 'state-indexes.bin')
-    if os.path.exists(fi):
-        os.replace(fi, fi + '.pre-compact')
-    print('done. originals kept as records.log.pre-compact / state.bin.pre-compact / state-indexes.bin.pre-compact;')
-    print('verify with state-digests.mjs, then delete them to reclaim the space.')
+        run(store, patterns, apply)
+    except Refusal as refusal:
+        print('refusing: %s' % refusal); return 1
     return 0
 
 

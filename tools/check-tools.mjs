@@ -2,10 +2,11 @@
 // wrote. It needs Python 3, as python3, or as python on Windows.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { crc32 } from 'node:zlib';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsStore } from '../index.js';
 
@@ -96,14 +97,14 @@ import json, struct, sys
 from chronicle_payload import decode_update
 f = open(sys.argv[1], 'rb'); size = f.seek(0, 2); f.seek(0); seen = []
 while f.tell() < size:
-    record = f.tell(); f.read(6); f.read(32); rtype = f.read(struct.unpack('<H', f.read(2))[0]).decode(); enc = f.read(1)[0]
+    record = f.tell(); f.read(6); branch = struct.unpack('<QQQq', f.read(32))[2]; rtype = f.read(struct.unpack('<H', f.read(2))[0]).decode(); enc = f.read(1)[0]
     size_at = f.tell(); payload = f.read(struct.unpack('<I', f.read(4))[0])
     for _ in range(2): f.read(8 * struct.unpack('<H', f.read(2))[0])
     f.read(4)
     if rtype == 'state_update':
         u = decode_update(enc, payload); op = u['operation']
         seen.append({'state': u['state_id'], 'kind': op if isinstance(op, str) else next(iter(op)),
-                     'record': record, 'payload': size_at + 4})
+                     'record': record, 'payload': size_at + 4, 'branch': branch})
 print(json.dumps(seen))`, join(store, 'records.log')]);
   assert.equal(run.status, 0, `reading the updates of ${store}:\n${run.err}`);
   return JSON.parse(run.out);
@@ -122,6 +123,137 @@ const REGISTRATIONS = [
   { id: 'settings', strategy: 'snapshot' },
   { id: 'files', strategy: 'tree', deltaSnapshotEvery: 2, fullSnapshotEvery: 2 },
 ];
+
+const MODULE = join(tools, '..');
+const WHOLE = 'whole';
+const CONTENT = 'words that state-digests.mjs must not print';
+const COMPACT_REGISTRATIONS = [
+  { id: WHOLE, strategy: 'snapshot' },
+  { id: 'messages', strategy: 'append_log', deltaSnapshotEvery: 3, fullSnapshotEvery: 2 },
+  { id: 'files', strategy: 'tree', deltaSnapshotEvery: 2, fullSnapshotEvery: 2 },
+];
+
+function compact(store, ...args) {
+  return python([join(tools, 'compact-set-states.py'), store, ...args]);
+}
+
+function digest(store, label) {
+  const run = spawnSync(process.execPath, [join(tools, 'state-digests.mjs'), store],
+    { encoding: 'utf8', env: { ...process.env, CHRONICLE_MODULE: MODULE } });
+  assert.equal(run.status, 0, `state-digests.mjs on ${label} exited ${run.status}:\n${run.stdout}${run.stderr}`);
+  return run.stdout;
+}
+
+function filesOf(dir) {
+  const files = {};
+  const walk = (at) => {
+    for (const entry of readdirSync(at, { withFileTypes: true })) {
+      const path = join(at, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else files[relative(dir, path)] = `${statSync(path).mode.toString(8)} ${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+    }
+  };
+  walk(dir);
+  return files;
+}
+
+function applies(store, label) {
+  const before = digest(store, `${label} before the tool`);
+  const size = statSync(join(store, 'records.log')).size;
+  const run = compact(store, '--state', WHOLE, '--apply');
+  assert.equal(run.status, 0, `compact-set-states.py on ${label} exited ${run.status}:\n${run.out}${run.err}`);
+  assert.equal(digest(store, `${label} after the tool`), before, `state-digests.mjs should read ${label} the same after the tool`);
+  assert.ok(statSync(join(store, 'records.log')).size < size, `the tool should make the log of ${label} smaller`);
+  console.log(`ok: compact-set-states.py applies to ${label}, its log is smaller, and state-digests.mjs reads it the same`);
+}
+
+function refuses(store, label, says) {
+  const before = filesOf(store);
+  const run = compact(store, '--state', WHOLE, '--apply');
+  assert.equal(run.status, 1, `compact-set-states.py on ${label} exited ${run.status}:\n${run.out}${run.err}`);
+  assert.ok(`${run.out}${run.err}`.includes(says), `compact-set-states.py on ${label} should say "${says}":\n${run.out}${run.err}`);
+  assert.deepEqual(filesOf(store), before, `compact-set-states.py changed a file of ${label} as it refused`);
+  console.log(`ok: compact-set-states.py refuses ${label}, exit 1, and changes no file`);
+}
+
+// The bytes the tool puts in place of state.bin while it swaps the files.
+function blockedStateBin(store) {
+  const run = spawnSync(PYTHON, ['-c', `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('compact', 'compact-set-states.py')
+tool = importlib.util.module_from_spec(spec); spec.loader.exec_module(tool)
+sys.stdout.buffer.write(tool.blocked_state_bin(sys.argv[1]))`, store], { cwd: tools });
+  assert.equal(run.status, 0, `reading the tool's blocked state.bin:\n${run.stderr}`);
+  return run.stdout;
+}
+
+// Each head this build reads, on a copy, since an open saves state.bin.
+function headOffsets(store) {
+  const copy = join(scratch, 'heads');
+  cpSync(store, copy, { recursive: true });
+  const reader = JsStore.open({ path: copy });
+  const heads = [];
+  for (const { name } of reader.listBranches()) {
+    reader.switchBranch(name);
+    for (const { id } of reader.listStates()) {
+      const offset = reader.stateHeadOffset(id);
+      if (offset !== null) heads.push({ branch: name, state: id, offset });
+    }
+  }
+  reader.close();
+  rmSync(copy, { recursive: true });
+  return heads;
+}
+
+function appendRecord(store, template, sequence, payload) {
+  const path = join(store, 'records.log');
+  const log = readFileSync(path);
+  const header = Buffer.from(log.subarray(template.record, template.payload - 4));
+  header.writeBigUInt64LE(1n << 40n, 6);
+  header.writeBigUInt64LE(BigInt(sequence), 14);
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(payload.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32LE(crc32(payload));
+  writeFileSync(path, Buffer.concat([log, header, length, payload, Buffer.alloc(4), crc]));
+  return log.length;
+}
+
+// A whole-value state set 40 times over five branches, a list state that takes both kinds of snapshot, a tree state,
+// and records that aren't state updates. side is a branch of main and deep a branch of side; idle has no write; gone
+// is written, then deleted. The store is closed on deep.
+function branchedStore(name, { goneLast = false } = {}) {
+  const path = join(scratch, name);
+  const store = JsStore.create({ path });
+  for (const registration of COMPACT_REGISTRATIONS) store.registerState(registration);
+  const blob = store.storeBlob(Buffer.from('notes'), 'text/plain');
+  const write = (branch, from, count) => {
+    store.switchBranch(branch);
+    for (let n = from; n < from + count; n++) {
+      store.setStateJson(WHOLE, { n, branch, text: CONTENT, padding: 'x'.repeat(200) });
+      store.appendToStateJson('messages', { n, branch, text: CONTENT });
+      store.treeSet('files', `${branch}-${n}.txt`, { blobHash: blob, size: 5, mode: 0o644 });
+      store.appendJson('note', { n, branch, text: CONTENT });
+    }
+  };
+  write('main', 0, 5);
+  const past = store.currentSequence();
+  write('main', 5, 5);
+  store.createBranch('side', 'main');
+  write('side', 10, 10);
+  store.createBranch('deep', 'side');
+  write('deep', 20, 10);
+  store.createBranch('idle', 'main');
+  const gone = store.createBranch('gone', 'main').id;
+  if (!goneLast) write('gone', 30, 5);
+  write('deep', 35, 5);
+  if (goneLast) write('gone', 30, 5);
+  store.switchBranch('deep');
+  store.deleteBranch('gone');
+  store.sync();
+  store.close();
+  return { path, past, gone };
+}
 
 try {
   const enumBody = readFileSync(join(tools, '..', 'src', 'types.rs'), 'utf8').replace(/\r\n/g, '\n')
@@ -296,6 +428,235 @@ try {
     'the store with both encodings, without state.bin, reads its 55 items');
   replayed.close();
   console.log('ok: without state.bin, this build reads the 55 items of the store with both encodings');
+
+  // compact-set-states.py and state-digests.mjs. Each store is checked with state-digests.mjs before and after the
+  // tool, and the two outputs must be equal.
+  const compactCases = {
+    'the check reads every branch, prints no content, leaves the branch it found, and fails on a failed read': () => {
+      const { path } = branchedStore('digest');
+      const read = digest(path, 'the store with branches');
+      for (const branch of ['main', 'side', 'deep', 'idle']) assert.ok(read.includes(`branch ${branch}\t`), `state-digests.mjs should read branch ${branch}:\n${read}`);
+      assert.ok(!read.includes(CONTENT), 'state-digests.mjs printed content');
+      const reopened = JsStore.open({ path });
+      assert.equal(reopened.currentBranch().name, 'deep', 'state-digests.mjs should leave the store on the branch it found');
+      reopened.close();
+      const sideHead = headOffsets(path).find(({ branch, state }) => branch === 'side' && state === WHOLE).offset;
+      const sideSet = updates(path).find(({ record }) => record === sideHead);
+      const broken = copyWithPayload(path, 'digest-broken', sideSet, (payload) => {
+        payload[0] = 0xc1;
+        return payload;
+      });
+      const run = spawnSync(process.execPath, [join(tools, 'state-digests.mjs'), broken], { encoding: 'utf8', env: { ...process.env, CHRONICLE_MODULE: MODULE } });
+      assert.notEqual(run.status, 0, `state-digests.mjs should exit non-zero when a read of branch side fails:\n${run.stdout}${run.stderr}`);
+      console.log('ok: state-digests.mjs reads every branch, prints no content, leaves the branch it found, and exits non-zero on a failed read');
+    },
+
+    'branches': () => {
+      const { path } = branchedStore('branches');
+      const kinds = new Set(updates(path).filter(({ state }) => state === 'messages').map(({ kind }) => kind));
+      assert.ok(kinds.has('Snapshot') && kinds.has('DeltaSnapshot'), `the premise: messages holds both kinds of snapshot, not ${[...kinds]}`);
+      const unchanged = filesOf(path);
+      const dry = compact(path, '--state', WHOLE);
+      assert.equal(dry.status, 0, `the dry run exited ${dry.status}:\n${dry.out}${dry.err}`);
+      assert.deepEqual(filesOf(path), unchanged, 'the dry run changed a file');
+      const reached = new Set(headOffsets(path).filter(({ state }) => state === WHOLE).map(({ offset }) => offset)).size;
+      const before = digest(path, 'the store with branches before the tool');
+      const log = readFileSync(join(path, 'records.log'));
+      const index = readFileSync(join(path, 'state.bin'));
+      const run = compact(path, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py on the store with branches exited ${run.status}:\n${run.out}${run.err}`);
+      assert.equal(digest(path, 'the store with branches after the tool'), before, 'state-digests.mjs should read the store with branches the same after the tool');
+      assert.ok(statSync(join(path, 'records.log')).size < log.length, 'the tool should make the log of the store with branches smaller');
+      assert.ok(readFileSync(join(path, 'records.log.pre-compact')).equals(log), 'records.log.pre-compact should be the old log');
+      assert.ok(readFileSync(join(path, 'state.bin.pre-compact')).equals(index), 'state.bin.pre-compact should be the old state.bin');
+      assert.equal(updates(path).filter(({ state }) => state === WHOLE).length, reached,
+        `each head of ${WHOLE} is a set, so its ${reached} heads should be all of its updates that stay`);
+      console.log(`ok: compact-set-states.py applies to a store with branches, keeps the ${reached} sets its heads name, and state-digests.mjs reads it the same`);
+    },
+
+    'a named list state and a named tree state': () => {
+      const { path } = branchedStore('lists');
+      const history = /^ {2}\S+\tmessages\tat eight sequences /;
+      const reads = (text) => text.split('\n').filter((line) => !history.test(line)).join('\n');
+      const before = digest(path, 'the store with branches before the tool');
+      assert.ok(history.test(before.split('\n').find((line) => line.includes('\tmessages\tat eight'))), `the premise: the check reads the history of messages:\n${before}`);
+      const size = statSync(join(path, 'records.log')).size;
+      const run = compact(path, '--state', 'messages', '--state', 'files', '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py on messages and files exited ${run.status}:\n${run.out}${run.err}`);
+      assert.equal(reads(digest(path, 'the store with branches after the tool')), reads(before),
+        'every read but the history of messages should be the same after the tool');
+      assert.ok(statSync(join(path, 'records.log')).size < size, 'the tool should make the log smaller');
+      console.log('ok: compact-set-states.py on a list state and a tree state leaves every read of them on every branch but their history the same');
+    },
+
+    'life after the cut': () => {
+      const { path, past } = branchedStore('life');
+      const before = JsStore.open({ path });
+      before.switchBranch('main');
+      const pastMessages = before.getStateJsonAt('messages', past);
+      const pastWhole = before.getStateJsonAt(WHOLE, past);
+      before.switchBranch('deep');
+      before.close();
+      assert.notEqual(pastWhole, null, `the premise: main holds ${WHOLE} at sequence ${past} before the tool`);
+      const twin = join(scratch, 'life-twin');
+      cpSync(path, twin, { recursive: true });
+      const run = compact(path, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py exited ${run.status}:\n${run.out}${run.err}`);
+      const cut = updates(path).length;
+      for (const store of [path, twin]) {
+        const later = JsStore.open({ path: store });
+        for (const branch of ['main', 'side', 'deep', 'idle']) {
+          later.switchBranch(branch);
+          for (let n = 0; n < 7; n++) later.appendToStateJson('messages', { after: n, branch });
+          later.setStateJson(WHOLE, { after: true, branch });
+        }
+        later.switchBranch('deep');
+        later.close();
+      }
+      const kinds = new Set(updates(path).slice(cut).filter(({ state }) => state === 'messages').map(({ kind }) => kind));
+      assert.ok(kinds.has('Snapshot') && kinds.has('DeltaSnapshot'), `the premise: the writes after the tool take both kinds of snapshot, not ${[...kinds]}`);
+      assert.equal(digest(path, 'the store written after the tool'), digest(twin, 'its twin that the tool never ran on'),
+        'the store written after the tool should read as its twin does');
+      const branched = JsStore.open({ path });
+      branched.createBranchAt('past', 'main', past);
+      branched.switchBranch('past');
+      assert.equal(branched.getStateJson(WHOLE), null, `a branch made at sequence ${past}, before the cut, should not hold ${WHOLE}`);
+      assert.deepEqual(branched.getStateJson('messages'), pastMessages, 'its messages should be what main read at that sequence before the tool');
+      branched.switchBranch('deep');
+      branched.close();
+      console.log('ok: after the tool each branch takes appends, snapshots and a set, and reads after a reopen as a twin the tool never ran on; a branch made before the cut holds the list state and not the cut one');
+    },
+
+    'the refusals': () => {
+      const { path: base } = branchedStore('refusals');
+      const copyOf = (name) => {
+        const to = join(scratch, name);
+        cpSync(base, to, { recursive: true });
+        return to;
+      };
+      const open = copyOf('refuse-open');
+      const held = JsStore.open({ path: open });
+      try {
+        refuses(open, 'an open store', 'the store is open');
+      } finally {
+        held.close();
+      }
+      const stale = copyOf('refuse-stale');
+      const saved = readFileSync(join(stale, 'state.bin'));
+      const writer = JsStore.open({ path: stale });
+      writer.setStateJson(WHOLE, { late: true });
+      writer.close();
+      writeFileSync(join(stale, 'state.bin'), saved);
+      refuses(stale, 'a state.bin older than its log', 'older than records.log');
+      for (const name of ['records.log.compact', 'state.bin.compact', 'records.log.pre-compact', 'state.bin.pre-compact', 'state-indexes.bin.pre-compact']) {
+        const earlier = copyOf(`refuse-${name}`);
+        writeFileSync(join(earlier, name), 'left');
+        refuses(earlier, `a store with ${name}`, name);
+      }
+      const blocked = copyOf('refuse-blocked');
+      writeFileSync(join(blocked, 'state.bin'), blockedStateBin(blocked));
+      refuses(blocked, 'a store whose state.bin is blocked', 'stopped');
+      const moved = updates(base).filter(({ state }) => state === 'messages').at(-1);
+      const corrupt = copyWithPayload(base, 'refuse-checksum', moved, (payload) => {
+        const at = payload.indexOf(Buffer.from('deep'));
+        payload[at] = 'D'.charCodeAt(0);
+        return payload;
+      }, { checksum: 'kept' });
+      refuses(corrupt, 'a record that fails its checksum', `the record at offset ${moved.record} of records.log fails its checksum`);
+
+      const json = fixture(join(scratch, 'refuse-json'));
+      const before = JsStore.open({ path: json });
+      before.registerState({ id: WHOLE, strategy: 'snapshot' });
+      before.setStateJson(WHOLE, { n: 0 });
+      before.appendToStateJson('messages', { n: 50, text: 'message 50' });
+      before.setStateJson(WHOLE, { n: 1 });
+      const sequence = before.currentSequence();
+      before.close();
+      const held2 = updates(json).filter(({ state }) => state === 'messages');
+      const appended = appendRecord(json, held2[0], sequence + 1, Buffer.from(JSON.stringify({
+        record_id: 0, global_sequence: sequence + 1, state_id: 'messages', prev_update_offset: held2.at(-1).record,
+        operation: { Append: [...Buffer.from(JSON.stringify({ n: 51, text: 'message 51' }))] }, timestamp: Date.now() * 1000,
+      })));
+      rmSync(join(json, 'state.bin'));
+      const replayed = JsStore.open({ path: json });
+      replayed.registerState({ id: 'messages', strategy: 'append_log' });
+      assert.equal(replayed.getStateLen('messages'), 52, 'the premise: this build replays the appended JSON update');
+      replayed.close();
+      refuses(json, 'a JSON update that needs a new link', `offset ${appended} needs a new link`);
+    },
+
+    'the old form': () => {
+      const old = fixture(join(scratch, 'old-form'));
+      const writer = JsStore.open({ path: old });
+      writer.registerState({ id: WHOLE, strategy: 'snapshot' });
+      for (let n = 0; n < 5; n++) writer.setStateJson(WHOLE, { n, padding: 'x'.repeat(200) });
+      writer.close();
+      applies(old, 'the store that 0.2.1 began');
+    },
+
+    'the states between': () => {
+      const { path } = branchedStore('between');
+      const applied = join(scratch, 'between-applied');
+      cpSync(path, applied, { recursive: true });
+      const run = compact(applied, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py exited ${run.status}:\n${run.out}${run.err}`);
+      for (const [label, log] of [['the old log', join(path, 'records.log')], ['the new log', join(applied, 'records.log')]]) {
+        const between = join(scratch, `between-${label.replace(/ /g, '-')}`);
+        cpSync(path, between, { recursive: true });
+        cpSync(log, join(between, 'records.log'));
+        writeFileSync(join(between, 'state.bin'), blockedStateBin(between));
+        const files = filesOf(between);
+        assert.throws(() => JsStore.open({ path: between }), /Invalid state index magic/, `open should refuse a blocked state.bin with ${label}`);
+        assert.throws(() => JsStore.openOrCreate({ path: between }), /Invalid state index magic/, `openOrCreate should refuse a blocked state.bin with ${label}`);
+        assert.deepEqual(filesOf(between), files, `a refused open changed a file of the store with ${label}`);
+      }
+      console.log('ok: open and openOrCreate refuse a blocked state.bin with the old log and with the new one, and change no file');
+    },
+
+    'after the newest head': () => {
+      const goneLast = branchedStore('gone-last', { goneLast: true });
+      const newest = Math.max(...headOffsets(goneLast.path).map(({ offset }) => offset));
+      const goneWrites = updates(goneLast.path).filter(({ branch }) => String(branch) === goneLast.gone);
+      assert.ok(goneWrites.length && goneWrites.at(-1).record > newest,
+        `the premise: the deleted branch's last update lies after the newest head, ${newest}`);
+      applies(goneLast.path, 'a store whose newest state updates are a deleted branch\'s');
+      const ahead = join(scratch, 'ahead');
+      const store = JsStore.create({ path: ahead });
+      for (const registration of COMPACT_REGISTRATIONS) store.registerState(registration);
+      for (let n = 0; n < 5; n++) store.setStateJson(WHOLE, { n, padding: 'x'.repeat(200) });
+      store.createEmptyBranch('fresh', 'main');
+      store.sync();
+      store.close();
+      const saved = readFileSync(join(ahead, 'state.bin'));
+      const writer = JsStore.open({ path: ahead });
+      writer.switchBranch('fresh');
+      for (let n = 0; n < 3; n++) writer.setStateJson(WHOLE, { n, fresh: true });
+      writer.switchBranch('main');
+      writer.close();
+      writeFileSync(join(ahead, 'state.bin'), saved);
+      const copy = join(scratch, 'ahead-copy');
+      cpSync(ahead, copy, { recursive: true });
+      const before = digest(copy, 'a copy of the store whose log is ahead of its state.bin');
+      assert.ok(before.includes('branch fresh\t'), `the premise: the check reads branch fresh:\n${before}`);
+      const run = compact(ahead, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py on the store whose log is ahead of its state.bin exited ${run.status}:\n${run.out}${run.err}`);
+      assert.equal(digest(ahead, 'the store whose log was ahead of its state.bin'), before,
+        'the store whose log was ahead of its state.bin should read the same after the tool');
+      console.log('ok: compact-set-states.py applies to a store whose log is ahead of its state.bin, and it reads the same');
+    },
+
+    'the mode': () => {
+      const { path } = branchedStore('mode');
+      for (const name of ['records.log', 'state.bin']) chmodSync(join(path, name), 0o640);
+      const run = compact(path, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py exited ${run.status}:\n${run.out}${run.err}`);
+      for (const name of ['records.log', 'state.bin']) {
+        assert.equal(statSync(join(path, name)).mode & 0o777, 0o640, `the new ${name} should have the old one's mode`);
+      }
+      console.log('ok: the new records.log and state.bin have the modes of the old ones');
+    },
+  };
+  for (const [, run] of Object.entries(compactCases)) run();
 } finally {
   rmSync(scratch, { recursive: true, force: true });
 }
