@@ -203,6 +203,17 @@ test('Listing uses exact literal prefixes and ordered original path spellings', 
   assert.deepEqual(paths(store.treeList(FILES, 'docs/')), ['docs/README.md', 'docs/readme.md']);
 });
 
+test('Removing a key leaves a key that starts with it', t => {
+  const { store } = fresh(t, FILES);
+  const removed = stage(store, 'removed', 0o100644);
+  const kept = stage(store, 'kept', 0o100644);
+  store.treeSet(FILES, 'src/drop', removed);
+  store.treeSet(FILES, 'src/drop.bak', kept);
+  store.treeRemove(FILES, 'src/drop');
+  assert.deepEqual([store.treeGet(FILES, 'src/drop'), point(store, FILES, 'src/drop.bak'), rows(store.treeList(FILES))],
+    [null, fields(kept), [row('src/drop.bak', kept)]]);
+});
+
 test('File and intent removals rewind together and respect separate write order', t => {
   const { store, mount } = fresh(t, FILES, INTENTS);
   store.setAutoSnapshot(false);

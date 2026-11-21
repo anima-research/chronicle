@@ -158,6 +158,12 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
     assert.throws(() => store.switchBranch('target'), refused('branches.bin'));
   });
   assert.equal(sourceView.getStateJson('work'), 'after refused switch');
+  const reported = store.currentBranch().name;
+  const other = reported === 'source' ? 'target' : 'source';
+  const otherValue = store.view(other).getStateJson('work');
+  store.setStateJson('work', 'after the failed checkpoint');
+  assert.deepEqual([store.view(reported).getStateJson('work'), store.view(other).getStateJson('work')],
+    ['after the failed checkpoint', otherValue]);
 });
 
 test('A switch whose saved branch list cannot be written leaves the source selected and writable', {

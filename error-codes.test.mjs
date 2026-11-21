@@ -26,6 +26,7 @@ function freshStore() {
 
 function throwsCoded(call, code, message) {
   assert.throws(call, (error) => {
+    assert.ok(error instanceof Error, `the refusal threw ${typeof error}, not an Error`);
     assert.equal(error.code, code);
     if (typeof message === 'string') assert.equal(error.message, message);
     else assert.match(error.message, message);
@@ -604,6 +605,10 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
         assert.match(reason, /[^\s\p{C}]/u, kind);
         return true;
       }, kind);
+      rmSync(path);
+      assert.equal(reopened.getBlob(hash), null, kind);
+      assert.equal(reopened.storeBlob(content, 'text/plain'), hash, kind);
+      assert.deepEqual(reopened.getBlob(hash), content, kind);
     }
     writeFileSync(path, good);
     assert.deepEqual(reopened.getBlob(hash), content, kind);

@@ -150,7 +150,8 @@ test('No record, stored null and other falsy JSON values are different states', 
   const replaced = store.setStateJson(counterId, 43);
   assert.deepEqual([reader.getStateJson(counterId), store.getStateJsonAt(counterId, replaced.sequence)], [43, 43]);
   assert.deepEqual([store.getStateJson('value/null'), typeof store.stateHeadOffset('value/null'),
-    store.getStateJson(emptyId), store.stateHeadOffset(emptyId)], [null, 'number', null, null]);
+    store.stateHeadOffset('value/null') >= 0, store.getStateJson(emptyId), store.stateHeadOffset(emptyId)],
+    [null, 'number', true, null, null]);
   for (const id of Object.keys(scalars)) assert.equal(typeof store.stateHeadOffset(id), 'number', id);
 
   store.appendToStateJson(windowId, { id: 'first' });

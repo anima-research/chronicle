@@ -229,3 +229,22 @@ test('An ordinary append writes a record whose size does not grow with the log',
   assert.ok(short.stored > 0 && Math.abs(long.stored - short.stored) <= 8 && Math.abs(long.payload - short.payload) <= 8,
     `an append to a log of 4 items stored ${short.stored} bytes with a ${short.payload}-byte record, and to a log of 4,096 items ${long.stored} with ${long.payload}`);
 });
+
+test('compactState on a root switched to another branch compacts that branch alone', (t) => {
+  const { store } = freshStore(t);
+  const id = 'ledger';
+  store.registerState(appendLog(id, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
+  for (let i = 0; i < 3; i++) store.appendToStateJson(id, { on: 'main', i });
+  store.createBranch('work');
+  store.switchBranch('work');
+  for (let i = 0; i < 3; i++) store.appendToStateJson(id, { on: 'work', i });
+  const main = store.view('main');
+  const before = { main: main.stateHeadOffset(id), work: store.stateHeadOffset(id) };
+  const values = { main: main.getStateJson(id), work: store.getStateJson(id) };
+  store.compactState(id);
+  assert.equal(store.currentBranch().name, 'work');
+  assert.deepEqual(
+    [main.stateHeadOffset(id), main.getStateJson(id), store.stateHeadOffset(id) !== before.work, store.getStateJson(id)],
+    [before.main, values.main, true, values.work]);
+  main.close();
+});
