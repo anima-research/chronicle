@@ -67,12 +67,23 @@ statuses:
       - "src/atomic_file.rs:638 — unreadable_directory_is_saved_without_its_sync"
       - "tests/atomic_metadata.rs:328 — a_store_directory_without_read_access_still_saves"
     gap: "A pre-append sync can return without making the new store's name durable, and in a writable but unreadable checkpoint directory it can also leave the latest state checkpoint's rename unsynced."
+  - id: IR.a.11
+    status: partly-pinned
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
+    tests:
+      - "tests/record_ids_by_type_order.rs:135 — type_lists_ascend_after_a_torn_tail_issues_its_id_again"
+      - "tests/journal-replay.test.mjs:167 — A typed journal outlives historical cuts and deletion of a contributing branch"
+      - "tests/write-refusals.test.mjs:89 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+      - "tests/late-failures.test.mjs:656 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
+    gap: "A test would need to interrupt an actual append of a layout containing a receipt and assert, both on the handle after the throw and on reopen, that readers see either no new record or one record containing both parts."
   - id: IR.a.12
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
-      - "tests/journal-replay.test.mjs:193 — Journal lists are growable snapshots with append-only visible suffixes"
-    gap: "The test checks the exact prefix and Number order for small IDs; a boundary test would have to check what happens when successive decimal IDs would round to the same Number."
+      - "tests/journal-replay.test.mjs:192 — Journal lists are growable snapshots with append-only visible suffixes"
+      - "tests/journal-replay.test.mjs:53 — Type IDs and record sequences use different coordinates and survive reopen"
+      - "src/records/log.rs:919 — test_multiple_records"
+    gap: "The Rust log checks unit increments, but a binding test would need to assert that successive uninterrupted `appendJson` calls return and list decimal IDs exactly one apart, including for large safe integers rather than just small IDs."
   - id: IR.a.13
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -379,11 +390,11 @@ statuses:
     tests:
       - "test-batches.mjs:455 — Quarantine generation links name complete identity writes after replay"
   - id: IR.d.16
-    status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: fully-pinned
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
-      - "tests/unclean-boundaries.test.mjs:234 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
-    gap: "The pending event survives a killed writer and the checkpoint survives redaction and compaction, but to establish stable-storage persistence at append return a test would have to verify the log flush at that boundary, before any separate sync or close."
+      - "tests/unclean-boundaries.test.mjs:107 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
+      - "tests/auto_snapshot_failure.rs:145 — each_write_form_returns_its_record_when_its_own_snapshot_fails"
   - id: IR.d.17
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -885,10 +896,11 @@ statuses:
       - "test-views.mjs:410 — A checkout changes the shared cursor, not saved branch objects or pinned views"
   - id: IR.m.11
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
       - "tests/branch-catalog.test.mjs:142 — Creation metadata is in epoch microseconds and stays with the identity"
-    gap: "The returned `created` number is in epoch microseconds, so a caller must divide it by 1,000 before using it as JavaScript Date milliseconds."
+      - "tests/branch-catalog.test.mjs:161 — currentBranch and listBranches give created in epoch milliseconds, as new Date reads it"
+    gap: "`currentBranch().created` returns epoch microseconds, not the epoch milliseconds that JavaScript Date expects."
   - id: IR.m.12
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1761,12 +1773,12 @@ statuses:
       - "tests/review7_fixes.rs:161 — a_batch_after_a_callers_delta_snapshot_counts_the_items_it_restates"
     gap: "The method returns the count stored in the branch head, which can be zero for a readable three-item legacy log or for a log whose caller-supplied delta snapshot contains two items."
   - id: IR.y.2
-    status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
-      - "tests/review7_fixes.rs:458 — a_batch_whose_count_meets_a_damaged_record_is_refused"
-      - "test-batches.mjs:484 — a write whose own snapshot fails returns its record and goes into snapshotFailures(), and the writes stay recorded across a reopen"
-    gap: "A checksum failure in a record or an item that cannot be decoded can make the log unreadable while length lookup still succeeds from the branch head."
+      - "tests/node-lifecycle.test.mjs:58 — Dead handles throw instead of reporting empty inventories, records or revisions"
+      - "test-views.mjs:334 — a view on a deleted branch throws \"Branch not found\" (and stays dead if the name is reused)"
+    gap: "The tests pin synchronous throws for closed handles and deleted branches; to cover failure of the count lookup itself, a test would need to make that lookup fail on a live branch and assert that `getStateLen` throws synchronously."
   - id: IR.y.3
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2016,10 +2028,11 @@ statuses:
       - "tests/selective-lineage.test.mjs:430 — Storage, presentation and later writes have distinct inclusive cutoffs"
   - id: IR.ac.9
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
       - "tests/branch-catalog.test.mjs:145 — Creation metadata is in epoch microseconds and stays with the identity"
-    gap: "The listed creation time is in epoch microseconds, so it must be divided by 1000 before it is passed to JavaScript’s Date constructor."
+      - "tests/branch-catalog.test.mjs:161 — currentBranch and listBranches give created in epoch milliseconds, as new Date reads it"
+    gap: "`listBranches()` returns the same numeric `created` value as `createBranch()`, but in epoch microseconds, so callers must divide it by 1000 before passing it to `new Date()`."
   - id: IR.ac.10
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2206,11 +2219,10 @@ statuses:
     tests:
       - "test-batches.mjs:192 — openOrCreate opens a version-1 store without moving it to version 2, and the first batch marks it"
   - id: IR.af.2
-    status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: fully-pinned
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
-      - "tests/blob-keys.test.mjs:21 — Synchronous blob keys address exact bytes independently of MIME or provenance"
-    gap: "The test writes and reads through the result without awaiting or unwrapping it; to pin the literal JS class as well, it would need to assert that the result is an instance of JsStore."
+      - "tests/blob-keys.test.mjs:107 — openOrCreate honors the supplied blob read-cache capacity, for a new store and an existing one"
   - id: IR.af.3
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3302,12 +3314,13 @@ statuses:
     gap: "If an archived blob landed but the sync of its directory was refused, a later store sync can return without securing the blob name, independently of the missing parent sync for a new store."
   - id: IR.aw.13
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
+      - "tests/late-failures.test.mjs:656 — the second try"
+      - "tests/late-failures.test.mjs:663 — the other rules"
       - "src/records/log.rs:877 — a_failed_sync_is_reported_by_every_later_one"
-      - "src/store.rs:5729 — a_failed_log_fsync_publishes_nothing_until_reopen"
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "After a log fsync failure, syncing the same work on the live handle keeps reporting DurabilityLost even after the fault clears; on the normal path, records in a newly created store also share the unsynced store name."
+      - "src/store.rs:5728 — a_failed_log_fsync_publishes_nothing_until_reopen"
+    gap: "If an fsync of the record log fails, retrying `sync()` on the same handle still throws `DurabilityLost` after the fault clears; the store must be reopened first."
   - id: IR.aw.14
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3606,11 +3619,10 @@ statuses:
       - "tests/tree-contract.test.mjs:141 — A saved tree hit can restore an undecodable intent without touching its blob"
       - "tests/point_write_cost.rs:79 — ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows"
   - id: IR.ba.11
-    status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: fully-pinned
+    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
     tests:
       - "tests/point_write_cost.rs:77 — ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows"
-    gap: "The test bounds ordinary removals in 32- and 4,096-key trees and checks that one state remains registered; an unconditional per-eviction bound would also need a byte-count assertion when the removal reaches a snapshot boundary."
   - id: IR.ba.12
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
