@@ -28,6 +28,7 @@ const syncLost = problem => problem.syncLost === true;
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
 const env = { ...process.env };
 delete env.LD_PRELOAD;
+delete env.CHRONICLE_LATE_AIMED;
 
 function straceProblem() {
   const probe = spawnSync('strace', ['-f', '-y', '-o', '/dev/null', '-e', `trace=${CALLS}`, '-e', 'inject=fsync:error=EIO:when=1', 'true'],
@@ -184,10 +185,10 @@ async function pooled(work) {
   }
 }
 
-function child(command, args, cwd) {
+function child(command, args, cwd, childEnv = env) {
   return pooled(() => new Promise(resolve => {
     const started = Date.now();
-    const proc = spawn(command, args, { cwd, env, detached: true });
+    const proc = spawn(command, args, { cwd, env: childEnv, detached: true });
     let timedOut = false;
     const bound = setTimeout(() => {
       timedOut = true;
@@ -226,7 +227,8 @@ async function traced(scenario, extra, inject) {
   const record = join(dir, 'record');
   const injection = inject ? ['-e', `inject=${inject.name}:error=${inject.errno}:when=${inject.when}`] : [];
   const result = await child('strace', ['-f', '-y', '-o', record, '-e', `trace=${CALLS}`, ...injection,
-    process.execPath, '--single-threaded', WRITER, 'run', scenario.file, root, outside, ...extra], dir);
+    process.execPath, '--single-threaded', WRITER, 'run', scenario.file, root, outside, ...extra], dir,
+  inject ? { ...env, CHRONICLE_LATE_AIMED: '1' } : env);
   let out = null;
   try {
     out = JSON.parse(result.stdout);
@@ -258,25 +260,43 @@ function cleanProblem(kind, clean) {
   return kind.cleanProblem(out);
 }
 
-function whenInClean(all, call, clean) {
-  if (!call.main) return null;
-  let index = all.indexOf(call);
-  let nth = 0;
-  for (; index >= 0 && !all[index].mark; index--) if (all[index].main && all[index].name === call.name) nth++;
-  const start = index < 0 ? 0 : clean.all.findIndex(({ mark }) => mark === all[index].mark) + 1;
-  if (index >= 0 && start === 0) return null;
-  const same = clean.all.slice(start).filter(({ main, name }) => main && name === call.name);
-  return same[nth - 1]?.when ?? null;
+function countBefore(record, name) {
+  const at = record.all.findIndex(({ mark }) => mark === 'begin');
+  if (at < 0) return null;
+  const before = record.all.slice(0, at);
+  if (before.some(({ injected }) => injected)) return null;
+  return before.filter(call => call.main && call.name === name).length;
 }
 
-function hit(run, clean) {
-  const { all, requests } = requestsOfCall(run.text, run.store, run.dir);
-  const refused = all.filter(call => call.injected);
-  if (refused.length !== 1) return { why: `the record shows ${refused.length} refused requests`, when: null };
-  const when = whenInClean(all, refused[0], clean);
-  const request = requests.find(({ call }) => call === refused[0]);
-  if (!request) return { why: `the refused request is not at or under the store's directory in the call: ${refused[0].text}`, when };
-  return { id: request.id, when, request };
+function nextAim(point, missed, aimed, clean) {
+  const refused = missed.all.filter(({ injected }) => injected);
+  const inClean = countBefore(clean, point.name);
+  if (!point.call.main || refused.length !== 1 || !refused[0].main || inClean === null) return null;
+  const counts = [missed, ...aimed.filter(record => record !== missed), clean]
+    .map(record => countBefore(record, point.name)).filter(count => count !== null);
+  const votes = count => counts.filter(other => other === count).length;
+  const count = counts.reduce((best, other) => (votes(other) > votes(best) ? other : best));
+  const placeInClean = request => request.when - inClean;
+  const own = countBefore(missed, point.name);
+  const index = call => missed.all.indexOf(call);
+  const callBegin = missed.all.findIndex(({ mark }) => mark === 'call-begin');
+  if (own === null || callBegin < 0 || index(refused[0]) < callBegin) return count + placeInClean(point);
+  const target = missed.requests.find(({ id }) => id === point.id);
+  const ofStore = missed.requests.some(({ call }) => call === refused[0]);
+  if (target && (!ofStore || index(target.call) < index(refused[0]))) return target.call.main ? count + target.when - own : null;
+  const before = missed.requests.filter(({ name, call }) => name === point.name && index(call) < index(refused[0])).length;
+  const next = clean.requests.filter(({ name }) => name === point.name)[before];
+  if (!next) return null;
+  return count + placeInClean(point) + refused[0].when - own + (ofStore ? 0 : 1) - placeInClean(next);
+}
+
+function hit(run) {
+  const record = requestsOfCall(run.text, run.store, run.dir);
+  const refused = record.all.filter(call => call.injected);
+  if (refused.length !== 1) return { why: `the record shows ${refused.length} refused requests`, record };
+  const request = record.requests.find(({ call }) => call === refused[0]);
+  if (!request) return { why: `the refused request is not at or under the store's directory in the call: ${refused[0].text}`, record };
+  return { id: request.id, request, record };
 }
 
 async function aimAll(scenario, kind, clean, extra) {
@@ -284,30 +304,26 @@ async function aimAll(scenario, kind, clean, extra) {
   const counted = new Map(points.map(point => [point.id, []]));
   const misses = new Map(points.map(point => [point.id, []]));
   const aims = new Map(points.map(point => [point.id, point.when]));
+  const records = [];
   let aimed = 0;
   let slowest = 0;
-  const kept = new Set();
   for (let round = 0; round < 3; round++) {
     const open = points.filter(point => counted.get(point.id).length === 0);
     if (open.length === 0) break;
     aimed += open.length;
     const runs = await Promise.all(open.map(point => traced(scenario, extra,
       { name: point.name, errno: errnoOf(point.name), when: aims.get(point.id) })));
-    const found = runs.map(run => hit(run, clean));
+    const found = runs.map(run => hit(run));
+    records.push(...found.map(({ record }) => record));
     slowest = Math.max(slowest, ...runs.map(run => run.result.ms));
-    if (round === 0) {
-      for (const name of new Set(open.map(point => point.name))) {
-        const ofName = open.flatMap((point, index) => (point.name === name ? [found[index].id === point.id] : []));
-        if (ofName.length > 1 && ofName.filter(Boolean).length * 2 >= ofName.length) kept.add(name);
-      }
-    }
     runs.forEach((run, index) => {
       const point = open[index];
-      const { id, why, when, request } = found[index];
+      const { id, why, request, record } = found[index];
       if (id && counted.has(id)) counted.get(id).push({ ...run, errno: errnoOf(request.name), refused: request.path });
       if (id === point.id) return;
-      misses.get(point.id).push(why ?? `it refused ${id}`);
-      if (!kept.has(point.name) && when !== null) aims.set(point.id, aims.get(point.id) + point.when - when);
+      const next = nextAim(point, record, records, clean);
+      misses.get(point.id).push(`${why ?? `it refused ${id}`}${next === null ? `, and the aim stays at ${aims.get(point.id)}` : ''}`);
+      if (next !== null) aims.set(point.id, next);
     });
   }
   return { points, counted, misses, aimed, slowest };
@@ -728,7 +744,7 @@ async function scenarioResult(scenario, kind) {
 
 const asText = value => (typeof value === 'function' ? String(value) : value);
 
-function refused(scenario, kind, { rules = [], todos = [] } = {}) {
+function refused(scenario, kind, { rules = [], todos = [], firstAimMisses = false } = {}) {
   return async t => {
     const file = join(base, `${scenario.name}.json`);
     writeFileSync(file, JSON.stringify({
@@ -745,6 +761,7 @@ function refused(scenario, kind, { rules = [], todos = [] } = {}) {
     const lost = todos.filter(each => each.point !== undefined && !result.points.some(point => point.id === each.point));
     assert.deepEqual(lost.map(({ point, rule }) => `${point}, ${rule}`), [], 'a todo names a fault point that the call no longer has');
     if (result.points.length === 0) {
+      assert.ok(!firstAimMisses, `${kind.noPoints}, so the control has nothing to aim at`);
       t.skip(kind.noPoints);
       return;
     }
@@ -757,6 +774,7 @@ function refused(scenario, kind, { rules = [], todos = [] } = {}) {
         if (runs.length === 0) {
           assert.fail(`${NOT_MEASURED}: three aimed runs did not refuse ${point.id} (${at}): ${result.misses.get(point.id).join('; ')}`);
         }
+        assert.ok(!firstAimMisses || result.misses.get(point.id).length > 0, `The first aimed run refused ${point.id}, so the control made no miss for the aim to correct`);
         const judged = runs.map(run => [run, judge(kind, rules, result.clean, run, result.answers.get(run))]);
         const here = todos.filter(each => each.point === undefined || each.point === point.id);
         const ownedBy = (rule, problem) => here.find(each => each.rule === rule && each.owns(problem));
@@ -778,6 +796,80 @@ function refused(scenario, kind, { rules = [], todos = [] } = {}) {
     }
   };
 }
+
+suite('The aim after a missed run', () => {
+  const STORE = '/t/root/store';
+  const FDS = { log: `7<${STORE}/records.log>`, event: '19<anon_inode:[eventfd]>', out: '1<pipe:[42]>' };
+  const MARKS = { start: 'begin', begin: 'call-begin', end: 'call-end' };
+  const recordOf = (steps, refusedAt = -1) => requestsOfCall(steps.map((step, index) => {
+    const [what, tid = '1'] = step.split('@');
+    if (MARKS[what]) {
+      return `${tid} statx(AT_FDCWD, "/chronicle-mark/${MARKS[what]}", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x7ffd00) = -1 ENOENT (No such file or directory)`;
+    }
+    return `${tid} write(${FDS[what]}, "x", 1) = ${index === refusedAt ? '-1 ENOSPC (No space left on device) (INJECTED)' : '1'}`;
+  }).join('\n'), STORE, '/t');
+  const pointOf = (record, id) => record.requests.find(request => request.id === id);
+  const aimAfter = (record, id, missed, others = []) => nextAim(pointOf(record, id), missed, [...others, missed], record);
+  const clean = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'log', 'log', 'event', 'end']);
+  const short = recordOf(['out', 'start', 'out', 'begin', 'log', 'log', 'log', 'end']);
+
+  test('After a refused call that is no request of the store, the next aim is where the next request of the store would stand', () => {
+    assert.equal(pointOf(clean, 'write 1').when, 4);
+    assert.equal(aimAfter(clean, 'write 1', recordOf(['out', 'out', 'start', 'out', 'begin', 'event'], 5)), 5);
+    assert.equal(aimAfter(clean, 'write 1', recordOf(['out', 'out', 'start', 'out', 'begin', 'event', 'log', 'log', 'log', 'end'], 5)), 5);
+  });
+
+  test('After a refused request of the store, the next aim moves by that request\'s shift against the clean run', () => {
+    assert.equal(pointOf(clean, 'write 3').when, 6);
+    assert.equal(aimAfter(clean, 'write 3', recordOf(['out', 'out', 'start', 'out', 'begin', 'event', 'log', 'log'], 7)), 7);
+  });
+
+  test('After a refused request of the store that the store carried on from, the next aim moves by that request\'s shift', () => {
+    assert.equal(aimAfter(clean, 'write 3', recordOf(['out', 'out', 'start', 'out', 'begin', 'event', 'log', 'log', 'out', 'log', 'end'], 7)), 7);
+  });
+
+  test('After an aim that overshot, the next aim is the place at which the target stands in the missed run', () => {
+    assert.equal(aimAfter(clean, 'write 2', recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'log', 'log', 'end'], 7)), 5);
+  });
+
+  test('After one aimed run with fewer calls before the first mark, where the other runs agree with the clean run, the aim stays', () => {
+    const other = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'log', 'log', 'end'], 7);
+    assert.equal(aimAfter(clean, 'write 1', recordOf(['out', 'start', 'out', 'begin', 'log', 'log', 'log', 'end'], 5), [other]), 4);
+  });
+
+  test('After aimed runs with more calls before the first mark than the clean run, every aim moves by the difference', () => {
+    const first = recordOf(['out', 'out', 'start', 'out', 'begin', 'log'], 5);
+    const second = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'log'], 6);
+    assert.equal(aimAfter(short, 'write 2', first, [second]), 5);
+    assert.equal(aimAfter(short, 'write 3', second, [first]), 6);
+  });
+
+  test('When only the clean run and the missed runs vote, an odd aimed run and then a run refused before the call lead the third aim to the target', () => {
+    const one = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'log', 'end']);
+    const odd = recordOf(['out', 'start', 'out', 'begin', 'log', 'log', 'end'], 5);
+    assert.equal(aimAfter(one, 'write 1', odd), 3);
+    assert.equal(aimAfter(one, 'write 1', recordOf(['out', 'out', 'start', 'out'], 3), [odd]), 4);
+  });
+
+  test('When only the clean run and the missed run vote, after an odd clean run the second aim is the target', () => {
+    const one = recordOf(['out', 'start', 'out', 'begin', 'log', 'log', 'end']);
+    assert.equal(pointOf(one, 'write 1').when, 3);
+    assert.equal(aimAfter(one, 'write 1', recordOf(['out', 'out', 'start', 'out'], 3)), 4);
+  });
+
+  test('A run refused before the first mark gives no count, and the point takes the count from the other runs', () => {
+    const one = recordOf(['out', 'start', 'out', 'begin', 'log', 'end']);
+    const other = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'end'], 5);
+    assert.equal(aimAfter(one, 'write 1', recordOf(['out'], 0), [other]), 4);
+  });
+
+  test('A point off the main thread, a refused call off it, or a target shown off it, keeps its aim', () => {
+    assert.equal(aimAfter(clean, 'write 1', recordOf(['out', 'out', 'start', 'out', 'begin', 'event', 'log@2', 'end'], 5)), null);
+    const threaded = recordOf(['out', 'start', 'begin', 'log@2', 'log@2', 'end']);
+    assert.equal(aimAfter(threaded, 'write 1', recordOf(['out', 'start', 'begin', 'log@2', 'log@2', 'end'], 4)), null);
+    assert.equal(aimAfter(clean, 'write 1', recordOf(['out', 'out', 'start', 'out', 'begin', 'log@2', 'log', 'log', 'log', 'end'], 5)), null);
+  });
+});
 
 const notLinux = process.platform !== 'linux' && 'the record of system calls comes from strace, which is for Linux';
 function escapedProblem() {
@@ -952,6 +1044,17 @@ if (skip) {
         call: (s, f, h) => s.treeBatch('files', [{ op: 'set', path: 'b.txt', entry: h.entry(f.blob) }, { op: 'remove', path: 'a.txt' }]),
         reads: h => ({ files: h.files }),
       }, writeKind));
+    test('The aim finds each point of treeBatch when its aimed runs make a write of their own before the call',
+      refused({
+        name: 'treeBatchWithForeignWrite',
+        method: () => 'treeBatch',
+        setup: (s, f, h) => { f.devNull = h.devNull(); },
+        call: (s, f, h) => {
+          if (h.aimed) h.foreignWrite(f.devNull);
+          return s.treeBatch('files', [{ op: 'set', path: 'b.txt', entry: h.entry(f.blob) }, { op: 'remove', path: 'a.txt' }]);
+        },
+        reads: h => ({ files: h.files }),
+      }, writeKind, { firstAimMisses: true }));
     test('A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'treeRemove',

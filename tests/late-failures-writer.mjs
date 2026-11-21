@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
 
@@ -40,6 +40,9 @@ function coldSetup(s, f) {
 const h = {
   message, entry, utf8, branchNames, stateList, files, branchStates, journal, messages, identified, strategyOf,
   threeWrites, threeReads: { journal, mode: s => s.getStateJson('mode'), messages }, coldSetup,
+  aimed: process.env.CHRONICLE_LATE_AIMED === '1',
+  devNull: () => openSync('/dev/null', 'w'),
+  foreignWrite: fd => writeSync(fd, 'x'),
 };
 
 function base(s, f) {
