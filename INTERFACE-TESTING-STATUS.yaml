@@ -1,0 +1,2717 @@
+# INTERFACE TESTING STATUS
+statuses:
+  - id: IR.a.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:90 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.a.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:92 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.a.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:103 — Failing a barrier leaves exactly the landed journal suffix and state readable"
+  - id: IR.a.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:167 — A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.a.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:67 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.a.6
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk (todo)"
+    gap: "After an append in a newly created store, sync flushes the log but not the parent directory entry for the store, so power loss can make even the synced record unreachable."
+  - id: IR.a.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:87 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.a.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:94 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.a.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:53 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.a.10
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk (todo)"
+    gap: "For a newly created store, sync can return before the journal append without syncing the parent directory entry needed to find the referenced state after power loss."
+  - id: IR.a.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/record_ids_by_type_order.rs:148 — type_lists_ascend_after_a_torn_tail_issues_its_id_again"
+  - id: IR.a.12
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:193 — Journal lists are growable snapshots with append-only visible suffixes"
+    gap: "The test checks both the exact prefix and Number ordering for small IDs; to guard against precision loss, it would need to assert that no successful append produces a Number collision when the ID sequence reaches the safe-integer boundary."
+  - id: IR.a.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:96 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.a.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1470 — open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death"
+  - id: IR.a.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1466 — open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death"
+  - id: IR.a.16
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
+    gap: "The harness compares live journal reads with a copy reopened after a throw, but a test would need to establish that a complete acceptance actually landed despite the throw and assert that the very next live type-list refresh yields its original compile ID and receipt."
+  - id: IR.a.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:88 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.a.18
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/crash_state_recovery.rs generic_appends_cannot_forge_internal_state_updates"
+  - id: IR.a.19
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/disk_scaling.rs record_append_disk_linear"
+  - id: IR.b.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:115 — Fresh factory handles advertise capabilities before state setup"
+  - id: IR.b.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:206 — Suffix reads preserve the boundary, even with a bad window item or an enormous limit"
+  - id: IR.b.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:1053 — each_item_of_an_identity_batch_names_the_record_that_holds_it"
+  - id: IR.b.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:488 — a write whose own snapshot fails returns its record and goes into snapshotFailures(), and the writes stay recorded across a reopen"
+  - id: IR.b.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:239 — a batch that presents a message the store holds stamps it with the batch's record and keeps its own id and sequence"
+  - id: IR.b.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:293 — on a view, an identity batch counts and stamps on the view's branch"
+  - id: IR.b.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:371 — Slices share prefix record stamps but distinguish independent sibling presentations"
+  - id: IR.b.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:918 — each_item_of_an_identity_batch_names_the_record_that_holds_it"
+  - id: IR.b.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:514 — a write whose own snapshot fails returns its record and goes into snapshotFailures(), and the writes stay recorded across a reopen"
+  - id: IR.b.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:219 — appendManyToStateJsonWithIdentity: every item stamped with the one record, items at firstOrdinal + i, MANIFEST marked"
+  - id: IR.b.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:296 — on a view, an identity batch counts and stamps on the view's branch"
+  - id: IR.b.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:379 — Slices share prefix record stamps but distinguish independent sibling presentations"
+  - id: IR.b.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:879 — an_identity_batch_stores_its_items_stamped_with_its_one_record"
+  - id: IR.b.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:101 — Interrupted identity writes expose no partial stamped row or batch"
+  - id: IR.b.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:116 — Interrupted identity writes expose no partial stamped row or batch"
+  - id: IR.b.16
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/state_update_encoding.rs json_shape_of_a_batch"
+  - id: IR.c.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:290 — Append, identity append and prepared byte edit agree on stored JSON normalization"
+  - id: IR.c.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:242 — Open does not initialize, settle or sanitize application state"
+  - id: IR.c.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:160 — Pre-record I/O refusals preserve whole branch-local JSON values"
+  - id: IR.c.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:106 — A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.c.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:268 — The ended log is read from the branch that the root has selected"
+  - id: IR.c.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:229 — An ordinary append writes a record whose size does not grow with the log"
+  - id: IR.c.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:163 — Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.c.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in appendToStateJson leaves a throw or a return, whole values and a store that opens again"
+  - id: IR.c.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:295 — Append, identity append and prepared byte edit agree on stored JSON normalization"
+  - id: IR.c.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:47 — Replacing or redacting a log down to zero is not an absent registration"
+  - id: IR.c.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1222 — interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix"
+  - id: IR.c.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch_views.rs:868 — state_head_offset_is_an_exact_revision_key"
+  - id: IR.c.13
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk (todo)"
+    gap: "When Chronicle creates the store directory, sync returns without syncing its entry in the parent directory, so a machine crash can leave even the synced appends unreachable."
+  - id: IR.c.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:242 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.c.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1193 — interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix"
+  - id: IR.c.16
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/state_update_encoding.rs json_wire_format_unchanged_by_serde_bytes"
+  - id: IR.d.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:256 — Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.d.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:169 — A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.d.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:447 — Quarantine generation links name complete identity writes after replay"
+  - id: IR.d.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:221 — appendManyToStateJsonWithIdentity: every item stamped with the one record, items at firstOrdinal + i, MANIFEST marked"
+  - id: IR.d.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:1191 — contending_single_identity_writers_each_stamp_their_own_one_record"
+  - id: IR.d.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:419 — Quarantine generation links name complete identity writes after replay"
+  - id: IR.d.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:378 — Slices share prefix record stamps but distinguish independent sibling presentations"
+  - id: IR.d.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:317 — A refused single stamped append does not advance the log"
+  - id: IR.d.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:1024 — each_item_of_an_identity_batch_names_the_record_that_holds_it"
+  - id: IR.d.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:182 — stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.d.11
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in appendToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+    gap: "If a row lands despite a throw, a test should compare both stamps at the old tail ordinal with its actual writing record: the fault harness compares the body but reduces the stamps to a single validity boolean."
+  - id: IR.d.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:208 — appendManyToStateJsonWithIdentity: every item stamped with the one record, items at firstOrdinal + i, MANIFEST marked"
+  - id: IR.d.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:303 — Append, identity append and prepared byte edit agree on stored JSON normalization"
+  - id: IR.d.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:268 — Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.d.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:455 — Quarantine generation links name complete identity writes after replay"
+  - id: IR.d.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:107 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
+  - id: IR.d.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:1063 — each_item_of_an_identity_batch_names_the_record_that_holds_it"
+  - id: IR.d.18
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/state_update_encoding.rs msgpack_stores_bytes_as_bin"
+  - id: IR.d.19
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/disk_scaling.rs json_append_with_identity_disk_linear"
+  - id: IR.e.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:78 Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.e.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:5220 test_subscription_catch_up_records"
+  - id: IR.e.3
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:231 An explicit branch name selects the replayed records of that branch"
+    gap: "Catch-up replays records and states from the calling handle’s branch instead of the branch named in the filter, and a replayed array can exceed the snapshot byte limit because the store does not count its brackets and commas."
+  - id: IR.e.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:5305 test_subscription_catch_up_no_from_sequence"
+  - id: IR.e.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:124 Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.e.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:426 a catch-up that overruns the subscription's buffer drops it"
+  - id: IR.f.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:111 — close with writes pending returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+  - id: IR.f.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:344 — A pre-record write failure leaves every valid batch target unchanged"
+  - id: IR.f.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:336 — Close reports the failure of its own barrier when no sync failed before it"
+  - id: IR.f.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:119 — A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.f.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:267 — Planning edits to materialized JS data does not write on mutation or close"
+  - id: IR.f.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:199 — Registration and retuning report non-duplicate refusals at the call"
+  - id: IR.f.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:301 — Close consumes the root even when its final barrier throws"
+  - id: IR.f.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:302 — Close consumes the root even when its final barrier throws"
+  - id: IR.f.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:56 — Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.f.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:305 — Close consumes the root even when its final barrier throws"
+  - id: IR.f.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:306 — Close consumes the root even when its final barrier throws"
+  - id: IR.g.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:79 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
+  - id: IR.g.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:72 — Toggling automatic snapshots acts immediately without losing disabled-period messages"
+  - id: IR.g.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch_at_snapshot_accounting.rs:131 — branch_at_keeps_an_inherited_batch_across_child_delta_snapshot"
+  - id: IR.g.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:71 — Toggling automatic snapshots acts immediately without losing disabled-period messages"
+  - id: IR.g.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:78 — Toggling automatic snapshots acts immediately without losing disabled-period messages"
+  - id: IR.g.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:246 — compactState on a root switched to another branch compacts that branch alone"
+  - id: IR.g.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:85 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
+  - id: IR.g.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:128 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
+  - id: IR.i.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:56 — A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.i.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch_state_isolation.rs:205 — test_nested_branches_isolation"
+  - id: IR.i.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:309 — createBranch with no parent forks the current branch and leaves the root on it"
+  - id: IR.i.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-read-scaling.test.mjs:110 — The current branch's ID costs the same with a long history or many branches (branchIdFixture)"
+  - id: IR.i.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:59 — the store's errors carry their kind"
+  - id: IR.j.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:118 — A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.j.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:120 — A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.j.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:473 — A redaction on a historical child leaves the source with that row and its rows after the cut"
+  - id: IR.j.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:405 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.j.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:174 — Listed ancestry describes immediate parents and inclusive cuts, not current heads"
+  - id: IR.j.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:456 — A head can anchor even an empty window"
+  - id: IR.j.7
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:268 — A failure after a successful fork and switch does not undo either"
+    gap: "The test checks the fork after a later registration throws; to cover the other named failures, refuse the switch or the redaction after a successful createBranchAt and verify from the source that the same child can still be inspected."
+  - id: IR.j.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:629 — A refused request in createBranchAt leaves a throw or a return, whole values and a store that opens again"
+  - id: IR.j.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:422 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.j.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:299 — createBranchAt behind the head leaves the root on its source and its later rows"
+  - id: IR.j.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:403 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.j.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch_at_snapshot_accounting.rs:289 — branch_at_counts_a_batch_before_the_cut_as_the_parent_did"
+  - id: IR.j.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:159 — A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.k.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:102 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.k.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:113 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.k.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:107 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.k.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:482 A selective historical fork cut at a message append has the message and not its presentation"
+  - id: IR.k.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/append_many.rs:1033 each_item_of_an_identity_batch_names_the_record_that_holds_it"
+  - id: IR.k.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective_fork.rs:245 selective_historical_fork_inherits_selected_states_at_the_sequence"
+  - id: IR.k.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective_fork.rs:238 selective_historical_fork_inherits_selected_states_at_the_sequence"
+  - id: IR.k.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:233 Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.k.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:231 Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.k.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:235 Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.k.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:483 A selective historical fork cut at a message append has the message and not its presentation"
+  - id: IR.k.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:249 Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.k.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:239 Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.k.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:116 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.k.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:253 Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.k.16
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:347 createBranchAtWithStates whose own checkpoint fails leaves the name free, and a retry makes the child (todo)"
+    gap: "If the fork's own checkpoint fails after allocation, the call throws but leaves the child in the branch list, so retrying the same name throws BranchExists."
+  - id: IR.k.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:237 Deletion through a parent view invalidates only the saved selective creation"
+  - id: IR.l.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:102 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.l.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:110 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.l.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:112 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.l.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective_fork.rs:152 selective_fork_inherits_exactly_the_selected_states"
+  - id: IR.l.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:495 A selective fork ignores a requested state that was never written and an ID that was never registered"
+  - id: IR.l.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:96 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.l.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:169 A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.l.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:183 A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.l.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:239 createBranchWithStates / createBranchAtWithStates inherit exactly the selected states"
+  - id: IR.l.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:190 A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.l.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:374 root close() closes every view and releases the lock with views still referenced; view-written branches persist"
+  - id: IR.l.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:223 Deletion through a parent view invalidates only the saved selective creation"
+  - id: IR.l.13
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:348 createBranchWithStates whose own checkpoint fails leaves the name free, and a retry makes the child (todo)"
+    gap: "If the fork allocates the child and then fails to write its checkpoint, it throws but leaves the name taken, so retrying after the write problem is fixed throws BranchExists."
+  - id: IR.m.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:40 Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.m.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:423 A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.m.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:405 A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.m.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:101 A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.m.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:122 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.m.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:165 The cursor distinguishes selection refusal from selection whose checkpoint failed"
+  - id: IR.m.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:334 a view on a deleted branch throws \"Branch not found\" (and stays dead if the name is reused)"
+  - id: IR.m.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:45 A live branch inventory distinguishes creations, not names or equal heads (assertInventory helper)"
+  - id: IR.m.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:102 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.m.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:410 A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.m.11
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:142 Creation metadata is in epoch microseconds and stays with the identity"
+    gap: "The selected branch's `created` is a stable timestamp in epoch microseconds, so it must be divided by 1,000 before use as JavaScript Date milliseconds."
+  - id: IR.m.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:245 Temporary damage to a cold record causes real read errors, not absent data"
+  - id: IR.m.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:415 A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.m.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:186 Listed ancestry describes immediate parents and inclusive cuts, not current heads"
+  - id: IR.m.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:187 Listed ancestry describes immediate parents and inclusive cuts, not current heads"
+  - id: IR.m.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:309 createBranch with no parent forks the current branch and leaves the root on it"
+  - id: IR.m.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-read-scaling.test.mjs:132 The current branch's ID costs the same with a long history or many branches"
+  - id: IR.n.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:448 — A head can anchor even an empty window"
+  - id: IR.n.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:99 — Head probes on root and view leave both histories untouched"
+  - id: IR.n.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:401 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.n.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:310 — The head after a lone edit or removal is the sequence of the record that it wrote"
+  - id: IR.n.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:53 — Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.n.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:413 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.n.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:430 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.n.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:455 — A head can anchor even an empty window"
+  - id: IR.n.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:101 — Head probes on root and view leave both histories untouched"
+  - id: IR.n.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:422 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.n.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:177 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.n.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:177 — A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.n.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:399 — Storage, presentation and later writes have distinct inclusive cutoffs"
+  - id: IR.o.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:229 — Deletion through a parent view invalidates only the saved selective creation"
+  - id: IR.o.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch_state_isolation.rs:1239 — test_delete_branch_doesnt_affect_sibling"
+  - id: IR.o.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:162 — A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.o.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:58 — the store's errors carry their kind"
+  - id: IR.o.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:167 — A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.o.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:230 — Deletion through a parent view invalidates only the saved selective creation"
+  - id: IR.o.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:237 — Deletion through a parent view invalidates only the saved selective creation"
+  - id: IR.o.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:131 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.o.9
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/branches/manager.rs test_cannot_delete_main; tests/error_handling.rs test_delete_main_branch"
+  - id: IR.o.10
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/branches/manager.rs test_cannot_delete_current"
+  - id: IR.o.11
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/branches/manager.rs deleting_a_branch_that_is_not_there_is_branch_not_found"
+  - id: IR.o.12
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/store.rs deleting_a_branch_drops_its_snapshot_failures; src/state/manager.rs purging_a_retired_branch_drops_a_count_checked_after_it_was_retired"
+  - id: IR.p.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:102 A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.p.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:333 Editing stamped content returns a new canonical point value, not a mutated cached object"
+  - id: IR.p.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:108 A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.p.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:475 A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.p.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:71 the store's errors carry their kind"
+  - id: IR.p.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:119 A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.p.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:312 Append, identity append and prepared byte edit agree on stored JSON normalization"
+  - id: IR.p.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:190 A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.p.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/integration.rs:596 test_get_state_at_with_edits"
+  - id: IR.p.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:144 stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.p.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:105 A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.p.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1222 interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix"
+  - id: IR.p.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:116 A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.p.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/point_write_cost.rs:110 ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows"
+  - id: IR.p.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:337 Editing stamped content returns a new canonical point value, not a mutated cached object"
+  - id: IR.p.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:272 Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.q.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:21 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:26 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:27 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:281 Mixed references and a repair that one sync covers recover after the writer dies without a close"
+  - id: IR.q.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:31 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:23 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:45 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:81 References on distinct branches resolve the same shared bytes after rebind"
+  - id: IR.q.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/blobs/storage.rs:1634 a_store_after_a_get_finds_the_blob_damaged_repairs_it_in_the_same_storage"
+  - id: IR.q.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:64 References on distinct branches resolve the same shared bytes after rebind"
+  - id: IR.q.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:35 Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.q.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:602 damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
+  - id: IR.q.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:618 damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
+  - id: IR.q.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:614 damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
+  - id: IR.r.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:48 Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.r.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:92 Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.r.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:92 Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.r.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:237 A repaired-away ID has the ordinary JS null miss until reissued"
+  - id: IR.r.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:232 Temporary damage to a cold record causes real read errors, not absent data"
+  - id: IR.r.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:167 A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.r.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:104 Failing a barrier leaves exactly the landed journal suffix and state readable"
+  - id: IR.r.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1470 open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death"
+  - id: IR.r.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:147 every read surface hands back each object with its keys in the order written"
+  - id: IR.r.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:84 Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.r.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:96 Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.r.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:94 Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.r.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:241 A repaired-away ID has the ordinary JS null miss until reissued"
+  - id: IR.s.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:89 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:90 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:185 — Journal lists are growable snapshots with append-only visible suffixes"
+  - id: IR.s.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:99 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:169 — A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.s.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:262 — Failing a barrier leaves exactly the landed journal suffix and state readable"
+  - id: IR.s.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:61 — Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.s.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:90 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:90 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:92 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:223 — Journal lists are growable snapshots with append-only visible suffixes"
+  - id: IR.s.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:91 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:101 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:106 — Type IDs and record sequences use different coordinates and survive reopen"
+  - id: IR.s.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:181 — Journal lists are growable snapshots with append-only visible suffixes"
+  - id: IR.s.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/record_ids_by_type_order.rs:42 — type_lists_ascend_after_a_torn_tail_issues_its_id_again (assert_ascending, called at lines 160, 181 and 188)"
+  - id: IR.s.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:205 — Journal lists are growable snapshots with append-only visible suffixes"
+  - id: IR.s.18
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:101 — Failing a barrier leaves exactly the landed journal suffix and state readable (journalWriter)"
+  - id: IR.t.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:277 — Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches"
+  - id: IR.t.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:87 — the store's errors carry their kind"
+  - id: IR.t.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:88 — the store's errors carry their kind"
+  - id: IR.t.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:247 — createBranchWithStates / createBranchAtWithStates inherit exactly the selected states"
+  - id: IR.t.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:98 — the store's errors carry their kind"
+  - id: IR.t.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:236 — Temporary damage to a cold record causes real read errors, not absent data"
+  - id: IR.u.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:108 — Fresh factory handles advertise capabilities before state setup"
+  - id: IR.u.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:155 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.u.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:156 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.u.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:137 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.u.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:154 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.u.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:409 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.u.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:404 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.u.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:313 — Switching and reusing a branch name cannot revive another identity's indexes"
+  - id: IR.u.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cold_metadata_scaling.rs:197 — cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content"
+  - id: IR.v.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:68 — two views interleave writes; each reads only its own branch; root cursor and main untouched"
+  - id: IR.v.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:450 — A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.v.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:283 — Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.v.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:44 — appendManyToStateJson: one record holding the batch, items at firstOrdinal + i, MANIFEST marked"
+  - id: IR.v.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:413 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.v.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:119 — getStateItemsJson: one entry per index, in order, null where getStateItemJson is null"
+  - id: IR.v.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-read-scaling.test.mjs:91 — Warm point, page and suffix conversion do not scale with the untouched prefix"
+  - id: IR.v.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:456 — A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.v.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:153 — Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.v.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:334 — Editing stamped content returns a new canonical point value, not a mutated cached object"
+  - id: IR.v.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:319 — Append, identity append and prepared byte edit agree on stored JSON normalization"
+  - id: IR.v.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:337 — Editing stamped content returns a new canonical point value, not a mutated cached object"
+  - id: IR.v.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:240 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.v.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:233 — Temporary damage to a cold record causes real read errors, not absent data"
+  - id: IR.w.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:98 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.w.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:280 — Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches"
+  - id: IR.w.3
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/proto-key.test.mjs:43 — A channel named __proto__ keeps its own generation counter through a snapshot (todo)"
+    gap: "When the stored JSON object contains a numeric own property named __proto__, the decoded object omits that property instead of preserving the stored contents."
+  - id: IR.w.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:119 — A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.w.5
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/proto-key.test.mjs:43 — A channel named __proto__ keeps its own generation counter through a snapshot (todo)"
+    gap: "For a channel named __proto__, the stored generation counter is present in the bytes but is not an own property of the returned generations map."
+  - id: IR.w.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:234 — Temporary damage to a cold record causes real read errors, not absent data"
+  - id: IR.w.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:264 — Planning edits to materialized JS data does not write on mutation or close"
+  - id: IR.w.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:137 — Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.w.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:108 — A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.w.10
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/review7_fixes.rs:120 — a_batch_counts_a_legacy_states_items_before_it_takes_its_ordinals"
+    gap: "On reopening a legacy log whose redaction saved a count of zero, the full read returns [0, 1, 2] while getStateLen still reports zero."
+  - id: IR.w.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:120 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.w.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:133 — No record, stored null and other falsy JSON values are different states"
+  - id: IR.w.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:147 — No record, stored null and other falsy JSON values are different states"
+  - id: IR.w.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:371 — Slices share prefix record stamps but distinguish independent sibling presentations"
+  - id: IR.w.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+  - id: IR.w.16
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/proto-key.test.mjs:43 — A channel named __proto__ keeps its own generation counter through a snapshot (todo)"
+    gap: "For a snapshot containing a numeric __proto__ entry, setStateJson writes the entry but stringifying the result of getStateJson leaves it out."
+  - id: IR.w.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:461 — A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.w.18
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:196 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.w.19
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:96 — the store's errors carry their kind"
+  - id: IR.w.20
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:152 — No record, stored null and other falsy JSON values are different states"
+  - id: IR.w.21
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/state/cache.rs shared_cache_offset_index_does_not_grow_without_bound"
+  - id: IR.w.22
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/reconstruction_scaling.rs cold_read_append_log_linear; tests/reconstruction_scaling.rs cold_read_edit_sprinkled_linear; tests/reconstruction_scaling.rs cold_read_tree_linear"
+  - id: IR.x.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:180 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.x.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:417 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.x.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:177 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.x.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:192 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.x.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:152 — Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.x.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:152 — Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.x.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:181 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.x.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:191 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.y.1
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/review7_fixes.rs:120 a_batch_counts_a_legacy_states_items_before_it_takes_its_ordinals"
+    gap: "On reopening a log with a count saved by a pre-0.5 release after a redaction, the store reports zero even though the same branch reads back as [0, 1, 2]."
+  - id: IR.y.2
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/review7_fixes.rs:458 a_batch_whose_count_meets_a_damaged_record_is_refused"
+    gap: "When a damaged record makes recounting the log fail its checksum, the length lookup still succeeds with the stored count of 3 rather than throwing for the unreadable log."
+  - id: IR.y.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:173 A registered append log that was never written still counts as no items after a reopen"
+  - id: IR.y.4
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/review7_fixes.rs:125 a_batch_counts_a_legacy_states_items_before_it_takes_its_ordinals"
+    gap: "On the reopened legacy log the count immediately before the batch is zero, but the batch recounts the three surviving items and starts at ordinal 3."
+  - id: IR.y.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:4179 a_reopened_store_answers_a_length_without_reading_a_record"
+  - id: IR.y.6
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:4062 a_head_an_earlier_release_left_across_a_change_keeps_its_reading_through_a_snapshot_and_a_reopen"
+    gap: "With the earlier-release head in this test, the slice contains [0, 1, 2, 3] and the tail contains 3, but the reported exclusive end is 3 instead of 4."
+  - id: IR.y.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:130 snapshot, tree, edit and redact through views are isolated in both directions"
+  - id: IR.y.8
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/review7_fixes.rs:120 a_batch_counts_a_legacy_states_items_before_it_takes_its_ordinals"
+    gap: "For the reopened legacy log with three surviving items, the count supplied as the old prefix end is 0, so the resulting half-open redaction range is empty."
+  - id: IR.y.9
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:99 Interrupted identity writes expose no partial stamped row or batch"
+    gap: "The test checks a throw with no new row published; to cover an ambiguous outcome it would also have to check that a successful reread includes a row that did land despite a throw."
+  - id: IR.y.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:160 No record, stored null and other falsy JSON values are different states"
+  - id: IR.y.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:454 A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.z.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:109 Fresh factory handles advertise capabilities before state setup"
+  - id: IR.z.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:155 Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.z.3
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:4062 a_head_an_earlier_release_left_across_a_change_keeps_its_reading_through_a_snapshot_and_a_reopen"
+    gap: "On reopening a log with the stale head saved by an earlier release after a redaction, the slice and whole-state read both return four items, but the store reports a length of three."
+  - id: IR.z.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-read-scaling.test.mjs:69 Warm point, page and suffix conversion do not scale with the untouched prefix"
+  - id: IR.z.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-read-scaling.test.mjs:91 Warm point, page and suffix conversion do not scale with the untouched prefix"
+  - id: IR.z.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:206 Suffix reads preserve the boundary, even with a bad window item or an enormous limit"
+  - id: IR.z.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:158 Message and context read paths preserve inline and referenced content as stored"
+  - id: IR.z.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:378 Slices share prefix record stamps but distinguish independent sibling presentations"
+  - id: IR.z.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:196 Suffix reads preserve the boundary, even with a bad window item or an enormous limit"
+  - id: IR.z.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:210 Suffix reads preserve the boundary, even with a bad window item or an enormous limit"
+  - id: IR.aa.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:268 — The ended log is read from the branch that the root has selected"
+  - id: IR.aa.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:242 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.aa.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:242 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.aa.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:242 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.aa.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:238 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.aa.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:242 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.aa.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:234 — The ended log returns a bounded suffix of complete AgentRecords"
+  - id: IR.aa.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — getStateTail on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+  - id: IR.aa.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/long_store_snapshots.rs:657 — test_set_on_append_log_read_paths_before_snapshot"
+  - id: IR.ab.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:429 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.ab.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:299 — Close consumes the root even when its final barrier throws"
+  - id: IR.ab.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in close leaves a throw or a return, whole values and a store that opens again (close and isClosed rule)"
+  - id: IR.ab.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:408 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.ab.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:603 — damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
+  - id: IR.ab.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:88 — Liveness is sampled on the handle that is about to read"
+  - id: IR.ab.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:94 — Liveness is sampled on the handle that is about to read"
+  - id: IR.ac.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:35 — A live branch inventory distinguishes creations, not names or equal heads (assertInventory)"
+  - id: IR.ac.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:38 — A live branch inventory distinguishes creations, not names or equal heads (assertInventory)"
+  - id: IR.ac.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:55 — Dead handles throw instead of reporting empty inventories, records or revisions (assertDead)"
+  - id: IR.ac.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:56 — A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.ac.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:104 — A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.ac.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:57 — A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.ac.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:181 — Listed ancestry describes immediate parents and inclusive cuts, not current heads"
+  - id: IR.ac.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:177 — Listed ancestry describes immediate parents and inclusive cuts, not current heads"
+  - id: IR.ac.9
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:145 — Creation metadata is in epoch microseconds and stays with the identity"
+    gap: "For a newly created branch, the listed `created` matches `currentBranch().created` but is in epoch microseconds, so it must be divided by 1,000 before passing it to `new Date`."
+  - id: IR.ac.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:39 — A live branch inventory distinguishes creations, not names or equal heads (assertInventory)"
+  - id: IR.ac.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:77 — A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.ac.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:238 — Deletion through a parent view invalidates only the saved selective creation"
+  - id: IR.ac.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:172 — Listed ancestry describes immediate parents and inclusive cuts, not current heads"
+  - id: IR.ad.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:48 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:95 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:117 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:54 — Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.ad.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:124 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:113 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:96 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:106 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:97 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ad.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:192 — A listed populated receipt can be cleared and reused without registration"
+  - id: IR.ae.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:242 — Open does not initialize, settle or sanitize application state"
+  - id: IR.ae.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:627 — opening a store that is not there is InvalidFormat"
+  - id: IR.ae.3
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/proto-key.test.mjs:46 — A channel named __proto__ keeps its own generation counter through a snapshot (todo)"
+    gap: "When a persisted snapshot contains a numeric property named `__proto__`, the bytes retain the key and value, but `getStateJson` returns an object without that own property."
+  - id: IR.ae.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:218 — A copy with a torn tail recovers at its own path while the resident stays open and whole"
+  - id: IR.ae.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:176 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.ae.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:119 — A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.ae.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:213 — a second open of a store in use is Locked"
+  - id: IR.ae.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:117 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.ae.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:649 — opening a store under a path that is a file is an Io error"
+  - id: IR.ae.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:115 — Fresh factory handles advertise capabilities before state setup"
+  - id: IR.ae.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:196 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.ae.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:177 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.ae.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:207 — a second open of a store in use is Locked"
+  - id: IR.ae.14
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/torn_tail_recovery.rs:69 — torn_tail_record_is_recovered_on_open"
+    gap: "A test must make a later open step fail after a torn tail, then stat `records.log` before any retry and assert that its length is exactly the saved end of the last whole record."
+  - id: IR.ae.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:102 — A stopped log can be backfilled by its persisted duplicate positions"
+  - id: IR.ae.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:111 — sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+  - id: IR.ae.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:256 — Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.ae.18
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/state/field_index.rs test_load_missing_file_returns_none; src/state/field_index.rs test_load_stale_version_returns_none; src/state/field_index.rs test_load_garbage_returns_none; src/state/field_index.rs test_load_oversized_length_field_does_not_panic; src/state/field_index.rs test_load_length_field_exceeding_remaining_bytes_does_not_panic"
+  - id: IR.af.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:146 — Session directories isolate stores and preserve application-owned neighbors"
+  - id: IR.af.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:48 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.af.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:124 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.af.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:214 — a second open of a store in use is Locked"
+  - id: IR.af.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:120 — Fresh factory handles advertise capabilities before state setup"
+  - id: IR.af.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:372 — root close() closes every view and releases the lock with views still referenced; view-written branches persist"
+  - id: IR.af.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:214 — a second open of a store in use is Locked"
+  - id: IR.af.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:157 — after close and reopen, the order holds"
+  - id: IR.af.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:286 — openOrCreate reopens a store on its saved branch before any view or switch"
+  - id: IR.af.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:135 — Session directories isolate stores and preserve application-owned neighbors"
+  - id: IR.af.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:191 — openOrCreate opens a version-1 store without moving it to version 2, and the first batch marks it"
+  - id: IR.af.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:198 — batched appends, and create or openOrCreate where something is already there, refuse with theirs"
+  - id: IR.af.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:145 — Session directories isolate stores and preserve application-owned neighbors"
+  - id: IR.af.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:148 — Session directories isolate stores and preserve application-owned neighbors"
+  - id: IR.af.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/create_existing_store.rs:227 — an_open_or_create_error_after_lock_acquisition_releases_the_lock"
+  - id: IR.af.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1466 — open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death"
+  - id: IR.af.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:116 — openOrCreate honors the supplied blob read-cache capacity, for a new store and an existing one"
+  - id: IR.af.18
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/torn_tail_recovery.rs:151 — midlog_corruption_still_fails_open"
+  - id: IR.af.19
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/create_existing_store.rs open_or_create_creates_into_an_existing_empty_directory"
+  - id: IR.af.20
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/create_existing_store.rs open_or_create_finishes_a_create_that_stopped_before_its_manifest; tests/create_existing_store.rs open_or_create_finishes_a_create_that_stopped_inside_its_manifest_save"
+  - id: IR.af.21
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/lock_file.rs creating_a_store_leaves_an_existing_lock_files_bytes_alone"
+  - id: IR.ag.1
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:185 — An explicit branch name selects the live records of that branch (todo)"
+    gap: "Polling the ID of a live record subscription filtered to `work` returns records written on `main` as well as those written on `work`."
+  - id: IR.ag.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:57 — before hook, empty-poll subprocess probe"
+  - id: IR.ag.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:86 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.ag.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:81 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.ag.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:119 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.ag.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:122 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.ag.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:144 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.ag.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:124 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.ah.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:193 Registration straight after opening a store older than field indexes indexes its history"
+  - id: IR.ah.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:309 Switching and reusing a branch name cannot revive another identity's indexes"
+  - id: IR.ah.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:162 Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ah.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:157 Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ah.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:165 Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ah.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:384 Unpaginated native history results have no ordinary page cap"
+  - id: IR.ah.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:272 Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.ah.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:176 Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ah.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:170 Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ah.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:417 Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.ah.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:433 Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.ah.12
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cold_metadata_scaling.rs:238 cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content"
+    gap: "The cold probes check for slot reconstruction and cost growth with more nonmatches or distinct keys at zero or one hit; a test would also need to bound output work as the number of matching ordinals grows."
+  - id: IR.ai.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:107 — Fresh factory handles advertise capabilities before state setup"
+  - id: IR.ai.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:140 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ai.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:181 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ai.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:177 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ai.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:310 — Switching and reusing a branch name cannot revive another identity's indexes"
+  - id: IR.ai.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:283 — Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.ai.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:184 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.ai.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:371 — Time pages order values first and split tied groups without repeats"
+  - id: IR.ai.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:373 — Time pages order values first and split tied groups without repeats"
+  - id: IR.ai.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:374 — Time pages order values first and split tied groups without repeats"
+  - id: IR.ai.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:385 — Unpaginated native history results have no ordinary page cap"
+  - id: IR.ai.12
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cold_metadata_scaling.rs:265 — cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content"
+    gap: "The probes check for slot reconstruction and excessive cost growth as history grows with two hits; to cover the + k term, a test would also need to bound the work as the number of matching ordinals grows."
+  - id: IR.ai.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:414 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.ai.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:437 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.ak.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:192 — stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.ak.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:74 — firstOrdinal follows single appends, earlier batches, snapshots and redacts"
+  - id: IR.ak.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:119 — getStateItemsJson: one entry per index, in order, null where getStateItemJson is null"
+  - id: IR.ak.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:62 — Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.ak.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:179 — Repair on a stopped copy preserves historical coordinates and leaves the original alone"
+  - id: IR.ak.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:191 — stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.ak.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:283 — Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.ak.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1364 — a_torn_shard_redaction_never_recovers_part_of_the_selected_group"
+  - id: IR.ak.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:58 — Replacing or redacting a log down to zero is not an absent registration"
+  - id: IR.ak.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:107 — The one surviving ledger checkpoint outlives prefix redaction and compaction"
+  - id: IR.al.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:60 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.al.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:87 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.al.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:47 — Replacing or redacting a log down to zero is not an absent registration"
+  - id: IR.al.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:208 — A fresh registration takes its cadence fields with no retune"
+  - id: IR.al.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:214 — Duplicate by exact ID refuses even a different strategy on reopen"
+  - id: IR.al.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:222 — Duplicate by exact ID refuses even a different strategy on reopen"
+  - id: IR.al.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:196 — Registration and retuning report non-duplicate refusals at the call"
+  - id: IR.al.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:133 — No record, stored null and other falsy JSON values are different states"
+  - id: IR.al.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:68 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.al.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:64 — Registration inventory is global, exact, read-only and usable by ID after reopen"
+  - id: IR.al.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:208 — Duplicate by exact ID refuses even a different strategy on reopen"
+  - id: IR.al.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:195 — A listed populated receipt can be cleared and reused without registration"
+  - id: IR.al.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:194 — Explicit tree cadence fields drive keyed snapshot boundaries"
+  - id: IR.al.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:149 — The first full cadence is measured in delta intervals"
+  - id: IR.al.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:211 — Duplicate by exact ID refuses even a different strategy on reopen"
+  - id: IR.al.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:5771 — a_failed_log_fsync_publishes_nothing_until_reopen"
+  - id: IR.am.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:106 — Fresh factory handles advertise capabilities before state setup"
+  - id: IR.am.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:407 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.am.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:117 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.am.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:246 — A narrow time query through the binding costs the same over a long history"
+  - id: IR.am.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:142 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.am.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:165 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.am.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:193 — Registration straight after opening a store older than field indexes indexes its history"
+  - id: IR.am.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/store.rs:4236 — registering_a_fresh_field_index_again_reads_no_record"
+  - id: IR.am.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:433 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.am.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:417 — Missing, wrong-kind and poisoned indexes differ from successful empty queries"
+  - id: IR.am.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:342 — Switching and reusing a branch name cannot revive another identity's indexes"
+  - id: IR.am.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:283 — Shared-handle edits cannot leave queryable stale channel or timestamp hits"
+  - id: IR.am.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:121 — Three exact history indexes agree on message ordinals across two state IDs"
+  - id: IR.an.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:55 — Toggling automatic snapshots acts immediately without losing disabled-period messages"
+  - id: IR.an.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:61 — Toggling automatic snapshots acts immediately without losing disabled-period messages"
+  - id: IR.an.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:78 — Toggling automatic snapshots acts immediately without losing disabled-period messages"
+  - id: IR.ao.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:275 — Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches"
+  - id: IR.ao.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:183 — A listed populated receipt can be cleared and reused without registration"
+  - id: IR.ao.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:282 — Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches"
+  - id: IR.ao.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:278 — Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches"
+  - id: IR.ao.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:280 — Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches"
+  - id: IR.ao.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective_fork.rs:245 — selective_historical_fork_inherits_selected_states_at_the_sequence"
+  - id: IR.ao.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:181 — A listed populated receipt can be cleared and reused without registration"
+  - id: IR.ao.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:159 — Pre-record I/O refusals preserve whole branch-local JSON values"
+  - id: IR.ao.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:290 — Byte and object setters round-trip the same large receipt"
+  - id: IR.ap.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:230 JS snapshot replacement preserves caller-owned keys and normalized JSON values"
+  - id: IR.ap.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:239 Clearing a slot whole advances the branch and leaves its earlier rows at the saved sequence"
+  - id: IR.ap.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:127 A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.ap.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:156 Pre-record I/O refusals preserve whole branch-local JSON values"
+  - id: IR.ap.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:111 sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+  - id: IR.ap.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/log-readback.test.mjs:47 Replacing or redacting a log down to zero is not an absent registration"
+  - id: IR.ap.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:240 Clearing a slot whole advances the branch and leaves its earlier rows at the saved sequence"
+  - id: IR.ap.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:151 No record, stored null and other falsy JSON values are different states"
+  - id: IR.ap.9
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/proto-key.test.mjs:43 A channel named __proto__ keeps its own generation counter through a snapshot (todo)"
+    gap: "When the caller supplies an own numeric `__proto__` generation, the stored bytes retain it but the object returned by `getStateJson` has no such own property."
+  - id: IR.ap.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:192 A listed populated receipt can be cleared and reused without registration"
+  - id: IR.ap.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:185 stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.ap.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1195 interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix"
+  - id: IR.ap.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:162 Pre-record I/O refusals preserve whole branch-local JSON values"
+  - id: IR.ap.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:226 JS snapshot replacement preserves caller-owned keys and normalized JSON values"
+  - id: IR.ap.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:244 A number that is not finite is refused at the call or never read back"
+  - id: IR.ap.16
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
+  - id: IR.ap.17
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-key-order.mjs:238 A lone low surrogate half in summary text reads back as U+FFFD"
+  - id: IR.ap.18
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:296 Byte and object setters round-trip the same large receipt"
+  - id: IR.aq.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:164 stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.aq.2
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/state-catalog.test.mjs:152 No record, stored null and other falsy JSON values are different states"
+    gap: "Missing heads, stored null and valid JSON of the wrong shape are covered; a test should also assert a numeric head for a written window slot whose bytes cannot be decoded as JSON."
+  - id: IR.aq.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:173 stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.aq.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:142 stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.aq.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:475 A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.aq.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:307 on a view, an identity batch counts and stamps on the view's branch"
+  - id: IR.aq.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:59 Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.aq.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:105 Fresh factory handles advertise capabilities before state setup"
+  - id: IR.aq.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cold_metadata_scaling.rs:161 cold_metadata_and_narrow_index_probes_do_not_scale_with_message_content"
+  - id: IR.aq.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:211 stateHeadOffset is an exact, handle-independent revision key"
+  - id: IR.as.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:21 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:22 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:306 — Staging is not publication and one mixed batch updates only its commit branch"
+  - id: IR.as.4
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — storeBlob / with fsync 3 of the call refused / the barrier (todo at line 38)"
+    gap: "If syncing the directory fails after the blob was renamed into place, a later sync or close can return without making the blob's name durable."
+  - id: IR.as.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:91 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.as.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:22 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:22 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:290 — Staging is not publication and one mixed batch updates only its commit branch"
+  - id: IR.as.9
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — storeBlob / with fsync 3 of the call refused / the errno (todo at line 35; also fsync 1 at line 34)"
+    gap: "When a blob directory sync is refused, the thrown error has no Node-style errno code and its message continues after `(os error N)`, so the caller cannot extract the errno."
+  - id: IR.as.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob_storage.rs:193 — storing_the_content_again_leaves_a_readable_copy_as_it_is"
+  - id: IR.as.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:21 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:45 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:48 — Synchronous blob keys address exact bytes independently of MIME or provenance"
+  - id: IR.as.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/blobs/storage.rs:1634 — a_store_after_a_get_finds_the_blob_damaged_repairs_it_in_the_same_storage"
+  - id: IR.at.1
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/blob-async.mjs Async hashes with a full libuv pool"
+  - id: IR.at.2
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/blobs/chunks.rs chunks_cover_the_content_in_order_within_their_bounds"
+  - id: IR.at.3
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/blobs/chunks.rs a_change_moves_only_the_cuts_near_it; src/blobs/chunks.rs the_same_content_is_cut_where_it_was"
+  - id: IR.au.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test.mjs:331 — Test 38: Subscription APIs (basic smoke test)"
+  - id: IR.au.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:326 — The default queue holds a thousand events and cleanup also removes overflowed IDs"
+  - id: IR.au.3
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:313 — The snapshot byte cap includes the delimiters of a replayed JSON array (todo)"
+    gap: "With a 9-byte cap, replay returns the 11-byte array [\"é\",\"é\"] because it counts the elements but not the brackets and comma."
+  - id: IR.au.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:81 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.au.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:88 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.au.6
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:185 — An explicit branch name selects the live records of that branch (todo)"
+    gap: "A live record subscription selecting work by name receives records written on main as well as those written on work."
+  - id: IR.au.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:272 — Replay honors selected state IDs and explicit and default snapshot byte limits"
+  - id: IR.au.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:124 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.au.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:68 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.au.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:69 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.au.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:124 — Event inclusion flags select replay and live classes with bare names and JSON data"
+  - id: IR.au.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:78 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.au.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:92 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.au.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:63 — Dead handles throw instead of reporting empty inventories, records or revisions"
+  - id: IR.au.15
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/subscriptions/manager.rs test_not_caught_up_doesnt_receive"
+  - id: IR.av.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:122 — A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.av.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:405 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.av.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:100 — A live branch inventory distinguishes creations, not names or equal heads"
+  - id: IR.av.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:423 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.av.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:414 — A checkout changes the shared cursor, not saved branch objects or pinned views"
+  - id: IR.av.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/history-index.test.mjs:325 — Switching and reusing a branch name cannot revive another identity's indexes"
+  - id: IR.av.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:473 — A redaction on a historical child leaves the source with that row and its rows after the cut"
+  - id: IR.av.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/journal-replay.test.mjs:159 — A typed journal outlives historical cuts and deletion of a contributing branch"
+  - id: IR.av.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:583 — all_branch_creation_paths_survive_with_inherited_heads_and_tail"
+  - id: IR.av.10
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:182 — A switch whose saved branch list cannot be written leaves the source selected and writable"
+    gap: "An unknown name leaves the source selected, but if saving branches.bin fails during a switch to an existing target, switchBranch throws with the target already selected."
+  - id: IR.av.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:263 — A failure after a successful fork and switch does not undo either"
+  - id: IR.av.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/branch-catalog.test.mjs:286 — openOrCreate reopens a store on its saved branch before any view or switch"
+  - id: IR.av.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1166 — a_switch_back_to_source_survives_a_barrier_without_drop"
+  - id: IR.aw.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:175 — Mixed references and a repair that one sync covers recover after the writer dies without a close (mixedWriter)"
+  - id: IR.aw.2
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk (todo)"
+    gap: "When Chronicle creates the store directory, sync returns without syncing its parent, so a power loss can lose the name needed to reopen the whole batch."
+  - id: IR.aw.3
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again / with fsync 3 of the call refused / the barrier (todo at line 38)"
+    gap: "After storeBlob places a blob but cannot sync its directory, the following sync returns normally instead of throwing or making the blob's name durable."
+  - id: IR.aw.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/atomic_metadata.rs:179 — sync_only_republishes_metadata_that_changed"
+  - id: IR.aw.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:104 — Failing a barrier leaves exactly the landed journal suffix and state readable (journalWriter)"
+  - id: IR.aw.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:262 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
+  - id: IR.aw.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1166 — a_switch_back_to_source_survives_a_barrier_without_drop"
+  - id: IR.aw.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:270 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
+  - id: IR.aw.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:300 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
+  - id: IR.aw.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:316 — Synced progress and queue replacements recover without another flush"
+  - id: IR.aw.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/unclean-boundaries.test.mjs:315 — Synced progress and queue replacements recover without another flush"
+  - id: IR.aw.12
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again / with fsync 3 of the call refused / the barrier (todo at line 38)"
+    gap: "If the blob's directory sync failed after the blob was put in place, the guard's sync can return without securing the name needed to retrieve that blob."
+  - id: IR.aw.13
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "src/records/log.rs:879 — a_failed_sync_is_reported_by_every_later_one"
+    gap: "If the record-log fsync fails once, syncing the same work on the same open store still reports DurabilityLost even when the retry's own fsync succeeds."
+  - id: IR.aw.14
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/atomic_file.rs first_checkpoint_uses_normal_creation_permissions; src/atomic_file.rs replacement_preserves_permissions; src/atomic_file.rs special_bits_survive_where_both_ids_carry_over"
+  - id: IR.aw.15
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/atomic_file.rs replacement_stays_private_while_written"
+  - id: IR.aw.16
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/atomic_file.rs ownership_the_writer_may_not_set_is_left_and_what_it_granted_dropped; src/atomic_file.rs only_the_refusals_cp_accepts_leave_ownership_to_the_writer; src/atomic_file.rs group_carries_over_when_the_owner_cannot"
+  - id: IR.aw.17
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/atomic_file.rs same_bytes_over_a_name_that_became_a_fifo_are_refused_without_waiting"
+  - id: IR.aw.18
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/atomic_file.rs dropping_a_staging_path_after_its_rename_leaves_the_renamed_file"
+  - id: IR.ax.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:303 — Staging is not publication and one mixed batch updates only its commit branch"
+  - id: IR.ax.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:305 — Staging is not publication and one mixed batch updates only its commit branch"
+  - id: IR.ax.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:84 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.ax.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:82 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.ax.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:310 — Staging is not publication and one mixed batch updates only its commit branch"
+  - id: IR.ax.6
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 — A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again"
+    gap: "The fault harness compares `treeList` with a reopened copy, but a test would need to establish that the record landed before a throw and check each changed path with `treeGet` immediately, before retry or sync."
+  - id: IR.ax.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:83 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.ay.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:83 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:84 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:87 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:262 — File and intent removals rewind together and respect separate write order"
+  - id: IR.ay.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:305 — Staging is not publication and one mixed batch updates only its commit branch"
+  - id: IR.ay.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:366 — A malformed live tree cannot masquerade as a miss or empty inventory"
+  - id: IR.ay.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:90 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:91 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:92 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:100 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1280 — an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence"
+  - id: IR.ay.12
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:84 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+    gap: "The test checks all three mutations when nothing landed; to distinguish accurate readback from always reporting the old value after a throw, a test would need a recorded change followed by an error and a treeGet returning the new hash, size and mode or null for the removed key."
+  - id: IR.ay.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:72 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:94 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ay.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:139 — A saved tree hit can restore an undecodable intent without touching its blob"
+  - id: IR.az.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:109 Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.az.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:260 File and intent removals rewind together and respect separate write order"
+  - id: IR.az.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:195 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:196 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:367 A malformed live tree cannot masquerade as a miss or empty inventory"
+  - id: IR.az.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/late-failures.test.mjs:650 treeList on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+  - id: IR.az.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:198 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:199 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:200 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:201 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:202 Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.az.12
+    status: partly-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:117 Two exact-key trees preserve byte counts, modes and independent content references"
+    gap: "The test lists a never-stored blob reference; a test must also assert that the path and hash remain listed while the referenced blob exists but `getBlob` throws on it."
+  - id: IR.az.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:119 Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.az.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:120 Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.ba.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:242 — File and intent removals rewind together and respect separate write order"
+  - id: IR.ba.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:78 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.ba.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:244 — File and intent removals rewind together and respect separate write order"
+  - id: IR.ba.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:266 — File and intent removals rewind together and respect separate write order"
+  - id: IR.ba.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:111 — sync after treeRemove returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+  - id: IR.ba.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:79 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.ba.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:241 — File and intent removals rewind together and respect separate write order"
+  - id: IR.ba.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1302 — an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence"
+  - id: IR.ba.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:262 — File and intent removals rewind together and respect separate write order"
+  - id: IR.ba.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:174 — An intent whose blob is unreadable can be saved, replaced, restored and removed"
+  - id: IR.ba.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/point_write_cost.rs:77 — ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows"
+  - id: IR.ba.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:80 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.ba.13
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "src/state/operations.rs test_tree_remove_nonexistent"
+  - id: IR.bb.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:79 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.bb.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:90 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.bb.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:101 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.bb.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:135 — A saved tree hit can restore an undecodable intent without touching its blob"
+  - id: IR.bb.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:70 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.bb.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:262 — File and intent removals rewind together and respect separate write order"
+  - id: IR.bb.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:199 — Listing uses exact literal prefixes and ordered original path spellings"
+  - id: IR.bb.8
+    status: not-met
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk (todo)"
+    gap: "When the store has made its own directory, sync after treeSet returns without syncing the parent directory, so a power loss can still lose the store's name and with it access to the entry."
+  - id: IR.bb.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:71 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.bb.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/crash_state_recovery.rs:1300 — an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence"
+  - id: IR.bb.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:105 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.bb.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:172 — An intent whose blob is unreadable can be saved, replaced, restored and removed"
+  - id: IR.bb.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/write-refusals.test.mjs:76 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+  - id: IR.bb.14
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/point_write_cost.rs:70 — ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows"
+  - id: IR.bb.15
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/tree-contract.test.mjs:124 — Two exact-key trees preserve byte counts, modes and independent content references"
+  - id: IR.bb.16
+    status: fully-pinned
+    tests_commit: "f4e39ace350a01f1bdf036d14e3f0cb8e2ad2d56"
+    test: "tests/tree_integration.rs test_tree_ops_rejected_on_non_tree_state"
+  - id: IR.bc.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:92 — Interleaved polls drain distinct filtered streams in order without consuming each other"
+  - id: IR.bc.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:305 — a poll of a subscription made through ${made} and unsubscribed through another handle while its buffer is full returns what was queued, then says it was dropped"
+  - id: IR.bc.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/subscription-stream.test.mjs:333 — The default queue holds a thousand events and cleanup also removes overflowed IDs"
+  - id: IR.bc.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "error-codes.test.mjs:158 — the binding's own refusals carry theirs"
+  - id: IR.bd.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:100 — Reapplying a retune on reopen changes scheduling without replacing the named log"
+  - id: IR.bd.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:123 — Reapplying a retune on reopen changes scheduling without replacing the named log"
+  - id: IR.bd.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:164 — The first full cadence is measured in delta intervals"
+  - id: IR.bd.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:103 — Reapplying a retune on reopen changes scheduling without replacing the named log"
+  - id: IR.bd.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/cadence.test.mjs:102 — Reapplying a retune on reopen changes scheduling without replacing the named log"
+  - id: IR.bd.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/checkpoint-errors.test.mjs:209 — Registration and retuning report non-duplicate refusals at the call"
+  - id: IR.be.1
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:107 — A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.be.2
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:109 — A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.be.3
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:112 — A sampled non-main parent name works for all three named-parent forks"
+  - id: IR.be.4
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-batches.mjs:276 — on a view, an identity batch counts and stamps on the view's branch"
+  - id: IR.be.5
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:61 — two views interleave writes; each reads only its own branch; root cursor and main untouched"
+  - id: IR.be.6
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:190 — A selective head fork shares the seed records but subsequent writes diverge"
+  - id: IR.be.7
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:475 — A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
+  - id: IR.be.8
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/blob-keys.test.mjs:81 — References on distinct branches resolve the same shared bytes after rebind"
+  - id: IR.be.9
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:256 — Cold historical child keeps its selected prefix, references and later private window"
+  - id: IR.be.10
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/node-lifecycle.test.mjs:88 — Liveness is sampled on the handle that is about to read"
+  - id: IR.be.11
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:38 — root handle: pinnedBranch() is null, view() of a missing branch throws"
+  - id: IR.be.12
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "test-views.mjs:266 — createBranchWithStates / createBranchAtWithStates inherit exactly the selected states"
+  - id: IR.be.13
+    status: fully-pinned
+    tests_commit: "b59a5bea6f0153d9282dd174232179dfa31f0867"
+    test: "tests/selective-lineage.test.mjs:169 — A selective head fork shares the seed records but subsequent writes diverge"
