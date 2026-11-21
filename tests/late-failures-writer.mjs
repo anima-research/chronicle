@@ -1,10 +1,46 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
-import * as scenarios from './late-failures-scenarios.mjs';
 
 const message = (text, n) => ({ channel: 'general', text, n });
 const entry = blobHash => ({ blobHash, size: 4, mode: 0o644 });
+const utf8 = buffer => (buffer === null || buffer === undefined ? null : buffer.toString('utf8'));
+const stamped = (id, sequence) => typeof id === 'string' && id !== '' && Number.isSafeInteger(sequence) && sequence >= 0;
+const plain = items => (items === null ? null : items.map(({ id, sequence, ...rest }) => ({ ...rest, stamped: stamped(id, sequence) })));
+const payloads = (s, type) => s.getRecordIdsByType(type).map(id => JSON.parse(utf8(s.getRecord(id).payload)));
+const branchNames = s => s.listBranches().map(({ name }) => name).sort();
+const stateList = s => s.listStates().map(({ id, strategy }) => `${id} ${strategy}`).sort();
+const files = s => s.treeList('files').map(({ path, blobHash, size, mode }) => ({ path, blobHash, size, mode }));
+const branchStates = name => s => {
+  if (!s.listBranches().some(branch => branch.name === name)) return null;
+  const view = s.view(name);
+  return { messages: view.getStateJson('messages'), mode: view.getStateJson('mode') };
+};
+const journal = s => payloads(s, 'journal');
+const messages = s => s.getStateJson('messages');
+const identified = s => plain(s.getStateJson('identified'));
+const strategyOf = s => s.listStates().find(({ id }) => id === 'messages')?.strategy ?? null;
+
+function threeWrites(s) {
+  s.appendJson('journal', { n: 1 });
+  s.setStateJson('mode', { mode: 'new' });
+  s.appendToStateJson('messages', message('new', 1));
+}
+
+function coldSetup(s, f) {
+  [1, 2, 3].forEach(n => s.appendToStateJson('messages', message('more', n)));
+  s.registerStateFieldIndex('messages', '/channel', 'string');
+  s.registerStateFieldIndex('messages', '/n', 'number');
+  f.at = s.currentSequence();
+  s.setStateJson('mode', { mode: 'later' });
+  f.record = s.getRecordIdsByType('journal')[0];
+  s.createBranch('other');
+}
+
+const h = {
+  message, entry, utf8, branchNames, stateList, files, branchStates, journal, messages, identified, strategyOf,
+  threeWrites, threeReads: { journal, mode: s => s.getStateJson('mode'), messages }, coldSetup,
+};
 
 function base(s, f) {
   for (const [id, strategy] of [['mode', 'snapshot'], ['raw', 'snapshot'], ['messages', 'append_log'],
@@ -20,9 +56,12 @@ function base(s, f) {
   s.treeSet('files', 'a.txt', entry(f.blob));
 }
 
-function known(name) {
-  const scenario = Object.hasOwn(scenarios, name) ? scenarios[name] : undefined;
-  if (scenario === undefined || scenario.name !== name) throw new Error(`tests/late-failures-scenarios.mjs has no scenario named ${name}`);
+const FUNCTIONS = ['setup', 'unsynced', 'call', 'reads', 'read', 'probe', 'method'];
+
+function scenarioAt(path) {
+  const spec = JSON.parse(readFileSync(path, 'utf8'));
+  const scenario = { ...spec };
+  for (const field of FUNCTIONS) if (spec[field] !== undefined) scenario[field] = (0, eval)(`(${spec[field]})`);
   return scenario;
 }
 
@@ -52,8 +91,9 @@ function freshHash(dir) {
   return hash;
 }
 
-function run([name, root, outside, index]) {
-  const scenario = known(name);
+function run([scenarioFile, root, outside, index]) {
+  const scenario = scenarioAt(scenarioFile);
+  const { name } = scenario;
   const path = join(root, 'store');
   const f = {};
   const marks = [];
@@ -73,7 +113,7 @@ function run([name, root, outside, index]) {
   let s = JsStore.create({ path });
   base(s, f);
   const { kind } = scenario;
-  scenario.setup?.(s, f);
+  scenario.setup?.(s, f, h);
   s.sync();
   mark('setup');
 
@@ -82,7 +122,7 @@ function run([name, root, outside, index]) {
     let i = 0;
     for (; i < scenario.appends && i < at; i++) {
       if (index === undefined) mark(`append-${i}-begin`);
-      scenario.call(s, f, i);
+      scenario.call(s, f, h, i);
       if (index === undefined) mark(`append-${i}-end`);
     }
     if (index === undefined) {
@@ -90,22 +130,22 @@ function run([name, root, outside, index]) {
       return out;
     }
   }
-  scenario.unsynced?.(s);
+  scenario.unsynced?.(s, f, h);
   if (kind === 'cold') {
     const { read } = scenario;
-    out.expected = attempt(() => read(s, f));
+    out.expected = attempt(() => read(s, f, h));
     s.close();
     s = JsStore.open({ path });
     mark('opened');
-    out.call = step('call', () => read(s, f));
-    out.retry = step('retry', () => read(s, f));
+    out.call = step('call', () => read(s, f, h));
+    out.retry = step('retry', () => read(s, f, h));
     s.close();
     mark('end');
     return out;
   }
 
-  const { reads } = scenario;
-  const call = () => scenario.call(s, f, Number(index));
+  const reads = scenario.reads(h);
+  const call = () => scenario.call(s, f, h, Number(index));
   out.method = scenario.method ? scenario.method(Number(index)) : name;
   out.old = readAll(reads, s, f);
   out.call = step('call', call);
@@ -139,9 +179,10 @@ function run([name, root, outside, index]) {
   return out;
 }
 
-function reopen([name, index, ...paths]) {
-  const scenario = known(name);
-  const { reads, probe } = scenario;
+function reopen([scenarioFile, index, ...paths]) {
+  const scenario = scenarioAt(scenarioFile);
+  const reads = scenario.reads(h);
+  const { probe } = scenario;
   const answers = paths.map(path => {
     const f = {};
     if (scenario.freshBlob) f.fresh = freshHash(`${path}-scratch`);
@@ -149,7 +190,7 @@ function reopen([name, index, ...paths]) {
     const opened = attempt(() => { s = JsStore.open({ path }); });
     if (!opened.ok) return { opened };
     const result = { opened, reads: readAll(reads, s, f) };
-    if (probe) result.probe = attempt(() => probe(s));
+    if (probe) result.probe = attempt(() => probe(s, f, h));
     s.close();
     return result;
   });
@@ -157,11 +198,16 @@ function reopen([name, index, ...paths]) {
   const s = JsStore.create({ path: `${paths[0]}-without-the-call` });
   base(s, {});
   s.sync();
-  const old = attempt(() => probe(s));
+  const old = attempt(() => probe(s, {}, h));
   s.close();
   return { answers, old };
 }
 
-if (process.argv[2] === 'run') process.stdout.write(JSON.stringify(run(process.argv.slice(3))));
-else if (process.argv[2] === 'reopen') process.stdout.write(JSON.stringify(reopen(process.argv.slice(3))));
-else throw new Error(`late-failures-writer.mjs takes run or reopen, not ${process.argv[2]}`);
+try {
+  if (process.argv[2] === 'run') process.stdout.write(JSON.stringify(run(process.argv.slice(3))));
+  else if (process.argv[2] === 'reopen') process.stdout.write(JSON.stringify(reopen(process.argv.slice(3))));
+  else throw new Error(`late-failures-writer.mjs takes run or reopen, not ${process.argv[2]}`);
+} catch (error) {
+  process.stderr.write(`${error?.stack ?? error}\n${error}\n`);
+  process.exitCode = 1;
+}

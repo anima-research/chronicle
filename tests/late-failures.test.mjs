@@ -1,61 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { availableParallelism, constants, tmpdir } from 'node:os';
 import { join, posix } from 'node:path';
 import { after, suite, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { quoted, readTrace, resolved } from './durability-trace.mjs';
-import {
-  appendJson,
-  appendManyToStateJsonWithIdentity,
-  appendToStateJson,
-  appendToStateJsonWithIdentity,
-  compactState,
-  createBranch,
-  createBranchAt,
-  createBranchAtWithStates,
-  createBranchWithStates,
-  deleteBranch,
-  editStateItem,
-  redactStateItems,
-  registerState,
-  registerStateFieldIndex,
-  setAutoSnapshot,
-  setState,
-  setStateJson,
-  storeBlob,
-  switchBranch,
-  treeBatch,
-  treeRemove,
-  treeSet,
-  updateStateStrategy,
-  sync,
-  close,
-  long,
-  currentBranch,
-  currentSequence,
-  getBlob,
-  getRecord,
-  getRecordIdsByType,
-  getState,
-  getStateIndexValueCounts,
-  getStateItemJson,
-  getStateJson,
-  getStateJsonAt,
-  getStateLen,
-  getStateSlice,
-  getStateTail,
-  listBranches,
-  listStates,
-  queryStateIndexEq,
-  queryStateIndexRange,
-  stateHeadOffset,
-  treeGet,
-  treeList,
-} from './late-failures-scenarios.mjs';
-import * as scenarios from './late-failures-scenarios.mjs';
 
 const CALLS = '%file,%desc,mmap,munmap,msync,sync,syncfs,io_uring_setup,io_uring_enter,io_uring_register,io_setup,io_submit';
 const WRITER = fileURLToPath(new URL('./late-failures-writer.mjs', import.meta.url));
@@ -275,7 +226,7 @@ async function traced(scenario, extra, inject) {
   const record = join(dir, 'record');
   const injection = inject ? ['-e', `inject=${inject.name}:error=${inject.errno}:when=${inject.when}`] : [];
   const result = await child('strace', ['-f', '-y', '-o', record, '-e', `trace=${CALLS}`, ...injection,
-    process.execPath, '--single-threaded', WRITER, 'run', scenario.name, root, outside, ...extra], dir);
+    process.execPath, '--single-threaded', WRITER, 'run', scenario.file, root, outside, ...extra], dir);
   let out = null;
   try {
     out = JSON.parse(result.stdout);
@@ -366,7 +317,7 @@ async function reopened(scenario, kind, extra, runs) {
   const layout = runs.map(run => kind.stores(run));
   const paths = runs.flatMap((run, index) => layout[index].map(where => run[where]));
   if (paths.length === 0) return { each: layout.map(() => ({})) };
-  const result = await child(process.execPath, [WRITER, 'reopen', scenario.name, extra[0] ?? '-', ...paths], base);
+  const result = await child(process.execPath, [WRITER, 'reopen', scenario.file, extra[0] ?? '-', ...paths], base);
   if (result.status !== 0) throw new Error(`the reopening process ended with status ${result.status}: ${result.stderr.trim().split('\n').slice(-3).join(' | ')}`);
   const { answers, old } = JSON.parse(result.stdout);
   return {
@@ -775,16 +726,18 @@ async function scenarioResult(scenario, kind) {
   return { clean, points, counted, misses, aimed, slowest: Math.max(slowest, clean.result.ms), answers: new Map(runs.map((run, index) => [run, answers[index]])), cleanAnswer, extra };
 }
 
-const declared = new Set();
+const asText = value => (typeof value === 'function' ? String(value) : value);
 
 function refused(scenario, kind, { rules = [], todos = [] } = {}) {
-  declared.add(scenario);
   return async t => {
-    assert.ok(scenario !== undefined, 'the test refers to no scenario of tests/late-failures-scenarios.mjs');
-    assert.equal(scenario.kind, kind.name, `the scenario ${scenario.name} is of the kind ${scenario.kind}, and its test judges it as ${kind.name}`);
+    const file = join(base, `${scenario.name}.json`);
+    writeFileSync(file, JSON.stringify({
+      ...Object.fromEntries(Object.entries(scenario).map(([field, value]) => [field, asText(value)])),
+      kind: kind.name,
+    }));
     let result;
     try {
-      result = await scenarioResult(scenario, kind);
+      result = await scenarioResult({ ...scenario, file }, kind);
     } catch (error) {
       result = { failure: error.stack };
     }
@@ -848,55 +801,133 @@ if (skip) {
   after(() => rmSync(base, { recursive: true, force: true }));
   suite('A refused request', { concurrency: true }, () => {
     test('A refused request in appendJson leaves a throw or a return, whole values and a store that opens again',
-      refused(appendJson, writeKind));
+      refused({
+        name: 'appendJson',
+        call: (s, f, h) => s.appendJson('journal', { n: 1 }),
+        reads: h => ({ journal: h.journal }),
+      }, writeKind));
     test('A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again',
-      refused(appendManyToStateJsonWithIdentity, writeKind));
+      refused({
+        name: 'appendManyToStateJsonWithIdentity',
+        call: (s, f, h) => s.appendManyToStateJsonWithIdentity('identified', [{ text: 'two' }, { text: 'three' }], 'id', 'sequence'),
+        reads: h => ({ identified: h.identified }),
+      }, writeKind));
     test('A refused request in appendToStateJson leaves a throw or a return, whole values and a store that opens again',
-      refused(appendToStateJson, writeKind, {
+      refused({
+        name: 'appendToStateJson',
+        call: (s, f, h) => s.appendToStateJson('messages', h.message('new', 1)),
+        reads: h => ({ messages: h.messages }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
       }));
     test('A refused request in appendToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again',
-      refused(appendToStateJsonWithIdentity, writeKind));
+      refused({
+        name: 'appendToStateJsonWithIdentity',
+        call: (s, f, h) => s.appendToStateJsonWithIdentity('identified', { text: 'new' }, 'id', 'sequence'),
+        reads: h => ({ identified: h.identified }),
+      }, writeKind));
     test('A refused request in compactState leaves a throw or a return, whole values and a store that opens again',
-      refused(compactState, writeKind));
+      refused({
+        name: 'compactState',
+        setup: (s, f, h) => [1, 2, 3].forEach(n => s.appendToStateJson('messages', h.message('more', n))),
+        call: (s, f, h) => s.compactState('messages'),
+        reads: h => ({ messages: h.messages, length: s => s.getStateLen('messages') }),
+      }, writeKind));
     test('A refused request in createBranch leaves a throw or a return, whole values and a store that opens again',
-      refused(createBranch, writeKind));
+      refused({
+        name: 'createBranch',
+        call: (s, f, h) => s.createBranch('made'),
+        reads: h => ({ branches: h.branchNames }),
+      }, writeKind));
     test('A refused request in createBranchAt leaves a throw or a return, whole values and a store that opens again',
-      refused(createBranchAt, writeKind));
+      refused({
+        name: 'createBranchAt',
+        setup: (s, f, h) => { f.at = s.currentSequence(); s.setStateJson('mode', { mode: 'later' }); },
+        call: (s, f, h) => s.createBranchAt('made', 'main', f.at),
+        reads: h => ({ branches: h.branchNames, made: h.branchStates('made') }),
+      }, writeKind));
     test('A refused request in createBranchAtWithStates leaves a throw or a return, whole values and a store that opens again',
-      refused(createBranchAtWithStates, writeKind, {
+      refused({
+        name: 'createBranchAtWithStates',
+        setup: (s, f, h) => { f.at = s.currentSequence(); s.setStateJson('mode', { mode: 'later' }); },
+        call: (s, f, h) => s.createBranchAtWithStates('made', 'main', f.at, { stateIds: ['messages'] }),
+        reads: h => ({ branches: h.branchNames, made: h.branchStates('made') }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
         todos: [
           { rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
         ],
       }));
     test('A refused request in createBranchWithStates leaves a throw or a return, whole values and a store that opens again',
-      refused(createBranchWithStates, writeKind, {
+      refused({
+        name: 'createBranchWithStates',
+        call: (s, f, h) => s.createBranchWithStates('made', 'main', { stateIds: ['messages'] }),
+        reads: h => ({ branches: h.branchNames, made: h.branchStates('made') }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
         todos: [
           { rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
         ],
       }));
     test('A refused request in deleteBranch leaves a throw or a return, whole values and a store that opens again',
-      refused(deleteBranch, writeKind));
+      refused({
+        name: 'deleteBranch',
+        setup: (s, f, h) => s.createBranch('gone'),
+        call: (s, f, h) => s.deleteBranch('gone'),
+        reads: h => ({ branches: h.branchNames }),
+      }, writeKind));
     test('A refused request in editStateItem leaves a throw or a return, whole values and a store that opens again',
-      refused(editStateItem, writeKind));
+      refused({
+        name: 'editStateItem',
+        call: (s, f, h) => s.editStateItem('messages', 0, Buffer.from(JSON.stringify(h.message('edited', 0)))),
+        reads: h => ({ messages: h.messages }),
+      }, writeKind));
     test('A refused request in redactStateItems leaves a throw or a return, whole values and a store that opens again',
-      refused(redactStateItems, writeKind));
+      refused({
+        name: 'redactStateItems',
+        setup: (s, f, h) => s.appendManyToStateJsonWithIdentity('identified', [{ text: 'two' }, { text: 'three' }], 'id', 'sequence'),
+        call: (s, f, h) => s.redactStateItems('identified', 0, 2),
+        reads: h => ({ identified: h.identified, length: s => s.getStateLen('identified') }),
+      }, writeKind));
     test('A refused request in registerState leaves a throw or a return, whole values and a store that opens again',
-      refused(registerState, writeKind));
+      refused({
+        name: 'registerState',
+        call: (s, f, h) => s.registerState({ id: 'added', strategy: 'snapshot' }),
+        reads: h => ({ states: h.stateList }),
+      }, writeKind));
     test('A refused request in registerStateFieldIndex leaves a throw or a return, whole values and a store that opens again',
-      refused(registerStateFieldIndex, writeKind));
+      refused({
+        name: 'registerStateFieldIndex',
+        call: (s, f, h) => s.registerStateFieldIndex('messages', '/channel', 'string'),
+        reads: h => ({ index: s => s.queryStateIndexEq('messages', '/channel', 'general', {}) }),
+      }, writeKind));
     test('A refused request in setAutoSnapshot leaves a throw or a return, whole values and a store that opens again',
-      refused(setAutoSnapshot, writeKind));
+      refused({
+        name: 'setAutoSnapshot',
+        call: (s, f, h) => s.setAutoSnapshot(false),
+        reads: h => ({ enabled: s => s.autoSnapshotEnabled() }),
+      }, writeKind));
     test('A refused request in setState leaves a throw or a return, whole values and a store that opens again',
-      refused(setState, writeKind));
+      refused({
+        name: 'setState',
+        call: (s, f, h) => s.setState('raw', Buffer.from('new bytes')),
+        reads: h => ({ raw: s => h.utf8(s.getState('raw')) }),
+      }, writeKind));
     test('A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again',
-      refused(setStateJson, writeKind, {
+      refused({
+        name: 'setStateJson',
+        call: (s, f, h) => s.setStateJson('mode', { mode: 'new' }),
+        reads: h => ({ mode: s => s.getStateJson('mode') }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
       }));
     test('A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again',
-      refused(storeBlob, writeKind, {
+      refused({
+        name: 'storeBlob',
+        freshBlob: true,
+        call: (s, f, h) => s.storeBlob(Buffer.from('fresh blob'), 'text/plain'),
+        reads: h => ({ blob: (s, f) => h.utf8(s.getBlob(f.fresh)) }),
+      }, writeKind, {
         todos: [
           { point: 'fsync 1', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: wordsAfterOsError },
           { point: 'fsync 3', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: wordsAfterOsError },
@@ -904,26 +935,56 @@ if (skip) {
         ],
       }));
     test('A refused request in switchBranch leaves a throw or a return, whole values and a store that opens again',
-      refused(switchBranch, writeKind, {
+      refused({
+        name: 'switchBranch',
+        setup: (s, f, h) => s.createBranch('other'),
+        call: (s, f, h) => s.switchBranch('other'),
+        reads: h => ({ current: s => s.currentBranch().name }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
         todos: [
           { rule: 'the reads', owns: newAfterThrow, todo: 'When a refused request makes switchBranch throw, the handle has already switched to the target.' },
         ],
       }));
     test('A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again',
-      refused(treeBatch, writeKind));
+      refused({
+        name: 'treeBatch',
+        call: (s, f, h) => s.treeBatch('files', [{ op: 'set', path: 'b.txt', entry: h.entry(f.blob) }, { op: 'remove', path: 'a.txt' }]),
+        reads: h => ({ files: h.files }),
+      }, writeKind));
     test('A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again',
-      refused(treeRemove, writeKind, {
+      refused({
+        name: 'treeRemove',
+        call: (s, f, h) => s.treeRemove('files', 'a.txt'),
+        reads: h => ({ files: h.files }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
       }));
     test('A refused request in treeSet leaves a throw or a return, whole values and a store that opens again',
-      refused(treeSet, writeKind, {
+      refused({
+        name: 'treeSet',
+        call: (s, f, h) => s.treeSet('files', 'b.txt', h.entry(f.blob)),
+        reads: h => ({ files: h.files }),
+      }, writeKind, {
         rules: [oldAfterThrow()],
       }));
     test('A refused request in updateStateStrategy leaves a throw or a return, whole values and a store that opens again',
-      refused(updateStateStrategy, writeKind));
+      refused({
+        name: 'updateStateStrategy',
+        call: (s, f, h) => s.updateStateStrategy({ id: 'messages', strategy: 'append_log', deltaSnapshotEvery: 5, fullSnapshotEvery: 2 }),
+        reads: h => ({ strategy: h.strategyOf, messages: h.messages }),
+        probe: (s, f, h) => {
+          for (let n = 0; n < 5; n++) s.appendToStateJson('messages', h.message('probe', n));
+          return s.listStates().find(({ id }) => id === 'messages').opsSinceSnapshot;
+        },
+      }, writeKind));
     test('A refused request in sync leaves a throw or a return, whole values and a store that opens again',
-      refused(sync, syncKind, {
+      refused({
+        name: 'sync',
+        unsynced: (s, f, h) => h.threeWrites(s),
+        call: (s, f, h) => s.sync(),
+        reads: h => h.threeReads,
+      }, syncKind, {
         rules: [secondSyncReturns],
         todos: [{
           point: 'fsync 1', rule: 'the second try', owns: syncLost,
@@ -931,57 +992,144 @@ if (skip) {
         }],
       }));
     test('A refused request in close leaves a throw or a return, whole values and a store that opens again',
-      refused(close, closeKind));
+      refused({
+        name: 'close',
+        unsynced: (s, f, h) => h.threeWrites(s),
+        call: (s, f, h) => s.close(),
+        reads: h => h.threeReads,
+      }, closeKind));
     test('A refused request in an append of a long run without a barrier leaves a throw or a return, whole values and a store that opens again',
-      refused(long, longKind, {
+      refused({
+        name: 'long',
+        appends: 400,
+        method: i => (i % 2 === 0 ? 'appendJson' : 'appendToStateJson'),
+        call: (s, f, h, i) => (i % 2 === 0 ? s.appendJson('journal', { n: i }) : s.appendToStateJson('messages', h.message('long', i))),
+        reads: h => ({ journal: h.journal, messages: h.messages }),
+      }, longKind, {
         rules: [oldAfterThrow('appendToStateJson')],
       }));
     test('currentBranch on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(currentBranch, coldKind));
+      refused({
+        name: 'currentBranch',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.currentBranch().name,
+      }, coldKind));
     test('currentSequence on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(currentSequence, coldKind));
+      refused({
+        name: 'currentSequence',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.currentSequence(),
+      }, coldKind));
     test('getBlob on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getBlob, coldKind));
+      refused({
+        name: 'getBlob',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.utf8(s.getBlob(f.blob)),
+      }, coldKind));
     test('getRecord on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getRecord, coldKind));
+      refused({
+        name: 'getRecord',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => {
+          const record = s.getRecord(f.record);
+          return record && { ...record, payload: h.utf8(record.payload) };
+        },
+      }, coldKind));
     test('getRecordIdsByType on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getRecordIdsByType, coldKind));
+      refused({
+        name: 'getRecordIdsByType',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.getRecordIdsByType('journal'),
+      }, coldKind));
     test('getState on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getState, coldKind));
+      refused({
+        name: 'getState',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.utf8(s.getState('raw')),
+      }, coldKind));
     test('getStateIndexValueCounts on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateIndexValueCounts, coldKind));
+      refused({
+        name: 'getStateIndexValueCounts',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.getStateIndexValueCounts('messages', '/channel'),
+      }, coldKind));
     test('getStateItemJson on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateItemJson, coldKind));
+      refused({
+        name: 'getStateItemJson',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.getStateItemJson('messages', 1),
+      }, coldKind));
     test('getStateJson on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateJson, coldKind));
+      refused({
+        name: 'getStateJson',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.getStateJson('messages'),
+      }, coldKind));
     test('getStateJsonAt on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateJsonAt, coldKind));
+      refused({
+        name: 'getStateJsonAt',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.getStateJsonAt('mode', f.at),
+      }, coldKind));
     test('getStateLen on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateLen, coldKind));
+      refused({
+        name: 'getStateLen',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.getStateLen('messages'),
+      }, coldKind));
     test('getStateSlice on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateSlice, coldKind));
+      refused({
+        name: 'getStateSlice',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.utf8(s.getStateSlice('messages', 1, 2)),
+      }, coldKind));
     test('getStateTail on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(getStateTail, coldKind));
+      refused({
+        name: 'getStateTail',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.utf8(s.getStateTail('messages', 2)),
+      }, coldKind));
     test('listBranches on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(listBranches, coldKind));
+      refused({
+        name: 'listBranches',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.branchNames(s),
+      }, coldKind));
     test('listStates on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(listStates, coldKind));
+      refused({
+        name: 'listStates',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.stateList(s),
+      }, coldKind));
     test('queryStateIndexEq on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(queryStateIndexEq, coldKind));
+      refused({
+        name: 'queryStateIndexEq',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.queryStateIndexEq('messages', '/channel', 'general', {}),
+      }, coldKind));
     test('queryStateIndexRange on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(queryStateIndexRange, coldKind));
+      refused({
+        name: 'queryStateIndexRange',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.queryStateIndexRange('messages', '/n', { gte: 1, lte: 2 }),
+      }, coldKind));
     test('stateHeadOffset on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(stateHeadOffset, coldKind));
+      refused({
+        name: 'stateHeadOffset',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.stateHeadOffset('messages'),
+      }, coldKind));
     test('treeGet on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(treeGet, coldKind));
+      refused({
+        name: 'treeGet',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => s.treeGet('files', 'a.txt'),
+      }, coldKind));
     test('treeList on a store opened again throws the errno of a refused read, and the same call again gives the true value',
-      refused(treeList, coldKind));
-  });
-
-  test('Each scenario of tests/late-failures-scenarios.mjs has one test, under its own name', () => {
-    const named = Object.entries(scenarios).filter(([key, scenario]) => key !== scenario.name).map(([key]) => key);
-    assert.deepEqual(named, [], 'these exports carry another name than their own');
-    const untested = Object.values(scenarios).filter(scenario => !declared.has(scenario)).map(({ name }) => name);
-    assert.deepEqual(untested, [], 'no test refers to these scenarios');
+      refused({
+        name: 'treeList',
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.files(s),
+      }, coldKind));
   });
 }
