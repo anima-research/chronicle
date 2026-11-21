@@ -1,4 +1,12 @@
 # INTERFACE TESTING STATUS
+#
+# A status is one reader's finding. The reader read the tests at `tests_commit`, changed no test, and said what the tests show for the requirement.
+# No test checks a status, and a later change to the tests can make a status stale.
+#
+# fully-pinned: a test fails if the package stops meeting the requirement.
+# partly-pinned: a test fails if the package stops meeting a part of the requirement. `gap` names the part that no test covers.
+# not-pinned: no test fails.
+# not-met: the package does not do what the requirement asks, in whole or in part. `gap` gives the case.
 statuses:
   - id: IR.a.1
     status: fully-pinned
