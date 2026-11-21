@@ -61,7 +61,8 @@ function splitCall(text) {
   if (current.trim() !== '') args.push(current.trim());
   const rest = text.slice(i + 1);
   const ret = /^\s*=\s*(\S+)/.exec(rest)?.[1] ?? '?';
-  return { name: text.slice(0, open), args, rest, ok: ret !== '?' && !ret.startsWith('-1') };
+  const ok = ret !== '?' && !ret.startsWith('-1');
+  return { name: text.slice(0, open), args, rest, ok, bytes: ok && /^\d+$/.test(ret) ? Number(ret) : 0 };
 }
 
 export function quoted(arg) {
@@ -114,10 +115,31 @@ class Disk {
     this.exists = new Set(names);
     this.files = new Set();
     this.names = new Set();
+    this.pending = new Map();
+    this.lost = new Map();
   }
 
-  wrote(path) {
+  wrote(path, bytes = 0) {
     this.files.add(path);
+    this.pending.set(path, (this.pending.get(path) ?? 0) + bytes);
+    const owed = this.lost.get(path);
+    if (owed === undefined) return;
+    if (owed > bytes) this.lost.set(path, owed - bytes);
+    else this.lost.delete(path);
+  }
+
+  refused(path) {
+    const owed = this.pending.get(path) ?? 0;
+    if (owed > 0) this.lost.set(path, owed);
+  }
+
+  fileSynced(path) {
+    if (this.lost.has(path)) {
+      this.pending.set(path, this.lost.get(path));
+      return;
+    }
+    this.files.delete(path);
+    this.pending.delete(path);
   }
 
   made(path) {
@@ -126,8 +148,8 @@ class Disk {
   }
 
   removed(path) {
-    for (const set of [this.exists, this.files, this.names]) {
-      for (const entry of [...set]) if (isUnder(entry, path)) set.delete(entry);
+    for (const set of [this.exists, this.files, this.names, this.pending, this.lost]) {
+      for (const entry of [...set.keys()]) if (isUnder(entry, path)) set.delete(entry);
     }
   }
 
@@ -141,20 +163,27 @@ class Disk {
         if (set !== this.names || entry !== from) set.add(to + entry.slice(from.length));
       }
     }
+    for (const map of [this.pending, this.lost]) {
+      for (const [entry, bytes] of [...map]) {
+        if (!isUnder(entry, from)) continue;
+        map.delete(entry);
+        map.set(to + entry.slice(from.length), bytes);
+      }
+    }
     this.made(to);
   }
 
   synced(path) {
-    this.files.delete(path);
+    this.fileSynced(path);
     for (const name of [...this.names]) if (posix.dirname(name) === path) this.names.delete(name);
   }
 
   datasynced(path) {
-    this.files.delete(path);
+    this.fileSynced(path);
   }
 
   syncedAll() {
-    this.files.clear();
+    for (const path of [...this.files]) this.fileSynced(path);
     this.names.clear();
   }
 }
@@ -207,7 +236,7 @@ export function readTrace(text, { root, cwd, names = [root] }) {
 
   for (const call of calls) {
     marksAt.push(marks.length);
-    const { name, args, rest, ok } = splitCall(call.text);
+    const { name, args, rest, ok, bytes } = splitCall(call.text);
     const markName = args.map(quoted).map(path => MARK.exec(path ?? '')?.[1]).find(Boolean);
     if (markName) {
       marks.push({ name: markName, files: [...disk.files], names: [...disk.names] });
@@ -300,15 +329,15 @@ export function readTrace(text, { root, cwd, names = [root] }) {
     }
     if (WRITES_TO_FIRST.has(name) || WRITES_TO_THIRD.has(name)) {
       const path = written(args[WRITES_TO_FIRST.has(name) ? 0 : 2]);
-      if (ok && inRoot(path)) disk.wrote(path);
+      if (ok && inRoot(path)) disk.wrote(path, bytes);
       continue;
     }
     if (name === 'fsync' || name === 'fdatasync') {
       const path = written(args[0]);
-      if (ok && inRoot(path)) {
-        if (name === 'fsync') disk.synced(path);
-        else disk.datasynced(path);
-      }
+      if (!inRoot(path)) continue;
+      if (!ok) disk.refused(path);
+      else if (name === 'fsync') disk.synced(path);
+      else disk.datasynced(path);
       continue;
     }
     if (name === 'sync') {

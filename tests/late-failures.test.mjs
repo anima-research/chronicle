@@ -37,6 +37,10 @@ const TODOS = [
     scenario: 'storeBlob', point: 'fsync 3', rule: 'the barrier', owns: problem => problem.nameInRefused === true,
     todo: "After a refused sync of a blob's directory, sync and close return while the blob's name is not synced.",
   },
+  {
+    scenario: 'sync', point: 'fsync 1', rule: 'the second try', owns: problem => problem.syncLost === true,
+    todo: 'After a refused sync of the record log, sync on the same handle throws DurabilityLost until the store is opened again.',
+  },
 ];
 
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
@@ -447,6 +451,8 @@ function judge(scenario, clean, run, reopen) {
   }
   if (out.retry && !out.retry.ok && !(out.call.code === 'DurabilityLost' && out.retry.code === 'DurabilityLost')) {
     add('the second try', `the same call again threw: ${shown(out.retry)}`);
+  } else if (scenario.kind === 'sync' && out.retry && !out.retry.ok) {
+    problems.get('the second try').push({ text: `sync again threw: ${shown(out.retry)}`, syncLost: true });
   }
   if (out.retry?.ok) whole('the second try', 'the reads after the same call again', out.retryReads, true);
   if (out.retryReads) oneState('the second try', 'the reads after the same call again', out.retryReads);

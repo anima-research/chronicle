@@ -147,6 +147,22 @@ test('Creation metadata is in epoch microseconds and stays with the identity', (
   assert.equal(listed.created, selected.created);
 });
 
+test('currentBranch and listBranches give created in epoch milliseconds, as new Date reads it', {
+  todo: 'The store gives created in epoch microseconds.',
+}, (t) => {
+  const { store } = freshStore(t);
+  const before = Date.now();
+  const born = store.createBranch('dated');
+  const after = Date.now();
+  store.switchBranch(born.name);
+  const slack = 10 * 60 * 1000;
+  for (const [method, created] of [['currentBranch', store.currentBranch().created],
+    ['listBranches', named(store.listBranches(), born.name).created]]) {
+    assert.ok(before - slack <= created && created <= after + slack,
+      `${method}().created = ${created}, expected [${before}, ${after}] ms`);
+  }
+});
+
 test('Listed ancestry describes immediate parents and inclusive cuts, not current heads', (t) => {
   const { store } = freshStore(t);
   const main = store.currentBranch();
