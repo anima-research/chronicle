@@ -39,10 +39,10 @@ statuses:
       - "tests/journal-replay.test.mjs:67 — Type IDs and record sequences use different coordinates and survive reopen"
   - id: IR.a.6
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "When the store has just been created, sync after appendJson does not sync the parent directory entry for the store, so a power loss can make even the synced journal unreachable."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "When Chronicle creates the store directory, `sync()` after an append returns without syncing that directory’s name in its parent, so power loss can leave the synced journal unreachable."
   - id: IR.a.7
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -60,22 +60,20 @@ statuses:
     tests:
       - "tests/journal-replay.test.mjs:53 — Type IDs and record sequences use different coordinates and survive reopen"
   - id: IR.a.10
-    status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
-    tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-      - "src/atomic_file.rs:638 — unreadable_directory_is_saved_without_its_sync"
-      - "tests/atomic_metadata.rs:328 — a_store_directory_without_read_access_still_saves"
-    gap: "A pre-append sync can return without making the new store's name durable, and in a writable but unreadable checkpoint directory it can also leave the latest state checkpoint's rename unsynced."
-  - id: IR.a.11
     status: partly-pinned
-    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
+      - "tests/durability.test.mjs:92 — sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/durability.test.mjs:92 — sync after appendToStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/checkpoint-errors.test.mjs:260 — Failing a barrier leaves exactly the landed journal suffix and state readable"
+    gap: "The trace checks files and names at the state barrier, but a recovery test should interrupt after the referencing append, before any later successful sync, and assert that any surviving entry resolves to the exact pre-synced state."
+  - id: IR.a.11
+    status: fully-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
+    tests:
+      - "tests/journal-replay.test.mjs:155 — A typed journal outlives historical cuts and deletion of a contributing branch"
       - "tests/record_ids_by_type_order.rs:135 — type_lists_ascend_after_a_torn_tail_issues_its_id_again"
-      - "tests/journal-replay.test.mjs:167 — A typed journal outlives historical cuts and deletion of a contributing branch"
-      - "tests/write-refusals.test.mjs:89 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
-      - "tests/late-failures.test.mjs:656 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
-    gap: "A test would need to interrupt an actual append of a layout containing a receipt and assert, both on the handle after the throw and on reopen, that readers see either no new record or one record containing both parts."
+      - "tests/late-failures.test.mjs:767 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
   - id: IR.a.12
     status: partly-pinned
     tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
@@ -95,26 +93,24 @@ statuses:
     tests:
       - "tests/crash_state_recovery.rs:1403 — open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death"
   - id: IR.a.15
-    status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: fully-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/crash_state_recovery.rs:1466 — open_or_create_reindexes_a_complete_typed_tail_once_after_writer_death"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
-    gap: "The recovery test supplies a complete unindexed log record, but the throw tests accept old or new on reopen; a test should independently establish that a throwing append left a complete record and require that particular record on reopen."
   - id: IR.a.16
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
-      - "tests/journal-replay.test.mjs:170 — A typed journal outlives historical cuts and deletion of a contributing branch"
-    gap: "Force a throw after a complete acceptance reaches the log and require the very next same-handle type refresh, before sync or retry, to find it exactly once with both its compile ID and its receipt."
+      - "tests/late-failures.test.mjs:767 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
+      - "tests/journal-replay.test.mjs:155 — A typed journal outlives historical cuts and deletion of a contributing branch"
+    gap: "A test should force an append to throw after the complete acceptance has landed and require the first type-list read on the same handle, before retry or sync, to find its original compile ID and receipt."
   - id: IR.a.17
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:92 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
-    gap: "EFBIG is checked unconditionally, but the injected-failure judge exempts DurabilityLost; a test must also reject errno-less errors with that code when appendJson throws for a known OS refusal."
+      - "tests/late-failures.test.mjs:767 — A refused request in appendJson leaves a throw or a return, whole values and a store that opens again"
+    gap: "The file-size-limit test requires the exact errno, but the injected-failure test would also need to require the refused request’s errno when the append throws with code `DurabilityLost`, which its errno rule expressly exempts."
   - id: IR.a.18
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -195,17 +191,20 @@ statuses:
       - "tests/append_many.rs:881 — an_identity_batch_stores_its_items_stamped_with_its_one_record"
   - id: IR.b.14
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "test-batches.mjs:266 — an empty batch, or one with an item that isn't an object, throws and writes nothing"
       - "tests/write-refusals.test.mjs:232 — Interrupted identity writes expose no partial stamped row or batch"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+      - "tests/append_many.rs:1234 — an_identity_batch_that_is_refused_writes_nothing"
+      - "tests/late-failures.test.mjs:767 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+      - "tests/crash_state_recovery.rs:544 — a_torn_batch_is_dropped_whole"
   - id: IR.b.15
-    status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
+      - "error-codes.test.mjs:178 — batched appends, and create or openOrCreate where something is already there, refuse with theirs"
       - "tests/write-refusals.test.mjs:116 — Interrupted identity writes expose no partial stamped row or batch"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+    gap: "The fault test allows either whole outcome after a throw; to pin readback in the landed case, inject a throw after the batch has been recorded and assert that the next successful read on the writing branch shows it without retrying the append."
   - id: IR.b.16
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -255,10 +254,12 @@ statuses:
       - "tests/unclean-boundaries.test.mjs:281 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
   - id: IR.c.8
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:166 — Pre-record I/O refusals preserve whole branch-local JSON values"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendToStateJson leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in appendToStateJson leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in an append of a long run without a barrier leaves a throw or a return, whole values and a store that opens again"
+      - "src/store.rs:5770 — a_failed_log_fsync_publishes_nothing_until_reopen"
   - id: IR.c.9
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -271,12 +272,14 @@ statuses:
       - "tests/log-readback.test.mjs:53 — Replacing or redacting a log down to zero is not an absent registration"
       - "tests/long_store_snapshots.rs:643 — test_set_on_append_log_read_paths_before_snapshot"
   - id: IR.c.11
-    status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/crash_state_recovery.rs:1166 — interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix"
       - "tests/crash_state_recovery.rs:620 — torn_tail_replays_only_complete_updates"
-      - "tests/late-failures.test.mjs:650 — A refused request in an append of a long run without a barrier leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in an append of a long run without a barrier leaves a throw or a return, whole values and a store that opens again"
+      - "tests/write-refusals.test.mjs:166 — Pre-record I/O refusals preserve whole branch-local JSON values"
+    gap: "After an unsynced append to one slot, refuse the snapshot write to a different slot (the registry or compacted table) and assert on unclean reopen that the append is present and the snapshot still has its old value."
   - id: IR.c.12
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -285,10 +288,10 @@ statuses:
       - "test-batches.mjs:305 — on a view, an identity batch counts and stamps on the view's branch"
   - id: IR.c.13
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "When Chronicle creates the store directory, sync can return after an append without syncing that directory's name in its parent, so a machine crash can still make the store and its appends unreachable."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "When Chronicle creates the store directory, `sync()` after an append returns without syncing that directory’s name in its parent, so a machine crash can leave no store path to reopen."
   - id: IR.c.14
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -364,11 +367,11 @@ statuses:
       - "test-views.mjs:182 — stateHeadOffset is an exact, handle-independent revision key"
   - id: IR.d.11
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:232 — Interrupted identity writes expose no partial stamped row or batch"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
-    gap: "For an item that lands despite a throw, compare the row at the old length, including both stamps, with the actual writing record: the late-failure comparison replaces the id and sequence with a single boolean indicating that they look valid."
+      - "tests/late-failures.test.mjs:767 — A refused request in appendToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+    gap: "For a throw after the record lands, a test should verify that both the pre-append ordinal and a fresh full read on that branch show the complete body-group item with the writing record’s exact id and sequence."
   - id: IR.d.12
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -452,10 +455,13 @@ statuses:
       - "error-codes.test.mjs:159 — the binding's own refusals carry theirs"
   - id: IR.f.1
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
+      - "tests/node-lifecycle.test.mjs:52 — Dead handles throw instead of reporting empty inventories, records or revisions"
       - "tests/checkpoint-errors.test.mjs:325 — Close succeeds once a fault that failed an earlier sync clears, and the value is there after a reopen"
-      - "tests/durability.test.mjs:111 — close with writes pending returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/durability.test.mjs:92 — close with writes pending returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/durability.test.mjs:92 — close on a reopened store with a write pending returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/blob-async.mjs:114 — tests/blob-async.mjs"
   - id: IR.f.2
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -490,11 +496,13 @@ statuses:
       - "error-codes.test.mjs:194 — batched appends, and create or openOrCreate where something is already there, refuse with theirs"
   - id: IR.f.7
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/node-lifecycle.test.mjs:99 — Liveness is sampled on the handle that is about to read"
+      - "tests/node-lifecycle.test.mjs:84 — Liveness is sampled on the handle that is about to read"
+      - "tests/checkpoint-errors.test.mjs:325 — Close succeeds once a fault that failed an earlier sync clears, and the value is there after a reopen"
       - "tests/checkpoint-errors.test.mjs:302 — Close consumes the root even when its final barrier throws"
-      - "tests/late-failures.test.mjs:650 — A refused request in close leaves a throw or a return, whole values and a store that opens again"
+      - "tests/checkpoint-errors.test.mjs:325 — Close reports the failure of its own barrier when no sync failed before it"
+      - "tests/late-failures.test.mjs:767 — A refused request in close leaves a throw or a return, whole values and a store that opens again"
   - id: IR.f.8
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -622,12 +630,13 @@ statuses:
       - "tests/branch-catalog.test.mjs:174 — Listed ancestry describes immediate parents and inclusive cuts, not current heads"
     gap: "The live listing is checked; a test would also need to reopen the offline-repaired store and compare the listed child ID, parent ID and fork point with the values saved at creation."
   - id: IR.j.6
-    status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
+      - "error-codes.test.mjs:61 — the store's errors carry their kind"
       - "tests/selective-lineage.test.mjs:118 — A sampled non-main parent name works for all three named-parent forks"
       - "tests/selective-lineage.test.mjs:456 — A head can anchor even an empty window"
-      - "tests/late-failures.test.mjs:650 — A refused request in createBranchAt leaves a throw or a return, whole values and a store that opens again"
+    gap: "Beyond a taken name and an out-of-range cut, a JS test should force a missing parent and a refused branch checkpoint and assert that `createBranchAt` throws from the call in each case."
   - id: IR.j.7
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -636,10 +645,11 @@ statuses:
     gap: "The test fails registration after a successful switch; it would also need to check that the same historical child remains inspectable when the switch itself or a later redaction fails."
   - id: IR.j.8
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:111 — sync after createBranchAt returns after the store asks for each file that it wrote and each name that it made to be put on disk"
-      - "tests/late-failures.test.mjs:629 — A refused request in createBranchAt leaves a throw or a return, whole values and a store that opens again"
+      - "tests/durability.test.mjs:92 — sync after createBranchAt returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/late-failures.test.mjs:587 — A refused request in createBranchAt leaves a throw or a return, whole values and a store that opens again"
+      - "tests/branch_state_isolation.rs:827 — test_create_branch_at_persists_across_reopen"
   - id: IR.j.9
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -751,12 +761,11 @@ statuses:
       - "tests/selective-lineage.test.mjs:253 — Cold historical child keeps its selected prefix, references and later private window"
   - id: IR.k.16
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/selective-lineage.test.mjs:347 — createBranchAtWithStates whose own checkpoint fails leaves the name free, and a retry makes the child"
-      - "tests/late-failures.test.mjs:650 — the reads"
-      - "tests/late-failures.test.mjs:657 — the other rules"
-    gap: "If the fork's own checkpoint fails after allocation, the call throws but the handle still lists the child, so retrying with the same name fails with BranchExists."
+      - "tests/late-failures.test.mjs:767 — A refused request in createBranchAtWithStates leaves a throw or a return, whole values and a store that opens again"
+    gap: "If the child’s checkpoint fails after allocation, `createBranchAtWithStates` throws but leaves the child visible on the handle, so retrying after repair gets `BranchExists`."
   - id: IR.k.17
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -831,12 +840,11 @@ statuses:
       - "tests/branch-catalog.test.mjs:237 — Deletion through a parent view invalidates only the saved selective creation"
   - id: IR.l.13
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/selective-lineage.test.mjs:347 — createBranchWithStates whose own checkpoint fails leaves the name free, and a retry makes the child"
-      - "tests/late-failures.test.mjs:650 — the reads"
-      - "tests/late-failures.test.mjs:657 — the other rules"
-    gap: "If the fork allocates the child and then its checkpoint fails, the call throws but the child remains visible and its name stays taken."
+      - "tests/late-failures.test.mjs:767 — A refused request in createBranchWithStates leaves a throw or a return, whole values and a store that opens again"
+    gap: "When the new branch’s checkpoint fails, createBranchWithStates throws but keeps the child on the open handle, so retrying after the checkpoint can succeed again throws BranchExists."
   - id: IR.m.1
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1024,11 +1032,10 @@ statuses:
       - "tests/branch-catalog.test.mjs:239 — Deletion through a parent view invalidates only the saved selective creation"
   - id: IR.o.3
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "test.mjs:234 — Test 29: deleteBranch"
-      - "tests/branch-catalog.test.mjs:230 — Deletion through a parent view invalidates only the saved selective creation"
-      - "tests/late-failures.test.mjs:650 — A refused request in deleteBranch leaves a throw or a return, whole values and a store that opens again"
+      - "tests/branch-catalog.test.mjs:245 — Deletion through a parent view invalidates only the saved selective creation"
   - id: IR.o.4
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1112,10 +1119,10 @@ statuses:
       - "test-views.mjs:475 — A warmed root sees same-branch edits and suffix writes before following a divergent checkout"
   - id: IR.p.5
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "error-codes.test.mjs:61 — the store's errors carry their kind"
-      - "tests/late-failures.test.mjs:650 — A refused request in editStateItem leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in editStateItem leaves a throw or a return, whole values and a store that opens again"
   - id: IR.p.6
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1220,11 +1227,13 @@ statuses:
       - "tests/blob-keys.test.mjs:81 — References on distinct branches resolve the same shared bytes after rebind"
   - id: IR.q.9
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/blob-keys.test.mjs:21 — Synchronous blob keys address exact bytes independently of MIME or provenance"
       - "src/blobs/storage.rs:1614 — a_store_after_a_get_finds_the_blob_damaged_repairs_it_in_the_same_storage"
-      - "tests/late-failures.test.mjs:650 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
+      - "src/blobs/storage.rs:1129 — a_failed_rename_removes_the_staging_file_and_leaves_the_path_as_it_was"
+      - "src/blobs/storage.rs:1168 — a_failed_sync_after_the_rename_is_tried_again_by_the_next_store"
+      - "tests/late-failures.test.mjs:767 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
   - id: IR.q.10
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1237,11 +1246,11 @@ statuses:
       - "tests/blob-keys.test.mjs:35 — Synchronous blob keys address exact bytes independently of MIME or provenance"
   - id: IR.q.12
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "error-codes.test.mjs:602 — damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
-      - "tests/late-failures.test.mjs:650 — getBlob on a store opened again throws the errno of a refused read, and the same call again gives the true value"
-    gap: "Assert that the displayed reason contains a visible character for a whole-blob checksum failure and for a refused file read too: the former accepts any message matching `/.+/`, and the latter accepts an errno code without checking the message."
+      - "tests/late-failures.test.mjs:767 — getBlob on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+    gap: "Assert that the reason has a visible character for a whole-blob checksum failure and a refused read too: the former accepts a message matching `/.+/` (even a tab), and the latter accepts an `EIO` code without checking the message."
   - id: IR.q.13
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1249,10 +1258,10 @@ statuses:
       - "error-codes.test.mjs:618 — damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
   - id: IR.q.14
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "error-codes.test.mjs:611 — damage found in a chunked blob's file or its chunks is InvalidFormat, and in a blob stored whole ChecksumMismatch"
-      - "tests/late-failures.test.mjs:650 — getBlob on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/late-failures.test.mjs:767 — getBlob on a store opened again throws the errno of a refused read, and the same call again gives the true value"
   - id: IR.r.1
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1453,13 +1462,13 @@ statuses:
       - "error-codes.test.mjs:98 — the store's errors carry their kind"
   - id: IR.t.6
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/checkpoint-errors.test.mjs:236 — Temporary damage to a cold record causes real read errors, not absent data"
-      - "tests/late-failures.test.mjs:650 — getState on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/late-failures.test.mjs:767 — getState on a store opened again throws the errno of a refused read, and the same call again gives the true value"
       - "tests/node-lifecycle.test.mjs:60 — Dead handles throw instead of reporting empty inventories, records or revisions"
       - "test-views.mjs:336 — a view on a deleted branch throws \"Branch not found\" (and stays dead if the name is reused)"
-    gap: "In addition to I/O and handle failures, a test should make a cold state record fail its checksum and assert that JS getState throws without the deserialization prefix rather than returning bytes."
+    gap: "A test would need to assert that `getState` also throws without the deserialization prefix when a cold record has an invalid header or a bad checksum, rather than returning its bytes as foreign content."
   - id: IR.u.1
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1620,13 +1629,13 @@ statuses:
     gap: "A channel named `__proto__` loses its own numeric entry in the returned generations map, although the neighboring channel entry survives."
   - id: IR.w.6
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "error-codes.test.mjs:96 — the store's errors carry their kind"
       - "tests/checkpoint-errors.test.mjs:234 — Temporary damage to a cold record causes real read errors, not absent data"
-      - "error-codes.test.mjs:116 — a view's refusals carry theirs"
+      - "tests/late-failures.test.mjs:767 — getStateJson on a store opened again throws the errno of a refused read, and the same call again gives the true value"
       - "tests/node-lifecycle.test.mjs:56 — Dead handles throw instead of reporting empty inventories, records or revisions"
-      - "tests/late-failures.test.mjs:650 — getStateJson on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/branch-catalog.test.mjs:246 — Deletion through a parent view invalidates only the saved selective creation"
   - id: IR.w.7
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1674,13 +1683,13 @@ statuses:
       - "test-batches.mjs:371 — Slices share prefix record stamps but distinguish independent sibling presentations"
   - id: IR.w.15
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:163 — Pre-record I/O refusals preserve whole branch-local JSON values"
       - "tests/write-refusals.test.mjs:232 — Interrupted identity writes expose no partial stamped row or batch"
-      - "tests/late-failures.test.mjs:650 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
-      - "tests/late-failures.test.mjs:650 — A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
-    gap: "To rule out an assumed rollback even when a write lands, a test would need a throw with an independently verified complete new record and compare the immediate reread with its contents, including its actual batch stamps rather than just whether the stamps look valid."
+      - "tests/late-failures.test.mjs:767 — A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in appendManyToStateJsonWithIdentity leaves a throw or a return, whole values and a store that opens again"
+    gap: "Exercise a write that is independently known to have landed before it throws, and assert that a successful immediate getStateJson returns the recorded snapshot or every batch row with the recording update’s exact ID and sequence."
   - id: IR.w.16
     status: not-met
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1882,11 +1891,11 @@ statuses:
       - "test-batches.mjs:378 — Slices share prefix record stamps but distinguish independent sibling presentations"
   - id: IR.z.9
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/log-readback.test.mjs:155 — Message and context read paths preserve inline and referenced content as stored"
       - "tests/log-readback.test.mjs:210 — Suffix reads preserve the boundary, even with a bad window item or an enormous limit"
-      - "tests/late-failures.test.mjs:650 — getStateSlice on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/late-failures.test.mjs:767 — getStateSlice on a store opened again throws the errno of a refused read, and the same call again gives the true value"
   - id: IR.z.10
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1931,10 +1940,11 @@ statuses:
       - "tests/log-readback.test.mjs:234 — The ended log returns a bounded suffix of complete AgentRecords"
   - id: IR.aa.8
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
+      - "tests/late-failures.test.mjs:767 — getStateTail on a store opened again throws the errno of a refused read, and the same call again gives the true value"
       - "error-codes.test.mjs:101 — the store's errors carry their kind"
-      - "tests/late-failures.test.mjs:650 — getStateTail on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/log-readback.test.mjs:234 — The ended log returns a bounded suffix of complete AgentRecords"
   - id: IR.aa.9
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1955,11 +1965,13 @@ statuses:
       - "tests/checkpoint-errors.test.mjs:302 — Close consumes the root even when its final barrier throws"
   - id: IR.ab.3
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/checkpoint-errors.test.mjs:301 — Close consumes the root even when its final barrier throws"
-      - "tests/late-failures.test.mjs:650 — A refused request in close leaves a throw or a return, whole values and a store that opens again"
-    gap: "The fault-injection test checks the boolean against independent reads, but no case actually makes `close()` throw while leaving the handle readable and then asserts `isClosed() === false`; the checkpoint test observes false after `sync()` throws, not after `close()` throws."
+      - "tests/checkpoint-errors.test.mjs:325 — Close reports the failure of its own barrier when no sync failed before it"
+      - "tests/late-failures.test.mjs:767 — A refused request in sync leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in close leaves a throw or a return, whole values and a store that opens again"
+    gap: "The fault tests check the boolean against subsequent reads, but none forces a `close()` throw before consumption and asserts `isClosed() === false` on that still-readable handle."
   - id: IR.ab.4
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -1987,10 +1999,11 @@ statuses:
       - "tests/branch-catalog.test.mjs:35 — A live branch inventory distinguishes creations, not names or equal heads"
   - id: IR.ac.2
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/branch-catalog.test.mjs:38 — A live branch inventory distinguishes creations, not names or equal heads"
-      - "tests/late-failures.test.mjs:629 — A refused request in createBranch leaves a throw or a return, whole values and a store that opens again"
+      - "tests/journal-replay.test.mjs:162 — A typed journal outlives historical cuts and deletion of a contributing branch"
+      - "tests/late-failures.test.mjs:587 — A refused request in createBranch leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ac.3
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2193,10 +2206,11 @@ statuses:
       - "tests/log-readback.test.mjs:102 — A stopped log can be backfilled by its persisted duplicate positions"
   - id: IR.ae.16
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/unclean-boundaries.test.mjs:260 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
-      - "tests/durability.test.mjs:111 — ${label} returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/durability.test.mjs:92 — sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/durability.test.mjs:92 — sync on a reopened store after appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
   - id: IR.ae.17
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2539,11 +2553,12 @@ statuses:
       - "tests/log-readback.test.mjs:102 — A stopped log can be backfilled by its persisted duplicate positions"
   - id: IR.ak.4
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
+      - "tests/log-readback.test.mjs:56 — Replacing or redacting a log down to zero is not an absent registration"
       - "tests/state-catalog.test.mjs:310 — The head after a lone edit or removal is the sequence of the record that it wrote"
       - "tests/node-lifecycle.test.mjs:62 — Dead handles throw instead of reporting empty inventories, records or revisions"
-      - "tests/late-failures.test.mjs:650 — A refused request in redactStateItems leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in redactStateItems leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ak.5
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2667,12 +2682,12 @@ statuses:
       - "error-codes.test.mjs:61 — the store's errors carry their kind"
   - id: IR.al.16
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "src/store.rs:5771 — a_failed_log_fsync_publishes_nothing_until_reopen"
-      - "tests/late-failures.test.mjs:650 — A refused request in registerState leaves a throw or a return, whole values and a store that opens again"
-      - "tests/durability.test.mjs:111 — sync after registerState returns after the store asks for each file that it wrote and each name that it made to be put on disk"
-    gap: "The reopen test retains the earlier ID and registers the failed one on retry, but to pin independent on-disk durability the syscall test would need to check the checkpoint file and its directory at each successful registration's return, not after a subsequent sync."
+      - "tests/late-failures.test.mjs:767 — A refused request in registerState leaves a throw or a return, whole values and a store that opens again"
+      - "tests/durability.test.mjs:92 — sync after registerState returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+    gap: "A test should check durability at each successful registration, then fail the next registration before any slot data is written or an explicit sync runs, reopen, and assert that registering the missing IDs yields the full list with the original strategies."
   - id: IR.am.1
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2800,10 +2815,9 @@ statuses:
       - "tests/state-catalog.test.mjs:181 — A listed populated receipt can be cleared and reused without registration"
   - id: IR.ao.8
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:159 — Pre-record I/O refusals preserve whole branch-local JSON values"
-      - "tests/late-failures.test.mjs:650 — A refused request in setState leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ao.9
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2833,10 +2847,11 @@ statuses:
       - "tests/write-refusals.test.mjs:156 — Pre-record I/O refusals preserve whole branch-local JSON values"
   - id: IR.ap.5
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:111 — sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
-      - "tests/checkpoint-errors.test.mjs:106 — Failing a barrier leaves exactly the landed journal suffix and state readable"
+      - "tests/durability.test.mjs:92 — sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/unclean-boundaries.test.mjs:300 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
+      - "tests/late-failures.test.mjs:767 — A refused request in sync leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ap.6
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2876,10 +2891,10 @@ statuses:
       - "tests/crash_state_recovery.rs:1166 — interrupted_watermark_and_marking_sequences_recover_only_the_completed_prefix"
   - id: IR.ap.13
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:162 — Pre-record I/O refusals preserve whole branch-local JSON values"
-      - "tests/late-failures.test.mjs:650 — A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ap.14
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2893,10 +2908,10 @@ statuses:
       - "test-key-order.mjs:228 — JS snapshot replacement preserves caller-owned keys and normalized JSON values"
   - id: IR.ap.16
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:163 — Pre-record I/O refusals preserve whole branch-local JSON values"
-      - "tests/late-failures.test.mjs:650 — A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in setStateJson leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ap.17
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -2990,10 +3005,10 @@ statuses:
       - "tests/log-readback.test.mjs:166 — Message and context read paths preserve inline and referenced content as stored"
   - id: IR.as.4
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again > with fsync 3 of the call refused > the barrier"
-    gap: "If the blob is in place but syncing its directory fails, a later `sync` and `close` can both return without making the blob's name durable."
+      - "tests/late-failures.test.mjs:767 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
+    gap: "If syncing the blob’s directory fails after the rename, `storeBlob` throws with the blob already in place, and later `sync()` and `close()` return without making its name durable."
   - id: IR.as.5
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3020,11 +3035,10 @@ statuses:
       - "tests/tree-contract.test.mjs:348 — A pre-record write failure leaves every valid batch target unchanged"
   - id: IR.as.9
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again > with fsync 1 of the call refused > the errno"
-      - "tests/late-failures.test.mjs:650 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again > with fsync 3 of the call refused > the errno"
-    gap: "When a directory sync for the blob is refused, the thrown error lacks a Node errno code and has extra words after `(os error N)`, so the workspace cannot extract the errno."
+      - "tests/late-failures.test.mjs:767 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
+    gap: "When either directory sync in the traced `storeBlob` call is refused, the error has no matching Node errno code and its message adds text after `(os error N)`, so neither accepted form identifies the cause."
   - id: IR.as.10
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3212,12 +3226,11 @@ statuses:
       - "tests/crash_state_recovery.rs:583 — all_branch_creation_paths_survive_with_inherited_heads_and_tail"
   - id: IR.av.10
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/checkpoint-errors.test.mjs:182 — A switch whose saved branch list cannot be written leaves the source selected and writable"
-      - "tests/late-failures.test.mjs:650 — the reads"
-      - "tests/late-failures.test.mjs:657 — the other rules"
-    gap: "If the branch-list checkpoint fails after selection, `switchBranch` throws with the destination still selected, rather than leaving the handle on the source."
+      - "tests/late-failures.test.mjs:767 — A refused request in switchBranch leaves a throw or a return, whole values and a store that opens again"
+    gap: "If saving the branch list fails after the cursor moves, `switchBranch` throws synchronously but leaves the target selected instead of the source."
   - id: IR.av.11
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3231,12 +3244,12 @@ statuses:
       - "tests/crash_state_recovery.rs:1160 — a_switch_back_to_source_survives_a_barrier_without_drop"
   - id: IR.av.13
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:111 — sync after switchBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk"
-      - "tests/late-failures.test.mjs:629 — A refused request in switchBranch leaves a throw or a return, whole values and a store that opens again"
+      - "tests/durability.test.mjs:92 — sync after switchBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/late-failures.test.mjs:587 — A refused request in switchBranch leaves a throw or a return, whole values and a store that opens again"
       - "tests/crash_state_recovery.rs:1166 — a_switch_back_to_source_survives_a_barrier_without_drop"
-    gap: "The syscall test covers switching to a child; the switch back to the source has reopen evidence, but a test would also need to check that no changed file or directory entry is left unsynced when that return barrier finishes."
+    gap: "The switch-back test checks that reopening reads the source after process exit; to pin durability for that direction, a trace must also assert that no selection file or directory entry remains unsynced when `sync()` returns after switching back."
   - id: IR.aw.1
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3244,19 +3257,17 @@ statuses:
       - "tests/unclean-boundaries.test.mjs:175 — Mixed references and a repair that one sync covers recover after the writer dies without a close"
   - id: IR.aw.2
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-      - "tests/late-failures.test.mjs:650 — the barrier"
-      - "src/atomic_file.rs:638 — unreadable_directory_is_saved_without_its_sync"
-    gap: "Sync can return with the new store's name unsynced, with a blob name still unsynced after a directory-sync refusal, or with a replacement checkpoint whose directory the writer could not open to sync."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+      - "tests/late-failures.test.mjs:767 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
+    gap: "Sync can return with the store's newly created name still unsynced in its parent, or with a blob's name still unsynced after the blob-directory fsync failed."
   - id: IR.aw.3
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — the barrier"
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "The JS call returns normally rather than throwing when a prior refusal left a blob name unsynced, and also returns without establishing durability of a newly created store's own name."
+      - "tests/late-failures.test.mjs:767 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
+    gap: "When a blob has been renamed into place but its directory sync was refused, the later JsStore.sync returns normally without making that name durable."
   - id: IR.aw.4
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3270,57 +3281,54 @@ statuses:
       - "tests/checkpoint-errors.test.mjs:104 — Failing a barrier leaves exactly the landed journal suffix and state readable"
   - id: IR.aw.6
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "On the first appendJson of a typed journal entry in a newly created store, sync returns without making the store's directory entry durable, so the record need not remain reachable by its ID after power loss."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "Even after appendJson and sync on a new store, the store's own directory entry is not synced, so a caller cannot rely on reaching the record by its saved ID after power loss."
   - id: IR.aw.7
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "src/atomic_file.rs:638 — unreadable_directory_is_saved_without_its_sync"
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "Sync accepts a metadata replacement without syncing its directory when the writer cannot open that directory, so a saved selection can roll back on power loss; in a new store even the store name is not secured."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "After a state write or branch switch in a store whose directory Chronicle created, sync returns without securing the store's name in its parent, so the state and selection need not remain reachable after power loss."
   - id: IR.aw.8
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "When the message is in a store whose directory Chronicle just created, the barrier after the message append leaves that directory's name unsynced, so delivery is not unconditionally durable."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "After appending messages in a store whose directory Chronicle created, sync leaves that directory's name unsynced, so its normal return cannot certify that the deliveries will be reachable after power loss."
   - id: IR.aw.9
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "In a newly created store the barrier after setStateJson of the mode can return with the store name still unsynced, so power loss can make even the successfully synced choice unreachable."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "After setting the mode in a newly created store, sync can return without syncing the store's name in its parent, so the saved choice is not guaranteed reachable after power loss."
   - id: IR.aw.10
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "If the named progress lives in a newly created store, sync after the named-state write does not secure the store name, so it cannot guarantee the progress is recoverable after power loss."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "If Chronicle created the store directory, syncing named state does not secure that directory's name in its parent, so even a correctly written progress checkpoint need not be reachable after power loss."
   - id: IR.aw.11
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "A queue replacement in a newly created store shares the setStateJson barrier's unsynced store name, so normal return need not leave a recoverable copy of the queue IDs after power loss."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "If Chronicle created the store directory, sync after setStateJson leaves the directory's own name unsynced, so it cannot guarantee recovery of the replacement slot and its IDs after power loss."
   - id: IR.aw.12
     status: not-met
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — the barrier"
-      - "tests/durability.test.mjs:132 — Each barrier asks for the name of the store's own directory to be put on disk"
-    gap: "If an archived blob landed but the sync of its directory was refused, a later store sync can return without securing the blob name, independently of the missing parent sync for a new store."
+      - "tests/late-failures.test.mjs:767 — A refused request in storeBlob leaves a throw or a return, whole values and a store that opens again"
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "A single sync can leave a readable blob's name unsynced after a refused blob-directory fsync, and on a newly created store it also leaves the store's own name unsynced."
   - id: IR.aw.13
     status: not-met
-    tests_commit: "d6cf0d8a1cedfdb4f8bc33ce4f571e92485d8976"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:656 — the second try"
-      - "tests/late-failures.test.mjs:663 — the other rules"
-      - "src/records/log.rs:877 — a_failed_sync_is_reported_by_every_later_one"
+      - "tests/late-failures.test.mjs:767 — A refused request in sync leaves a throw or a return, whole values and a store that opens again"
       - "src/store.rs:5728 — a_failed_log_fsync_publishes_nothing_until_reopen"
-    gap: "If an fsync of the record log fails, retrying `sync()` on the same handle still throws `DurabilityLost` after the fault clears; the store must be reopened first."
+    gap: "If the log fsync fails, either in the barrier itself or in an earlier periodic flush, another sync on that handle still fails with DurabilityLost rather than committing the already-written work."
   - id: IR.aw.14
     status: partly-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3385,17 +3393,18 @@ statuses:
       - "tests/tree-contract.test.mjs:310 — Staging is not publication and one mixed batch updates only its commit branch"
   - id: IR.ax.6
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again"
-    gap: "A test must force a throw after a known complete batch record, check every changed path with `treeGet` before any retry or sync, and verify that the recorded update remains committed."
+      - "tests/late-failures.test.mjs:767 — A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again"
+    gap: "A test must establish that the batch record landed before the throw, then check every changed path with `treeGet` on the same handle before retry or sync; the fault test compares `treeList` with a reopened copy but does not require a landed record."
   - id: IR.ax.7
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "error-codes.test.mjs:170 — the binding's own refusals carry theirs"
       - "tests/tree-contract.test.mjs:348 — A pre-record write failure leaves every valid batch target unchanged"
-      - "tests/late-failures.test.mjs:650 — A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again"
+      - "tests/write-refusals.test.mjs:92 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+      - "tests/late-failures.test.mjs:767 — A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again"
   - id: IR.ay.1
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3428,10 +3437,10 @@ statuses:
       - "tests/tree-contract.test.mjs:354 — A pre-record write failure leaves every valid batch target unchanged"
   - id: IR.ay.6
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/tree-contract.test.mjs:366 — A malformed live tree cannot masquerade as a miss or empty inventory"
-      - "tests/late-failures.test.mjs:650 — treeGet on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/late-failures.test.mjs:767 — treeGet on a store opened again throws the errno of a refused read, and the same call again gives the true value"
   - id: IR.ay.7
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3505,17 +3514,17 @@ statuses:
       - "tests/tree-contract.test.mjs:196 — Listing uses exact literal prefixes and ordered original path spellings"
       - "tests/tree-contract.test.mjs:174 — An intent whose blob is unreadable can be saved, replaced, restored and removed"
   - id: IR.az.5
-    status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/tree-contract.test.mjs:367 — A malformed live tree cannot masquerade as a miss or empty inventory"
-      - "tests/late-failures.test.mjs:650 — treeList on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+      - "tests/late-failures.test.mjs:767 — treeList on a store opened again throws the errno of a refused read, and the same call again gives the true value"
+    gap: "A test should list a tree containing both a valid entry and a malformed entry and assert a diagnostic throw rather than a partial inventory; the existing cases reject a wholly malformed tree or fail the first disk read."
   - id: IR.az.6
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/late-failures.test.mjs:650 — treeList on a store opened again throws the errno of a refused read, and the same call again gives the true value"
-      - "tests/tree-contract.test.mjs:367 — A malformed live tree cannot masquerade as a miss or empty inventory"
+      - "tests/late-failures.test.mjs:767 — treeList on a store opened again throws the errno of a refused read, and the same call again gives the true value"
   - id: IR.az.7
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3582,18 +3591,19 @@ statuses:
       - "tests/tree-contract.test.mjs:266 — File and intent removals rewind together and respect separate write order"
       - "tests/crash_state_recovery.rs:1222 — an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence"
   - id: IR.ba.5
-    status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:111 — sync after treeRemove returns after the store asks for each file that it wrote and each name that it made to be put on disk"
-      - "tests/late-failures.test.mjs:629 — A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again"
+      - "tests/durability.test.mjs:92 — sync after treeRemove returns after the store asks for each file that it wrote and each name that it made to be put on disk"
+      - "tests/late-failures.test.mjs:587 — A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again"
+    gap: "The trace covers one removal followed by sync; a test should remove entries from both the file and intent trees without an intervening sync and assert that both removals are durable when that one sync returns."
   - id: IR.ba.6
     status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:92 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
-      - "tests/late-failures.test.mjs:650 — A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again"
-    gap: "The POSIX tests check the recovered errno; a Windows test would have to provoke a removal I/O error and recognize its Node-style code without using the Unix message fallback."
+      - "tests/late-failures.test.mjs:767 — A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again"
+    gap: "The POSIX tests check the recognizable errno; a Windows test would need to provoke a removal I/O error and assert the matching Node-style code, since the numeric message fallback does not apply there."
   - id: IR.ba.7
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3625,10 +3635,11 @@ statuses:
       - "tests/point_write_cost.rs:77 — ordinary_point_replacements_and_evictions_stay_small_as_the_collection_grows"
   - id: IR.ba.12
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:80 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
-      - "tests/late-failures.test.mjs:650 — A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again"
+      - "tests/crash_state_recovery.rs:1300 — an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence"
   - id: IR.ba.13
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3674,26 +3685,25 @@ statuses:
       - "tests/tree-contract.test.mjs:199 — Listing uses exact literal prefixes and ordered original path spellings"
     gap: "After removing a path and restoring its saved entry with treeSet, assert that both the full listing and the matching directory listing contain that path again; the restoration tests check it with treeGet instead."
   - id: IR.bb.8
-    status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: not-met
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
-      - "tests/durability.test.mjs:111 — sync after treeSet returns after the store asks for each file that it wrote and each name that it made to be put on disk"
-      - "tests/late-failures.test.mjs:629 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
-      - "tests/tree_integration.rs:231 — test_tree_persistence_across_reopen"
-    gap: "Assert that several pending sets across the file and intent trees, including an earlier tool set, are all recoverable and synced at the same barrier before close or drop; the syscall test syncs after a single set and the multi-set reopen test drops the store first."
+      - "tests/durability.test.mjs:199 — Each barrier asks for the name of the store's own directory to be put on disk"
+    gap: "When Chronicle creates the store directory, `sync()` after `treeSet` syncs the contents without syncing the parent directory, so the store’s name is not guaranteed to survive a power loss."
   - id: IR.bb.9
-    status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: partly-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:92 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
-      - "tests/late-failures.test.mjs:650 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
+      - "tests/late-failures.test.mjs:767 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
+    gap: "A Windows test would need to provoke a known OS write failure through `treeSet` and check its `E…` code: both existing errno checks run on POSIX, where the message alone suffices."
   - id: IR.bb.10
     status: fully-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:72 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
+      - "tests/late-failures.test.mjs:767 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
       - "tests/crash_state_recovery.rs:1300 — an_interrupted_adoption_recovers_the_tree_outcome_without_completion_evidence"
-      - "tests/late-failures.test.mjs:650 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
   - id: IR.bb.11
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
@@ -3705,12 +3715,11 @@ statuses:
     tests:
       - "tests/tree-contract.test.mjs:164 — An intent whose blob is unreadable can be saved, replaced, restored and removed"
   - id: IR.bb.13
-    status: partly-pinned
-    tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
+    status: fully-pinned
+    tests_commit: "891829d46074d7df34eeb8a2e784264cd0e06773"
     tests:
       - "tests/write-refusals.test.mjs:76 — Tree and journal mutations preserve the OS cause and do not publish a refused edit"
-      - "tests/late-failures.test.mjs:650 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
-    gap: "Fault a checkpoint replacement at a due tree snapshot after the update record is written and assert that publishing the new list and throwing cannot both happen; the checkpoint test refuses the record write and the traced set inserts a key below the snapshot threshold."
+      - "tests/late-failures.test.mjs:767 — A refused request in treeSet leaves a throw or a return, whole values and a store that opens again"
   - id: IR.bb.14
     status: fully-pinned
     tests_commit: "0713b281e9516f0129930165a17c145cfc70fc12"
