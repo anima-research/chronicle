@@ -49,7 +49,7 @@ interfaces:
         statement: "An accepted layout and its optional receipt must land as one commit: a crash or failed append must not publish one part without the other."
       - id: IR.a.12
         origin: revealed
-        statement: "Appending an accepted-layout record must extend that type's ID list at the end, preserving its previous prefix in ascending order. The fold index pushes successful IDs itself, refreshes from its previous length after failure, and needs the IDs it compares to remain distinguishable in order when converted to JavaScript `Number`."
+        statement: "Appending an accepted-layout record extends that type's ID list at the end, preserving its previous prefix in ascending order. Within JavaScript's safe integer range, IDs are sequential decimal integers whose order survives conversion to `Number`."
       - id: IR.a.13
         origin: revealed
         statement: "`RecordJournal.write` also requires the result's `.sequence` to be the numeric branch sequence of the appended record, consistent with the sequence later read during replay."
@@ -235,7 +235,7 @@ interfaces:
         statement: "A quarantine event’s `eventId` is a nonempty string usable as an exact reference in a later ledger append. An alert or clear must match the intended exhaustion generation, and an `alert_sent` must still be able to name the pending event it acknowledges after replay."
       - id: IR.d.16
         origin: revealed
-        statement: "A successful ledger append precedes the side effect that relies on it. The pending-alert event must be persisted before external delivery, and the appended checkpoint at the old ledger length must survive redaction of the preceding items and subsequent compaction."
+        statement: "When `appendToStateJsonWithIdentity` returns, the appended item is already written to the store's log so that subsequent reads and a reopened store after process exit recover it, and a checkpoint item appended at the old ledger length survives redaction of the preceding items (`0..length`) and subsequent compaction."
       - id: IR.d.17
         origin: revealed
         statement: "For the benchmark’s per-row replacement for `appendManyToStateJsonWithIdentity`, successive single appends must leave the same window items, ordinals and presented rows as the batch, including after reopen. The deliberate difference is that each item names its own writing record instead of all items naming one record."
@@ -1050,7 +1050,7 @@ interfaces:
         statement: "For a written append log, `getStateLen(id)` synchronously returns a nonnegative integer counting the items in that named state as seen by the receiving handle on its branch. The unit is a stored item, not a byte, a Chronicle record, or a filtered result such as the number of active quarantines."
       - id: IR.y.2
         origin: revealed
-        statement: "An inability to determine the count is signaled by throwing synchronously, not by returning `null`, zero, or a stale length. The callers have no separate error-result channel; in particular, an unreadable ended log must fail the lookup rather than let a namespace ownership check pass."
+        statement: "An inability to determine the state's length is signaled by throwing synchronously, not by returning `null`, zero, or a stale length. Callers treat `null` as an absent state of length zero and have no separate error channel."
       - id: IR.y.3
         origin: revealed
         statement: "For seven callers, a never-written state is a successful empty count, not a read error. They accept `null` and convert it to zero; none of these seven needs to distinguish it from numeric zero."
@@ -1316,7 +1316,7 @@ interfaces:
         statement: "The static method accepts a configuration object whose `path` string names the store directory. Six callers supply no other setting."
       - id: IR.af.2
         origin: revealed
-        statement: "Success returns an already-open `JsStore` object synchronously, not a promise, status, or descriptor. Callers use the object directly or pass it unchanged as the store for a framework or context manager."
+        statement: "Success returns an already-open store handle synchronously, not a promise, status, or descriptor. Callers invoke store methods on the returned handle directly or pass it unchanged to a framework or context manager."
       - id: IR.af.3
         origin: revealed
         statement: "The returned handle is writable in place: persisted changes through it or through a manager borrowing it belong to the store at the supplied path and are visible on a later open. This includes imported messages, warmup summaries, a selected recovery branch, and load repairs made during an audit."
@@ -2153,7 +2153,7 @@ interfaces:
         statement: "An empty replacement intent can remove a tree reference even when the blob it points to is missing or unreadable. Clearing the intent must not require successfully decoding the old record."
       - id: IR.ba.11
         origin: revealed
-        statement: "Checkpoint eviction costs a per-key O(entry) write in the one registered checkpoint tree. It cannot rewrite a fleet-wide checkpoint map or leave a permanent state registration per evicted agent without defeating the caller's scaling requirement."
+        statement: "Evicting a key does not rewrite the whole collection on each eviction, and does not leave a permanent state registration per evicted agent."
       - id: IR.ba.12
         origin: revealed
         statement: "Checkpoint eviction assumes, for its failure diagnostic, that a throwing removal leaves the agent's checkpoint key in the store. Unlike the workspace tool commit, eviction does no read-back: it logs the failure and lets teardown finish."
