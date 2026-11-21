@@ -19,7 +19,7 @@
 //! 2 and keep the batch; see the Breaking note).
 
 use chronicle::{
-    FieldIndexKind, Sequence, StateOperation, StateRegistration, StateStrategy,
+    FieldIndexKind, RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy,
     StateUpdateRecord, Store, StoreConfig, StoreError,
 };
 use serde_json::{json, Value};
@@ -900,44 +900,12 @@ fn an_identity_batch_stores_its_items_stamped_with_its_one_record() {
     }
 }
 
-/// n single identity appends and one identity batch of the same items: each
-/// item is stamped with the record that holds it, which for the batch is its
-/// one record for every item. Apart from the stamps the stored bytes are the
-/// same, and with the single record's stamps swapped for the batch's they are
-/// the batch's bytes exactly. A field index on the items' own ids answers
-/// each item's ordinal in both, and a cut by an item's stamped sequence
-/// keeps it, and the one before drops it: for a single append that is the
-/// item alone, for the batch the whole batch.
-#[test]
-fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
-    let dir = TempDir::new().unwrap();
-    let store = Store::create(config(dir.path())).unwrap();
-    for id in ["single", "batched"] {
-        register(&store, id, 100, 100);
-        register_identity_indexes(&store, id);
-        store
-            .append_to_state_json_with_identity(id, json!({ "id": "first" }), "by", "at")
-            .unwrap();
-    }
-    let items: Vec<Value> = (0..6).map(identity_item).collect();
-    let singles: Vec<chronicle::Record> = items
-        .iter()
-        .map(|item| {
-            store
-                .append_to_state_json_with_identity("single", item.clone(), "by", "at")
-                .unwrap()
-        })
-        .collect();
-    let batch = store
-        .append_many_to_state_json_with_identity("batched", &items, "by", "at")
-        .unwrap();
-    assert_eq!(batch.first_ordinal, 1);
-    for id in ["single", "batched"] {
-        store
-            .append_to_state_json_with_identity(id, json!({ "id": "last" }), "by", "at")
-            .unwrap();
-    }
-
+fn check_identity_ordinals(
+    store: &Store,
+    items: &[Value],
+    singles: &[chronicle::Record],
+    batch: &chronicle::AppendedBatch,
+) {
     let read = |id: &str, ordinal: usize| -> (Vec<u8>, Value) {
         let bytes = store.get_state_item(id, ordinal).unwrap().unwrap();
         let value = serde_json::from_slice(&bytes).unwrap();
@@ -955,7 +923,6 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
         );
         assert_ne!(single_bytes, batched_bytes, "item {i}: the stamps differ");
 
-        // Each stamp names the record that holds the item, at its sequence.
         for (value, holder) in [(&single, &singles[i]), (&batched, &batch.record)] {
             let by: u64 = value["by"].as_str().unwrap().parse().unwrap();
             let record = store.get_record(chronicle::RecordId(by)).unwrap().unwrap();
@@ -973,7 +940,6 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
         }
     }
 
-    // The field index on the items' own ids answers each one's ordinal.
     for (i, item) in items.iter().enumerate() {
         if let Some(own) = item.get("id").and_then(Value::as_str) {
             for id in ["single", "batched"] {
@@ -1004,6 +970,50 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
             Some(vec![1 + i as u32])
         );
     }
+}
+
+#[test]
+fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
+    identity_batch_case(false);
+    identity_batch_case(true);
+}
+
+fn identity_batch_case(presented: bool) {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(dir.path())).unwrap();
+    let first = json!({ "id": "first" });
+    let first_records = ["single", "batched"].map(|id| {
+        register(&store, id, 100, 100);
+        register_identity_indexes(&store, id);
+        store
+            .append_to_state_json_with_identity(id, first.clone(), "by", "at")
+            .unwrap()
+    });
+    let mut items: Vec<Value> = (0..6).map(identity_item).collect();
+    if presented {
+        items[1]["id"] = json!("m1");
+        items[5]["v"] = json!(1);
+    }
+    let singles: Vec<chronicle::Record> = items
+        .iter()
+        .map(|item| {
+            store
+                .append_to_state_json_with_identity("single", item.clone(), "by", "at")
+                .unwrap()
+        })
+        .collect();
+    let batch = store
+        .append_many_to_state_json_with_identity("batched", &items, "by", "at")
+        .unwrap();
+    assert_eq!(batch.first_ordinal, 1);
+    let last = json!({ "id": "last" });
+    let last_records = ["single", "batched"].map(|id| {
+        store
+            .append_to_state_json_with_identity(id, last.clone(), "by", "at")
+            .unwrap()
+    });
+
+    check_identity_ordinals(&store, &items, &singles, &batch);
 
     // Cuts by a stamped sequence.
     let cut_len = |id: &str, name: &str, at: Sequence| -> usize {
@@ -1026,6 +1036,162 @@ fn each_item_of_an_identity_batch_names_the_record_that_holds_it() {
         2 + items.len(),
         "after the batch: all of it and what followed"
     );
+
+    store.sync().unwrap();
+    drop(store);
+    let store = Store::open(config(dir.path())).unwrap();
+    check_identity_ordinals(&store, &items, &singles, &batch);
+    for (leg, id) in ["single", "batched"].into_iter().enumerate() {
+        let window = value(&store, id);
+        let stream = window.as_array().unwrap();
+        let mut expected = vec![stamped(&first, "by", "at", &first_records[leg])];
+        for (i, item) in items.iter().enumerate() {
+            let owner = if id == "single" { &singles[i] } else { &batch.record };
+            expected.push(stamped(item, "by", "at", owner));
+        }
+        expected.push(stamped(&last, "by", "at", &last_records[leg]));
+        assert_eq!(stream, &expected, "{id}: reopened window");
+
+        let mut presented = Vec::new();
+        for (ordinal, item) in stream.iter().enumerate() {
+            if let Some(row) = item["id"].as_str() {
+                presented.push((ordinal, row));
+            } else if let Some(row) = item["retract"].as_str() {
+                presented.retain(|(_, id)| *id != row);
+            }
+        }
+        assert_eq!(presented, [(0, "first"), (1, "m0"), (3, "m2"), (5, "m4"), (7, "last")], "{id}");
+    }
+}
+
+#[test]
+fn contending_single_identity_writers_each_stamp_their_own_one_record() {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Barrier};
+
+    enum Wrote {
+        Stamped(chronicle::Record, Value),
+        Plain(chronicle::Record, Vec<u8>),
+    }
+
+    const WRITERS: usize = 4;
+    const ROUNDS: usize = 24;
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(Store::create(config(dir.path())).unwrap());
+    register(&store, "log", 10, 10);
+    store.set_auto_snapshot(false);
+    let side = store.create_branch("side", None).unwrap();
+    let main = store.current_branch();
+    let records_before = store.stats().unwrap().record_count;
+    let side_before = store.get_branch_by_id(side.id).unwrap().head;
+
+    let ready = Arc::new(Barrier::new(WRITERS + 2));
+    let mut writes = Vec::new();
+    for round in 0..ROUNDS {
+        let mut threads: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let store = Arc::clone(&store);
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    let item = json!({ "writer": writer, "round": round, "body": "w".repeat(2048) });
+                    let input = item.clone();
+                    ready.wait();
+                    let record = store.append_to_state_json_with_identity("log", input, "by", "at").unwrap();
+                    Wrote::Stamped(record, item)
+                })
+            })
+            .collect();
+        for branch in [None, Some(side.id)] {
+            let store = Arc::clone(&store);
+            let ready = Arc::clone(&ready);
+            threads.push(std::thread::spawn(move || {
+                let payload = format!("plain {round} {branch:?}").into_bytes();
+                let input = RecordInput::raw("plain", payload.clone());
+                ready.wait();
+                let record = match branch {
+                    None => store.append(input),
+                    Some(branch) => store.append_on(branch, input),
+                }
+                .unwrap();
+                Wrote::Plain(record, payload)
+            }));
+        }
+        writes.extend(threads.into_iter().map(|h| h.join().unwrap()));
+    }
+
+    assert_eq!(
+        store.stats().unwrap().record_count,
+        records_before + (ROUNDS * (WRITERS + 2)) as u64
+    );
+    let ids: BTreeSet<_> = writes
+        .iter()
+        .map(|(Wrote::Stamped(r, _) | Wrote::Plain(r, _))| r.id.0)
+        .collect();
+    assert_eq!(ids.len(), writes.len(), "every write took an ID of its own");
+    let sequences = |branch: chronicle::BranchId| -> Vec<u64> {
+        let mut taken: Vec<u64> = writes
+            .iter()
+            .map(|(Wrote::Stamped(r, _) | Wrote::Plain(r, _))| r)
+            .filter(|r| r.branch == branch)
+            .map(|r| r.sequence.0)
+            .collect();
+        taken.sort_unstable();
+        taken
+    };
+    assert_eq!(
+        sequences(main.id),
+        ((main.head.0 + 1)..=(main.head.0 + (ROUNDS * (WRITERS + 1)) as u64)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sequences(side.id),
+        ((side_before.0 + 1)..=(side_before.0 + ROUNDS as u64)).collect::<Vec<_>>()
+    );
+    for branch in [main.id, side.id] {
+        let mut taken: Vec<(u64, u64)> = writes
+            .iter()
+            .map(|(Wrote::Stamped(r, _) | Wrote::Plain(r, _))| r)
+            .filter(|r| r.branch == branch)
+            .map(|r| (r.sequence.0, r.id.0))
+            .collect();
+        taken.sort_unstable();
+        assert!(
+            taken.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "IDs follow the order of the sequences on each branch: {taken:?}"
+        );
+    }
+
+    let mut stamped_writes: Vec<_> = writes
+        .iter()
+        .filter_map(|write| match write {
+            Wrote::Stamped(record, item) => Some((record, item)),
+            Wrote::Plain(record, payload) => {
+                let stored = store.get_record(record.id).unwrap().unwrap();
+                assert_eq!(
+                    (stored.id, stored.branch, stored.sequence, &stored.payload),
+                    (record.id, record.branch, record.sequence, payload)
+                );
+                None
+            }
+        })
+        .collect();
+    stamped_writes.sort_by_key(|(r, _)| r.sequence);
+    let mut expected = Vec::new();
+    for (returned, input) in stamped_writes {
+        assert_eq!(returned.branch, main.id);
+        let stored = store.get_record(returned.id).unwrap().unwrap();
+        assert_eq!(
+            (stored.id, stored.branch, stored.sequence),
+            (returned.id, returned.branch, returned.sequence)
+        );
+        let bytes = match StateUpdateRecord::decode(&stored).unwrap().operation {
+            StateOperation::Append(bytes) => bytes,
+            other => panic!("expected a stamped append, got {other:?}"),
+        };
+        let own = stamped(input, "by", "at", returned);
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), own, "record {:?}", returned.id);
+        expected.push(own);
+    }
+    assert_eq!(value(&store, "log"), json!(expected));
 }
 
 /// An identity batch with an item that isn't a JSON object is refused

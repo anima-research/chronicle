@@ -7,6 +7,7 @@
 
 use chronicle::types::{StateOperation, StateRegistration, StateStrategy};
 use chronicle::{RecordId, RecordInput, Store, StoreConfig};
+use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
@@ -72,16 +73,51 @@ fn type_lists_ascend_with_interleaved_types_and_across_a_reopen() {
 fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
-    let newest_layout = {
+    let layout = |compile_id: &str, count: u64| {
+        json!({
+            "compileId": compile_id,
+            "kind": "snapshot",
+            "units": [{"k": "m", "n": count}],
+            "receipt": {"compileId": compile_id, "kind": "baseline", "messages": count}
+        })
+    };
+    let intact_pair = layout("compile-intact", 10);
+    let torn_pair = layout("compile-torn", 11);
+    let (intact_layout, newest_layout, intact_sequence, synced_records) = {
         let store = Store::create(config(&path)).unwrap();
         for i in 0..10 {
             append(&store, if i % 2 == 0 { "layout" } else { "message" }, i);
         }
         store.sync().unwrap();
+        let synced_records = store.stats().unwrap().record_count;
         // Two more layouts; the second is torn below, as a crash mid-append
         // would leave it.
-        append(&store, "layout", 10);
-        append(&store, "layout", 11)
+        let write_layout = |pair: &Value| {
+            let records = store.stats().unwrap().record_count;
+            let head = store.current_branch().head;
+            let record = store
+                .append(RecordInput::json("layout", pair).unwrap())
+                .unwrap();
+            assert_eq!(
+                (
+                    store.stats().unwrap().record_count,
+                    store.current_branch().head,
+                    record.sequence
+                ),
+                (records + 1, head.next(), head.next())
+            );
+            record
+        };
+        let intact = write_layout(&intact_pair);
+        let newest = write_layout(&torn_pair);
+        for (id, expected) in [(intact.id, &intact_pair), (newest.id, &torn_pair)] {
+            let record = store.get_record(id).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&record.payload).unwrap(),
+                *expected
+            );
+        }
+        (intact.id, newest.id, intact.sequence, synced_records)
     };
     let log_path = path.join("records.log");
     let len = std::fs::metadata(&log_path).unwrap().len();
@@ -96,13 +132,50 @@ fn type_lists_ascend_after_a_torn_tail_issues_its_id_again() {
         !store.get_records_by_type("layout").contains(&newest_layout),
         "the torn record is gone"
     );
+    assert!(store.get_record(newest_layout).unwrap().is_none());
+    let intact = store.get_record(intact_layout).unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&intact.payload).unwrap(),
+        intact_pair
+    );
+    let tail: Vec<(RecordId, String)> = store
+        .iter_from(intact_sequence)
+        .map(|read| {
+            let (_, record) = read.unwrap();
+            (record.id, record.record_type)
+        })
+        .collect();
+    assert_eq!(
+        (
+            tail,
+            store.current_branch().head,
+            store.stats().unwrap().record_count
+        ),
+        (
+            vec![(intact_layout, "layout".to_string())],
+            intact_sequence,
+            synced_records + 1
+        )
+    );
     assert_ascending(&store, "layout", 6);
     // The torn record's ID is issued again, here to a record of another type,
     // and each list still ascends.
+    let replacement_payload = json!({"compileId": "compile-new", "message": 12});
+    let replacement = store
+        .append(RecordInput::json("message", &replacement_payload).unwrap())
+        .unwrap();
     assert_eq!(
-        append(&store, "message", 12),
-        newest_layout,
+        replacement.id, newest_layout,
         "the torn record's ID is issued again"
+    );
+    let found = store.get_record(newest_layout).unwrap().unwrap();
+    assert_eq!(
+        (
+            found.id,
+            found.record_type.as_str(),
+            serde_json::from_slice::<Value>(&found.payload).unwrap()
+        ),
+        (newest_layout, "message", replacement_payload)
     );
     append(&store, "layout", 13);
     assert_ascending(&store, "layout", 7);

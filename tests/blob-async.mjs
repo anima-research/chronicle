@@ -98,7 +98,10 @@ try {
   assert.throws(() => detached.storeBlobAsync(Buffer.from('x'), 'text/plain'), /View has been closed/);
   assert.deepEqual(store.getBlob(await fromView), viewContent);
 
-  const sync = (() => { try { store.storeBlob(Buffer.from('x'), 'x'.repeat(65_536)); } catch (error) { return error.message; } })();
+  const refusal = (() => { try { store.storeBlob(Buffer.from('x'), 'x'.repeat(65_536)); } catch (error) { return error; } })();
+  assert.deepEqual([refusal.code, /content type can be at most 65535 bytes/.test(refusal.message),
+    /^IO error: .*\(os error \d+\)$/s.test(refusal.message)], ['InvalidOperation', true, false]);
+  const sync = refusal.message;
   await assert.rejects(store.storeBlobAsync(Buffer.from('x'), 'x'.repeat(65_536)), (error) => error.message === sync);
 
   const lateContents = contents.map((content, i) => Buffer.concat([content, Buffer.from([i])]));

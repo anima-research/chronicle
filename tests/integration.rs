@@ -1978,6 +1978,25 @@ fn test_register_field_index_idempotent_reregistration_skips_materialization() {
         rebuilds,
         "re-registering a current index rebuilt the slot"
     );
+
+    store.sync().unwrap();
+    drop(store);
+    let store = Store::open(StoreConfig {
+        path: dir.path().join("store"),
+        blob_cache_size: 100,
+        create_if_missing: false,
+    })
+    .unwrap();
+
+    let rebuilds = store.state_reconstruction_count();
+    store
+        .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+        .unwrap();
+    assert_eq!(store.state_reconstruction_count(), rebuilds);
+    assert_eq!(
+        store.query_state_index_range("messages", "/v", Some(7.0), Some(9.0), None, None, false),
+        Some(vec![7, 8, 9])
+    );
 }
 
 #[test]
