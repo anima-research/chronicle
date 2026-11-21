@@ -1,26 +1,10 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
+import * as scenarios from './late-failures-scenarios.mjs';
 
 const message = (text, n) => ({ channel: 'general', text, n });
 const entry = blobHash => ({ blobHash, size: 4, mode: 0o644 });
-const utf8 = buffer => (buffer === null || buffer === undefined ? null : buffer.toString('utf8'));
-const stamped = (id, sequence) => typeof id === 'string' && id !== '' && Number.isSafeInteger(sequence) && sequence >= 0;
-const plain = items => (items === null ? null : items.map(({ id, sequence, ...rest }) => ({ ...rest, stamped: stamped(id, sequence) })));
-const payloads = (s, type) => s.getRecordIdsByType(type).map(id => JSON.parse(utf8(s.getRecord(id).payload)));
-const branchNames = s => s.listBranches().map(({ name }) => name).sort();
-const stateList = s => s.listStates().map(({ id, strategy }) => `${id} ${strategy}`).sort();
-const files = s => s.treeList('files').map(({ path, blobHash, size, mode }) => ({ path, blobHash, size, mode }));
-const branchStates = name => s => {
-  if (!s.listBranches().some(branch => branch.name === name)) return null;
-  const view = s.view(name);
-  return { messages: view.getStateJson('messages'), mode: view.getStateJson('mode') };
-};
-
-const journal = s => payloads(s, 'journal');
-const messages = s => s.getStateJson('messages');
-const identified = s => plain(s.getStateJson('identified'));
-const strategyOf = s => s.listStates().find(({ id }) => id === 'messages')?.strategy ?? null;
 
 function base(s, f) {
   for (const [id, strategy] of [['mode', 'snapshot'], ['raw', 'snapshot'], ['messages', 'append_log'],
@@ -36,144 +20,11 @@ function base(s, f) {
   s.treeSet('files', 'a.txt', entry(f.blob));
 }
 
-function threeWrites(s) {
-  s.appendJson('journal', { n: 1 });
-  s.setStateJson('mode', { mode: 'new' });
-  s.appendToStateJson('messages', message('new', 1));
+function known(name) {
+  const scenario = Object.hasOwn(scenarios, name) ? scenarios[name] : undefined;
+  if (scenario === undefined || scenario.name !== name) throw new Error(`tests/late-failures-scenarios.mjs has no scenario named ${name}`);
+  return scenario;
 }
-
-const longMethod = i => (i % 2 === 0 ? 'appendJson' : 'appendToStateJson');
-const longCall = (s, i) => (longMethod(i) === 'appendJson'
-  ? s.appendJson('journal', { n: i })
-  : s.appendToStateJson('messages', message('long', i)));
-
-const writes = {
-  appendJson: { call: s => s.appendJson('journal', { n: 1 }), reads: { journal } },
-  appendManyToStateJsonWithIdentity: {
-    call: s => s.appendManyToStateJsonWithIdentity('identified', [{ text: 'two' }, { text: 'three' }], 'id', 'sequence'),
-    reads: { identified },
-  },
-  appendToStateJson: { call: s => s.appendToStateJson('messages', message('new', 1)), reads: { messages } },
-  appendToStateJsonWithIdentity: {
-    call: s => s.appendToStateJsonWithIdentity('identified', { text: 'new' }, 'id', 'sequence'),
-    reads: { identified },
-  },
-  compactState: {
-    setup: s => [1, 2, 3].forEach(n => s.appendToStateJson('messages', message('more', n))),
-    call: s => s.compactState('messages'),
-    reads: { messages, length: s => s.getStateLen('messages') },
-  },
-  createBranch: { call: s => s.createBranch('made'), reads: { branches: branchNames } },
-  createBranchAt: {
-    setup: (s, f) => { f.at = s.currentSequence(); s.setStateJson('mode', { mode: 'later' }); },
-    call: (s, f) => s.createBranchAt('made', 'main', f.at),
-    reads: { branches: branchNames, made: branchStates('made') },
-  },
-  createBranchAtWithStates: {
-    setup: (s, f) => { f.at = s.currentSequence(); s.setStateJson('mode', { mode: 'later' }); },
-    call: (s, f) => s.createBranchAtWithStates('made', 'main', f.at, { stateIds: ['messages'] }),
-    reads: { branches: branchNames, made: branchStates('made') },
-  },
-  createBranchWithStates: {
-    call: s => s.createBranchWithStates('made', 'main', { stateIds: ['messages'] }),
-    reads: { branches: branchNames, made: branchStates('made') },
-  },
-  deleteBranch: {
-    setup: s => s.createBranch('gone'),
-    call: s => s.deleteBranch('gone'),
-    reads: { branches: branchNames },
-  },
-  editStateItem: {
-    call: s => s.editStateItem('messages', 0, Buffer.from(JSON.stringify(message('edited', 0)))),
-    reads: { messages },
-  },
-  redactStateItems: {
-    setup: s => s.appendManyToStateJsonWithIdentity('identified', [{ text: 'two' }, { text: 'three' }], 'id', 'sequence'),
-    call: s => s.redactStateItems('identified', 0, 2),
-    reads: { identified, length: s => s.getStateLen('identified') },
-  },
-  registerState: { call: s => s.registerState({ id: 'added', strategy: 'snapshot' }), reads: { states: stateList } },
-  registerStateFieldIndex: {
-    call: s => s.registerStateFieldIndex('messages', '/channel', 'string'),
-    reads: { index: s => s.queryStateIndexEq('messages', '/channel', 'general', {}) },
-  },
-  setAutoSnapshot: { call: s => s.setAutoSnapshot(false), reads: { enabled: s => s.autoSnapshotEnabled() } },
-  setState: { call: s => s.setState('raw', Buffer.from('new bytes')), reads: { raw: s => utf8(s.getState('raw')) } },
-  setStateJson: { call: s => s.setStateJson('mode', { mode: 'new' }), reads: { mode: s => s.getStateJson('mode') } },
-  storeBlob: {
-    call: s => s.storeBlob(Buffer.from('fresh blob'), 'text/plain'),
-    reads: { blob: (s, f) => utf8(s.getBlob(f.fresh)) },
-  },
-  switchBranch: {
-    setup: s => s.createBranch('other'),
-    call: s => s.switchBranch('other'),
-    reads: { current: s => s.currentBranch().name },
-  },
-  treeBatch: {
-    call: (s, f) => s.treeBatch('files', [
-      { op: 'set', path: 'b.txt', entry: entry(f.blob) },
-      { op: 'remove', path: 'a.txt' },
-    ]),
-    reads: { files },
-  },
-  treeRemove: { call: s => s.treeRemove('files', 'a.txt'), reads: { files } },
-  treeSet: { call: (s, f) => s.treeSet('files', 'b.txt', entry(f.blob)), reads: { files } },
-  updateStateStrategy: {
-    call: s => s.updateStateStrategy({ id: 'messages', strategy: 'append_log', deltaSnapshotEvery: 5, fullSnapshotEvery: 2 }),
-    reads: { strategy: strategyOf, messages },
-    probe: s => {
-      for (let n = 0; n < 5; n++) s.appendToStateJson('messages', message('probe', n));
-      return s.listStates().find(({ id }) => id === 'messages').opsSinceSnapshot;
-    },
-  },
-};
-
-const coldReads = {
-  currentBranch: s => s.currentBranch().name,
-  currentSequence: s => s.currentSequence(),
-  getBlob: (s, f) => utf8(s.getBlob(f.blob)),
-  getRecord: (s, f) => {
-    const record = s.getRecord(f.record);
-    return record && { ...record, payload: utf8(record.payload) };
-  },
-  getRecordIdsByType: s => s.getRecordIdsByType('journal'),
-  getState: s => utf8(s.getState('raw')),
-  getStateIndexValueCounts: s => s.getStateIndexValueCounts('messages', '/channel'),
-  getStateItemJson: s => s.getStateItemJson('messages', 1),
-  getStateJson: s => s.getStateJson('messages'),
-  getStateJsonAt: (s, f) => s.getStateJsonAt('mode', f.at),
-  getStateLen: s => s.getStateLen('messages'),
-  getStateSlice: s => utf8(s.getStateSlice('messages', 1, 2)),
-  getStateTail: s => utf8(s.getStateTail('messages', 2)),
-  listBranches: branchNames,
-  listStates: stateList,
-  queryStateIndexEq: s => s.queryStateIndexEq('messages', '/channel', 'general', {}),
-  queryStateIndexRange: s => s.queryStateIndexRange('messages', '/n', { gte: 1, lte: 2 }),
-  stateHeadOffset: s => s.stateHeadOffset('messages'),
-  treeGet: s => s.treeGet('files', 'a.txt'),
-  treeList: files,
-};
-
-function coldSetup(s, f) {
-  [1, 2, 3].forEach(n => s.appendToStateJson('messages', message('more', n)));
-  s.registerStateFieldIndex('messages', '/channel', 'string');
-  s.registerStateFieldIndex('messages', '/n', 'number');
-  f.at = s.currentSequence();
-  s.setStateJson('mode', { mode: 'later' });
-  f.record = s.getRecordIdsByType('journal')[0];
-  s.createBranch('other');
-}
-
-const scenarios = [
-  ...Object.keys(writes).map(name => ({ name, kind: 'write' })),
-  { name: 'sync', kind: 'sync' },
-  { name: 'close', kind: 'close' },
-  { name: 'long', kind: 'long' },
-  ...Object.keys(coldReads).map(name => ({ name, kind: 'cold' })),
-];
-
-const longReads = { journal, messages };
-const threeReads = { journal, mode: s => s.getStateJson('mode'), messages };
 
 function attempt(work) {
   try {
@@ -202,7 +53,7 @@ function freshHash(dir) {
 }
 
 function run([name, root, outside, index]) {
-  const scenario = scenarios.find(item => item.name === name);
+  const scenario = known(name);
   const path = join(root, 'store');
   const f = {};
   const marks = [];
@@ -217,23 +68,21 @@ function run([name, root, outside, index]) {
     mark(`${label}-end`);
     return outcome;
   };
-  if (name === 'storeBlob') f.fresh = freshHash(join(outside, 'scratch'));
+  if (scenario.freshBlob) f.fresh = freshHash(join(outside, 'scratch'));
   mark('begin');
   let s = JsStore.create({ path });
   base(s, f);
   const { kind } = scenario;
-  const write = writes[name];
-  write?.setup?.(s, f);
-  if (kind === 'cold') coldSetup(s, f);
+  scenario.setup?.(s, f);
   s.sync();
   mark('setup');
 
   if (kind === 'long') {
     const at = index === undefined ? Infinity : Number(index);
     let i = 0;
-    for (; i < 400 && i < at; i++) {
+    for (; i < scenario.appends && i < at; i++) {
       if (index === undefined) mark(`append-${i}-begin`);
-      longCall(s, i);
+      scenario.call(s, f, i);
       if (index === undefined) mark(`append-${i}-end`);
     }
     if (index === undefined) {
@@ -241,9 +90,9 @@ function run([name, root, outside, index]) {
       return out;
     }
   }
-  if (kind === 'sync' || kind === 'close') threeWrites(s);
+  scenario.unsynced?.(s);
   if (kind === 'cold') {
-    const read = coldReads[name];
+    const { read } = scenario;
     out.expected = attempt(() => read(s, f));
     s.close();
     s = JsStore.open({ path });
@@ -255,12 +104,9 @@ function run([name, root, outside, index]) {
     return out;
   }
 
-  const reads = kind === 'long' ? longReads : kind === 'write' ? write.reads : threeReads;
-  const call = kind === 'long' ? () => longCall(s, Number(index))
-    : kind === 'sync' ? () => s.sync()
-    : kind === 'close' ? () => s.close()
-    : () => write.call(s, f);
-  out.method = kind === 'long' ? longMethod(Number(index)) : name;
+  const { reads } = scenario;
+  const call = () => scenario.call(s, f, Number(index));
+  out.method = scenario.method ? scenario.method(Number(index)) : name;
   out.old = readAll(reads, s, f);
   out.call = step('call', call);
   if (kind === 'close') {
@@ -294,12 +140,11 @@ function run([name, root, outside, index]) {
 }
 
 function reopen([name, index, ...paths]) {
-  const scenario = scenarios.find(item => item.name === name);
-  const reads = scenario.kind === 'long' ? longReads : scenario.kind === 'write' ? writes[name].reads : threeReads;
-  const probe = writes[name]?.probe;
+  const scenario = known(name);
+  const { reads, probe } = scenario;
   const answers = paths.map(path => {
     const f = {};
-    if (name === 'storeBlob') f.fresh = freshHash(`${path}-scratch`);
+    if (scenario.freshBlob) f.fresh = freshHash(`${path}-scratch`);
     let s = null;
     const opened = attempt(() => { s = JsStore.open({ path }); });
     if (!opened.ok) return { opened };
@@ -317,6 +162,6 @@ function reopen([name, index, ...paths]) {
   return { answers, old };
 }
 
-if (process.argv[2] === 'list') process.stdout.write(JSON.stringify(scenarios));
-else if (process.argv[2] === 'run') process.stdout.write(JSON.stringify(run(process.argv.slice(3))));
+if (process.argv[2] === 'run') process.stdout.write(JSON.stringify(run(process.argv.slice(3))));
 else if (process.argv[2] === 'reopen') process.stdout.write(JSON.stringify(reopen(process.argv.slice(3))));
+else throw new Error(`late-failures-writer.mjs takes run or reopen, not ${process.argv[2]}`);

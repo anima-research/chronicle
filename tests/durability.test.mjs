@@ -77,6 +77,23 @@ const unsyncedIn = (mark, dir) => ({
   names: relative(inside(mark.names, dir).filter(path => path !== dir), dir),
 });
 
+const declaredLabels = new Set();
+function atBarrier(label) {
+  declaredLabels.add(label);
+  return () => {
+    judged();
+    const index = run.labels.indexOf(label);
+    assert.ok(index >= 0, `tests/durability-writer.mjs has no barrier named ${label}`);
+    if (run.barriers[index].pending) {
+      const pending = unsyncedIn(at(`pending-${index}`), run.store);
+      assert.ok(pending.files.length > 0, `Before ${label}, the store had no unsynced file, so the barrier had nothing to do`);
+    }
+    const unsynced = unsyncedIn(at(`barrier-${index}`), run.store);
+    assert.deepEqual(unsynced, { files: [], names: [] },
+      `After ${label}, the store had not asked to put these on disk: files [${unsynced.files.join(', ')}], names [${unsynced.names.join(', ')}]`);
+  };
+}
+
 if (skip) {
   test('sync and close ask for what the store wrote to be put on disk', { skip }, () => {});
 } else if (run.labels === null) {
@@ -100,17 +117,67 @@ if (skip) {
       `${notMeasured}: the record does not show the rename of a file that was not synced.`);
   });
 
-  run.labels.forEach((label, index) => {
-    test(`${label} returns after the store asks for each file that it wrote and each name that it made to be put on disk`, () => {
-      judged();
-      if (run.barriers[index].pending) {
-        const pending = unsyncedIn(at(`pending-${index}`), run.store);
-        assert.ok(pending.files.length > 0, `Before ${label}, the store had no unsynced file, so the barrier had nothing to do`);
-      }
-      const unsynced = unsyncedIn(at(`barrier-${index}`), run.store);
-      assert.deepEqual(unsynced, { files: [], names: [] },
-        `After ${label}, the store had not asked to put these on disk: files [${unsynced.files.join(', ')}], names [${unsynced.names.join(', ')}]`);
-    });
+  test('sync on a new store after one appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync on a new store after one appendJson'));
+  test('sync after registerState returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after registerState'));
+  test('sync after appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after appendJson'));
+  test('sync after setStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after setStateJson'));
+  test('sync after setState returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after setState'));
+  test('sync after appendToStateJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after appendToStateJson'));
+  test('sync after appendToStateJsonWithIdentity returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after appendToStateJsonWithIdentity'));
+  test('sync after appendManyToStateJsonWithIdentity returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after appendManyToStateJsonWithIdentity'));
+  test('sync after editStateItem returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after editStateItem'));
+  test('sync after redactStateItems returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after redactStateItems'));
+  test('sync after registerStateFieldIndex returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after registerStateFieldIndex'));
+  test('sync after storeBlob returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after storeBlob'));
+  test('sync after treeSet returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after treeSet'));
+  test('sync after treeRemove returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after treeRemove'));
+  test('sync after treeBatch returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after treeBatch'));
+  test('sync after compactState returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after compactState'));
+  test('sync after updateStateStrategy returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after updateStateStrategy'));
+  test('sync after setAutoSnapshot returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after setAutoSnapshot'));
+  test('sync after createBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after createBranch'));
+  test('sync after switchBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after switchBranch'));
+  test('sync after createBranchWithStates returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after createBranchWithStates'));
+  test('sync after createBranchAt returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after createBranchAt'));
+  test('sync after createBranchAtWithStates returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after createBranchAtWithStates'));
+  test('sync after deleteBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after deleteBranch'));
+  test('sync after a write through a view of a branch that is not the current one returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync after a write through a view of a branch that is not the current one'));
+  test('close with writes pending returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('close with writes pending'));
+  test('sync on a reopened store after appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync on a reopened store after appendJson'));
+  test('close on a reopened store with a write pending returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('close on a reopened store with a write pending'));
+
+  test('Each barrier of the writer has its test', () => {
+    judged();
+    const untested = run.labels.filter(label => !declaredLabels.has(label));
+    assert.deepEqual(untested, [], 'no test names these barriers of tests/durability-writer.mjs');
   });
 
   test('The store renames no file before it asks for that file to be put on disk', () => {
