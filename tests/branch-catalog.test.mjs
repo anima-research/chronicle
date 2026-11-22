@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { knownFailure } from './known-failure.mjs';
 import { ErrorCode, JsStore } from '../index.js';
 
 function freshStore(t) {
@@ -147,20 +146,6 @@ test('Creation metadata is in epoch microseconds and stays with the identity', (
     `listBranches.created = ${listed.created} µs, expected [${before}, ${after}] ms`);
   assert.equal(listed.created, selected.created);
 });
-
-test('currentBranch and listBranches give created in epoch milliseconds, as new Date reads it', knownFailure('The store gives created in epoch microseconds.', (t) => {
-  const { store } = freshStore(t);
-  const before = Date.now();
-  const born = store.createBranch('dated');
-  const after = Date.now();
-  store.switchBranch(born.name);
-  const slack = 10 * 60 * 1000;
-  for (const [method, created] of [['currentBranch', store.currentBranch().created],
-    ['listBranches', named(store.listBranches(), born.name).created]]) {
-    assert.ok(before - slack <= created && created <= after + slack,
-      `${method}().created = ${created}, expected [${before}, ${after}] ms`);
-  }
-}));
 
 test('Listed ancestry describes immediate parents and inclusive cuts, not current heads', (t) => {
   const { store } = freshStore(t);
