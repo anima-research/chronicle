@@ -117,9 +117,11 @@ class Disk {
     this.names = new Set();
     this.pending = new Map();
     this.lost = new Map();
+    this.written = new Set();
   }
 
   wrote(path, bytes = 0) {
+    this.written.add(path);
     this.files.add(path);
     this.pending.set(path, (this.pending.get(path) ?? 0) + bytes);
     const owed = this.lost.get(path);
@@ -239,7 +241,8 @@ export function readTrace(text, { root, cwd, names = [root] }) {
     const { name, args, rest, ok, bytes } = splitCall(call.text);
     const markName = args.map(quoted).map(path => MARK.exec(path ?? '')?.[1]).find(Boolean);
     if (markName) {
-      marks.push({ name: markName, files: [...disk.files], names: [...disk.names] });
+      marks.push({ name: markName, files: [...disk.files], names: [...disk.names], written: [...disk.written] });
+      disk.written = new Set();
       continue;
     }
     const anywhere = rootText.test(call.text) || rootText.test(rest);

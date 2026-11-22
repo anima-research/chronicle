@@ -79,13 +79,17 @@ const unsyncedIn = (mark, dir) => ({
 });
 
 const declaredLabels = new Set();
-function atBarrier(label) {
+function atBarrier(label, { writesNothing = false, leavesUnsynced = false } = {}) {
   declaredLabels.add(label);
   return () => {
     judged();
     const index = run.labels.indexOf(label);
     assert.ok(index >= 0, `tests/durability-writer.mjs has no barrier named ${label}`);
-    if (run.barriers[index].pending) {
+    if (!writesNothing) {
+      const written = relative(inside(at(`pending-${index}`).written, run.store), run.store);
+      assert.ok(written.length > 0, `Before ${label}, its mutation wrote no file of the store, so the barrier had nothing to do`);
+    }
+    if (leavesUnsynced) {
       const pending = unsyncedIn(at(`pending-${index}`), run.store);
       assert.ok(pending.files.length > 0, `Before ${label}, the store had no unsynced file, so the barrier had nothing to do`);
     }
@@ -139,7 +143,7 @@ if (skip) {
   test('sync after redactStateItems returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync after redactStateItems'));
   test('sync after registerStateFieldIndex returns after the store asks for each file that it wrote and each name that it made to be put on disk',
-    atBarrier('sync after registerStateFieldIndex'));
+    atBarrier('sync after registerStateFieldIndex', { writesNothing: true }));
   test('sync after storeBlob returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync after storeBlob'));
   test('sync after treeSet returns after the store asks for each file that it wrote and each name that it made to be put on disk',
@@ -153,7 +157,7 @@ if (skip) {
   test('sync after updateStateStrategy returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync after updateStateStrategy'));
   test('sync after setAutoSnapshot returns after the store asks for each file that it wrote and each name that it made to be put on disk',
-    atBarrier('sync after setAutoSnapshot'));
+    atBarrier('sync after setAutoSnapshot', { writesNothing: true }));
   test('sync after createBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync after createBranch'));
   test('sync after switchBranch returns after the store asks for each file that it wrote and each name that it made to be put on disk',
@@ -169,11 +173,11 @@ if (skip) {
   test('sync after a write through a view of a branch that is not the current one returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync after a write through a view of a branch that is not the current one'));
   test('close with writes pending returns after the store asks for each file that it wrote and each name that it made to be put on disk',
-    atBarrier('close with writes pending'));
+    atBarrier('close with writes pending', { leavesUnsynced: true }));
   test('sync on a reopened store after appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync on a reopened store after appendJson'));
   test('close on a reopened store with a write pending returns after the store asks for each file that it wrote and each name that it made to be put on disk',
-    atBarrier('close on a reopened store with a write pending'));
+    atBarrier('close on a reopened store with a write pending', { leavesUnsynced: true }));
 
   test('Each barrier of the writer has its test', () => {
     judged();
