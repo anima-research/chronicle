@@ -15,9 +15,23 @@ const WRITES_TO_FIRST = new Set([
 ]);
 const WRITES_TO_THIRD = new Set(['copy_file_range', 'splice']);
 const OPENS = { open: [null, 0, 1], creat: [null, 0, null], openat: [0, 1, 2], openat2: [0, 1, 2] };
+const MOVES_A_POSITION = new Set(['copy_file_range', 'sendfile', 'sendfile64', 'splice']);
 const MARK = /^\/chronicle-mark\/(.+)$/;
 
 const isUnder = (path, dir) => path === dir || path.startsWith(`${dir}/`);
+
+const joined = (ranges, [from, to]) => {
+  if (to <= from) return ranges;
+  const kept = [];
+  for (const [a, b] of ranges) {
+    if (b < from || a > to) kept.push([a, b]);
+    else [from, to] = [Math.min(from, a), Math.max(to, b)];
+  }
+  return [...kept, [from, to]].sort(([a], [b]) => a - b);
+};
+const without = (ranges, [from, to]) => ranges.flatMap(([a, b]) => (b <= from || a >= to)
+  ? [[a, b]]
+  : [...(a < from ? [[a, from]] : []), ...(b > to ? [[to, b]] : [])]);
 
 function splitCall(text) {
   const open = text.indexOf('(');
@@ -113,35 +127,69 @@ export function resolved(dirArg, pathArg, cwd) {
 class Disk {
   constructor(names) {
     this.exists = new Set(names);
-    this.files = new Set();
     this.names = new Set();
-    this.pending = new Map();
-    this.lost = new Map();
+    this.state = new Map();
     this.written = new Set();
   }
 
-  wrote(path, bytes = 0) {
+  get files() {
+    return new Set([...this.state].filter(([, f]) => f.dirty.length > 0 || f.dirtyUnknown || f.cut || f.lost.length > 0 || f.lostUnknown)
+      .map(([path]) => path));
+  }
+
+  of(path) {
+    if (!this.state.has(path)) this.state.set(path, { dirty: [], dirtyUnknown: false, cut: false, lost: [], lostUnknown: false, size: null });
+    return this.state.get(path);
+  }
+
+  wrote(path, from, bytes) {
+    if (from !== null && bytes === 0) return;
     this.written.add(path);
-    this.files.add(path);
-    this.pending.set(path, (this.pending.get(path) ?? 0) + bytes);
-    const owed = this.lost.get(path);
-    if (owed === undefined) return;
-    if (owed > bytes) this.lost.set(path, owed - bytes);
-    else this.lost.delete(path);
+    const file = this.of(path);
+    if (from === null) {
+      file.dirtyUnknown = true;
+      file.size = null;
+      return;
+    }
+    file.dirty = joined(file.dirty, [from, from + bytes]);
+    file.lost = without(file.lost, [from, from + bytes]);
+    if (file.size !== null) file.size = Math.max(file.size, from + bytes);
+  }
+
+  cutTo(path, length) {
+    this.written.add(path);
+    const file = this.of(path);
+    if (length === null) {
+      file.dirtyUnknown = true;
+      file.size = null;
+      return;
+    }
+    file.dirty = without(file.dirty, [length, Infinity]);
+    file.lost = without(file.lost, [length, Infinity]);
+    if (length === 0) {
+      file.dirtyUnknown = false;
+      file.lostUnknown = false;
+    }
+    file.cut = true;
+    file.size = length;
   }
 
   refused(path) {
-    const owed = this.pending.get(path) ?? 0;
-    if (owed > 0) this.lost.set(path, owed);
+    const file = this.state.get(path);
+    if (!file) return;
+    file.lost = file.dirty.reduce(joined, file.lost);
+    file.lostUnknown ||= file.dirtyUnknown || file.cut;
+    file.dirty = [];
+    file.dirtyUnknown = false;
+    file.cut = false;
   }
 
   fileSynced(path) {
-    if (this.lost.has(path)) {
-      this.pending.set(path, this.lost.get(path));
-      return;
-    }
-    this.files.delete(path);
-    this.pending.delete(path);
+    const file = this.state.get(path);
+    if (!file) return;
+    file.dirty = [];
+    file.dirtyUnknown = false;
+    file.cut = false;
   }
 
   made(path) {
@@ -150,27 +198,26 @@ class Disk {
   }
 
   removed(path) {
-    for (const set of [this.exists, this.files, this.names, this.pending, this.lost]) {
-      for (const entry of [...set.keys()]) if (isUnder(entry, path)) set.delete(entry);
+    for (const set of [this.exists, this.names]) {
+      for (const entry of [...set]) if (isUnder(entry, path)) set.delete(entry);
     }
+    for (const entry of [...this.state.keys()]) if (isUnder(entry, path)) this.state.delete(entry);
   }
 
   renamed(from, to) {
     if (from === to) return;
     this.removed(to);
-    for (const set of [this.exists, this.files, this.names]) {
+    for (const set of [this.exists, this.names]) {
       for (const entry of [...set]) {
         if (!isUnder(entry, from)) continue;
         set.delete(entry);
         if (set !== this.names || entry !== from) set.add(to + entry.slice(from.length));
       }
     }
-    for (const map of [this.pending, this.lost]) {
-      for (const [entry, bytes] of [...map]) {
-        if (!isUnder(entry, from)) continue;
-        map.delete(entry);
-        map.set(to + entry.slice(from.length), bytes);
-      }
+    for (const [entry, file] of [...this.state]) {
+      if (!isUnder(entry, from)) continue;
+      this.state.delete(entry);
+      this.state.set(to + entry.slice(from.length), file);
     }
     this.made(to);
   }
@@ -185,7 +232,7 @@ class Disk {
   }
 
   syncedAll() {
-    for (const path of [...this.files]) this.fileSynced(path);
+    for (const path of this.state.keys()) this.fileSynced(path);
     this.names.clear();
   }
 }
@@ -227,6 +274,16 @@ function descriptor(arg, cwd) {
 
 export function readTrace(text, { root, cwd, names = [root] }) {
   const disk = new Disk(names);
+  const handles = new Map();
+  const numberOf = arg => /^(\d+)</.exec(arg ?? '')?.[1] ?? null;
+  const handleOf = (arg, path) => {
+    const handle = handles.get(numberOf(arg));
+    return handle && handle.path === path ? handle : null;
+  };
+  const unfollowed = arg => {
+    const handle = handles.get(numberOf(arg));
+    if (handle) handle.position = null;
+  };
   const marks = [];
   const unsyncedRenames = [];
   const problems = [];
@@ -269,6 +326,8 @@ export function readTrace(text, { root, cwd, names = [root] }) {
         problem('an open whose path the record does not resolve');
         continue;
       }
+      const opened = /^\s*=\s*(\d+)/.exec(rest)?.[1];
+      if (opened !== undefined) handles.delete(opened);
       if (!inRoot(path)) continue;
       const flags = flagIndex === null ? 'O_CREAT|O_WRONLY|O_TRUNC' : args[flagIndex];
       if (flags.includes('O_TMPFILE')) {
@@ -276,7 +335,9 @@ export function readTrace(text, { root, cwd, names = [root] }) {
         continue;
       }
       if (flags.includes('O_CREAT') && !disk.exists.has(path)) disk.made(path);
-      if (flags.includes('O_TRUNC')) disk.wrote(path);
+      if (flags.includes('O_CREAT') && flags.includes('O_EXCL')) disk.of(path).size = 0;
+      if (flags.includes('O_TRUNC')) disk.cutTo(path, 0);
+      if (opened !== undefined) handles.set(opened, { path, position: 0, append: flags.includes('O_APPEND'), shared: false });
       continue;
     }
     if (name === 'mkdir' || name === 'mkdirat' || name === 'symlink' || name === 'symlinkat') {
@@ -314,6 +375,9 @@ export function readTrace(text, { root, cwd, names = [root] }) {
         unsyncedRenames.push({ from, to, at: marks.length, line: call.line });
       }
       disk.renamed(from, to);
+      for (const handle of handles.values()) {
+        if (handle.path !== null && isUnder(handle.path, from)) handle.path = to + handle.path.slice(from.length);
+      }
       continue;
     }
     if (name === 'unlink' || name === 'unlinkat' || name === 'rmdir') {
@@ -327,12 +391,33 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       if (!ok) continue;
       const path = resolved(null, args[0], cwd);
       if (path === null) problem('a truncation whose path the record does not resolve');
-      else if (inRoot(path)) disk.wrote(path);
+      else if (inRoot(path)) disk.cutTo(path, /^\d+$/.test(args[1] ?? '') ? Number(args[1]) : null);
       continue;
     }
     if (WRITES_TO_FIRST.has(name) || WRITES_TO_THIRD.has(name)) {
-      const path = written(args[WRITES_TO_FIRST.has(name) ? 0 : 2]);
-      if (ok && inRoot(path)) disk.wrote(path, bytes);
+      const target = args[WRITES_TO_FIRST.has(name) ? 0 : 2];
+      const path = written(target);
+      if (MOVES_A_POSITION.has(name)) {
+        unfollowed(args[0]);
+        unfollowed(args[WRITES_TO_FIRST.has(name) ? 1 : 2]);
+      }
+      if (!ok || !inRoot(path)) continue;
+      const handle = handleOf(target, path);
+      const follows = handle !== null && !handle.shared;
+      const end = follows && handle.append ? disk.of(path).size : null;
+      if (name === 'ftruncate') {
+        disk.cutTo(path, /^\d+$/.test(args[1] ?? '') ? Number(args[1]) : null);
+      } else if (name === 'write' || name === 'writev' || (name === 'pwritev2' && args[3] === '-1')) {
+        const from = !follows ? null : handle.append ? end : handle.position;
+        disk.wrote(path, from, bytes);
+        if (handle) handle.position = from === null ? null : from + bytes;
+      } else if (name === 'pwrite64' || name === 'pwritev' || name === 'pwritev2') {
+        const offset = /^\d+$/.test(args[3] ?? '') ? Number(args[3]) : null;
+        const appends = !follows || handle.append || /RWF_APPEND/.test(args[4] ?? '');
+        disk.wrote(path, appends ? end : offset, bytes);
+      } else {
+        disk.wrote(path, null, bytes);
+      }
       continue;
     }
     if (name === 'fsync' || name === 'fdatasync') {
@@ -356,6 +441,46 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       if (!/MAP_SHARED/.test(args[3] ?? '')) continue;
       const d = descriptor(args[4], cwd);
       if (d.bare || inRoot(d.path) || inRoot(d.deleted)) problem('a shared mapping of a file');
+      continue;
+    }
+    if (name === 'read' || name === 'readv' || (name === 'preadv2' && args[3] === '-1')) {
+      const handle = handles.get(numberOf(args[0]));
+      if (handle && handle.position !== null) handle.position = ok ? handle.position + bytes : handle.position;
+      continue;
+    }
+    if (name === 'lseek') {
+      const handle = handles.get(numberOf(args[0]));
+      if (handle && ok) {
+        handle.position = bytes;
+        if (args[2] === 'SEEK_END' && args[1] === '0' && handle.path !== null && inRoot(handle.path)) disk.of(handle.path).size = bytes;
+      } else if (handle) {
+        handle.position = null;
+      }
+      continue;
+    }
+    if (name === 'llseek' || name === '_llseek') {
+      unfollowed(args[0]);
+      continue;
+    }
+    if (name === 'close') {
+      handles.delete(numberOf(args[0]));
+      continue;
+    }
+    if (name === 'close_range') {
+      const first = Number(args[0]);
+      const last = /^\d+$/.test(args[1] ?? '') ? Number(args[1]) : Infinity;
+      for (const number of [...handles.keys()]) if (Number(number) >= first && Number(number) <= last) handles.delete(number);
+      continue;
+    }
+    if (name === 'dup' || name === 'dup2' || name === 'dup3' || ((name === 'fcntl' || name === 'fcntl64') && /F_DUPFD/.test(args[1] ?? ''))) {
+      const copy = /^\s*=\s*(\d+)/.exec(rest)?.[1];
+      const handle = handles.get(numberOf(args[0]));
+      if (copy !== undefined) handles.delete(copy);
+      if (ok && copy !== undefined && handle) {
+        handle.shared = true;
+        handle.position = null;
+        handles.set(copy, handle);
+      }
       continue;
     }
     if (NEUTRAL.has(name)) continue;
