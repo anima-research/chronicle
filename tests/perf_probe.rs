@@ -1,3 +1,4 @@
+//! Targeted wall-clock probes.
 //! Not part of the normal test run — execute with:
 //!   cargo test --release --test perf_probe -- --ignored --nocapture
 
