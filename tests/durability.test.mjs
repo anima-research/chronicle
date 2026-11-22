@@ -50,7 +50,7 @@ function traceWriter() {
   }
   const trace = readTrace(readFileSync(record, 'utf8'), { root, cwd: process.cwd(), names: [root, control] });
   const expected = ['begin', ...CONTROL_MARKS,
-    ...barriers.flatMap(({ pending }, index) => pending ? [`pending-${index}`, `barrier-${index}`] : [`barrier-${index}`]), 'end'];
+    ...barriers.flatMap(({ pending, opens }, index) => [...(opens ? [`opened-${index}`] : []), ...(pending ? [`pending-${index}`] : []), `barrier-${index}`]), 'end'];
   const found = trace.marks.map(({ name }) => name);
   const run = { labels, barriers, root, control, store: join(root, 'store'), trace, failure: null };
   if (found.join('\n') !== expected.join('\n')) {
