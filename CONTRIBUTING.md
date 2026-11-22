@@ -210,5 +210,19 @@ Binaries ship inside the single published tarball. The platform packages that
 them as `optionalDependencies` breaks `npm ci` for every consumer on npm >= 11,
 so the release workflow fails if they reappear — don't add them back.
 
+Two files at the repository root are snapshots:
+`INTERFACE-REQUIREMENTS-LIST.yaml` and `INTERFACE-TESTING-STATUS.yaml`. The
+first file lists what the calling packages need from the store, and it groups
+the requirements by method. Model readers found most of the requirements in
+the code of the callers. The head of the first file names the commit of each
+caller. The readers found the other requirements in the tests of this
+repository. The second file gives one status for each requirement. One model
+reader read the tests at one commit and wrote the status, and the status names
+that commit. Programs outside this repository wrote both files, so do not edit
+them by hand. No test checks either file, and a reader can be wrong. A status
+can be stale after the tests change, and a requirement can be stale after a
+caller changes. So treat a line of either file as a dated finding, and check
+the code before you rely on it.
+
 Stores are binary; use the inspector tooling in `tools/` and `ui/` rather than
 reading them by hand. `docs/loom-of-looms.md` is the algebraic spec.
