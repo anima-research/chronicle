@@ -16,6 +16,7 @@ const WRITES_TO_FIRST = new Set([
 const WRITES_TO_THIRD = new Set(['copy_file_range', 'splice']);
 const OPENS = { open: [null, 0, 1], creat: [null, 0, null], openat: [0, 1, 2], openat2: [0, 1, 2] };
 const MOVES_A_POSITION = new Set(['copy_file_range', 'sendfile', 'sendfile64', 'splice']);
+const COUNTS_BYTES = new Set(['copy_file_range', 'pwrite64', 'pwritev', 'pwritev2', 'sendfile', 'sendfile64', 'splice', 'write', 'writev']);
 const MARK = /^\/chronicle-mark\/(.+)$/;
 
 const isUnder = (path, dir) => path === dir || path.startsWith(`${dir}/`);
@@ -157,8 +158,10 @@ class Disk {
   }
 
   cutTo(path, length) {
-    this.written.add(path);
     const file = this.of(path);
+    const clean = file.dirty.length === 0 && !file.dirtyUnknown && !file.cut && file.lost.length === 0 && !file.lostUnknown;
+    if (length !== null && clean && file.size === length) return;
+    this.written.add(path);
     if (length === null) {
       file.dirtyUnknown = true;
       file.size = null;
@@ -376,7 +379,9 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       }
       disk.renamed(from, to);
       for (const handle of handles.values()) {
-        if (handle.path !== null && isUnder(handle.path, from)) handle.path = to + handle.path.slice(from.length);
+        if (handle.path === null) continue;
+        if (isUnder(handle.path, from)) handle.path = to + handle.path.slice(from.length);
+        else if (isUnder(handle.path, to)) handle.path = null;
       }
       continue;
     }
@@ -385,6 +390,9 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       const path = name === 'unlinkat' ? resolved(args[0], args[1], cwd) : resolved(null, args[0], cwd);
       if (path === null) problem('a removal that the record does not resolve');
       else if (inRoot(path)) disk.removed(path);
+      if (path !== null) {
+        for (const handle of handles.values()) if (handle.path !== null && isUnder(handle.path, path)) handle.path = null;
+      }
       continue;
     }
     if (name === 'truncate') {
@@ -402,18 +410,20 @@ export function readTrace(text, { root, cwd, names = [root] }) {
         unfollowed(args[WRITES_TO_FIRST.has(name) ? 1 : 2]);
       }
       if (!ok || !inRoot(path)) continue;
+      if (COUNTS_BYTES.has(name) && bytes === 0) continue;
       const handle = handleOf(target, path);
       const follows = handle !== null && !handle.shared;
-      const end = follows && handle.append ? disk.of(path).size : null;
+      const end = follows ? disk.of(path).size : null;
+      const appendsByFlag = name === 'pwritev2' && /RWF_APPEND/.test(args[4] ?? '');
       if (name === 'ftruncate') {
         disk.cutTo(path, /^\d+$/.test(args[1] ?? '') ? Number(args[1]) : null);
       } else if (name === 'write' || name === 'writev' || (name === 'pwritev2' && args[3] === '-1')) {
-        const from = !follows ? null : handle.append ? end : handle.position;
+        const from = !follows ? null : handle.append || appendsByFlag ? end : handle.position;
         disk.wrote(path, from, bytes);
         if (handle) handle.position = from === null ? null : from + bytes;
       } else if (name === 'pwrite64' || name === 'pwritev' || name === 'pwritev2') {
         const offset = /^\d+$/.test(args[3] ?? '') ? Number(args[3]) : null;
-        const appends = !follows || handle.append || /RWF_APPEND/.test(args[4] ?? '');
+        const appends = !follows || handle.append || appendsByFlag;
         disk.wrote(path, appends ? end : offset, bytes);
       } else {
         disk.wrote(path, null, bytes);
@@ -452,7 +462,8 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       const handle = handles.get(numberOf(args[0]));
       if (handle && ok) {
         handle.position = bytes;
-        if (args[2] === 'SEEK_END' && args[1] === '0' && handle.path !== null && inRoot(handle.path)) disk.of(handle.path).size = bytes;
+        const path = descriptor(args[0], cwd).path ?? null;
+        if (args[2] === 'SEEK_END' && args[1] === '0' && !handle.shared && handle.path !== null && handle.path === path && inRoot(path)) disk.of(path).size = bytes;
       } else if (handle) {
         handle.position = null;
       }
@@ -470,6 +481,14 @@ export function readTrace(text, { root, cwd, names = [root] }) {
       const first = Number(args[0]);
       const last = /^\d+$/.test(args[1] ?? '') ? Number(args[1]) : Infinity;
       for (const number of [...handles.keys()]) if (Number(number) >= first && Number(number) <= last) handles.delete(number);
+      continue;
+    }
+    if ((name === 'fcntl' || name === 'fcntl64') && args[1] === 'F_SETFL') {
+      const handle = handles.get(numberOf(args[0]));
+      if (handle && ok) {
+        if (/^O_[A-Z_|]+$/.test(args[2] ?? '')) handle.append = /\bO_APPEND\b/.test(args[2]);
+        else handle.shared = true;
+      }
       continue;
     }
     if (name === 'dup' || name === 'dup2' || name === 'dup3' || ((name === 'fcntl' || name === 'fcntl64') && /F_DUPFD/.test(args[1] ?? ''))) {
