@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
 
@@ -43,6 +43,11 @@ const h = {
   aimed: process.env.CHRONICLE_LATE_AIMED === '1',
   devNull: () => openSync('/dev/null', 'w'),
   foreignWrite: fd => writeSync(fd, 'x'),
+  foreignReads: () => {
+    const fd = openSync('/dev/zero', 'r');
+    for (let i = 1 + Math.floor(Math.random() * 8); i > 0; i--) readSync(fd, Buffer.alloc(1), 0, 1, null);
+    closeSync(fd);
+  },
 };
 
 function base(s, f) {
@@ -59,7 +64,7 @@ function base(s, f) {
   s.treeSet('files', 'a.txt', entry(f.blob));
 }
 
-const FUNCTIONS = ['setup', 'unsynced', 'call', 'reads', 'read', 'probe', 'method'];
+const FUNCTIONS = ['start', 'setup', 'unsynced', 'call', 'reads', 'read', 'probe', 'method'];
 
 function scenarioAt(path) {
   const spec = JSON.parse(readFileSync(path, 'utf8'));
@@ -112,6 +117,7 @@ function run([scenarioFile, root, outside, index]) {
     return outcome;
   };
   if (scenario.freshBlob) f.fresh = freshHash(join(outside, 'scratch'));
+  scenario.start?.(h);
   mark('begin');
   let s = JsStore.create({ path });
   base(s, f);

@@ -225,8 +225,10 @@ async function traced(scenario, extra, inject) {
   mkdirSync(root, { recursive: true });
   mkdirSync(outside);
   const record = join(dir, 'record');
+  const store = join(root, 'store');
   const injection = inject ? ['-e', `inject=${inject.name}:error=${inject.errno}:when=${inject.when}`] : [];
-  const result = await child('strace', ['-f', '-y', '-o', record, '-e', `trace=${CALLS}`, ...injection,
+  const paths = inject?.path ? [join(store, inject.path), ...inject.marks.map(label => `/chronicle-mark/${label}`)] : [];
+  const result = await child('strace', ['-f', '-y', '-o', record, '-e', `trace=${CALLS}`, ...paths.flatMap(path => ['-P', path]), ...injection,
     process.execPath, '--single-threaded', WRITER, 'run', scenario.file, root, outside, ...extra], dir,
   inject ? { ...env, CHRONICLE_LATE_AIMED: '1' } : env);
   let out = null;
@@ -237,7 +239,6 @@ async function traced(scenario, extra, inject) {
   try {
     text = readFileSync(record, 'utf8');
   } catch {}
-  const store = join(root, 'store');
   return { dir, root, store, copy: join(outside, 'copy'), thrown: join(outside, 'thrown'), result, out, text, inject };
 }
 
@@ -299,11 +300,30 @@ function hit(run) {
   return { id: request.id, request, record };
 }
 
+function fileAim(point, clean) {
+  const onFile = call => call.tid === point.call.tid && call.name === point.name && call.paths[0] === point.path;
+  const upTo = clean.all.slice(0, clean.all.indexOf(point.call) + 1).filter(onFile);
+  return { path: posix.relative(clean.store, point.path), when: upTo.length, inCall: upTo.filter(call => call.inCall).length };
+}
+
+function fileHit(run, point, aim) {
+  const record = requestsOfCall(run.text, run.store, run.dir);
+  const refused = record.all.filter(call => call.injected);
+  if (refused.length !== 1) return { why: `the record shows ${refused.length} refused requests`, record };
+  const path = join(run.store, aim.path);
+  const onFile = call => call.inCall && call.tid === refused[0].tid && call.name === point.name && call.paths[0] === path;
+  if (!onFile(refused[0])) return { why: `the refused call is no ${point.name} of ${aim.path} in the call: ${refused[0].text}`, record };
+  const number = record.all.slice(0, record.all.indexOf(refused[0]) + 1).filter(onFile).length;
+  if (number !== aim.inCall) return { why: `it refused ${point.name} ${number} of ${aim.path} in the call, where the target is ${point.name} ${aim.inCall}`, record };
+  return { id: point.id, request: record.requests.find(({ call }) => call === refused[0]), record };
+}
+
 async function aimAll(scenario, kind, clean, extra) {
   const points = kind.points(clean.requests);
   const counted = new Map(points.map(point => [point.id, []]));
   const misses = new Map(points.map(point => [point.id, []]));
-  const aims = new Map(points.map(point => [point.id, point.when]));
+  const byFile = new Map(kind.aimsByFile ? points.map(point => [point.id, fileAim(point, clean)]) : []);
+  const aims = new Map(points.map(point => [point.id, byFile.get(point.id)?.when ?? point.when]));
   const records = [];
   let aimed = 0;
   let slowest = 0;
@@ -311,9 +331,11 @@ async function aimAll(scenario, kind, clean, extra) {
     const open = points.filter(point => counted.get(point.id).length === 0);
     if (open.length === 0) break;
     aimed += open.length;
-    const runs = await Promise.all(open.map(point => traced(scenario, extra,
-      { name: point.name, errno: errnoOf(point.name), when: aims.get(point.id) })));
-    const found = runs.map(run => hit(run));
+    const runs = await Promise.all(open.map(point => traced(scenario, extra, {
+      name: point.name, errno: errnoOf(point.name), when: aims.get(point.id),
+      ...(byFile.has(point.id) && { path: byFile.get(point.id).path, marks: clean.out.marks }),
+    })));
+    const found = runs.map((run, index) => (byFile.has(open[index].id) ? fileHit(run, open[index], byFile.get(open[index].id)) : hit(run)));
     records.push(...found.map(({ record }) => record));
     slowest = Math.max(slowest, ...runs.map(run => run.result.ms));
     runs.forEach((run, index) => {
@@ -321,7 +343,7 @@ async function aimAll(scenario, kind, clean, extra) {
       const { id, why, request, record } = found[index];
       if (id && counted.has(id)) counted.get(id).push({ ...run, errno: errnoOf(request.name), refused: request.path });
       if (id === point.id) return;
-      const next = nextAim(point, record, records, clean);
+      const next = byFile.has(point.id) ? null : nextAim(point, record, records, clean);
       misses.get(point.id).push(`${why ?? `it refused ${id}`}${next === null ? `, and the aim stays at ${aims.get(point.id)}` : ''}`);
       if (next !== null) aims.set(point.id, next);
     });
@@ -695,6 +717,7 @@ const longKind = {
 
 const coldKind = {
   name: 'cold',
+  aimsByFile: true,
   points: firstRead,
   find: noExtra,
   cleanProblem: out => (out.retry.ok ? null : `the clean run's second call threw: ${out.retry.message}`),
@@ -744,7 +767,7 @@ async function scenarioResult(scenario, kind) {
 
 const asText = value => (typeof value === 'function' ? String(value) : value);
 
-function refused(scenario, kind, { rules = [], todos = [], firstAimMisses = false } = {}) {
+function refused(scenario, kind, { rules = [], todos = [], firstAim } = {}) {
   return async t => {
     const file = join(base, `${scenario.name}.json`);
     writeFileSync(file, JSON.stringify({
@@ -762,7 +785,7 @@ function refused(scenario, kind, { rules = [], todos = [], firstAimMisses = fals
     assert.deepEqual(lost.map(({ point, rule }) => `${point}, ${rule}`), [], 'a todo names a fault point that the call no longer has');
     kind.cleanAnswers(result);
     if (result.points.length === 0) {
-      assert.ok(!firstAimMisses, `${kind.noPoints}, so the control has nothing to aim at`);
+      assert.ok(!firstAim, `${kind.noPoints}, so the control has nothing to aim at`);
       t.skip(kind.noPoints);
       return;
     }
@@ -774,7 +797,9 @@ function refused(scenario, kind, { rules = [], todos = [], firstAimMisses = fals
         if (runs.length === 0) {
           assert.fail(`${NOT_MEASURED}: three aimed runs did not refuse ${point.id} (${at}): ${result.misses.get(point.id).join('; ')}`);
         }
-        assert.ok(!firstAimMisses || result.misses.get(point.id).length > 0, `The first aimed run refused ${point.id}, so the control made no miss for the aim to correct`);
+        const missed = result.misses.get(point.id);
+        assert.ok(firstAim !== 'miss' || missed.length > 0, `The first aimed run refused ${point.id}, so the control made no miss for the aim to correct`);
+        assert.ok(firstAim !== 'hit' || missed.length === 0, `The first aimed run missed ${point.id}: ${missed.join('; ')}`);
         const judged = runs.map(run => [run, judge(kind, rules, result.clean, run, result.answers.get(run))]);
         const here = todos.filter(each => each.point === undefined || each.point === point.id);
         const ownedBy = (rule, problem) => here.find(each => each.rule === rule && each.owns(problem));
@@ -801,13 +826,14 @@ suite('The aim after a missed run', () => {
   const STORE = '/t/root/store';
   const FDS = { log: `7<${STORE}/records.log>`, event: '19<anon_inode:[eventfd]>', out: '1<pipe:[42]>' };
   const MARKS = { start: 'begin', begin: 'call-begin', end: 'call-end' };
-  const recordOf = (steps, refusedAt = -1) => requestsOfCall(steps.map((step, index) => {
+  const textOf = (steps, refusedAt = -1) => steps.map((step, index) => {
     const [what, tid = '1'] = step.split('@');
     if (MARKS[what]) {
       return `${tid} statx(AT_FDCWD, "/chronicle-mark/${MARKS[what]}", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x7ffd00) = -1 ENOENT (No such file or directory)`;
     }
     return `${tid} write(${FDS[what]}, "x", 1) = ${index === refusedAt ? '-1 ENOSPC (No space left on device) (INJECTED)' : '1'}`;
-  }).join('\n'), STORE, '/t');
+  }).join('\n');
+  const recordOf = (steps, refusedAt = -1) => requestsOfCall(textOf(steps, refusedAt), STORE, '/t');
   const pointOf = (record, id) => record.requests.find(request => request.id === id);
   const aimAfter = (record, id, missed, others = []) => nextAim(pointOf(record, id), missed, [...others, missed], record);
   const clean = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'log', 'log', 'event', 'end']);
@@ -861,6 +887,21 @@ suite('The aim after a missed run', () => {
     const one = recordOf(['out', 'start', 'out', 'begin', 'log', 'end']);
     const other = recordOf(['out', 'out', 'start', 'out', 'begin', 'log', 'end'], 5);
     assert.equal(aimAfter(one, 'write 1', recordOf(['out'], 0), [other]), 4);
+  });
+
+  test('A point aimed by its file is counted among the calls of its name on that file, from the start and inside the call', () => {
+    const fileClean = { ...recordOf(['out', 'start', 'log', 'event', 'begin', 'log', 'event', 'log', 'end']), store: STORE };
+    assert.deepEqual(fileAim(pointOf(fileClean, 'write 2'), fileClean), { path: 'records.log', when: 3, inCall: 2 });
+  });
+
+  test('A run aimed by its file counts only when it refused the target\'s number on that file inside the call', () => {
+    const fileClean = { ...recordOf(['out', 'start', 'log', 'begin', 'log', 'log', 'end']), store: STORE };
+    const point = pointOf(fileClean, 'write 2');
+    const aim = fileAim(point, fileClean);
+    const run = refusedAt => fileHit({ text: textOf(['start', 'log', 'begin', 'log', 'log', 'end'], refusedAt), store: STORE, dir: '/t' }, point, aim);
+    assert.equal(run(4).id, 'write 2');
+    assert.equal(run(3).why, 'it refused write 1 of records.log in the call, where the target is write 2');
+    assert.match(run(1).why, /^the refused call is no write of records.log in the call/);
   });
 
   test('A point off the main thread, a refused call off it, or a target shown off it, keeps its aim', () => {
@@ -1054,7 +1095,7 @@ if (skip) {
           return s.treeBatch('files', [{ op: 'set', path: 'b.txt', entry: h.entry(f.blob) }, { op: 'remove', path: 'a.txt' }]);
         },
         reads: h => ({ files: h.files }),
-      }, writeKind, { firstAimMisses: true }));
+      }, writeKind, { firstAim: 'miss' }));
     test('A refused request in treeRemove leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'treeRemove',
@@ -1186,6 +1227,13 @@ if (skip) {
         setup: (s, f, h) => h.coldSetup(s, f),
         read: (s, f, h) => h.utf8(s.getStateSlice('messages', 1, 2)),
       }, coldKind));
+    test('The aim finds the read of getStateSlice when the writer reads another file a random number of times before it begins',
+      refused({
+        name: 'getStateSliceWithForeignReads',
+        start: h => h.foreignReads(),
+        setup: (s, f, h) => h.coldSetup(s, f),
+        read: (s, f, h) => h.utf8(s.getStateSlice('messages', 1, 2)),
+      }, coldKind, { firstAim: 'hit' }));
     test('getStateTail on a store opened again throws the errno of a refused read, and the same call again gives the true value',
       refused({
         name: 'getStateTail',
