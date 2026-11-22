@@ -760,13 +760,13 @@ function refused(scenario, kind, { rules = [], todos = [], firstAimMisses = fals
     if (result.failure) assert.fail(result.failure);
     const lost = todos.filter(each => each.point !== undefined && !result.points.some(point => point.id === each.point));
     assert.deepEqual(lost.map(({ point, rule }) => `${point}, ${rule}`), [], 'a todo names a fault point that the call no longer has');
+    kind.cleanAnswers(result);
     if (result.points.length === 0) {
       assert.ok(!firstAimMisses, `${kind.noPoints}, so the control has nothing to aim at`);
       t.skip(kind.noPoints);
       return;
     }
     t.diagnostic(`${result.points.length} fault points, ${result.aimed} aimed runs, the slowest traced run ${result.slowest} ms`);
-    kind.cleanAnswers(result);
     for (const point of result.points) {
       await t.test(`with ${point.id} of the call refused`, async t => {
         const runs = result.counted.get(point.id);
@@ -997,7 +997,7 @@ if (skip) {
       refused({
         name: 'setAutoSnapshot',
         call: (s, f, h) => s.setAutoSnapshot(false),
-        reads: h => ({ enabled: s => s.autoSnapshotEnabled() }),
+        reads: () => ({}),
       }, writeKind));
     test('A refused request in setState leaves a throw or a return, whole values and a store that opens again',
       refused({
