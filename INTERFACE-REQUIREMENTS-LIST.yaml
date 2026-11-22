@@ -1,4 +1,8 @@
 # INTERFACE REQUIREMENTS LIST
+#
+# This file is a snapshot. The lines below name one commit of the package and one commit of each calling package.
+# Readers read the code at those commits and wrote these requirements.
+# The list says nothing about a later commit, and a reader can miss a requirement or state a requirement wrongly.
 generated_at: "2026-11-21T11:45:55Z"
 package:
   name: "@animalabs/chronicle"
