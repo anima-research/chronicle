@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { knownFailure } from './known-failure.mjs';
 import { ErrorCode, JsStore } from '../index.js';
 
 function freshStore(t) {
@@ -172,9 +173,7 @@ test('A branch selector left undefined selects what an omitted one does', t => {
   assert.deepEqual(drain(store, unspecified).map(recordId), control);
 });
 
-test('An explicit branch name selects the live records of that branch', {
-  todo: 'The live record filter ignores the branch name: a subscription to work receives records written to both main and work.',
-}, t => {
+test('An explicit branch name selects the live records of that branch', knownFailure('The live record filter ignores the branch name: a subscription to work receives records written to both main and work.', t => {
   const store = freshStore(t);
   store.createBranch('work');
   const named = startLive(store, { includeRecords: true, branch: 'work' });
@@ -183,7 +182,7 @@ test('An explicit branch name selects the live records of that branch', {
   const onWork = work.appendJson('note', 'on work');
   work.close();
   assert.deepEqual(drain(store, named).map(recordId), [onWork.id]);
-});
+}));
 
 function stateBranches(t) {
   const store = freshStore(t);
@@ -195,17 +194,13 @@ function stateBranches(t) {
   return { store, work, filter: { includeStateChanges: true, stateIds: ['mood'], branch: 'work' } };
 }
 
-test('An explicit branch name selects the replayed states of that branch', {
-  todo: "A state subscription ignores the branch name at a catch-up: it replays the value on the handle's branch.",
-}, t => {
+test('An explicit branch name selects the replayed states of that branch', knownFailure("A state subscription ignores the branch name at a catch-up: it replays the value on the handle's branch.", t => {
   const { store, filter } = stateBranches(t);
   const named = watchSnapshots(store, { filter });
   assert.deepEqual(replaySnapshots(store, named).map(snapshot => snapshot.data), ['on work']);
-});
+}));
 
-test('An explicit branch name selects the live state changes of that branch', {
-  todo: 'A state subscription ignores the branch name for live changes: they come from every branch.',
-}, t => {
+test('An explicit branch name selects the live state changes of that branch', knownFailure('A state subscription ignores the branch name for live changes: they come from every branch.', t => {
   const { store, work, filter } = stateBranches(t);
   const named = watchSnapshots(store, { filter });
   replaySnapshots(store, named);
@@ -213,11 +208,9 @@ test('An explicit branch name selects the live state changes of that branch', {
   store.setStateJson('mood', 'main again');
   work.close();
   assert.deepEqual(drain(store, named).map(event => JSON.parse(event.data).operation), [{ Set: [...Buffer.from('"work again"')] }]);
-});
+}));
 
-test('An explicit branch name selects the replayed records of that branch', {
-  todo: "A catch-up replays the branch of the handle that catches up, and ignores the subscription's branch name.",
-}, t => {
+test('An explicit branch name selects the replayed records of that branch', knownFailure("A catch-up replays the branch of the handle that catches up, and ignores the subscription's branch name.", t => {
   const store = freshStore(t);
   store.createBranch('work');
   store.appendJson('note', 'on main');
@@ -229,7 +222,7 @@ test('An explicit branch name selects the replayed records of that branch', {
   const events = drain(store, named);
   assert.equal(events.pop()?.eventType, 'caught_up');
   assert.deepEqual(events.map(recordId), [onWork.id]);
-});
+}));
 
 function setSnapshot(store, id, data) {
   store.registerState({ id, strategy: 'snapshot' });
@@ -306,13 +299,11 @@ test('A replayed JSON array over the snapshot byte cap keeps its newest items an
   );
 });
 
-test('The snapshot byte cap includes the delimiters of a replayed JSON array', {
-  todo: 'Array truncation budgets the elements but not the brackets and commas in the delivered snapshot.',
-}, t => {
+test('The snapshot byte cap includes the delimiters of a replayed JSON array', knownFailure('Array truncation budgets the elements but not the brackets and commas in the delivered snapshot.', t => {
   const snapshot = cutArray(t, ['é', 'é'], 9);
   assert.ok(jsonBytes(snapshot.data) <= 9, `${jsonBytes(snapshot.data)} snapshot bytes exceed the limit of 9`);
   assert.deepEqual(snapshot.data, ['é']);
-});
+}));
 
 test('The default queue holds a thousand events and cleanup also removes overflowed IDs', t => {
   const store = freshStore(t);

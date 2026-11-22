@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, r
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { knownFailure } from './known-failure.mjs';
 import { ErrorCode, JsStore } from '../index.js';
 
 function fixture(t) {
@@ -166,9 +167,7 @@ test('The cursor distinguishes selection refusal from selection whose checkpoint
     ['after the failed checkpoint', otherValue]);
 });
 
-test('A switch whose saved branch list cannot be written leaves the source selected and writable', {
-  todo: 'switchBranch selects the target before it saves the branch list, and keeps the target selected when that save fails.',
-}, t => {
+test('A switch whose saved branch list cannot be written leaves the source selected and writable', knownFailure('switchBranch selects the target before it saves the branch list, and keeps the target selected when that save fails.', t => {
   const f = fixture(t);
   const store = f.create();
   store.registerState({ id: 'work', strategy: 'snapshot' });
@@ -185,7 +184,7 @@ test('A switch whose saved branch list cannot be written leaves the source selec
   store.setStateJson('work', 'written on the source');
   assert.deepEqual([store.view(source.name).getStateJson('work'), store.view(target.name).getStateJson('work')],
     ['written on the source', 'target work']);
-});
+}));
 
 test('Registration and retuning report non-duplicate refusals at the call', t => {
   const first = fixture(t);

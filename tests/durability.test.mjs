@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, posix } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { knownFailure } from './known-failure.mjs';
 import { readTrace } from './durability-trace.mjs';
 
 const WRITER_BOUND_MS = 60_000;
@@ -188,14 +189,12 @@ if (skip) {
     assert.deepEqual(renames, [], `The store renamed these files before it asked to put them on disk: ${renames.join(', ')}`);
   });
 
-  test("Each barrier asks for the name of the store's own directory to be put on disk", {
-    todo: 'The store makes its directory and never syncs the directory that holds it.',
-  }, () => {
+  test("Each barrier asks for the name of the store's own directory to be put on disk", knownFailure('The store makes its directory and never syncs the directory that holds it.', () => {
     judged();
     const holder = posix.dirname(run.store);
     const unsynced = run.labels.flatMap((label, index) => at(`barrier-${index}`).names
       .filter(name => posix.dirname(name) === holder)
       .map(name => `after ${label}: ${posix.basename(name)}`));
     assert.deepEqual(unsynced, [], `The store had not asked to put these names on disk: ${unsynced.join(', ')}`);
-  });
+  }));
 }

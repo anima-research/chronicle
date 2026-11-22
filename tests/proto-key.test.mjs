@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
+import { knownFailure } from './known-failure.mjs';
 import { JsStore } from '../index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'chronicle-proto-key-'));
@@ -30,9 +31,7 @@ test('A channel named __proto__ keeps its key in the stored bytes', () => {
   }
 });
 
-test('A channel named __proto__ keeps its own generation counter through a snapshot', {
-  todo: 'getStateJson reads an own __proto__ key back as nothing: the binding assigns each key of the object it builds, and the __proto__ setter ignores a number.',
-}, () => {
+test('A channel named __proto__ keeps its own generation counter through a snapshot', knownFailure('getStateJson reads an own __proto__ key back as nothing: the binding assigns each key of the object it builds, and the __proto__ setter ignores a number.', () => {
   const at = join(dir, 'proto-key');
   let store = storeProtoChannel(at);
   try {
@@ -47,4 +46,4 @@ test('A channel named __proto__ keeps its own generation counter through a snaps
   } finally {
     store.close();
   }
-});
+}));
