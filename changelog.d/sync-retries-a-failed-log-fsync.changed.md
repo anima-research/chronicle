@@ -1,1 +1,2 @@
 - The record log is still flushed to disk every 100 records. It is now also flushed once the unflushed records pass 64 MiB. The log keeps those records in memory for a retry of a failed flush, and the new limit bounds that memory.
+- Reads now use the log's copy in memory while a failed flush stands. This covers each record written since the last good flush. After a failed write-back, the file can give the disk's older bytes. Those bytes can read as an error, or as a record of zeros.

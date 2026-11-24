@@ -102,7 +102,9 @@ pub struct RecordLog {
     /// The bytes written to the log since its last good fsync, kept in memory
     /// so that a sync after a failed fsync can write them again. They come
     /// from memory and never from the file: after a failed write-back, the
-    /// file can give the page cache's copy or the disk's older bytes.
+    /// file can give the page cache's copy or the disk's older bytes. For the
+    /// same reason, while a failure stands, a read of a record among them
+    /// decodes it from here.
     unsynced: Mutex<Unsynced>,
 
     /// How many of the next fsyncs fail without reaching the file, so unit
@@ -526,7 +528,9 @@ impl RecordLog {
         }
     }
 
-    /// Read a record at a given offset.
+    /// Read a record at a given offset. While a failed fsync of the log
+    /// stands, a record written since the last good fsync is read from the
+    /// bytes kept for the retry, not from the file.
     pub fn read_at(&self, offset: u64) -> Result<Record> {
         #[cfg(test)]
         {
@@ -537,8 +541,7 @@ impl RecordLog {
             }
         }
         let mut file = self.file.write();
-        file.seek(SeekFrom::Start(offset))?;
-        Self::read_record(&mut *file)
+        self.read_one(&mut file, offset).map(|(record, _)| record)
     }
 
     /// Read the records at several offsets, in the order given, taking the
@@ -548,11 +551,26 @@ impl RecordLog {
         let mut file = self.file.write();
         offsets
             .iter()
-            .map(|&offset| {
-                file.seek(SeekFrom::Start(offset))?;
-                Self::read_record(&mut *file)
-            })
+            .map(|&offset| self.read_one(&mut file, offset).map(|(record, _)| record))
             .collect()
+    }
+
+    /// The record at `offset` and the offset after it. While a failure
+    /// stands, a record past the last good fsync is decoded from the kept
+    /// bytes, since the file can give the disk's older bytes there.
+    fn read_one(&self, file: &mut File, offset: u64) -> Result<(Record, u64)> {
+        if self.durability_failure.lock().is_some() {
+            let unsynced = self.unsynced.lock();
+            if let Some(start) = offset.checked_sub(unsynced.synced_len) {
+                let kept = unsynced.bytes.get(start as usize..).unwrap_or_default();
+                let mut reader = std::io::Cursor::new(kept);
+                let record = Self::read_record_inner(&mut reader, None)?;
+                return Ok((record, offset + reader.position()));
+            }
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let record = Self::read_record(file)?;
+        Ok((record, file.stream_position()?))
     }
 
     /// Iterate all records from the beginning.
@@ -560,7 +578,9 @@ impl RecordLog {
         self.iter_from(0)
     }
 
-    /// Iterate all records from a given offset.
+    /// Iterate all records from a given offset. While a failed fsync of the
+    /// log stands, the records written since the last good fsync are read as
+    /// [`RecordLog::read_at`] reads them.
     pub fn iter_from(&self, offset: u64) -> RecordIterator<'_> {
         RecordIterator {
             log: self,
@@ -673,7 +693,7 @@ impl RecordLog {
     /// Shared record decoder. When `bound` is `Some(remaining)`, any length
     /// field larger than `remaining` is rejected as `InvalidFormat` before
     /// allocation.
-    fn read_record_inner(file: &mut File, bound: Option<u64>) -> Result<Record> {
+    fn read_record_inner<R: Read>(file: &mut R, bound: Option<u64>) -> Result<Record> {
         #[cfg(test)]
         RECORD_DECODES.with(|decodes| decodes.set(decodes.get() + 1));
 
@@ -984,10 +1004,7 @@ impl<'a> Iterator for RecordIterator<'a> {
         let current_offset = self.offset;
         let read = {
             let mut file = self.log.file.write();
-            file.seek(SeekFrom::Start(current_offset))
-                .map_err(StoreError::from)
-                .and_then(|_| RecordLog::read_record(&mut *file))
-                .and_then(|record| Ok((record, file.stream_position()?)))
+            self.log.read_one(&mut file, current_offset)
         };
         match read {
             Ok((record, next_offset)) => {
@@ -1132,6 +1149,42 @@ mod tests {
             log.sync().unwrap();
         }
         assert_eq!(payloads(&path), (1..=200u64).map(payload).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_read_while_a_failure_stands_decodes_the_kept_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        let payload = |i: u64| format!("record {i}").into_bytes();
+        let log = RecordLog::open_with_sync_interval(&path, 1000).unwrap();
+        let append = |i: u64| {
+            log.append(RecordInput::raw("test", payload(i)), BranchId(1), Sequence(i))
+                .unwrap()
+        };
+        let mut written: Vec<(Record, u64)> = (1..=3u64).map(append).collect();
+        log.sync().unwrap();
+        let synced = log.size();
+        written.extend((4..=6u64).map(append));
+        *log.fsync_failures.lock() = 1;
+        lost(log.sync());
+        zero(&path, synced, log.size());
+
+        let expected: Vec<Vec<u8>> = (1..=6u64).map(payload).collect();
+        let one: Vec<Vec<u8>> = written
+            .iter()
+            .map(|(record, offset)| {
+                let read = log.read_at(*offset).unwrap();
+                assert_eq!(read.id, record.id);
+                read.payload
+            })
+            .collect();
+        assert_eq!(one, expected, "read_at");
+        let offsets: Vec<u64> = written.iter().map(|(_, offset)| *offset).collect();
+        let many: Vec<Vec<u8>> =
+            log.read_many_at(&offsets).unwrap().into_iter().map(|record| record.payload).collect();
+        assert_eq!(many, expected, "read_many_at");
+        let iterated: Vec<Vec<u8>> = log.iter().map(|each| each.unwrap().1.payload).collect();
+        assert_eq!(iterated, expected, "iter");
     }
 
     #[test]
