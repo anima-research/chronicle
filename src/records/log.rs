@@ -103,8 +103,7 @@ pub struct RecordLog {
     /// so that a sync after a failed fsync can write them again. They come
     /// from memory and never from the file: after a failed write-back, the
     /// file can give the page cache's copy or the disk's older bytes. For the
-    /// same reason, while a failure stands, a read of a record among them
-    /// decodes it from here.
+    /// same reason, a read of a record among them decodes it from here.
     unsynced: Mutex<Unsynced>,
 
     /// How many of the next fsyncs fail without reaching the file, so unit
@@ -514,9 +513,9 @@ impl RecordLog {
         }
     }
 
-    /// Read a record at a given offset. While a failed fsync of the log
-    /// stands, a record written since the last good fsync is read from the
-    /// bytes kept for the retry, not from the file.
+    /// Read a record at a given offset. A record written since the last good
+    /// fsync of the log is read from the bytes kept for a retry, not from
+    /// the file.
     pub fn read_at(&self, offset: u64) -> Result<Record> {
         #[cfg(test)]
         {
@@ -542,7 +541,7 @@ impl RecordLog {
     }
 
     fn read_one(&self, file: &mut File, offset: u64) -> Result<(Record, u64)> {
-        if self.durability_failure.lock().is_some() {
+        {
             let unsynced = self.unsynced.lock();
             if let Some(start) = offset.checked_sub(unsynced.synced_len) {
                 let kept = usize::try_from(start)
@@ -564,9 +563,8 @@ impl RecordLog {
         self.iter_from(0)
     }
 
-    /// Iterate all records from a given offset. While a failed fsync of the
-    /// log stands, the records written since the last good fsync are read as
-    /// [`RecordLog::read_at`] reads them.
+    /// Iterate all records from a given offset. The records written since
+    /// the last good fsync are read as [`RecordLog::read_at`] reads them.
     pub fn iter_from(&self, offset: u64) -> RecordIterator<'_> {
         RecordIterator {
             log: self,
@@ -1135,39 +1133,47 @@ mod tests {
     }
 
     #[test]
-    fn a_read_while_a_failure_stands_decodes_the_kept_bytes() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("log.bin");
-        let payload = |i: u64| format!("record {i}").into_bytes();
-        let log = RecordLog::open_with_sync_interval(&path, 1000).unwrap();
-        let append = |i: u64| {
-            log.append(RecordInput::raw("test", payload(i)), BranchId(1), Sequence(i))
-                .unwrap()
-        };
-        let mut written: Vec<(Record, u64)> = (1..=3u64).map(append).collect();
-        log.sync().unwrap();
-        let synced = log.size();
-        written.extend((4..=6u64).map(append));
-        *log.fsync_failures.lock() = 1;
-        lost(log.sync());
-        zero(&path, synced, log.size());
+    fn a_read_past_the_last_good_fsync_decodes_the_kept_bytes() {
+        for failed_sync in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("log.bin");
+            let payload = |i: u64| format!("record {i}").into_bytes();
+            let log = RecordLog::open_with_sync_interval(&path, 1000).unwrap();
+            let append = |i: u64| {
+                log.append(RecordInput::raw("test", payload(i)), BranchId(1), Sequence(i))
+                    .unwrap()
+            };
+            let mut written: Vec<(Record, u64)> = (1..=3u64).map(append).collect();
+            log.sync().unwrap();
+            let synced = log.size();
+            written.extend((4..=6u64).map(append));
+            if failed_sync {
+                *log.fsync_failures.lock() = 1;
+                lost(log.sync());
+            }
+            zero(&path, synced, log.size());
 
-        let expected: Vec<Vec<u8>> = (1..=6u64).map(payload).collect();
-        let one: Vec<Vec<u8>> = written
-            .iter()
-            .map(|(record, offset)| {
-                let read = log.read_at(*offset).unwrap();
-                assert_eq!(read.id, record.id);
-                read.payload
-            })
-            .collect();
-        assert_eq!(one, expected, "read_at");
-        let offsets: Vec<u64> = written.iter().map(|(_, offset)| *offset).collect();
-        let many: Vec<Vec<u8>> =
-            log.read_many_at(&offsets).unwrap().into_iter().map(|record| record.payload).collect();
-        assert_eq!(many, expected, "read_many_at");
-        let iterated: Vec<Vec<u8>> = log.iter().map(|each| each.unwrap().1.payload).collect();
-        assert_eq!(iterated, expected, "iter");
+            let expected: Vec<Vec<u8>> = (1..=6u64).map(payload).collect();
+            let one: Vec<Vec<u8>> = written
+                .iter()
+                .map(|(record, offset)| {
+                    let read = log.read_at(*offset).unwrap();
+                    assert_eq!(read.id, record.id, "failed sync: {failed_sync}");
+                    read.payload
+                })
+                .collect();
+            assert_eq!(one, expected, "read_at, failed sync: {failed_sync}");
+            let offsets: Vec<u64> = written.iter().map(|(_, offset)| *offset).collect();
+            let many: Vec<Vec<u8>> = log
+                .read_many_at(&offsets)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.payload)
+                .collect();
+            assert_eq!(many, expected, "read_many_at, failed sync: {failed_sync}");
+            let iterated: Vec<Vec<u8>> = log.iter().map(|each| each.unwrap().1.payload).collect();
+            assert_eq!(iterated, expected, "iter, failed sync: {failed_sync}");
+        }
     }
 
     #[test]
@@ -1406,7 +1412,9 @@ mod tests {
             let input = RecordInput::raw("test", format!("record {i}").into_bytes());
             offsets.push(log.append(input, BranchId(1), Sequence(i)).unwrap().1);
         }
-        // Damage the third record's payload under the open log.
+        // Damage the third record's payload under the open log, after a sync,
+        // since the log reads records past its last good fsync from memory.
+        log.sync().unwrap();
         let mut file = OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(offsets[2] + payload_offset(4)))
             .unwrap();
