@@ -937,7 +937,7 @@ impl StateManager {
 
     /// Have `hook` run once at `point` (see `run_test_hook`).
     #[cfg(test)]
-    fn set_test_hook(&self, point: &'static str, hook: impl FnOnce(&StateManager) + Send + 'static) {
+    pub(crate) fn set_test_hook(&self, point: &'static str, hook: impl FnOnce(&StateManager) + Send + 'static) {
         self.test_hooks.lock().insert(point, Box::new(hook));
     }
 
@@ -2483,6 +2483,7 @@ mod tests {
         manager.copy_heads_for_branch(TEST_BRANCH, SIDE, None);
         let check = manager.count_check(SIDE, "items", offset).expect("the fork has the parent's check");
         assert!(check.exact);
+        manager.clear_cache();
         let before = manager.reconstruction_count();
         assert_eq!(manager.checked_item_count(SIDE, "items").unwrap(), 3);
         assert_eq!(manager.reconstruction_count(), before, "the fork's count read nothing");

@@ -88,6 +88,13 @@ fn store_count(path: &Path, branch: BranchId, state: &str, count: usize) {
     fs::write(&file, out).unwrap();
 }
 
+fn as_a_release_without_checks_left_it(path: &Path) {
+    let file = path.join("state.bin");
+    let bytes = fs::read(&file).unwrap();
+    let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+    fs::write(&file, &bytes[..13 + len]).unwrap();
+}
+
 /// A store as a release before 0.5.0 left it: six appends, then a Redact of
 /// `[3, 9)`. The value is `[0, 1, 2]`; such a release stored the count
 /// `6 - min(9 - 3, 6) = 0`.
@@ -107,6 +114,7 @@ fn legacy_store(dir: &TempDir) -> PathBuf {
     store.sync().unwrap();
     drop(store);
     store_count(&path, branch, "s", 0);
+    as_a_release_without_checks_left_it(&path);
     path
 }
 
@@ -117,7 +125,6 @@ fn a_batch_counts_a_legacy_states_items_before_it_takes_its_ordinals() {
 
     let store = open(&path);
     assert_eq!(value(&store, "s"), json!([0, 1, 2]));
-    assert_eq!(store.get_state_len("s").unwrap(), Some(0), "the stored count, as loaded");
 
     let batch = store
         .append_many_to_state_json("s", &[json!("a"), json!("b")])
@@ -158,7 +165,6 @@ fn a_batch_after_a_callers_delta_snapshot_counts_the_items_it_restates() {
             StateOperation::DeltaSnapshot(serde_json::to_vec(&json!([1, 2])).unwrap()),
         )
         .unwrap();
-    assert_eq!(store.get_state_len("log").unwrap(), Some(0));
 
     let batch = store.append_many_to_state_json("log", &[json!(3), json!(4)]).unwrap();
     assert_eq!(batch.first_ordinal, 2);
@@ -218,6 +224,7 @@ fn a_batch_to_a_state_whose_items_cant_be_read_takes_the_stored_count() {
             .unwrap();
         store.sync().unwrap();
     }
+    as_a_release_without_checks_left_it(&path);
     let store = open(&path);
     let before = store.state_reconstruction_count();
     let first = store.append_many_to_state_json("s", &[json!(1), json!(2)]).unwrap();
@@ -439,6 +446,7 @@ fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
         append(&store, "s", json!("last"));
         store.sync().unwrap();
     }
+    as_a_release_without_checks_left_it(&path);
     let store = open(&path);
     let head = store.current_branch().head;
     let records = store.stats().unwrap().record_count;
@@ -455,7 +463,10 @@ fn a_batch_whose_count_meets_a_damaged_record_is_refused() {
     assert_eq!(store.current_branch().head, head, "no record");
     assert_eq!(store.stats().unwrap().record_count, records);
     assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
-    assert_eq!(store.get_state_len("s").unwrap(), Some(3), "the stored count, unchanged");
+    assert!(
+        matches!(store.get_state_len("s"), Err(StoreError::ChecksumMismatch { .. })),
+        "a length read meets the same record"
+    );
 }
 
 /// A batch whose count reads a record of the state's chain whose framing is
@@ -479,6 +490,7 @@ fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
         append(&store, "s", json!("last"));
         store.sync().unwrap();
     }
+    as_a_release_without_checks_left_it(&path);
     let store = open(&path);
     let head = store.current_branch().head;
     let records = store.stats().unwrap().record_count;
@@ -509,21 +521,20 @@ fn a_batch_whose_count_meets_a_record_with_bad_framing_is_refused() {
     assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
 }
 
-/// An identity batch refused for an item that isn't an object leaves the
-/// state as it was, its stored count included: the refusal comes before the
-/// batch counts the state's items.
+/// An identity batch refused for an item that isn't an object reads
+/// nothing: the refusal comes before the batch counts the state's items. A
+/// length read after it counts them.
 #[test]
-fn a_refused_identity_batch_leaves_a_stale_count_as_it_was() {
+fn a_refused_identity_batch_reads_nothing_and_the_length_after_it_counts_the_items() {
     let dir = TempDir::new().unwrap();
     let path = legacy_store(&dir);
     let store = open(&path);
-    assert_eq!(store.get_state_len("s").unwrap(), Some(0), "the stored count, as loaded");
     let before = store.state_reconstruction_count();
 
     assert!(matches!(
         store.append_many_to_state_json_with_identity("s", &[json!({"a": 1}), json!(2)], "id", "seq"),
         Err(StoreError::InvalidOperation(_))
     ));
-    assert_eq!(store.get_state_len("s").unwrap(), Some(0), "nothing counted");
     assert_eq!(store.state_reconstruction_count(), before, "nothing read");
+    assert_eq!(store.get_state_len("s").unwrap(), Some(3), "the items, as before the batch");
 }

@@ -4059,7 +4059,6 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot, "setup: the head holds false, as an earlier release saved it");
         let old = json!([0, 1, 2, 3]);
         reads_alike(&store, &old, "at the old head");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(3), "its count, short of the reading");
         store.set_auto_snapshot(false);
         for v in [4, 5] {
             store.update_state("s", StateOperation::Append(n(v))).unwrap();
@@ -4068,6 +4067,7 @@ mod tests {
         drop(store);
         let store = reopen(test_config(&dir));
         reads_alike(&store, &json!([0, 1, 2, 3, 4, 5]), "after the new delta and a reopen");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(6), "the reading's length");
     }
 
     /// Opens a store this process closed a moment ago. A child that a
@@ -4506,8 +4506,8 @@ mod tests {
     }
 
     /// A store with a state "s" of `items` appended one at a time, synced,
-    /// closed and opened again, so the head comes from `state.bin` and this
-    /// session hasn't checked its count. Auto-snapshots are off.
+    /// closed and opened again, so the head and its saved check come from
+    /// `state.bin`. Auto-snapshots are off.
     fn reopened_with_items(dir: &TempDir, items: usize) -> Store {
         let config = test_config(dir);
         {
@@ -4535,6 +4535,17 @@ mod tests {
         store
     }
 
+    fn reopened_unchecked(dir: &TempDir, items: usize) -> Store {
+        drop(reopened_with_items(dir, items));
+        let state_bin = test_config(dir).path.join("state.bin");
+        let bytes = std::fs::read(&state_bin).unwrap();
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        std::fs::write(&state_bin, &bytes[..13 + len]).unwrap();
+        let store = reopen(test_config(dir));
+        store.set_auto_snapshot(false);
+        store
+    }
+
     /// A batch counts the items of a head this session hasn't checked before
     /// it takes the write lock, so other writers don't wait while it reads
     /// the whole value: here the count is read while the test holds the
@@ -4543,7 +4554,7 @@ mod tests {
     #[test]
     fn a_batch_counts_an_unchecked_head_before_it_takes_the_write_lock() {
         let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+        let store = reopened_unchecked(&dir, 3);
         let before = store.state_reconstruction_count();
         std::thread::scope(|scope| {
             let held = store.write_lock.lock();
@@ -4568,7 +4579,7 @@ mod tests {
     #[test]
     fn a_batch_whose_count_fails_to_read_says_it_was_not_recorded() {
         let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+        let store = reopened_unchecked(&dir, 3);
         let head = store.current_branch().head;
         let size = store.stats().unwrap().total_size_bytes;
         *store.log.read_failures.lock() = 1;
@@ -4587,6 +4598,34 @@ mod tests {
         assert_eq!(store.current_branch().head, head, "no record");
         assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
         assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
+    }
+
+    #[test]
+    fn a_length_read_that_a_write_races_counts_again_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 3);
+        let branch = store.current_branch().id;
+        drop(store);
+        let state_bin = test_config(&dir).path.join("state.bin");
+        let bytes = std::fs::read(&state_bin).unwrap();
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        let mut index: crate::state::StateIndex = rmp_serde::from_slice(&bytes[13..13 + len]).unwrap();
+        index.heads.get_mut(branch, "s").unwrap().item_count = 0;
+        let encoded = rmp_serde::to_vec(&index).unwrap();
+        let mut stale = bytes[..5].to_vec();
+        stale.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        stale.extend_from_slice(&encoded);
+        std::fs::write(&state_bin, stale).unwrap();
+        let store = Arc::new(reopen(test_config(&dir)));
+        store.set_auto_snapshot(false);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4), "the count of the head that the write moved");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
     }
 
     /// The snapshot outcomes of writes are noted after the write lock is

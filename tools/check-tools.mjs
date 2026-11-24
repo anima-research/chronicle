@@ -877,6 +877,20 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       console.log('ok: after the tool the store reads as a twin the tool never ran on; then each branch takes appends, snapshots and a set, and reads after a reopen as the twin does; a branch made before the cut holds the list state and not the cut one');
     },
 
+    'the checks of the counts': () => {
+      const { path } = branchedStore('checks-of-counts');
+      const stateBin = join(path, 'state.bin');
+      const indexEnd = (bytes) => 13 + Number(bytes.readBigUInt64LE(5));
+      const before = readFileSync(stateBin);
+      assert.ok(before.subarray(indexEnd(before), indexEnd(before) + 4).equals(Buffer.from('SCC\0')),
+        'the premise: this build saves the checks of the counts after the index');
+      const run = compact(path, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py on a state.bin that holds the checks exited ${run.status}:\n${run.out}${run.err}`);
+      const after = readFileSync(stateBin);
+      assert.equal(after.length, indexEnd(after), 'the new state.bin holds the index alone');
+      console.log('ok: compact-set-states.py reads a state.bin that holds the checks of the counts, and writes the new one without them');
+    },
+
     'the refusals': () => {
       const { path: base } = branchedStore('refusals');
       const copyOf = (name) => {
@@ -920,6 +934,9 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       const short = copyOf('refuse-short-index');
       writeFileSync(join(short, 'state.bin'), Buffer.from('STI\0'));
       refuses(short, 'a state.bin cut short', 'state.bin is not a whole state index');
+      const trailing = copyOf('refuse-trailing');
+      writeFileSync(join(trailing, 'state.bin'), Buffer.concat([readFileSync(join(trailing, 'state.bin')), Buffer.from('more')]));
+      refuses(trailing, 'a state.bin with more after its index than the checks of the counts', 'state.bin is not the length its index says');
       const nowhere = copyOf('refuse-head');
       withHeads(nowhere, `if key[1] == '${WHOLE}': head[0] += 1`);
       refuses(nowhere, 'a head that names no state update', 'no state update of whole is there');
