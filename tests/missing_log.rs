@@ -1,4 +1,6 @@
 use chronicle::{RecordInput, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, StoreError};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -42,6 +44,17 @@ fn corruption(result: chronicle::Result<Store>) -> String {
     }
 }
 
+fn files(path: &Path) -> BTreeMap<OsString, Option<Vec<u8>>> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let bytes = entry.file_type().unwrap().is_file().then(|| fs::read(entry.path()).unwrap());
+            (entry.file_name(), bytes)
+        })
+        .collect()
+}
+
 fn assert_names_the_missing_log(message: &str, store: &Path, used: &str) {
     assert!(message.contains(&*store.to_string_lossy()), "{message}");
     assert!(message.contains("records.log is missing"), "{message}");
@@ -58,14 +71,14 @@ fn a_used_store_without_its_log_is_refused_and_no_log_is_created() {
     closed_store(&path, with_state_history);
     fs::remove_file(path.join("records.log")).unwrap();
     fs::remove_dir_all(path.join("blobs")).unwrap();
+    let before = files(&path);
 
     for _ in 0..2 {
         assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
-        assert!(fs::symlink_metadata(path.join("records.log")).is_err(), "open created a records.log");
+        assert_eq!(files(&path), before, "a refused open changed the store's directory");
     }
     assert_names_the_missing_log(&corruption(Store::open_or_create(config(&path))), &path, "state.bin and branches.bin");
-    assert!(fs::symlink_metadata(path.join("records.log")).is_err(), "open_or_create created a records.log");
-    assert!(fs::symlink_metadata(path.join("blobs")).is_err(), "a refused open created blobs/");
+    assert_eq!(files(&path), before, "a refused open_or_create changed the store's directory");
 }
 
 #[test]
@@ -202,12 +215,34 @@ fn a_state_or_branch_file_whose_link_cannot_be_followed_is_refused_and_names_the
 
             let message = corruption(Store::open(config(&path)));
             assert!(message.contains(&*link.to_string_lossy()), "{file}: {message}");
-            let says = if leads_to_itself { "whose target the open can't reach" } else { "leads to nothing" };
-            assert!(message.contains(says), "{file}: {message}");
-            assert!(message.contains(&format!("Make the link lead to the store's {file}")), "{file}: {message}");
+            if leads_to_itself {
+                assert!(message.contains("whose target the open can't reach"), "{file}: {message}");
+                assert!(message.contains("Make the link's target reachable"), "{file}: {message}");
+            } else {
+                assert!(message.contains("leads to nothing"), "{file}: {message}");
+                assert!(message.contains(&format!("Make the link lead to the store's {file}")), "{file}: {message}");
+                assert!(message.contains(&format!("never saved its {file}, remove the link")), "{file}: {message}");
+            }
             assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "{file}: the open wrote through the link");
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn data_files_whose_links_lead_to_them_open_as_before() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let volume = dir.path().join("volume");
+    fs::create_dir(&volume).unwrap();
+    closed_store(&path, with_state_history);
+    for file in ["records.log", "state.bin", "branches.bin"] {
+        fs::rename(path.join(file), volume.join(file)).unwrap();
+        std::os::unix::fs::symlink(volume.join(file), path.join(file)).unwrap();
+    }
+
+    let store = Store::open(config(&path)).unwrap();
+    assert_eq!(store.get_state("messages").unwrap(), Some(b"2".to_vec()));
 }
 
 #[test]
@@ -217,13 +252,10 @@ fn an_empty_log_under_a_state_head_is_named_empty_and_nothing_is_saved_or_create
     closed_store(&path, with_state_history);
     fs::write(path.join("records.log"), b"").unwrap();
     fs::remove_dir_all(path.join("blobs")).unwrap();
-    let branches = fs::read(path.join("branches.bin")).unwrap();
-    let state = fs::read(path.join("state.bin")).unwrap();
+    let before = files(&path);
 
     assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path);
-    assert_eq!(fs::read(path.join("branches.bin")).unwrap(), branches, "the refused open changed branches.bin");
-    assert_eq!(fs::read(path.join("state.bin")).unwrap(), state, "the refused open changed state.bin");
-    assert!(fs::symlink_metadata(path.join("blobs")).is_err(), "the refused open created blobs/");
+    assert_eq!(files(&path), before, "the refused open changed the store's directory");
 }
 
 fn assert_names_the_empty_log(message: &str, store: &Path) {

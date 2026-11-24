@@ -3639,21 +3639,29 @@ impl Store {
             let Err(error) = fs::metadata(&link) else {
                 continue;
             };
-            let (unreachable, hint) = if error.kind() == std::io::ErrorKind::NotFound {
-                (Self::link_to_nothing(&link), ", by mounting the volume it points into, say")
+            let leads_to_nothing = error.kind() == std::io::ErrorKind::NotFound;
+            let (unreachable, remedy) = if leads_to_nothing {
+                (
+                    Self::link_to_nothing(&link),
+                    format!(
+                        "Make the link lead to the store's {file}, by mounting the volume it points into, say, then open the store again"
+                    ),
+                )
             } else {
                 (
                     format!("{} is a symbolic link whose target the open can't reach: {error}", link.display()),
-                    "",
+                    "Make the link's target reachable, then open the store again".to_string(),
                 )
             };
-            let remedy = format!("Make the link lead to the store's {file}{hint}, then open the store again");
             return Err(StoreError::Corruption(format!(
                 "{unreachable}, so the open stopped and created nothing where it leads. {}",
-                match (file, used.is_empty()) {
-                    ("records.log", false) => format!("{use_shown}. {remedy}"),
+                match (file, leads_to_nothing) {
+                    ("records.log", _) if !used.is_empty() => format!("{use_shown}. {remedy}"),
                     ("records.log", true) => format!(
                         "{remedy}. If the store has no records.log yet, remove the link, and the next open creates one here"
+                    ),
+                    (_, true) => format!(
+                        "{remedy}. If the store has never saved its {file}, remove the link, and its next save writes one here"
                     ),
                     _ => remedy,
                 }
