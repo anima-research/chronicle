@@ -219,7 +219,7 @@ let base;
 let counter = 0;
 
 async function traced(scenario, extra, inject) {
-  const dir = join(base, `${scenario.name}-${++counter}`);
+  const dir = join(base, `${scenario.name}-${String(++counter).padStart(4, '0')}`);
   const root = join(dir, 'root');
   const outside = join(dir, 'outside');
   mkdirSync(root, { recursive: true });
