@@ -1,4 +1,4 @@
-- **Callers that write after a failed log fsync:** such a write now throws `DurabilityLost` and writes nothing. This covers every append and state write. A write with invalid arguments still gets its own error first. Before, such writes went on, and `sync()` threw `DurabilityLost` until the store was reopened.
+- **Callers that write after a failed log fsync:** such a write now throws `DurabilityLost` and writes nothing. This covers every append and state write. Before, such writes went on, and `sync()` threw `DurabilityLost` until the store was reopened.
   - **What ends it:** the failure ends when a retry's fsync succeeds. Reopening the store also ends the failure. A retry writes the records since the last good fsync again, from memory, before it fsyncs. Each of these calls makes the retry, and it can now succeed where it threw before:
     - `sync()` and `close()`;
     - a dropped Rust `Store`;

@@ -239,10 +239,18 @@ impl RecordLog {
         };
 
         Self::fsync_at_open(&file).map_err(|error| {
+            let truncated = match &recovery {
+                Some(report) => format!(
+                    ". Before the fsync, this open truncated a torn tail of {} bytes after the \
+                     last whole record, and a later open won't report that either",
+                    report.dropped_bytes
+                ),
+                None => String::new(),
+            };
             StoreError::DurabilityLost(format!(
                 "fsync of the record log {} at open failed ({error}): records written to it \
                  before this open may not be on the disk, and a later open won't report this \
-                 failure again",
+                 failure again{truncated}",
                 path.display()
             ))
         })?;
@@ -340,7 +348,11 @@ impl RecordLog {
         *self.file_size.write() = new_size;
         let kept = {
             let mut unsynced = self.unsynced.lock();
-            unsynced.bytes.extend_from_slice(&bytes);
+            if unsynced.bytes.is_empty() {
+                unsynced.bytes = bytes;
+            } else {
+                unsynced.bytes.extend_from_slice(&bytes);
+            }
             unsynced.bytes.len()
         };
 
@@ -367,7 +379,7 @@ impl RecordLog {
     pub(crate) fn refuse_while_lost(&self) -> Result<()> {
         match &*self.durability_failure.lock() {
             Some(failure) => Err(StoreError::DurabilityLost(format!(
-                "fsync of the record log failed ({failure}), so nothing is written until \
+                "fsync of the record log failed ({failure}), so no record is written until \
                  sync() writes the records since the last good fsync again and its fsync \
                  succeeds, or the store is reopened"
             ))),
@@ -451,7 +463,7 @@ impl RecordLog {
                 Err(StoreError::DurabilityLost(format!(
                     "fsync of the record log failed ({failure}); records written since the \
                      last good fsync may not have reached the disk. Until a sync() writes \
-                     them again and its fsync succeeds, or the store is reopened, nothing is \
+                     them again and its fsync succeeds, or the store is reopened, no record is \
                      written and the store publishes no checkpoint"
                 )))
             }
@@ -536,7 +548,20 @@ impl RecordLog {
     }
 
     fn encode_record(record: &Record) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let len = LOG_MAGIC.len()
+            + 2
+            + 4 * 8
+            + 2
+            + record.record_type.len()
+            + 1
+            + 4
+            + record.payload.len()
+            + 2
+            + 8 * record.caused_by.len()
+            + 2
+            + 8 * record.linked_to.len()
+            + 4;
+        let mut bytes = Vec::with_capacity(len);
 
         // Magic
         bytes.extend_from_slice(LOG_MAGIC);
@@ -593,6 +618,7 @@ impl RecordLog {
         let checksum = crc32fast::hash(&record.payload);
         bytes.extend_from_slice(&checksum.to_le_bytes());
 
+        debug_assert_eq!(bytes.len(), len);
         bytes
     }
 
@@ -1008,7 +1034,7 @@ mod tests {
 
             let size = std::fs::metadata(&path).unwrap().len();
             let text = lost(append_byte(&log, 3));
-            assert!(text.contains("nothing is written until"), "{text}");
+            assert!(text.contains("no record is written until"), "{text}");
             assert_eq!(log.size(), size);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
 
@@ -1137,7 +1163,7 @@ mod tests {
             }
         }
         let text = lost(append_byte(&log, n));
-        assert!(text.contains("nothing is written until"), "{text}");
+        assert!(text.contains("no record is written until"), "{text}");
         log.sync().unwrap();
         append_byte(&log, n).unwrap();
     }
@@ -1157,7 +1183,17 @@ mod tests {
         assert!(text.contains(&path.display().to_string()), "{text}");
         assert!(text.contains("at open failed (injected fsync failure)"), "{text}");
         assert!(text.contains("a later open won't report this failure again"), "{text}");
+        assert!(!text.contains("torn tail"), "{text}");
         assert_eq!(payloads(&path), vec![vec![1]]);
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"REC\0torn").unwrap();
+        drop(file);
+        OPEN_FSYNC_FAILURES.with(|failures| failures.set(1));
+        let text = RecordLog::open(&path).err().expect("the open refuses").to_string();
+        assert!(text.contains("truncated a torn tail of 8 bytes"), "{text}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
     }
 
     // What a failed write-back can leave once the page cache no longer holds

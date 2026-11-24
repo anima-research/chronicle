@@ -5774,6 +5774,53 @@ mod tests {
     }
 
     #[test]
+    fn a_metadata_call_whose_log_retry_fails_throws_and_publishes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.create_branch("side", None).unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+        let files = || {
+            ["state.bin", "branches.bin"].map(|name| std::fs::read(config.path.join(name)).unwrap())
+        };
+        let published = files();
+        *store.log.fsync_failures.lock() = u64::MAX;
+        fn lost<T>(result: Result<T>) -> bool {
+            matches!(result, Err(StoreError::DurabilityLost(_)))
+        }
+        assert!(lost(store.sync()));
+        assert!(lost(store.register_state(StateRegistration {
+            id: "other".into(),
+            strategy: crate::types::StateStrategy::Snapshot,
+            initial_value: None,
+        })));
+        assert!(lost(store.update_state_strategy(
+            "items",
+            crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every: 50,
+                full_snapshot_every: 20,
+            },
+        )));
+        assert!(lost(store.create_branch("blocked", None)));
+        assert!(lost(store.create_empty_branch("blocked-empty", None)));
+        assert!(lost(store.create_branch_at("blocked-at", "main", Sequence(0))));
+        assert!(lost(store.switch_branch("side")));
+        assert!(lost(store.delete_branch("side")));
+        assert!(lost(store.sync()));
+        assert_eq!(files(), published, "nothing was published");
+    }
+
+    #[test]
     fn a_refused_batch_leaves_the_manifest_as_it_was() {
         let dir = TempDir::new().unwrap();
         let config = test_config(&dir);

@@ -718,7 +718,9 @@ impl JsStore {
                 .sync()
                 .map_err(|error| match error {
                     StoreError::DurabilityLost(text) => StoreError::DurabilityLost(format!(
-                        "{text}. close() has closed this handle, so only a reopen can end it now"
+                        "{text}. close() has closed this handle, and the store's own last sync as it \
+                         closed may still have saved those records, so a reopen shows what the \
+                         store holds"
                     )),
                     other => other,
                 })
