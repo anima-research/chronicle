@@ -141,8 +141,9 @@ impl BlobStorage {
     /// holds one, and its lock refuses a second `Store`, but
     /// `BlobStorage::new` takes no lock. The first
     /// [`Store::sync`](crate::Store::sync) of each handle of the `Store` that
-    /// holds this `BlobStorage` syncs the blob directory and every shard
-    /// directory in it, whatever made them. A sync that fails
+    /// holds this `BlobStorage` syncs the directory that holds the blob
+    /// directory, the blob directory and every shard directory in it,
+    /// whatever made them. A sync that fails
     /// before the rename returns an error with nothing stored; one that fails
     /// after it returns an error with the blob in place. Either way, storing
     /// the blob again through this `BlobStorage` tries the sync again, and so
@@ -377,12 +378,12 @@ impl BlobStorage {
             shard.creations_finished.fetch_add(1, Ordering::SeqCst);
             created?;
         }
-        self.sync_shard_entry(shard_of(hash)).map_err(|Unsynced { error, .. }| {
+        self.sync_shard_entry(shard_of(hash)).map_err(|Unsynced { directory, error }| {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot sync the directories holding {}, so {} wasn't written, and storing the blob again tries the sync again: {error}",
-                    self.path.display(),
+                    "cannot sync {}, so {} wasn't written, and storing the blob again tries the sync again: {error}",
+                    directory.display(),
                     blob_path.display()
                 ),
             )
@@ -455,7 +456,7 @@ impl BlobStorage {
         &self.shards[shard_of(hash)]
     }
 
-    fn sync_shard_entry(&self, shard: usize) -> std::result::Result<(), Unsynced> {
+    fn sync_entry(&self) -> std::result::Result<(), Unsynced> {
         if !self.entry_synced.load(Ordering::SeqCst) {
             let parent = self
                 .path
@@ -465,6 +466,11 @@ impl BlobStorage {
             sync_directory_named(parent)?;
             self.entry_synced.store(true, Ordering::SeqCst);
         }
+        Ok(())
+    }
+
+    fn sync_shard_entry(&self, shard: usize) -> std::result::Result<(), Unsynced> {
+        self.sync_entry()?;
         let durability = &self.shards[shard];
         if durability.creations_synced.load(Ordering::SeqCst)
             < durability.creations_begun.load(Ordering::SeqCst)
@@ -525,12 +531,14 @@ impl BlobStorage {
             error,
         };
         let entries = match fs::read_dir(&self.path) {
-            Ok(entries) => entries,
+            Ok(entries) => Some(entries),
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
             Err(error) => return Err(unlisted(error)),
         };
+        self.sync_entry()?;
         sync_directory_named(&self.path)?;
-        for entry in entries {
+        for entry in entries.into_iter().flatten() {
             let entry = entry.map_err(unlisted)?;
             if entry.file_type().map_err(unlisted)?.is_dir() {
                 self.sync_shard(&entry.path())?;

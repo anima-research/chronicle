@@ -689,8 +689,8 @@ impl JsStore {
     /// been closed"), and the lock file is released before `close()` returns
     /// — live views do not keep the store or its lock alive. If the record
     /// log's fsync has failed, or a sync of a directory that holds the store
-    /// or its blobs is refused, this throws that error after closing the
-    /// store, so it can be reopened.
+    /// or its blobs fails, this throws that error after closing the store,
+    /// so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed", but for `isClosed()`,
@@ -2039,14 +2039,18 @@ impl JsStore {
     /// checkpoint.
     /// On Unix, the first time on each open handle, this also syncs the
     /// directories that hold the store's directory, up to the root of its
-    /// filesystem, and `blobs/` with each shard directory in it, so that a
-    /// power loss can't take the store's name or a blob's, whatever made
-    /// them. After that, it syncs each blob directory whose sync after a blob
-    /// store this handle still owes. A directory that this process may not
-    /// open is passed over, as for a checkpoint save, and so is the directory
-    /// that holds a symbolic link on the store's path. A refused sync of one
-    /// of these directories throws its error, and the next `sync()` tries it
-    /// again. Appends, state writes and blob stores go on meanwhile.
+    /// filesystem, and, once the store has `blobs/`, the store's directory,
+    /// `blobs/` and each shard directory in it, so that a power loss can't
+    /// take the store's name or a blob's, whatever made them. After that, it
+    /// syncs each blob directory whose sync after a blob store this handle
+    /// still owes. As for a checkpoint save, a directory that this process
+    /// may not open is passed over, and so is every directory on a system
+    /// that doesn't sync directories. For a store path through a symbolic
+    /// link, the directory that holds the link's own name isn't synced. For
+    /// a link in `blobs/`, a shard directory or a blob name, the directory
+    /// that it leads to isn't synced. A failed sync of one of these
+    /// directories throws its error, and the next `sync()` tries it again.
+    /// Appends, state writes and blob stores go on meanwhile.
     /// State registration, strategy changes and branch changes checkpoint
     /// before returning. After one of those checkpoints fails, further
     /// mutations retry it before proceeding, and the change stays applied in

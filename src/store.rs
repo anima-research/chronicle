@@ -3288,15 +3288,18 @@ impl Store {
     ///
     /// On Unix, the first time on each open handle, this also syncs the
     /// directories that hold the store's directory, up to the root of its
-    /// filesystem, and the blob directory with each shard directory in it,
-    /// so that a power loss can't take the store's name or a blob's, whatever
-    /// made them. After that, it syncs each blob directory whose sync after a
-    /// blob store this handle still owes. As a blob store's syncs do, these go
+    /// filesystem, and, once the store has a blob directory, the store's
+    /// directory, the blob directory and each shard directory in it, so that
+    /// a power loss can't take the store's name or a blob's, whatever made
+    /// them. After that, it syncs each blob directory whose sync after a blob
+    /// store this handle still owes. As a blob store's syncs do, these go
     /// only where the system syncs directories and this process may open
     /// them. For a store path through a symbolic link, the directory that
-    /// holds the link's own name isn't synced. A refused sync of one of these
-    /// directories returns its error, and the next call tries it again.
-    /// Appends, state writes and blob stores go on meanwhile.
+    /// holds the link's own name isn't synced. For a link in the blob
+    /// directory, a shard directory or a blob name, the directory that it
+    /// leads to isn't synced. A failed sync of one of these directories
+    /// returns its error, and the next call tries it again. Appends, state
+    /// writes and blob stores go on meanwhile.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.sync_locked(&mut write)?;
