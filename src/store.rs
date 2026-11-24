@@ -1498,7 +1498,6 @@ impl Store {
         // goes into the log only once the MANIFEST names that feature, so
         // such a build refuses the store at open instead of part way
         // through it. If the MANIFEST can't be rewritten, nothing is written.
-        // A write that the log would refuse changes no MANIFEST either.
         self.log.refuse_while_lost()?;
         self.require_features(&mut write, Self::features_of(&operation))?;
 
@@ -3253,10 +3252,12 @@ impl Store {
     /// checkpoint could name records the disk doesn't hold, and the next call
     /// tries again. While the failure stands, every append and state update
     /// is refused with the same error before it writes, unless a check of
-    /// its own refuses it first. Registration, strategy changes, branch
-    /// creation, deletion and switching, and any write while one of them
-    /// waits for its checkpoint sync the same way first, so they go on when
-    /// the sync succeeds and fail with the same error when it fails.
+    /// its own refuses it first. Registration, strategy changes, and branch
+    /// creation, deletion and switching make their change and then save
+    /// their checkpoint, which makes the same retry: when it fails, they
+    /// return the error and keep the change, as for any failed checkpoint.
+    /// A write while such a checkpoint is owed saves it first, and returns
+    /// the error without its change when that save fails.
     /// Reopening the store also ends the failure. The open fsyncs the log
     /// first, and fails with the same error when that fsync fails. It
     /// replays the log from the last checkpoint, and can't tell whether
@@ -5733,8 +5734,6 @@ mod tests {
             );
         };
 
-        // The 100th update's periodic fsync, sync()'s retry and the
-        // registration's retry.
         *store.log.fsync_failures.lock() = 3;
         for n in 0..150u64 {
             let update =
@@ -5773,8 +5772,6 @@ mod tests {
         ));
     }
 
-    // Each call runs on a store of its own, so that its own checkpoint, and
-    // not an earlier call's owed one, meets the standing failure.
     #[test]
     fn a_metadata_call_whose_log_retry_fails_throws_and_publishes_nothing() {
         type Call = fn(&Store) -> Result<()>;
@@ -5826,6 +5823,11 @@ mod tests {
             assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
             assert_eq!(files(), published, "{name} published nothing");
             store.sync().unwrap();
+            assert_ne!(
+                files(),
+                published,
+                "{name} kept its change, and the good sync published it"
+            );
         }
     }
 

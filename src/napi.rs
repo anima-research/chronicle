@@ -720,8 +720,9 @@ impl JsStore {
                     StoreError::DurabilityLost(text) => StoreError::DurabilityLost(format!(
                         "{text}. That advice doesn't apply here: close() has closed this handle, \
                          so sync() on it throws StoreClosed. The store's own last sync as it \
-                         closed may still have saved those records, so a reopen shows what the \
-                         store holds"
+                         closed may still have saved those records. A reopen shows what the \
+                         store holds, but it can't tell whether records that the operating \
+                         system still caches reached the disk"
                     )),
                     other => other,
                 })
@@ -2038,8 +2039,11 @@ impl JsStore {
     /// `DurabilityLost`. While the failure stands, every append and state
     /// write throws it before it writes, unless a check of its own refuses it
     /// first. Registering a state, changing a strategy, and creating,
-    /// deleting or switching a branch sync the same way first, unless a check
-    /// of their own refuses them before, and throw it when that sync fails.
+    /// deleting or switching a branch make their change and then save their
+    /// checkpoint, which makes the same retry: when it fails, they throw it
+    /// and keep the change, as for any failed checkpoint. A write while such
+    /// a checkpoint is owed saves it first, and throws it without its change
+    /// when that save fails.
     /// Reopening the store also ends the failure. The open fsyncs the log
     /// first, and throws the same error when that fsync fails.
     /// Reopening can't tell whether records the operating system still caches

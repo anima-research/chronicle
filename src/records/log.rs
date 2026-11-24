@@ -112,14 +112,9 @@ pub struct RecordLog {
     #[cfg(test)]
     pub(crate) fsync_failures: Mutex<u64>,
 
-    /// How many of the next rewrites of the kept bytes write half of them
-    /// and then fail, so unit tests can stand in for a device error during
-    /// a retry.
     #[cfg(test)]
     pub(crate) rewrite_failures: Mutex<u64>,
 
-    /// How many of the next appends fail their write, so unit tests can
-    /// stand in for a full disk.
     #[cfg(test)]
     pub(crate) write_failures: Mutex<u64>,
 
@@ -143,8 +138,6 @@ struct Unsynced {
 
 #[cfg(test)]
 thread_local! {
-    /// How many of the next opens on this thread fail their fsync, so unit
-    /// tests can stand in for a device error found at open.
     static OPEN_FSYNC_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -152,9 +145,6 @@ impl RecordLog {
     /// Default sync interval - sync every 100 writes for balance of durability and performance.
     const DEFAULT_SYNC_INTERVAL: u64 = 100;
 
-    /// An append that makes the bytes written since the last good fsync pass
-    /// this many fsyncs at once, as the interval's fsync does, so that the
-    /// bytes kept for a retry stay below it plus one record.
     const SYNC_BYTES: usize = 64 * 1024 * 1024;
 
     /// Open or create a record log with default sync interval.
@@ -347,16 +337,12 @@ impl RecordLog {
             linked_to: input.linked_to,
         };
 
-        // Serialize into the kept bytes, the record's only encoded copy, and
-        // write it from there.
         let offset = *self.file_size.read();
         let (new_size, kept) = {
             let mut unsynced = self.unsynced.lock();
             let start = unsynced.bytes.len();
             let needed = start + Self::encoded_len(&record);
             if needed > unsynced.bytes.capacity() {
-                // Grow by doubling, as a Vec does, but never past the budget
-                // or the record that this append needs room for.
                 let doubled = (unsynced.bytes.capacity() * 2).min(self.sync_bytes);
                 unsynced.bytes.reserve_exact(needed.max(doubled) - start);
             }
@@ -555,14 +541,14 @@ impl RecordLog {
             .collect()
     }
 
-    /// The record at `offset` and the offset after it. While a failure
-    /// stands, a record past the last good fsync is decoded from the kept
-    /// bytes, since the file can give the disk's older bytes there.
     fn read_one(&self, file: &mut File, offset: u64) -> Result<(Record, u64)> {
         if self.durability_failure.lock().is_some() {
             let unsynced = self.unsynced.lock();
             if let Some(start) = offset.checked_sub(unsynced.synced_len) {
-                let kept = unsynced.bytes.get(start as usize..).unwrap_or_default();
+                let kept = usize::try_from(start)
+                    .ok()
+                    .and_then(|start| unsynced.bytes.get(start..))
+                    .unwrap_or_default();
                 let mut reader = std::io::Cursor::new(kept);
                 let record = Self::read_record_inner(&mut reader, None)?;
                 return Ok((record, offset + reader.position()));
@@ -1120,9 +1106,6 @@ mod tests {
         assert_eq!(payloads(&path), vec![vec![1], vec![2], vec![3], vec![4]]);
     }
 
-    // Zeroing the file's bytes after a failed sync stands in for pages that a
-    // failed write-back lost: a retry that took its bytes from the file would
-    // make the zeros durable.
     #[test]
     fn a_retry_writes_the_lost_records_again_from_memory() {
         let dir = TempDir::new().unwrap();
