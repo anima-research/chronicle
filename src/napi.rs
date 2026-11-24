@@ -688,7 +688,8 @@ impl JsStore {
     /// is synced, every view made from this handle stops working ("Store has
     /// been closed"), and the lock file is released before `close()` returns
     /// — live views do not keep the store or its lock alive. If the record
-    /// log's fsync has failed, this throws that error after closing the
+    /// log's fsync has failed, or a sync of a directory that holds the store
+    /// or its blobs is refused, this throws that error after closing the
     /// store, so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
@@ -965,7 +966,7 @@ impl JsStore {
     /// when writing or syncing the blob fails, and for a content type longer
     /// than 65,535 bytes. A sync that fails after the blob is in place still
     /// throws, and storing the blob again before the store closes tries the
-    /// sync again.
+    /// sync again, and so does the next `sync()`, which throws while it fails.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -2036,6 +2037,16 @@ impl JsStore {
     /// can. On Windows it doesn't wait for the rename to reach the disk, so
     /// after an OS crash or power loss the store may open from an earlier
     /// checkpoint.
+    /// On Unix, the first time on each open handle, this also syncs the
+    /// directories that hold the store's directory, up to the root of its
+    /// filesystem, and `blobs/` with each shard directory in it, so that a
+    /// power loss can't take the store's name or a blob's, whatever made
+    /// them. After that, it syncs each blob directory whose sync after a blob
+    /// store this handle still owes. A directory that this process may not
+    /// open is passed over, as for a checkpoint save, and so is the directory
+    /// that holds a symbolic link on the store's path. A refused sync of one
+    /// of these directories throws its error, and the next `sync()` tries it
+    /// again. Appends, state writes and blob stores go on meanwhile.
     /// State registration, strategy changes and branch changes checkpoint
     /// before returning. After one of those checkpoints fails, further
     /// mutations retry it before proceeding, and the change stays applied in

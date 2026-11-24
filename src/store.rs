@@ -133,6 +133,8 @@ struct WriteState {
     /// manifest). A write that needs one it lacks rewrites the MANIFEST
     /// first; see `Store::require_features`.
     features: u64,
+
+    names_synced: bool,
 }
 
 /// A branch change to announce once a checkpoint persists it.
@@ -154,6 +156,8 @@ pub struct Store {
 
     /// Lock file for exclusive access.
     _lock_file: File,
+
+    holders: Vec<PathBuf>,
 
     /// Record log (shared with StateManager for disk-based traversal).
     log: Arc<RecordLog>,
@@ -387,6 +391,8 @@ impl Store {
             }));
         }
 
+        let holders = Self::holders("create", &config.path)?;
+
         // With the lock held, staging files here were left by interrupted
         // saves, a create's own manifest save among them (as open sweeps them).
         crate::atomic_file::remove_staging_files(&config.path);
@@ -412,6 +418,7 @@ impl Store {
         Ok(Self {
             config,
             _lock_file: lock_file,
+            holders,
             log,
             index,
             blobs,
@@ -433,6 +440,7 @@ impl Store {
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
         let mut features = Self::verify_manifest(&config.path)?;
+        let holders = Self::holders("open", &config.path)?;
 
         // A MANIFEST naming format features was renamed into place by a
         // batch's mark, and a failed directory sync after that rename left
@@ -644,6 +652,7 @@ impl Store {
         Ok(Self {
             config,
             _lock_file: lock_file,
+            holders,
             log,
             index,
             blobs,
@@ -3276,9 +3285,40 @@ impl Store {
     /// may open from an earlier checkpoint. The record index is rebuilt on
     /// startup; checkpoint cost depends on state heads, branch metadata, and
     /// any registered field indexes.
+    ///
+    /// On Unix, the first time on each open handle, this also syncs the
+    /// directories that hold the store's directory, up to the root of its
+    /// filesystem, and the blob directory with each shard directory in it,
+    /// so that a power loss can't take the store's name or a blob's, whatever
+    /// made them. After that, it syncs each blob directory whose sync after a
+    /// blob store this handle still owes. As a blob store's syncs do, these go
+    /// only where the system syncs directories and this process may open
+    /// them. For a store path through a symbolic link, the directory that
+    /// holds the link's own name isn't synced. A refused sync of one of these
+    /// directories returns its error, and the next call tries it again.
+    /// Appends, state writes and blob stores go on meanwhile.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
-        self.sync_locked(&mut write)
+        self.sync_locked(&mut write)?;
+        let in_sync = |error: std::io::Error| std::io::Error::new(error.kind(), format!("sync: {error}"));
+        if !write.names_synced {
+            for directory in &self.holders {
+                crate::atomic_file::sync_directory_at(directory).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "sync: cannot sync {}, a directory that holds the store {}: {error}",
+                            directory.display(),
+                            self.config.path.display()
+                        ),
+                    )
+                })?;
+            }
+            self.blobs.sync_directories().map_err(in_sync)?;
+            write.names_synced = true;
+        }
+        self.blobs.sync_owed().map_err(in_sync)?;
+        Ok(())
     }
 
     /// Make the MANIFEST name `required` format features before a record
@@ -3716,6 +3756,45 @@ impl Store {
         }
     }
 
+    #[cfg(unix)]
+    fn holders(verb: &str, path: &Path) -> Result<Vec<PathBuf>> {
+        use std::os::unix::fs::MetadataExt;
+        let failed = |what: String, error: std::io::Error| {
+            StoreError::Io(std::io::Error::new(error.kind(), format!("{verb}: {what}: {error}")))
+        };
+        let real = fs::canonicalize(path).map_err(|error| {
+            failed(format!("cannot find the real path of {}", path.display()), error)
+        })?;
+        let device = fs::metadata(&real)
+            .map_err(|error| failed(format!("cannot read the metadata of {}", real.display()), error))?
+            .dev();
+        let mut holders = Vec::new();
+        for directory in real.ancestors().skip(1) {
+            let metadata = fs::metadata(directory).map_err(|error| {
+                failed(
+                    format!(
+                        "cannot read the metadata of {}, a directory that holds the store {}",
+                        directory.display(),
+                        path.display()
+                    ),
+                    error,
+                )
+            })?;
+            if metadata.dev() != device {
+                break;
+            }
+            holders.push(directory.to_owned());
+        }
+        Ok(holders)
+    }
+
+    // Windows has no portable directory sync, and checkpoint saves go without
+    // it there too.
+    #[cfg(not(unix))]
+    fn holders(_verb: &str, _path: &Path) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
     // LOCK is opened without truncating it, and nothing is written to it. It
     // must be a regular file in the store's directory, or absent (then it's
     // created). A symlink is refused: its target can be replaced by a rename,
@@ -3804,7 +3883,9 @@ impl Drop for Store {
                 path = %self.config.path.display(),
                 "final sync on drop failed: the next open replays state updates from the log \
                  past the last checkpoint, and may lose any registration or branch change \
-                 whose checkpoint failed"
+                 whose checkpoint failed. If the sync of a directory that holds the store or \
+                 its blobs failed, a power loss before the next sync can also take the store's \
+                 name or a blob's"
             );
         }
     }

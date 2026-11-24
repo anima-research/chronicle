@@ -434,6 +434,13 @@ pub(crate) fn sync_directory_at(directory: &Path) -> io::Result<()> {
     }
 }
 
+// Windows has no portable directory sync, and checkpoint saves go without it
+// there too.
+#[cfg(not(unix))]
+pub(crate) fn sync_directory_at(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Sync the directory a save of the checkpoint at `path` renames into: the
 /// one holding the file its symbolic links lead to, as `atomic_write` finds
 /// it, or `path`'s own where it is no link. An error names that directory.
