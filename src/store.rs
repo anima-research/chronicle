@@ -4,7 +4,7 @@ use crate::blobs::BlobStorage;
 use crate::branches::BranchManager;
 use crate::error::{Result, StoreError};
 use crate::records::{RecordIndex, RecordLog, RecoveryReport};
-use crate::state::{StateManager, StateSelection};
+use crate::state::{ItemCount, StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
     Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence, SnapshotFailure,
@@ -54,9 +54,9 @@ pub struct AppendedBatch {
     /// lock as the write. Item `i` of the batch is at `first_ordinal + i`, so
     /// a caller has every item's ordinal without a read.
     ///
-    /// Where this session hasn't kept the state's count on the branch itself
-    /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
-    /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
+    /// Where the store hasn't checked the state's count on the branch (a head
+    /// loaded with no saved check or installed by `create_branch_at`, or one
+    /// after a `DeltaSnapshot` the caller wrote or a value that isn't an
     /// array), the batch first counts
     /// the state's items, reading its whole value once, or again under the
     /// write lock where another write to the state lands during that count,
@@ -1369,10 +1369,17 @@ impl Store {
             // unchecked has its items counted here, unless the batch is
             // empty, which is refused before it's written.
             if !items.is_empty() {
-                first_ordinal = self
+                first_ordinal = match self
                     .state
                     .checked_item_count(branch_id, state_id)
-                    .map_err(Self::count_error)?;
+                    .map_err(Self::count_error)?
+                {
+                    ItemCount::NoHead => 0,
+                    ItemCount::Counted(count) => count,
+                    ItemCount::Moved => {
+                        unreachable!("a write moved the head while the batch held the write lock")
+                    }
+                };
             }
             Ok(StateOperation::AppendMany(items))
         })?;
@@ -1881,20 +1888,56 @@ impl Store {
         }))
     }
 
-    /// Get the length of an AppendLog state without loading all items.
-    ///
-    /// This is O(1) - the count is tracked in the state chain head.
-    /// Returns None if state doesn't exist, Some(0) for empty state.
+    /// The number of items a state holds on the current branch: `None` where
+    /// the state has no value, `Some(0)` for an empty one. See
+    /// [`Store::get_state_len_on`].
     pub fn get_state_len(&self, state_id: &str) -> Result<Option<usize>> {
         self.get_state_len_on(self.branches.current_id(), state_id)
     }
 
     /// `get_state_len` against the given branch.
+    ///
+    /// For a state registered as `AppendLog` it is the number of items that
+    /// a read of the state on the branch returns. The head's stored count is
+    /// returned where the store has checked it, which reads nothing. A head
+    /// it hasn't checked has its value read once to count its items, as a
+    /// batched append does, and the head keeps that count: a count that a
+    /// release before 0.5.0 stored, one that a `DeltaSnapshot` the caller
+    /// wrote left, and one on a branch an earlier release damaged can be
+    /// off. The store saves its checks at each sync, in `state.bin`, so a
+    /// list counted before a sync isn't counted again after an open, unless a
+    /// later write left its head unchecked. A value that
+    /// doesn't materialize as a JSON array has no items to count, and the
+    /// stored count is returned. An error reading the log for the count (an
+    /// I/O error, or a record of the state's chain that fails its checksum
+    /// or whose framing is bad) is returned, and nothing changes. The count
+    /// is taken once without the store's write lock, and once more under it
+    /// if a write moved the state's head meanwhile, so that writers wait for
+    /// that second count.
+    ///
+    /// For a state of any other strategy, and one with no registration, it
+    /// is the count the head stores, which reads nothing: for a Tree state an
+    /// estimate between full snapshots.
     pub fn get_state_len_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<usize>> {
         self.branch_by_id(branch_id)?;
-        match self.state.get_head(branch_id, state_id) {
-            Some(head) => Ok(Some(head.item_count)),
-            None => Ok(None),
+        match self.state.get_strategy(state_id) {
+            Some(crate::types::StateStrategy::AppendLog { .. }) => {
+                let count = match self.state.checked_item_count(branch_id, state_id)? {
+                    ItemCount::Moved => {
+                        let _write = self.write_lock.lock();
+                        self.state.checked_item_count(branch_id, state_id)?
+                    }
+                    count => count,
+                };
+                Ok(match count {
+                    ItemCount::NoHead => None,
+                    ItemCount::Counted(count) => Some(count),
+                    ItemCount::Moved => {
+                        unreachable!("a write moved the head while the length read held the write lock")
+                    }
+                })
+            }
+            _ => Ok(self.state.get_head(branch_id, state_id).map(|head| head.item_count)),
         }
     }
 
@@ -1981,7 +2024,7 @@ impl Store {
     /// JSON value (no bytes at all read as an empty list), as
     /// `get_state_slice` does, except the last item served from the head
     /// record alone, which reads no earlier item: an `Append`'s, or a batch's
-    /// last item where this session found the head's count exact.
+    /// last item where the store has found the head's count exact.
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -2008,8 +2051,8 @@ impl Store {
     /// (no bytes at all read as an empty list), as for `get_state_item`,
     /// except the last item served from the head
     /// record alone, which reads no earlier item. It answers otherwise than
-    /// `get_state_item` only at the last index of a head whose count this
-    /// session hasn't found exact (unchecked, or checked on a value that
+    /// `get_state_item` only at the last index of a head whose count the
+    /// store hasn't found exact (unchecked, or checked on a value that
     /// doesn't materialize), where `get_state_item` answers from the stored
     /// count and this from the value. Ordinals may repeat and come in any
     /// order. All of them are answered from one version of the state, read at

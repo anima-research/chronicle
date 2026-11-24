@@ -428,6 +428,9 @@ pub struct JsValueCount {
 pub struct JsStateInfo {
     pub id: String,
     pub strategy: String,
+    /// The count that the state's head keeps, read with nothing else. For an
+    /// `append_log` whose count the store hasn't checked it can differ from
+    /// `getStateLen`, which counts the items.
     pub item_count: Option<i64>,
     pub ops_since_snapshot: i64,
 }
@@ -1604,7 +1607,11 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Get the length of an AppendLog state.
+    /// The number of items a state holds on this handle's branch, `null`
+    /// where it has no value. For an `append_log` it is the number of items
+    /// that a read returns: a list whose count the store hasn't checked is
+    /// read once to count it. For another strategy it is the count the head
+    /// stores.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
         let (store, branch) = self.target()?;

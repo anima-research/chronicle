@@ -14,8 +14,9 @@ copied. A state update that the walk reaches is rewritten where its
 `prev_update_offset` must change: it then holds the new offset, or no link
 where the update it linked to was dropped, and gets a new checksum. Every record that the walk does not reach is copied byte for byte,
 whatever it holds, for a named state too. state.bin gets the new offsets, and
-every count in a head stays as chronicle wrote it. getStateLen reads a head's
-item count, which still describes the value at that head. The other counts
+every count in a head stays as chronicle wrote it. The new state.bin holds no
+checks of the lists' counts, so chronicle counts each list once more, at its
+first getStateLen or batch. The other counts
 time a state's next snapshot, so a named state's next snapshot can come at
 another point. listStates returns one of them as opsSinceSnapshot, which for a
 named state can still count updates that the run dropped.
@@ -406,6 +407,9 @@ def scan_log(path):
 
 STI_MAGIC = b'STI\0'
 STI_VERSION = 2
+# chronicle saves its checks of the lists' counts after the index: this magic, a version byte, and the length of the
+# rest as a little-endian u64. The tool writes state.bin without them, as its run moves the offsets they name.
+CHECKS_MAGIC = b'SCC\0'
 # A StateChainHead's fields, by position (src/state/manager.rs). chronicle reads a head that a legacy index saved with
 # fewer than eight, and gives the missing trailing fields their defaults.
 HEAD, LAST_DELTA, LAST_FULL = 0, 3, 4
@@ -417,6 +421,11 @@ def head_is_whole(head):
             and all(offset is None or is_count(offset) for offset in (head[LAST_DELTA], head[LAST_FULL])))
 
 
+def is_checks_or_nothing(rest):
+    return rest == b'' or (len(rest) >= 13 and rest[:4] == CHECKS_MAGIC
+                           and struct.unpack_from('<Q', rest, 5)[0] == len(rest) - 13)
+
+
 def read_state_bin(data):
     if data[:4] != STI_MAGIC: raise Refusal('state.bin is not a state index.')
     try:
@@ -425,7 +434,7 @@ def read_state_bin(data):
         index, end = mp_decode(data[13:13 + n])
     except DECODE_ERRORS as error:
         raise Refusal('state.bin is not a whole state index (%s).' % error)
-    if end != n or len(data) != 13 + n: raise Refusal('state.bin is not the length its index says.')
+    if end != n or not is_checks_or_nothing(data[13 + n:]): raise Refusal('state.bin is not the length its index says.')
     # rmp_serde::to_vec: StateIndex = [heads: map{[branch, state_id] -> [fields]}, strategies: map]
     if not (isinstance(index, list) and len(index) == 2 and isinstance(index[0], MpMap)
             and all(isinstance(key, list) and len(key) == 2 and is_count(key[0]) and isinstance(key[1], str)
