@@ -1,0 +1,1 @@
+- The record log is still flushed to disk every 100 records. It is now also flushed once the unflushed records pass 64 MiB. The log keeps those records in memory for a retry of a failed flush, and the new limit bounds that memory.

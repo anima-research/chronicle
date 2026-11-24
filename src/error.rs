@@ -9,10 +9,12 @@ pub enum StoreError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// An fsync of the record log failed, so records written before it may
-    /// not have reached the disk. Every later call that would publish a
-    /// checkpoint returns this until the store is reopened, which is the only
-    /// way to resume durable writes.
+    /// An fsync of the record log failed, so records written since the last
+    /// good fsync may not have reached the disk. Every later append, and
+    /// every call that would publish a checkpoint, returns this until a sync
+    /// writes those records again and its fsync succeeds, or the store is
+    /// reopened, unless a check of the call's own refuses it first. An open
+    /// whose fsync of the log fails returns it too.
     #[error("Durability lost: {0}")]
     DurabilityLost(String),
 
@@ -117,9 +119,12 @@ pub enum ErrorCode {
     /// reached through more links than it follows. The message carries its
     /// error.
     Io,
-    /// An fsync of the record log failed. `sync()` throws it until the store
-    /// is reopened, and so do the calls that checkpoint, unless a check of
-    /// their own refuses them first.
+    /// An fsync of the record log failed. Appends and state writes throw it
+    /// until a `sync()` writes the records since the last good fsync again
+    /// and its fsync succeeds, or the store is reopened. `sync()`, `close()`
+    /// and the calls that checkpoint make that retry and throw it when the
+    /// retry fails. An open whose fsync of the log fails throws it too. A
+    /// check of a call's own can refuse the call first.
     DurabilityLost,
     /// Not raised by this release.
     RecordNotFound,

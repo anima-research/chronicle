@@ -688,8 +688,8 @@ impl JsStore {
     /// is synced, every view made from this handle stops working ("Store has
     /// been closed"), and the lock file is released before `close()` returns
     /// — live views do not keep the store or its lock alive. If the record
-    /// log's fsync has failed, this throws that error after closing the
-    /// store, so it can be reopened.
+    /// log's fsync has failed and the sync's retry of it fails too, this
+    /// throws that error after closing the store, so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed", but for `isClosed()`,
@@ -714,7 +714,15 @@ impl JsStore {
                 writer.finish();
             }
             // Sync before closing
-            store.sync().map_err(to_napi_error)?;
+            store
+                .sync()
+                .map_err(|error| match error {
+                    StoreError::DurabilityLost(text) => StoreError::DurabilityLost(format!(
+                        "{text}. close() has closed this handle, so only a reopen can end it now"
+                    )),
+                    other => other,
+                })
+                .map_err(to_napi_error)?;
             // Drop the Arc. The slot and the writer thread, joined above, were
             // the only long-lived references (views hold the slot, not the
             // store), so the store is dropped here.
@@ -2018,15 +2026,19 @@ impl JsStore {
     /// Flush pending record/state contents and publish metadata checkpoints.
     /// A failure to save field indexes is only logged, since they are derived.
     /// Once an fsync of the record log has failed, this call's own or a
-    /// periodic one, this throws that failure every time until the store is
-    /// reopened, and publishes nothing: records written before it may not
-    /// have reached the disk, and a later fsync can't show that they did.
-    /// Its message begins `Durability lost:`, and its `code` is
-    /// `DurabilityLost`. Registering a state, changing a strategy, and
-    /// creating, deleting or switching a branch throw it too, unless a check
-    /// of their own refuses them first, and so does any write while one of
-    /// them waits for its checkpoint.
-    /// Reopening the store is the only way to resume durable writes.
+    /// periodic one, records written since the last good fsync may not have
+    /// reached the disk, and a later fsync alone can't show that they did.
+    /// So while that failure stands, this writes those records again from
+    /// memory and then fsyncs. When that succeeds, it returns as usual. When
+    /// it fails, it throws and publishes nothing, and the next `sync()` tries
+    /// again. Its message begins `Durability lost:`, and its `code` is
+    /// `DurabilityLost`. While the failure stands, every append and state
+    /// write throws it before it writes, unless a check of its own refuses it
+    /// first. Registering a state, changing a strategy, and creating,
+    /// deleting or switching a branch sync the same way first, unless a check
+    /// of their own refuses them before, and throw it when that sync fails.
+    /// Reopening the store also ends the failure. The open fsyncs the log
+    /// first, and throws the same error when that fsync fails.
     /// Reopening can't tell whether records the operating system still caches
     /// reached the disk: if they didn't while later records did, an open
     /// after the cache drops them refuses the store as mid-log corruption.
@@ -2040,7 +2052,8 @@ impl JsStore {
     /// before returning. After one of those checkpoints fails, further
     /// mutations retry it before proceeding, and the change stays applied in
     /// memory. A failed sync with no such change pending holds back no later
-    /// append or state update.
+    /// append or state update, unless what failed was the record log's fsync,
+    /// as above.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
