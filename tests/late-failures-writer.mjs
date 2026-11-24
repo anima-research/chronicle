@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
 
@@ -98,6 +98,15 @@ function freshHash(dir) {
   scratch.close();
   return hash;
 }
+function leaveBlob(dir, path) {
+  const hash = freshHash(dir);
+  const shard = readdirSync(join(dir, 'blobs')).find(each => existsSync(join(dir, 'blobs', each, hash)));
+  mkdirSync(join(path, 'blobs', shard), { recursive: true });
+  const fd = openSync(join(path, 'blobs', shard, hash), 'wx');
+  writeSync(fd, readFileSync(join(dir, 'blobs', shard, hash)));
+  fsyncSync(fd);
+  closeSync(fd);
+}
 
 function run([scenarioFile, root, outside, index]) {
   const scenario = scenarioAt(scenarioFile);
@@ -127,6 +136,7 @@ function run([scenarioFile, root, outside, index]) {
   if (scenario.movedIn) {
     s.close();
     renameSync(`${path}-before`, path);
+    leaveBlob(join(outside, 'left'), path);
     s = JsStore.open({ path });
   }
   mark('setup');

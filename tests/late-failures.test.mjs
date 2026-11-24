@@ -572,7 +572,18 @@ const oldAfterThrow = method => ({
   },
 });
 
-const ofTheNamesPass = run => holds(run.refused, run.store) || isUnder(run.refused, `${run.store}/blobs`);
+const callOf = run => {
+  const all = calls(run.text, run.dir);
+  return all.slice(all.findIndex(({ mark }) => mark === 'call-begin'), all.findIndex(({ mark }) => mark === 'call-end'));
+};
+
+const ofTheNamesPass = run => {
+  if (holds(run.refused, run.store) || isUnder(run.refused, `${run.store}/blobs`)) return true;
+  if (run.refused !== run.store) return false;
+  const inCall = callOf(run);
+  const refusedAt = inCall.findIndex(call => !call.ok && call.paths[0] === run.store);
+  return refusedAt > 0 && inCall.slice(0, refusedAt).some(call => SYNCS.has(call.name) && holds(call.paths[0], run.store));
+};
 
 const aRefusedNameSyncThrows = {
   rule: 'the call',
@@ -583,13 +594,21 @@ const aRefusedNameSyncThrows = {
 const theSecondTrySyncsItAgain = {
   rule: 'the second try',
   judge: ({ out, run }) => {
-    if (!ofTheNamesPass(run) || !out.retry) return [];
+    if (!ofTheNamesPass(run) || out.call.ok) return [];
+    if (!out.retry) return [{ text: `the reads after the call didn't give the old values, so no second try could sync ${run.refused}` }];
     const all = calls(run.text, run.dir);
     const begin = all.findIndex(({ mark }) => mark === 'retry-begin');
     const end = all.findIndex(({ mark }) => mark === 'retry-end');
     const again = all.slice(begin, end).some(call => SYNCS.has(call.name) && call.ok && call.paths[0] === run.refused);
     return again ? [] : [{ text: `the second try returned without syncing ${run.refused}, whose sync the call had refused` }];
   },
+};
+
+const theMessageNamesTheDirectory = {
+  rule: 'the call',
+  judge: ({ out, run }) => (!out.call.ok && [run.store, `${run.store}/blobs`].includes(run.refused)
+    && !out.call.message.includes(`cannot sync ${run.refused},`)
+    ? [{ text: `the call threw without naming ${run.refused}, whose sync was refused: ${out.call.message}` }] : []),
 };
 
 const theStoreNameWaits = {
@@ -1085,7 +1104,9 @@ if (skip) {
         freshBlob: true,
         call: (s, f, h) => s.storeBlob(Buffer.from('fresh blob'), 'text/plain'),
         reads: h => ({ blob: (s, f) => h.utf8(s.getBlob(f.fresh)) }),
-      }, writeKind));
+      }, writeKind, {
+        rules: [theMessageNamesTheDirectory],
+      }));
     test('A refused request in switchBranch leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'switchBranch',
@@ -1169,6 +1190,16 @@ if (skip) {
         call: (s, f, h) => s.close(),
         reads: h => h.threeReads,
       }, closeKind));
+    test('A refused request in the first close of a handle leaves a throw or a return, whole values and a store that opens again',
+      refused({
+        name: 'firstClose',
+        movedIn: true,
+        unsynced: (s, f, h) => h.threeWrites(s),
+        call: (s, f, h) => s.close(),
+        reads: h => h.threeReads,
+      }, closeKind, {
+        rules: [aRefusedNameSyncThrows, theStoreNameWaits],
+      }));
     test('A refused request in an append of a long run without a barrier leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'long',

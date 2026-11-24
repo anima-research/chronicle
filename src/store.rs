@@ -4526,6 +4526,29 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sync_passes_over_a_directory_holding_the_store_that_this_process_may_not_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let holder = dir.path().join("holder");
+        let store = Store::create(StoreConfig {
+            path: holder.join("store"),
+            ..test_config(&dir)
+        })
+        .unwrap();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = fs::File::open(&holder).is_ok();
+        let synced = store.sync();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            eprintln!("skipped: the directory could be opened despite its mode (running as root?)");
+            return;
+        }
+        synced.unwrap();
+    }
+
     /// Where open_or_create can't look at the directory again after its
     /// create was refused, it returns that error, not the refusal, which is
     /// true only of what create saw under the lock. Unix only: a directory
