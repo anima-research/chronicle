@@ -142,8 +142,8 @@ impl BlobStorage {
     /// `BlobStorage::new` takes no lock. The first
     /// [`Store::sync`](crate::Store::sync) of each handle of the `Store` that
     /// holds this `BlobStorage` syncs the directory that holds the blob
-    /// directory, the blob directory and every shard directory in it,
-    /// whatever made them. A sync that fails
+    /// directory, the blob directory and each of its 256 shard directories
+    /// that is there and isn't a symbolic link, whatever made them. A sync that fails
     /// before the rename returns an error with nothing stored; one that fails
     /// after it returns an error with the blob in place. Either way, storing
     /// the blob again through this `BlobStorage` tries the sync again, and so
@@ -526,22 +526,29 @@ impl BlobStorage {
         if cfg!(not(unix)) {
             return Ok(());
         }
-        let unlisted = |error| Unsynced {
-            directory: self.path.clone(),
-            error,
-        };
-        let entries = match fs::read_dir(&self.path) {
-            Ok(entries) => Some(entries),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
-            Err(error) => return Err(unlisted(error)),
-        };
         self.sync_entry()?;
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(Unsynced {
+                    directory: self.path.clone(),
+                    error,
+                })
+            }
+        }
         sync_directory_named(&self.path)?;
-        for entry in entries.into_iter().flatten() {
-            let entry = entry.map_err(unlisted)?;
-            if entry.file_type().map_err(unlisted)?.is_dir() {
-                self.sync_shard(&entry.path())?;
+        for shard in 0..self.shards.len() {
+            let directory = self.shard_dir(shard);
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => self.sync_shard(&directory)?,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) => {}
+                Err(error) => return Err(Unsynced { directory, error }),
             }
         }
         Ok(())

@@ -1,10 +1,11 @@
 - On Unix, `sync()` and `close()` now sync the directories that hold the
-  store's directory, up to the root of its filesystem. They do it on the
-  first call on each open handle. Before, a power loss after `sync()` could
+  store's directory, up to the root of its filesystem or to the first one
+  that this process may not look at. They do it on the first call on each
+  open handle. Before, a power loss after `sync()` could
   lose a new store. New parent directories could be lost the same way.
-- When the store has `blobs/`, that first call also syncs the store's
-  directory, `blobs/` and each shard directory. Before, a power loss could
-  lose a blob whose shard was never synced.
+- That first call also syncs the store's directory, `blobs/` and each
+  shard directory. Before, a power loss could lose a blob whose shard was
+  never synced.
 - A store with all 256 shards gets 258 more directory syncs on a handle's
   first `sync()`.
 - `sync()` and `close()` also retry a shard sync that failed in a blob

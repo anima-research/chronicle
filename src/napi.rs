@@ -2039,9 +2039,10 @@ impl JsStore {
     /// checkpoint.
     /// On Unix, the first time on each open handle, this also syncs the
     /// directories that hold the store's directory, up to the root of its
-    /// filesystem, and, once the store has `blobs/`, the store's directory,
-    /// `blobs/` and each shard directory in it, so that a power loss can't
-    /// take the store's name or a blob's, whatever made them. After that, it
+    /// filesystem or to the first one that this process may not look at, and
+    /// the store's directory, `blobs/` and each shard directory in it, so that
+    /// a power loss can't take the store's name or a blob's, whatever made
+    /// them. After that, it
     /// syncs each blob directory whose sync after a blob store this handle
     /// still owes. As for a checkpoint save, a directory that this process
     /// may not open is passed over, and so is every directory on a system

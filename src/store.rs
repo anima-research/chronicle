@@ -3288,10 +3288,10 @@ impl Store {
     ///
     /// On Unix, the first time on each open handle, this also syncs the
     /// directories that hold the store's directory, up to the root of its
-    /// filesystem, and, once the store has a blob directory, the store's
-    /// directory, the blob directory and each shard directory in it, so that
-    /// a power loss can't take the store's name or a blob's, whatever made
-    /// them. After that, it syncs each blob directory whose sync after a blob
+    /// filesystem or to the first one that this process may not look at, and
+    /// the store's directory, the blob directory and each shard directory in
+    /// it, so that a power loss can't take the store's name or a blob's,
+    /// whatever made them. After that, it syncs each blob directory whose sync after a blob
     /// store this handle still owes. As a blob store's syncs do, these go
     /// only where the system syncs directories and this process may open
     /// them. For a store path through a symbolic link, the directory that
@@ -3765,24 +3765,34 @@ impl Store {
         let failed = |what: String, error: std::io::Error| {
             StoreError::Io(std::io::Error::new(error.kind(), format!("{verb}: {what}: {error}")))
         };
-        let real = fs::canonicalize(path).map_err(|error| {
-            failed(format!("cannot find the real path of {}", path.display()), error)
-        })?;
+        let refused = |error: &std::io::Error| error.kind() == std::io::ErrorKind::PermissionDenied;
+        let real = match fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(error) if refused(&error) => path.to_owned(),
+            Err(error) => {
+                return Err(failed(format!("cannot find the real path of {}", path.display()), error))
+            }
+        };
         let device = fs::metadata(&real)
             .map_err(|error| failed(format!("cannot read the metadata of {}", real.display()), error))?
             .dev();
         let mut holders = Vec::new();
         for directory in real.ancestors().skip(1) {
-            let metadata = fs::metadata(directory).map_err(|error| {
-                failed(
-                    format!(
-                        "cannot read the metadata of {}, a directory that holds the store {}",
-                        directory.display(),
-                        path.display()
-                    ),
-                    error,
-                )
-            })?;
+            let directory = if directory.as_os_str().is_empty() { Path::new(".") } else { directory };
+            let metadata = match fs::metadata(directory) {
+                Ok(metadata) => metadata,
+                Err(error) if refused(&error) => break,
+                Err(error) => {
+                    return Err(failed(
+                        format!(
+                            "cannot read the metadata of {}, a directory that holds the store {}",
+                            directory.display(),
+                            path.display()
+                        ),
+                        error,
+                    ))
+                }
+            };
             if metadata.dev() != device {
                 break;
             }
