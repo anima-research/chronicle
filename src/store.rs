@@ -426,6 +426,22 @@ impl Store {
     }
 
     /// Open an existing store.
+    ///
+    /// A store writes `state.bin` and `branches.bin` only after its
+    /// `records.log`. So a store that holds either of them and has no
+    /// `records.log` has lost its log: open refuses it with `Corruption`,
+    /// naming the missing file, and creates no `records.log`. A
+    /// `records.log`, `state.bin` or `branches.bin` that is a symbolic link
+    /// leading to nothing is refused with `Corruption` in any store, and
+    /// nothing is created where it leads. A directory with a `MANIFEST` and
+    /// none of the other three files, as a create that stopped after its
+    /// `MANIFEST` leaves it, is opened, and the open creates its log. A
+    /// `records.log` that is 0 bytes as the open finds it, while `state.bin`
+    /// holds a state head or `branches.bin` a branch head above 0, is refused
+    /// with `Corruption`, naming it empty, before anything is created or
+    /// saved: an open by an earlier release creates such a file where the
+    /// log is missing, and so can an open that cuts off an incomplete first
+    /// record.
     pub fn open(config: StoreConfig) -> Result<Self> {
         // Verify manifest
         Self::verify_manifest(&config.path)?;
@@ -459,12 +475,15 @@ impl Store {
         // doc says what else it can reach.
         crate::atomic_file::remove_staging_files(&config.path);
 
+        Self::refuse_a_lost_log(&config.path)?;
+
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
-        let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
-        blobs.remove_staging_files();
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
+        Self::refuse_an_emptied_log(&config.path, &log, &state, &branches)?;
+        let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
+        blobs.remove_staging_files();
 
         // Reconcile branch heads against what the durable log actually holds.
         // `branches.bin` is only flushed on sync/Drop, so after an unclean
@@ -3581,20 +3600,96 @@ impl Store {
         )
     }
 
+    fn holds(path: &Path, file: &str) -> std::io::Result<bool> {
+        match fs::symlink_metadata(path.join(file)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
+            )),
+        }
+    }
+
     fn present_store_file(path: &Path) -> std::io::Result<Option<&'static str>> {
         for file in Self::STORE_FILES {
-            match fs::symlink_metadata(path.join(file)) {
-                Ok(_) => return Ok(Some(file)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(std::io::Error::new(
-                        error.kind(),
-                        format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
-                    ))
-                }
+            if Self::holds(path, file)? {
+                return Ok(Some(file));
             }
         }
         Ok(None)
+    }
+
+    fn refuse_a_lost_log(path: &Path) -> Result<()> {
+        let mut used = Vec::new();
+        for file in ["state.bin", "branches.bin"] {
+            if Self::holds(path, file)? {
+                used.push(file);
+            }
+        }
+        let used = used.join(" and ");
+        let use_shown = format!(
+            "{} holds {used}, which a store writes only after it has made its records.log",
+            path.display()
+        );
+        for file in ["records.log", "state.bin", "branches.bin"] {
+            let link = path.join(file);
+            if fs::symlink_metadata(&link).is_ok_and(|metadata| metadata.file_type().is_symlink())
+                && matches!(fs::metadata(&link), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                let remedy = format!(
+                    "Make the link lead to the store's {file}, by mounting the volume it points into, say, then open the store again"
+                );
+                return Err(StoreError::Corruption(format!(
+                    "{}, so the open stopped and created nothing where it leads. {}",
+                    Self::link_to_nothing(&link),
+                    match (file, used.is_empty()) {
+                        ("records.log", false) => format!("{use_shown}. {remedy}"),
+                        ("records.log", true) => format!(
+                            "{remedy}. If the store has no records.log yet, remove the link, and the next open creates one here"
+                        ),
+                        _ => remedy,
+                    }
+                )));
+            }
+        }
+        let log = path.join("records.log");
+        if used.is_empty()
+            || !matches!(fs::symlink_metadata(&log), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(());
+        }
+        Err(StoreError::Corruption(format!(
+            "{} is missing, though {use_shown}. This open created no records.log. Restore the records.log that belongs with this {used}, then open the store again",
+            log.display()
+        )))
+    }
+
+    fn refuse_an_emptied_log(
+        path: &Path,
+        log: &RecordLog,
+        state: &StateManager,
+        branches: &BranchManager,
+    ) -> Result<()> {
+        if log.size() > 0 || log.recovery().is_some() {
+            return Ok(());
+        }
+        let mut heads = Vec::new();
+        if state.checkpoint_offset().is_some() {
+            heads.push("state.bin");
+        }
+        if branches.list_branches().iter().any(|branch| branch.head.0 > 0) {
+            heads.push("branches.bin");
+        }
+        if heads.is_empty() {
+            return Ok(());
+        }
+        Err(StoreError::Corruption(format!(
+            "{} is empty, though {} {} heads of records that the log held. An open by an earlier release of Chronicle creates such an empty file where a store's records.log is missing. An open that finds the log's first record incomplete and cuts it off leaves one too. Restore the store's records.log over this file if a copy exists, then open the store again",
+            path.join("records.log").display(),
+            heads.join(" and "),
+            if heads.len() == 1 { "holds" } else { "hold" }
+        )))
     }
 
     // Published whole, through a staging file renamed over it, so a crash
