@@ -547,6 +547,14 @@ impl StateManager {
         Ok(())
     }
 
+    pub(crate) fn restore_strategy(&self, id: &str, strategy: Option<StateStrategy>) {
+        let mut index = self.index.write();
+        match strategy {
+            Some(strategy) => index.strategies.insert(id.to_string(), strategy),
+            None => index.strategies.remove(id),
+        };
+    }
+
     /// Update the strategy parameters of an already-registered state.
     ///
     /// Registrations persist in `state.bin`, so a consumer that re-registers
@@ -1965,44 +1973,49 @@ impl StateManager {
         self.cache.read().len()
     }
 
-    /// Release what is held for a branch that has just been deleted.
+    /// Mark a branch that has just been deleted, so that
+    /// `purge_retired_branches` releases what is held for it.
     ///
-    /// Derived data goes at once: the branch's cache entries (values other
-    /// branches still reference stay alive for them) and its field indexes.
-    ///
-    /// Its chain heads are only MARKED here and removed by
-    /// `purge_retired_branches`, which the store calls after it has saved
-    /// the branch list. `state.bin` and `branches.bin` are separate files
-    /// written one after the other; if the heads left `state.bin` first, a
-    /// crash between the two writes would bring the branch back (still
-    /// listed in `branches.bin`) with every state empty. Keeping them until
-    /// the deletion itself is durable means a crash can only bring the
-    /// branch back whole, or leave unreferenced heads behind — never a
-    /// branch stripped of its state.
+    /// Its field indexes (derived data) are set aside at once, so the next
+    /// `save` writes a `state-indexes.bin` without them. Its chain heads
+    /// stay. `state.bin` and `branches.bin` are separate files written one
+    /// after the other; if the heads left `state.bin` first, a crash between
+    /// the two writes would bring the branch back (still listed in
+    /// `branches.bin`) with every state empty. Keeping them until the
+    /// deletion itself is durable means a crash can only bring the branch
+    /// back whole, or leave unreferenced heads behind — never a branch
+    /// stripped of its state.
     pub fn retire_branch(&self, branch_id: BranchId) {
-        let prefix = format!("{}:", branch_id.0);
-        self.cache.write().pop_prefix(&prefix);
-        self.items_cache.write().pop_prefix(&prefix);
-        self.tree_cache.write().pop_prefix(&prefix);
-        self.field_indexes.write().drop_branch(branch_id);
-        self.counts.write().remove(&branch_id);
+        self.field_indexes.write().set_aside_branch(branch_id);
         self.retired_branches.lock().push(branch_id);
     }
 
-    /// Remove the chain heads of every branch retired so far. Call only
-    /// once the deletion of those branches has been durably saved. Returns
-    /// the number of heads removed. The next `save` writes a `state.bin`
-    /// without them.
+    pub(crate) fn unretire_branch(&self, branch_id: BranchId) {
+        self.retired_branches.lock().retain(|id| *id != branch_id);
+        self.field_indexes.write().restore_branch(branch_id);
+    }
+
+    /// Release what is held for every branch retired so far: its cache
+    /// entries (values other branches still reference stay alive for them),
+    /// its field indexes, its counts and its chain heads. Call only once the
+    /// deletion of those branches has been durably saved. Returns the number
+    /// of heads removed. The next `save` writes a `state.bin` without them.
     pub fn purge_retired_branches(&self) -> usize {
         let retired: Vec<BranchId> = std::mem::take(&mut *self.retired_branches.lock());
         if retired.is_empty() {
             return 0;
         }
+        for branch_id in &retired {
+            let prefix = format!("{}:", branch_id.0);
+            self.cache.write().pop_prefix(&prefix);
+            self.items_cache.write().pop_prefix(&prefix);
+            self.tree_cache.write().pop_prefix(&prefix);
+            self.field_indexes.write().drop_branch(*branch_id);
+        }
         let mut index = self.index.write();
         // A batch counts outside the store's write lock (see
-        // `checked_item_count`), so a count it checked can be kept for the
-        // branch after `retire_branch` dropped the branch's counts. It goes
-        // with the heads, under the same lock as they do.
+        // `checked_item_count`), so a count is removed with the heads, under
+        // the same lock as they are.
         let mut counts = self.counts.write();
         retired
             .into_iter()
@@ -2488,11 +2501,8 @@ mod tests {
         assert_eq!(manager.reconstruction_count(), before, "the fork's count read nothing");
     }
 
-    /// A batch counts outside the store's write lock, so its count can be
-    /// kept for a branch after `retire_branch` dropped the branch's counts,
-    /// while the heads are still there. Purging the branch's heads drops it.
     #[test]
-    fn purging_a_retired_branch_drops_a_count_checked_after_it_was_retired() {
+    fn purging_a_retired_branch_drops_its_counts() {
         let (_dir, log, manager) = setup_test();
         manager
             .register_state(StateRegistration {
@@ -2509,15 +2519,9 @@ mod tests {
         manager.record_update(TEST_BRANCH, "items", offset, &append).unwrap();
         assert!(manager.counts.read().contains_key(&TEST_BRANCH), "the write checked its count");
 
-        // Retiring drops the branch's counts at once, leaving its head
-        // unchecked, and the heads stay until the purge.
         manager.retire_branch(TEST_BRANCH);
-        assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "retire drops the counts");
+        assert!(manager.counts.read().contains_key(&TEST_BRANCH), "retiring releases nothing");
         assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 1);
-        assert!(
-            manager.counts.read().contains_key(&TEST_BRANCH),
-            "the count landed after the retire, beside the heads still held"
-        );
 
         assert_eq!(manager.purge_retired_branches(), 1);
         assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "it goes with the heads");

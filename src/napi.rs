@@ -1092,11 +1092,9 @@ impl JsStore {
     }
 
     /// Create a new branch, and checkpoint it before returning.
-    /// If the checkpoint fails, this throws but the branch stays in memory;
-    /// the next successful checkpoint publishes it and tells subscribers:
-    /// `sync()`, or the retry that every later mutation makes first. Calling
-    /// this again retries that checkpoint first and, once it succeeds, throws,
-    /// since the branch exists.
+    /// If the checkpoint fails, this throws and the store has no such branch:
+    /// the name is free, and the same call can run again once the cause is
+    /// mended. Subscribers hear of a branch only when the call returns it.
     ///
     /// With `from` omitted the parent is the current branch — on a view, the
     /// branch the view is pinned to.
@@ -1172,7 +1170,7 @@ impl JsStore {
 
     /// Create a new branch at a specific sequence point.
     /// This enables time-travel branching - the new branch will have state as of that sequence.
-    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
+    /// A failed checkpoint leaves no branch, as for `createBranch`.
     #[napi]
     pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -1190,7 +1188,7 @@ impl JsStore {
     }
 
     /// Create a new branch without copying state from parent.
-    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
+    /// A failed checkpoint leaves no branch, as for `createBranch`.
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -1209,10 +1207,9 @@ impl JsStore {
     }
 
     /// Switch to a branch, and checkpoint the switch before returning.
-    /// If the checkpoint fails, this throws but the switch stays in effect;
-    /// the next successful checkpoint publishes it: `sync()`, or the retry
-    /// that every later mutation makes first, so later writes go to the new
-    /// branch.
+    /// The store selects the branch once the checkpoint has saved it. If the
+    /// checkpoint fails, this throws and the branch that was current stays
+    /// current, so later writes go to it.
     ///
     ///
     /// Root handle only. A view is pinned to its branch for life and throws:
@@ -1275,11 +1272,8 @@ impl JsStore {
     }
 
     /// Delete a branch, and checkpoint the deletion before returning.
-    /// If the checkpoint fails, this throws but the branch stays deleted in
-    /// memory; the next successful checkpoint publishes the deletion and
-    /// tells subscribers: `sync()`, or the retry that every later mutation
-    /// makes first. Calling this again retries that checkpoint first and,
-    /// once it succeeds, throws, since the branch is gone.
+    /// If the checkpoint fails, this throws and the branch is still there,
+    /// with its state, and a view of it works as before.
     ///
     ///
     /// The main branch and the current branch cannot be deleted; nor can a
@@ -1304,11 +1298,8 @@ impl JsStore {
     // --- State Management ---
 
     /// Register a new state, and checkpoint it before returning. If the
-    /// checkpoint fails, this throws but the registration stays in memory;
-    /// the next successful checkpoint publishes it: `sync()`, or the retry
-    /// that every later mutation makes first. Calling this again retries that
-    /// checkpoint first and, once it succeeds, throws, since the state is
-    /// registered.
+    /// checkpoint fails, this throws and the state is not registered, so the
+    /// same call can run again once the cause is mended.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -1330,10 +1321,8 @@ impl JsStore {
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
-    /// Checkpoints before returning. If the checkpoint fails, this throws but
-    /// the new strategy stays in memory; the next successful checkpoint
-    /// publishes it: `sync()`, or the retry that every later mutation makes
-    /// first.
+    /// Checkpoints before returning. If the checkpoint fails, this throws and
+    /// the previous strategy is in force again.
     #[napi]
     pub fn update_state_strategy(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -2042,10 +2031,13 @@ impl JsStore {
     /// after an OS crash or power loss the store may open from an earlier
     /// checkpoint.
     /// State registration, strategy changes and branch changes checkpoint
-    /// before returning. After one of those checkpoints fails, further
-    /// mutations retry it before proceeding, and the change stays applied in
-    /// memory. A failed sync with no such change pending holds back no later
-    /// append or state update.
+    /// before returning. When one of those checkpoints fails, the call throws
+    /// and the store holds what it held before the call. The disk can still
+    /// hold part of the change until the next checkpoint, so each later
+    /// write of a record or a state, field-index registration or metadata
+    /// call saves the checkpoint again before it changes anything. A blob
+    /// write doesn't. A failed sync with no such change pending holds back
+    /// no later append or state update.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;

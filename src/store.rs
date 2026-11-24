@@ -120,13 +120,14 @@ const MANIFEST_HEADER_LEN: u64 = STORE_MAGIC.len() as u64 + 1;
 #[derive(Default)]
 struct WriteState {
     /// Metadata-only mutations cannot be replayed from records.log. If their
-    /// checkpoint failed, finish it before allowing another mutation to use
-    /// the in-memory definition. Reads may still inspect that tentative state.
+    /// checkpoint failed, the mutation is undone in memory, but the disk can
+    /// hold part of it, so the next write of a record or a state, field-index
+    /// registration or metadata mutation saves the checkpoint again before
+    /// it changes anything.
     checkpoint_required: bool,
 
-    /// A branch creation or deletion that no checkpoint has persisted yet.
-    /// Subscribers hear of it once one does, as its caller does. At most one
-    /// is ever pending, since a mutation first finishes a failed checkpoint.
+    /// The branch creation or deletion whose own checkpoint is running.
+    /// Subscribers hear of it once that checkpoint succeeds.
     pending_branch_event: Option<BranchEvent>,
 
     /// The format features the MANIFEST on disk names (0 for a version 1
@@ -191,6 +192,9 @@ pub struct Store {
     /// state's entry outlives its failure, keeping the sequence for that
     /// check, until its branch is deleted or the store closes.
     snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotOutcome>>>,
+
+    #[cfg(test)]
+    test_hooks: Mutex<std::collections::HashMap<&'static str, Box<dyn FnOnce(&Store) + Send>>>,
 }
 
 /// The snapshot outcome a [`Store`] has taken in last for one state on one
@@ -422,6 +426,8 @@ impl Store {
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery: None,
             snapshot_failures: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -657,6 +663,8 @@ impl Store {
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery,
             snapshot_failures: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1024,17 +1032,18 @@ impl Store {
 
     /// Register a new state and persist its strategy before returning.
     /// The log cannot reconstruct a lost registration after a crash.
-    /// If the checkpoint fails, the error is returned but the registration
-    /// stays in memory, and the next successful checkpoint publishes it:
-    /// `sync()`, or the retry that every later mutation makes first. Calling
-    /// this again retries that checkpoint first and, once it succeeds, returns
-    /// `StateExists`, since the registration was kept.
+    /// If the checkpoint fails, the error is returned and the store holds no
+    /// registration, so the same call can run again once the cause is
+    /// mended. See [`Store::sync`] for what the disk can hold until the next
+    /// successful checkpoint.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
+        let id = registration.id.clone();
         self.state.register_state(registration)?;
         write.checkpoint_required = true;
         self.sync_locked(&mut write)
+            .inspect_err(|_| self.state.restore_strategy(&id, None))
     }
 
     /// Update the strategy parameters of an already-registered state (same
@@ -1042,9 +1051,7 @@ impl Store {
     /// re-registration retune snapshot cadence on existing stores instead of
     /// being permanently pinned to the values from first registration.
     /// Checkpoints before returning. If the checkpoint fails, the error is
-    /// returned but the new strategy stays in memory, and the next successful
-    /// checkpoint publishes it: `sync()`, or the retry that every later
-    /// mutation makes first.
+    /// returned and the previous strategy is in force again.
     pub fn update_state_strategy(
         &self,
         state_id: &str,
@@ -1052,9 +1059,11 @@ impl Store {
     ) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
+        let previous = self.state.get_strategy(state_id);
         self.state.update_state_strategy(state_id, strategy)?;
         write.checkpoint_required = true;
         self.sync_locked(&mut write)
+            .inspect_err(|_| self.state.restore_strategy(state_id, previous))
     }
 
     /// Update a state and record it.
@@ -2931,11 +2940,13 @@ impl Store {
     // --- Branch Operations ---
 
     /// Create a new branch from the current branch head and checkpoint it.
-    /// If the checkpoint fails, the error is returned but the branch stays in
-    /// memory, and the next successful checkpoint publishes it and tells
-    /// subscribers: `sync()`, or the retry that every later mutation makes
-    /// first. Calling this again retries that checkpoint first and, once it
-    /// succeeds, returns `BranchExists`.
+    /// Subscribers hear of the branch when this returns it.
+    ///
+    /// If the checkpoint fails, the error is returned and the store holds no
+    /// such branch: its name is free, and the same call can run again once
+    /// the cause is mended. The failed call's branch ID is not given again
+    /// by this store. See [`Store::sync`] for what the disk can hold until
+    /// the next successful checkpoint.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         self.create_branch_inheriting(name, from, None)
     }
@@ -2994,14 +3005,15 @@ impl Store {
             branch: new_branch.clone(),
             parent: Some(parent_name),
         });
-        self.sync_locked(&mut write)?;
+        self.sync_locked(&mut write)
+            .inspect_err(|_| self.undo_create(&mut write, new_branch.id))?;
 
         Ok(new_branch)
     }
 
     /// Create and checkpoint a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
-    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
+    /// A failed checkpoint leaves no branch, as for `create_branch`.
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -3018,7 +3030,8 @@ impl Store {
             branch: new_branch.clone(),
             parent: parent_name,
         });
-        self.sync_locked(&mut write)?;
+        self.sync_locked(&mut write)
+            .inspect_err(|_| self.undo_create(&mut write, new_branch.id))?;
 
         // Don't copy state - let the caller populate state manually
         Ok(new_branch)
@@ -3036,7 +3049,7 @@ impl Store {
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
     ///
-    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
+    /// A failed checkpoint leaves no branch, as for `create_branch`.
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
         self.create_branch_at_inheriting(name, from, at, None)
     }
@@ -3149,23 +3162,33 @@ impl Store {
             branch: new_branch.clone(),
             parent: Some(from.to_string()),
         });
-        self.sync_locked(&mut write)?;
+        self.sync_locked(&mut write)
+            .inspect_err(|_| self.undo_create(&mut write, new_branch.id))?;
 
         Ok(new_branch)
     }
 
+    fn undo_create(&self, write: &mut WriteState, branch: BranchId) {
+        self.branches.remove(branch);
+        self.state.retire_branch(branch);
+        write.pending_branch_event = None;
+    }
+
     /// Switch to a different branch and checkpoint the current-branch pointer.
-    /// If the checkpoint fails, the error is returned but the switch stays in
-    /// effect, and the next successful checkpoint publishes it: `sync()`, or
-    /// the retry that every later mutation makes first, so later writes go
-    /// to the new branch.
+    /// The checkpoint saves the target as the current branch, and the store
+    /// selects it once that checkpoint has succeeded, so no call sees a
+    /// selection that wasn't saved. If the checkpoint fails, the error is
+    /// returned and the branch that was current stays current.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
-        let branch = self.branches.switch_branch(name)?;
+        let branch = self
+            .branches
+            .get_branch(name)
+            .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
         write.checkpoint_required = true;
-        self.sync_locked(&mut write)?;
-        Ok(branch)
+        self.sync_locked_selecting(&mut write, branch.id)?;
+        self.branches.switch_branch(name)
     }
 
     /// Get the current branch.
@@ -3181,38 +3204,43 @@ impl Store {
     /// Delete a branch and checkpoint the deletion.
     ///
     /// Besides removing the branch, this releases what the store held for
-    /// it: its cached state values and field indexes immediately, and its
-    /// chain heads once the deletion has been saved (this call's checkpoint,
-    /// or the next `sync`), so neither memory nor `state.bin` keeps growing
-    /// with branches that no longer exist. Records the branch wrote stay in
-    /// the append-only log.
+    /// it once this call's checkpoint has saved the deletion: its cached
+    /// state values, field indexes and chain heads, so neither memory nor
+    /// `state.bin` keeps growing with branches that no longer exist. The
+    /// checkpoint writes no field index of the branch, and its heads leave
+    /// `state.bin` at the next `sync`. Records the branch wrote stay in the
+    /// append-only log.
     ///
-    /// If the checkpoint fails, the error is returned but the branch stays
-    /// deleted in memory, and the next successful checkpoint publishes the
-    /// deletion and tells subscribers: `sync()`, or the retry that every
-    /// later mutation makes first. Calling this again retries that checkpoint
-    /// first and, once it succeeds, returns `BranchNotFound`.
+    /// If the checkpoint fails, the error is returned and the branch is
+    /// still there, with what the store held for it. See [`Store::sync`] for
+    /// what the disk can hold until the next successful checkpoint.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         // Serialized with writes, so a write that has already resolved this
         // branch finishes before the branch disappears under it.
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
 
-        let branch_id = self.branches.get_branch(name).map(|b| b.id);
+        let branch = self
+            .branches
+            .get_branch(name)
+            .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
         self.branches.delete_branch(name)?;
-        if let Some(branch_id) = branch_id {
-            self.state.retire_branch(branch_id);
-            // A snapshot outcome that comes in after this, from a write that
-            // finished on the branch before it went, is kept until close;
-            // `snapshot_failures` doesn't list it.
-            self.snapshot_failures.lock().remove(&branch_id);
-        }
+        self.state.retire_branch(branch.id);
 
         write.checkpoint_required = true;
         write.pending_branch_event = Some(BranchEvent::Deleted {
             name: name.to_string(),
         });
-        self.sync_locked(&mut write)?;
+        if let Err(error) = self.sync_locked(&mut write) {
+            self.state.unretire_branch(branch.id);
+            self.branches.restore(branch);
+            write.pending_branch_event = None;
+            return Err(error);
+        }
+        // A snapshot outcome that comes in after this, from a write that
+        // finished on the branch before it went, is kept until close;
+        // `snapshot_failures` doesn't list it.
+        self.snapshot_failures.lock().remove(&branch.id);
 
         Ok(())
     }
@@ -3261,12 +3289,18 @@ impl Store {
     ///
     /// State registration, strategy changes, and branch creation, deletion
     /// and switching checkpoint before returning, because the record log
-    /// cannot reconstruct them. If that checkpoint fails, the change stays in
-    /// memory, and every later mutation retries the checkpoint before
-    /// proceeding, so a successful write cannot depend on an unpersisted
-    /// registration or branch. This method retries it too; metadata is not
-    /// rolled back. A failed sync with no such change pending holds back no
-    /// later append or state update.
+    /// cannot reconstruct them. If that checkpoint fails, the call throws and
+    /// the store holds what it held before the call, so the same call can run
+    /// again once the cause is mended. The disk can still hold part of the
+    /// change: `state.bin` is saved before `branches.bin`, and a save can put
+    /// its new file in place and then fail. So each later write of a record
+    /// or a state, field-index registration or metadata call saves the
+    /// checkpoint again before it changes anything, and this method does
+    /// too. A blob write doesn't. A process that stops before that save
+    /// opens the store as the disk has it, which can include a registration,
+    /// a strategy, a branch's selection or deletion, or a branch with its
+    /// state, from a call that threw. A failed sync with no such change
+    /// pending holds back no later append or state update.
     ///
     /// On Unix a save also syncs the containing directory, where the system
     /// can. Where this process can't open that directory to sync it, the
@@ -3323,13 +3357,26 @@ impl Store {
 
     /// Call only while holding write_lock, so a state head cannot reach disk
     /// ahead of its log record and branch/state checkpoints cannot interleave.
-    /// A branch change waiting on a checkpoint is announced once one succeeds.
     fn sync_locked(&self, write: &mut WriteState) -> Result<()> {
+        self.sync_locked_selecting(write, self.branches.current_id())
+    }
+
+    #[cfg(test)]
+    fn run_test_hook(&self, point: &'static str) {
+        let hook = self.test_hooks.lock().remove(point);
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    fn sync_locked_selecting(&self, write: &mut WriteState, current: BranchId) -> Result<()> {
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
-        self.branches.save()?;
+        #[cfg(test)]
+        self.run_test_hook("checkpoint: branch list");
+        self.branches.save_selecting(current)?;
         // Deleted branches are now gone from branches.bin, so their chain
         // heads can go too (see `StateManager::retire_branch` for why not
         // before). They drop out of state.bin at the next sync.
@@ -3803,8 +3850,8 @@ impl Drop for Store {
                 %error,
                 path = %self.config.path.display(),
                 "final sync on drop failed: the next open replays state updates from the log \
-                 past the last checkpoint, and may lose any registration or branch change \
-                 whose checkpoint failed"
+                 past the last checkpoint, and finds the registrations and branches that the \
+                 last saves left on disk, which can hold part of a change whose call failed"
             );
         }
     }
@@ -5519,7 +5566,7 @@ mod tests {
         // state.bin with the heads still in it, then branches.bin without the
         // branch, and only then let the heads go...
         assert_eq!(store.state.head_count(), baseline_heads);
-        // ...the field indexes (derived data) were dropped at once, so the
+        // ...the field indexes (derived data) were set aside at once, so the
         // same checkpoint already wrote a file without them...
         assert_eq!(fs::metadata(&indexes_bin).unwrap().len(), baseline_indexes);
         // ...and state.bin, which the last deletion's checkpoint wrote with
@@ -5872,5 +5919,105 @@ mod tests {
         }
         // Exit without destructors, as a crash would.
         std::process::exit(73);
+    }
+
+    fn obstruct(path: &std::path::Path) -> Option<Vec<u8>> {
+        let previous = std::fs::read(path).ok();
+        if previous.is_some() {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::create_dir(path).unwrap();
+        previous
+    }
+
+    fn repair(path: &std::path::Path, previous: Option<Vec<u8>>) {
+        std::fs::remove_dir(path).unwrap();
+        if let Some(bytes) = previous {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    fn branch_names(store: &Store) -> Vec<String> {
+        let mut names: Vec<String> = store.list_branches().into_iter().map(|b| b.name).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn no_call_sees_a_switch_target_before_its_save_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.create_branch("target", None).unwrap();
+        let branches = store.path().join("branches.bin");
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let watch = |store: &Store| {
+            let seen = std::sync::Arc::clone(&seen);
+            store.test_hooks.lock().insert(
+                "checkpoint: branch list",
+                Box::new(move |store: &Store| seen.lock().push(store.current_branch().name)),
+            );
+        };
+
+        watch(&store);
+        let previous = obstruct(&branches);
+        assert!(matches!(store.switch_branch("target"), Err(StoreError::Io(_))));
+        repair(&branches, previous);
+        assert_eq!(store.current_branch().name, "main");
+        let record = store.append(RecordInput::raw("event", b"after".to_vec())).unwrap();
+        assert_eq!(store.get_branch("main").unwrap().id, record.branch);
+
+        watch(&store);
+        store.switch_branch("target").unwrap();
+        assert_eq!(store.current_branch().name, "target");
+        assert_eq!(*seen.lock(), ["main", "main"]);
+    }
+
+    #[test]
+    fn a_create_whose_log_fsync_fails_leaves_no_branch() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+        *store.log.fsync_failures.lock() = 1;
+        assert!(matches!(
+            store.create_branch("child", None),
+            Err(StoreError::DurabilityLost(_))
+        ));
+        assert_eq!(branch_names(&store), ["main"]);
+    }
+
+    #[test]
+    fn a_strategy_change_whose_checkpoint_fails_leaves_the_old_strategy_in_force() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        let old = crate::types::StateStrategy::AppendLog {
+            delta_snapshot_every: 100,
+            full_snapshot_every: 100,
+        };
+        let changed = crate::types::StateStrategy::AppendLog {
+            delta_snapshot_every: 7,
+            full_snapshot_every: 9,
+        };
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: old.clone(),
+                initial_value: None,
+            })
+            .unwrap();
+        let strategy = || format!("{:?}", store.state.get_strategy("items").unwrap());
+        for file in ["state.bin", "branches.bin"] {
+            let path = store.path().join(file);
+            let previous = obstruct(&path);
+            assert!(
+                matches!(store.update_state_strategy("items", changed.clone()), Err(StoreError::Io(_))),
+                "{file}"
+            );
+            assert_eq!(strategy(), format!("{old:?}"), "{file}");
+            repair(&path, previous);
+            store.sync().unwrap();
+            assert_eq!(strategy(), format!("{old:?}"), "{file}");
+        }
+        store.update_state_strategy("items", changed.clone()).unwrap();
+        assert_eq!(strategy(), format!("{changed:?}"));
     }
 }

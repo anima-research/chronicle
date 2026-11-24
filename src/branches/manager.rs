@@ -437,6 +437,19 @@ impl BranchManager {
         Ok(())
     }
 
+    pub(crate) fn remove(&self, id: BranchId) {
+        let mut index = self.index.write();
+        if let Some(branch) = index.branches.remove(&id) {
+            index.name_to_id.remove(&branch.name);
+        }
+    }
+
+    pub(crate) fn restore(&self, branch: Branch) {
+        let mut index = self.index.write();
+        index.name_to_id.insert(branch.name.clone(), branch.id);
+        index.branches.insert(branch.id, branch);
+    }
+
     /// Get branch ancestry (from child to root).
     pub fn get_ancestry(&self, name: &str) -> Result<Vec<Branch>> {
         let index = self.index.read();
@@ -725,7 +738,10 @@ impl BranchManager {
     /// checkpoint relies on the caller holding `Store::write_lock`, as
     /// `Store` does for this and for every mutation of either.
     pub fn save(&self) -> Result<()> {
-        let current_id = *self.current.read();
+        self.save_selecting(*self.current.read())
+    }
+
+    pub(crate) fn save_selecting(&self, current_id: BranchId) -> Result<()> {
         let index = self.index.read();
         let encoded = rmp_serde::to_vec(&*index)
             .map_err(|e| StoreError::Serialization(e.to_string()))?;
