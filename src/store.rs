@@ -1351,7 +1351,7 @@ impl Store {
                     .into(),
             ));
         }
-        // A head this session hasn't checked has its items counted here,
+        // A head the store hasn't checked has its items counted here,
         // before the write lock, as the count reads the state's whole value
         // and every other writer of the store would wait on the lock while
         // it did. The count is kept only if the head is where it was when
@@ -1913,7 +1913,8 @@ impl Store {
     /// or whose framing is bad) is returned, and nothing changes. The count
     /// is taken once without the store's write lock, and once more under it
     /// if a write moved the state's head meanwhile, so that writers wait for
-    /// that second count.
+    /// that second count. A branch deleted during the count gives
+    /// `BranchNotFound`, as one deleted before it does.
     ///
     /// For a state of any other strategy, and one with no registration, it
     /// is the count the head stores, which reads nothing: for a Tree state an
@@ -1929,13 +1930,16 @@ impl Store {
                     }
                     count => count,
                 };
-                Ok(match count {
-                    ItemCount::NoHead => None,
-                    ItemCount::Counted(count) => Some(count),
+                match count {
+                    ItemCount::NoHead => {
+                        self.branch_by_id(branch_id)?;
+                        Ok(None)
+                    }
+                    ItemCount::Counted(count) => Ok(Some(count)),
                     ItemCount::Moved => {
                         unreachable!("a write moved the head while the length read held the write lock")
                     }
-                })
+                }
             }
             _ => Ok(self.state.get_head(branch_id, state_id).map(|head| head.item_count)),
         }
@@ -4675,6 +4679,21 @@ mod tests {
         assert_eq!(store.get_state_len("s").unwrap(), Some(4), "the count of the head that the write moved");
         assert_eq!(*recount_held_the_lock.lock(), Some(true), "the second count held the write lock");
         assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn a_length_read_of_a_branch_deleted_during_its_count_finds_no_branch() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(reopened_unchecked(&dir, 3));
+        let child = store.create_branch("child", None).unwrap().id;
+        let deleter = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            deleter.delete_branch("child").unwrap();
+        });
+        match store.get_state_len_on(child, "s") {
+            Err(StoreError::BranchNotFound(_)) => {}
+            other => panic!("a length read of a branch deleted during its count: expected BranchNotFound, got {other:?}"),
+        }
     }
 
     /// The snapshot outcomes of writes are noted after the write lock is

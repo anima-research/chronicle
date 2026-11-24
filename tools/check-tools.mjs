@@ -891,6 +891,23 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       console.log('ok: compact-set-states.py reads a state.bin that holds the checks of the counts, and writes the new one without them');
     },
 
+    'a stale count that the store has not checked': () => {
+      const { path } = branchedStore('stale-count');
+      withHeads(path, "if key[1] == 'messages': head[6] = 0");
+      const twice = join(scratch, 'stale-count-twice');
+      cpSync(path, twice, { recursive: true });
+      const first = digest(twice, 'a store with a stale count, the first time');
+      assert.equal(digest(twice, 'a store with a stale count, the second time'), first,
+        'state-digests.mjs should read a store with a stale count the same twice');
+      const lists = first.split('\n').filter((line) => line.includes('\tmessages\tappend_log '));
+      assert.ok(lists.length > 0, `the digest should read messages:\n${first}`);
+      for (const line of lists) {
+        assert.match(line, /items=(\d+)\tcount=\1 /, 'the digest should give the count that the length read checked');
+      }
+      applies(path, 'a store whose list has a stale count that the store has not checked');
+      console.log('ok: state-digests.mjs reads a store with a stale count the same twice, and gives the checked count');
+    },
+
     'the refusals': () => {
       const { path: base } = branchedStore('refusals');
       const copyOf = (name) => {

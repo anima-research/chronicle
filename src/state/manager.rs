@@ -776,7 +776,7 @@ impl StateManager {
             }
         }
 
-        // Carry what this session knows of the count to the new head: one
+        // Carry what the store knows of the count to the new head: one
         // the operation set from the value it holds is exact, an operation
         // that adds, edits or removes items keeps the check as it was, and
         // any other leaves the new head unchecked.
@@ -987,7 +987,7 @@ impl StateManager {
             .filter(|check| check.at == head_offset)
     }
 
-    /// The head of `state_id` on `branch_id` and this session's check of its
+    /// The head of `state_id` on `branch_id` and the store's check of its
     /// count, read under one hold of the index. Every write that sets a
     /// head's count and its check does both under the index's write lock,
     /// so the pair is one moment's: read apart, a count landing between the
@@ -1358,8 +1358,8 @@ impl StateManager {
     /// state on every single append (2026-08-01 Mythos: each materialization
     /// re-parsed a 114 MB snapshot chain — 10-30s CPU stalls at every turn
     /// boundary). When the head record is an `Append` (or an `AppendMany`,
-    /// whose last item is the state's last, where this session has checked
-    /// the head's count: see `checked_item_count`) and the caller asks for
+    /// whose last item is the state's last, where the store has checked the
+    /// head's count: see `checked_item_count`) and the caller asks for
     /// the final index, the item is served from the head record alone:
     /// O(one record read) regardless of state size, no cache churn.
     ///
@@ -1421,19 +1421,19 @@ impl StateManager {
     /// in `ordinals`, in the order given, what `get_state_item` returns for
     /// it, `None` where it is out of range, the state has no value on this
     /// branch, or its value isn't an array, except at the last index of a
-    /// head whose count this session hasn't found exact (unchecked, or
-    /// checked on a value that doesn't materialize), where `get_state_item`
+    /// head whose count the store hasn't found exact (unchecked, or checked
+    /// on a value that doesn't materialize), where `get_state_item`
     /// answers from the stored count and this from the value. Ordinals may
     /// repeat and come in any order.
     ///
     /// Every answer comes from one version of the state, and the version is
     /// read once: from the warm item cache when it is current; from the head
     /// record alone when every ordinal asked for is the last one, as
-    /// `get_state_item`'s fast path serves it, and this session has checked
-    /// the head's count (see `checked_item_count`); and otherwise from one
+    /// `get_state_item`'s fast path serves it, and the store has checked the
+    /// head's count (see `checked_item_count`); and otherwise from one
     /// materialization, cached for later reads. So a batch of ordinals costs
     /// at most one materialization, not one per ordinal; at the last index of
-    /// a head whose count this session hasn't found exact, that is a
+    /// a head whose count the store hasn't found exact, that is a
     /// materialization where `get_state_item` reads only the head record. An
     /// empty request reads nothing. An ordinal past the end costs what it
     /// costs `get_state_item`: on a cold cache, the materialization that
@@ -1471,7 +1471,7 @@ impl StateManager {
         self.run_test_hook("item lookup: cache missed");
 
         // Only the last item asked for: the head record may hold it, as for
-        // `get_state_item`, where this session has found the head's count
+        // `get_state_item`, where the store has found the head's count
         // exact, so that the last item is the one the count makes last. The
         // check was read with the head, so it vouches for this head's count.
         if let Some(last) = head.item_count.checked_sub(1).filter(|_| exact) {

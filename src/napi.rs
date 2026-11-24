@@ -1665,7 +1665,8 @@ impl JsStore {
     /// bytes aren't one JSON value (no bytes at all read as an empty list),
     /// except the last item served from the head record alone, which reads
     /// no earlier item: an `appendToState`'s, or a batch's last item where
-    /// this session found the head's count exact.
+    /// the store found the head's count exact, in this session or in one
+    /// that saved its check before this open.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1694,8 +1695,9 @@ impl JsStore {
     /// given: what `getStateItemJson` returns for that index, so `null` if it
     /// is negative or out of range, the state doesn't exist, or the state's
     /// value isn't an array, except at the last index of a head whose count
-    /// this session hasn't found exact (unchecked, or checked on a value that
-    /// doesn't materialize), where `getStateItemJson` answers from the stored
+    /// the store hasn't found exact, in this session or in one that saved its
+    /// check before this open (unchecked, or checked on a value that doesn't
+    /// materialize), where `getStateItemJson` answers from the stored
     /// count and this from the value. Throws, as `getStateItemJson` does, if
     /// the state's bytes aren't one JSON value (no bytes at all read as an
     /// empty list), except the last item served from the head record alone,

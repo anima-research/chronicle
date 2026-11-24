@@ -14,9 +14,13 @@
   and `close()`. A list that the store counted before a sync isn't read for
   its count again after an open. A later write, such as a `DeltaSnapshot`
   written from Rust, can leave the head unchecked, and the list is then read
-  again. Earlier releases read only the index in `state.bin`, so they can open
-  a store that this release wrote. This release opens a store that has no
-  checks, and counts each of its lists at first use.
+  again. After an open, a saved check also lets `getStateItemsJson` read a
+  list's last item from its record alone. So does `getStateItemJson` after a
+  batch. Before, they did so only once a session had checked the count. That
+  read meets no earlier item, so an earlier item that isn't JSON no longer
+  makes it throw. Earlier releases read only the index in `state.bin`, so they
+  can open a store that this release wrote. This release opens a store that
+  has no checks, and counts each of its lists at first use.
 - `tools/compact-set-states.py` reads a `state.bin` that holds the checks, and
   writes the new one without them. An earlier copy of the tool refuses such a
   `state.bin` and changes nothing. It says that `state.bin` "is not the length
