@@ -2502,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn purging_a_retired_branch_drops_its_counts() {
+    fn purging_a_retired_branch_drops_a_count_checked_after_it_was_retired() {
         let (_dir, log, manager) = setup_test();
         manager
             .register_state(StateRegistration {
@@ -2521,7 +2521,12 @@ mod tests {
 
         manager.retire_branch(TEST_BRANCH);
         assert!(manager.counts.read().contains_key(&TEST_BRANCH), "retiring releases nothing");
+        manager.counts.write().remove(&TEST_BRANCH);
         assert_eq!(manager.checked_item_count(TEST_BRANCH, "items").unwrap(), 1);
+        assert!(
+            manager.counts.read().contains_key(&TEST_BRANCH),
+            "the count landed after the retire, beside the heads still held"
+        );
 
         assert_eq!(manager.purge_retired_branches(), 1);
         assert!(!manager.counts.read().contains_key(&TEST_BRANCH), "it goes with the heads");

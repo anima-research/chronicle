@@ -738,7 +738,8 @@ impl BranchManager {
     /// checkpoint relies on the caller holding `Store::write_lock`, as
     /// `Store` does for this and for every mutation of either.
     pub fn save(&self) -> Result<()> {
-        self.save_selecting(*self.current.read())
+        let current_id = *self.current.read();
+        self.save_selecting(current_id)
     }
 
     pub(crate) fn save_selecting(&self, current_id: BranchId) -> Result<()> {
