@@ -338,3 +338,62 @@ fn historical_fork_at_a_sequence_the_parent_inherited() {
         store.switch_branch("mid").unwrap();
     }
 }
+
+#[test]
+fn a_prefix_that_ends_inside_a_path_component_selects_by_plain_string() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(&dir)).unwrap();
+    seed(&store);
+    let on_parent: Vec<_> = ALL.iter().map(|id| observe(&store, id)).collect();
+    let selected = [
+        "agent/a/messages",
+        "agent/a/notes",
+        "agent/ab/messages",
+        "agent/a/config",
+        "agent/a/files",
+    ];
+
+    let selection = StateSelection { state_ids: vec![], state_prefixes: vec!["agent/a".into()] };
+    store.create_branch_with_states("child", None, &selection).unwrap();
+    store.switch_branch("child").unwrap();
+    for (i, id) in ALL.iter().enumerate() {
+        let got = observe(&store, id);
+        if selected.contains(id) {
+            assert_eq!(got, on_parent[i], "{id}: selected by the prefix");
+            assert!(got.0.is_some(), "{id}: test must select a state that has a value");
+        } else {
+            assert_eq!(got.0, None, "{id}: not selected");
+        }
+    }
+}
+
+#[test]
+fn an_exact_id_and_a_literal_prefix_select_no_id_that_only_extends_or_pattern_matches_them() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(config(&dir)).unwrap();
+    seed(&store);
+    let lookalikes = ["shared/log/archive", "agentXa/messages"];
+    for id in lookalikes {
+        store
+            .register_state(StateRegistration {
+                id: id.to_string(),
+                strategy: StateStrategy::AppendLog { delta_snapshot_every: 4, full_snapshot_every: 3 },
+                initial_value: None,
+            })
+            .unwrap();
+        append(&store, id, json!({ "state": id }));
+    }
+    let at = store.current_branch().head;
+    append(&store, "shared/log", json!("after the cut"));
+
+    let selection = StateSelection {
+        state_ids: vec!["shared/log".into()],
+        state_prefixes: vec!["agent.a".into(), "agent/a*".into()],
+    };
+    store.create_branch_at_with_states("past", "main", at, &selection).unwrap();
+    store.switch_branch("past").unwrap();
+    assert_eq!(store.get_state_len("shared/log").unwrap(), Some(7 + 4 * 6));
+    for id in lookalikes.iter().chain(["agent/a/messages", "agent/ab/messages"].iter()) {
+        assert_eq!(store.get_state(id).unwrap(), None, "{id}: not selected");
+    }
+}

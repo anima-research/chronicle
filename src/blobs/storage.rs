@@ -1165,6 +1165,7 @@ mod tests {
         );
         assert_eq!(staged(&dir.path().join("blobs")), 0);
         assert!(!storage.known.lock().contains_key(&hash));
+        assert_eq!(storage.get(&hash).unwrap().unwrap().content, b"in place");
         assert_eq!(
             reopened(&dir).get(&hash).unwrap().unwrap().content,
             b"in place"
@@ -1178,6 +1179,12 @@ mod tests {
         assert!(storage.known.lock().contains_key(&hash));
         assert_eq!(storage.store(b"in place", "text/plain").unwrap(), hash);
         assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+
+        assert!(storage.delete(&hash).unwrap());
+        assert!(storage.get(&hash).unwrap().is_none());
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        storage.store(b"in place", "text/plain").unwrap_err();
+        assert_eq!(storage.get(&hash).unwrap().unwrap().content, b"in place");
     }
 
     // Stores of one content racing from several storages each stage their
@@ -1610,6 +1617,30 @@ mod tests {
                 "chunked: {chunked}"
             );
         }
+
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let hash = storage.store(&content, "application/json").unwrap();
+        let file = storage.blob_path(&hash);
+        let len = fs::metadata(&file).unwrap().len() as usize;
+        fs::write(&file, vec![0; len]).unwrap();
+        assert!(reopened(&dir).get(&hash).is_err());
+
+        let retry = storage.store(&content, "application/json").map(drop);
+        let readback = |reader: &BlobStorage| {
+            reader.get(&hash).map(|blob| blob.map(|b| b.content)).map_err(|_| ())
+        };
+        let immediate = readback(&storage);
+        assert_eq!(
+            immediate,
+            readback(&reopened(&dir)),
+            "after a retry that gave {retry:?}"
+        );
+        if immediate.is_err() {
+            storage.store(&content, "application/json").unwrap();
+        }
+        assert_eq!(readback(&storage), Ok(Some(content.clone())));
+        assert_eq!(readback(&reopened(&dir)), Ok(Some(content)));
     }
 
     #[test]

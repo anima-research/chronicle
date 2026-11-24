@@ -4168,6 +4168,84 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_store_answers_a_length_without_reading_a_record() {
+        use crate::records::RECORD_DECODES;
+        let decodes = || RECORD_DECODES.with(|decodes| decodes.get());
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 64);
+        let rebuilds = store.state_reconstruction_count();
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        let len = store.get_state_len("s").unwrap();
+        assert_eq!(
+            (len, decodes(), store.state_reconstruction_count()),
+            (Some(64), 0, rebuilds)
+        );
+
+        assert!(store.get_state("s").unwrap().is_some());
+        assert!(
+            decodes() > 0 && store.state_reconstruction_count() > rebuilds,
+            "the counters see a read of the chain"
+        );
+    }
+
+    #[test]
+    fn registering_a_fresh_field_index_again_reads_no_record() {
+        use crate::records::RECORD_DECODES;
+        use crate::state::FieldIndexKind;
+        let decodes = || RECORD_DECODES.with(|decodes| decodes.get());
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let store = Store::create(config.clone()).unwrap();
+            store.set_auto_snapshot(false);
+            store
+                .register_state(StateRegistration {
+                    id: "messages".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for i in 0..64 {
+                let item = serde_json::to_vec(&json!({ "v": i, "w": i })).unwrap();
+                store
+                    .update_state("messages", StateOperation::Append(item))
+                    .unwrap();
+            }
+            store
+                .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+                .unwrap();
+            store.clear_state_caches();
+            let rebuilds = store.state_reconstruction_count();
+            RECORD_DECODES.with(|decodes| decodes.set(0));
+            store
+                .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+                .unwrap();
+            assert_eq!((decodes(), store.state_reconstruction_count()), (0, rebuilds));
+            store.sync().unwrap();
+        }
+
+        let store = reopen(config);
+        let rebuilds = store.state_reconstruction_count();
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+        assert_eq!((decodes(), store.state_reconstruction_count()), (0, rebuilds));
+        assert_eq!(
+            store.query_state_index_range("messages", "/v", Some(7.0), Some(9.0), None, None, false),
+            Some(vec![7, 8, 9])
+        );
+
+        store
+            .register_state_field_index("messages", "/w", FieldIndexKind::Number)
+            .unwrap();
+        assert!(decodes() > 0, "the counter sees an index built from the slot");
+    }
+
+    #[test]
     fn test_store_blob() {
         let dir = TempDir::new().unwrap();
         let store = Store::create(test_config(&dir)).unwrap();
@@ -5690,6 +5768,10 @@ mod tests {
         let items: Vec<u64> =
             serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
         assert_eq!(items, (0..150).collect::<Vec<u64>>());
+        assert!(matches!(
+            store.register_state(registration("items")),
+            Err(StoreError::StateExists(_))
+        ));
         store.register_state(registration("other")).unwrap();
         store.sync().unwrap();
     }

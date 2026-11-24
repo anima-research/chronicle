@@ -33,6 +33,22 @@ const phaseHolds = () => {
   assert.deepEqual(found, []);
 };
 
+const scenario = (name, run) => {
+  const open = () => JsStore.openOrCreate({ path: path.join(dir, name) });
+  let store = open();
+  const reopen = () => {
+    store.close();
+    store = open();
+    return store;
+  };
+  try {
+    run(store, reopen);
+  } finally {
+    store.close();
+  }
+  ok(name);
+};
+
 try {
   let store = JsStore.openOrCreate({ path: storePath });
   store.registerState({ id: 'snap', strategy: 'snapshot' });
@@ -190,7 +206,138 @@ try {
   store.close();
   ok('after compaction, and a reopen after it, the order holds');
 
-  console.log('\n✅ Key order tests passed!');
+  scenario('JS snapshot replacement preserves caller-owned keys and normalized JSON values', (store) => {
+    const slot = 'checkpoints';
+    store.registerState({ id: slot, strategy: 'snapshot' });
+    const first = { kept: 'root', deleted: 'old', path: ['a', 'b', 'c'] };
+    store.setStateJson(slot, first);
+    assert.deepEqual(store.getStateJson(slot), first);
+
+    const patch = [{ op: 'replace', path: '/title', value: 'new' }];
+    const pin = { id: 'p1', firstMessageId: 'a', lastMessageId: 'b', kind: 'pin' };
+    const limits = { high: Number.MAX_VALUE, low: -Number.MAX_VALUE, tiny: Number.MIN_VALUE, overflow: null };
+    const expected = {
+      kept: 'root', path: ['b', 'a'], destinations: { constructor: 'channel-c' },
+      checkpoint: { patch }, pins: [pin], limits, summary: 'before\ufffdafter',
+    };
+    store.setStateJson(slot, { ...expected, checkpoint: { data: undefined, patch }, summary: 'before\ud800after' });
+    const actual = store.getStateJson(slot);
+    assert.deepEqual([Object.hasOwn(actual.destinations, 'constructor'), actual.destinations.constructor], [true, 'channel-c']);
+    assert.deepEqual([Object.hasOwn(actual.checkpoint, 'data'), actual.checkpoint.patch,
+      Object.hasOwn(actual.pins[0], 'name'), actual.pins], [false, patch, false, [pin]]);
+    assert.deepEqual(actual.limits, { high: Number.MAX_VALUE, low: -Number.MAX_VALUE, tiny: Number.MIN_VALUE, overflow: null });
+    assert.equal(actual.summary, 'before\ufffdafter');
+    assert.deepEqual(actual, expected);
+  });
+
+  scenario('A lone low surrogate half in summary text reads back as U+FFFD', (store, reopen) => {
+    const slot = 'checkpoints';
+    store.registerState({ id: slot, strategy: 'snapshot' });
+    store.setStateJson(slot, { summary: 'before\udc00after' });
+    assert.equal(store.getStateJson(slot).summary, 'before\ufffdafter');
+    assert.equal(reopen().getStateJson(slot).summary, 'before\ufffdafter');
+  });
+
+  scenario('A number that is not finite is refused at the call or never read back', (store, reopen) => {
+    const values = [Infinity, -Infinity, NaN].flatMap((bad) => [bad, { nested: { bad } }, [1, bad]]);
+    const finite = (value) => JSON.stringify(value, (_, v) => {
+      if (typeof v === 'number' && !Number.isFinite(v)) throw new Error(`a stored ${v}`);
+      return v;
+    });
+    const slots = values.map((value, i) => {
+      const slot = `value/${i}`;
+      store.registerState({ id: slot, strategy: 'snapshot' });
+      let refused = false;
+      try { store.setStateJson(slot, value); } catch { refused = true; }
+      if (!refused) finite(store.getStateJson(slot));
+      return slot;
+    });
+    const reopened = reopen();
+    for (const slot of slots) finite(reopened.getStateJson(slot));
+  });
+
+  scenario('Byte-written namespaced snapshots preserve caller-normalized JSON on the intended branches', (store, reopen) => {
+    const slot = 'agent/context/kvunified:presentation-receipt';
+    store.registerState({ id: slot, strategy: 'snapshot' });
+    store.createBranch('draft');
+    store.createBranch('revision');
+    store.switchBranch('draft');
+    const draft = store.view('draft');
+    store.switchBranch('revision');
+
+    const receiptBytes = (level) => Buffer.from(String.raw`{"entries":[[{"level":${level},"café\ufffd":"first","café\ufffd":"last\ufffd","literal":"\\ud800"}]]}`);
+    const receipt = (level) => ({ entries: [[{ level, 'café\ufffd': 'last\ufffd', literal: '\\ud800' }]] });
+    const revisionBytes = receiptBytes(2);
+    const draftBytes = receiptBytes(5);
+    const draftSeed = receiptBytes(1);
+    draft.setState(slot, draftSeed);
+    store.setState(slot, revisionBytes);
+    assert.deepEqual([store.getState(slot), draft.getState(slot)], [revisionBytes, draftSeed]);
+    draft.setState(slot, draftBytes);
+    assert.deepEqual([store.getState(slot), draft.getState(slot)], [revisionBytes, draftBytes]);
+    assert.deepEqual(store.getStateJson(slot), receipt(2));
+    store.switchBranch('draft');
+    assert.deepEqual([store.getStateJson(slot), store.view('revision').getStateJson(slot)], [receipt(5), receipt(2)]);
+    const cold = reopen();
+    assert.deepEqual([cold.view('draft').getStateJson(slot), cold.view('revision').getStateJson(slot)], [receipt(5), receipt(2)]);
+  });
+
+  scenario('Append, identity append and prepared byte edit agree on stored JSON normalization', (store, reopen) => {
+    const slot = 'messages';
+    store.registerState({ id: slot, strategy: 'append_log' });
+    store.appendToStateJson(slot, [{ zeta: [2, 1], alpha: 'one', optional: undefined }, 'last']);
+    const first = [{ zeta: [2, 1], alpha: 'one' }, 'last'];
+    assert.deepEqual(store.getStateItemJson(slot, 0), first);
+
+    store.appendToStateJson(slot, { zeta: 'x\ud800y', optional: undefined, alpha: { low: 'a\udc00b', literal: '\\ud800' } });
+    const plain = { zeta: 'x\ufffdy', alpha: { low: 'a\ufffdb', literal: '\\ud800' } };
+    const warmPoint = store.getStateItemJson(slot, 1);
+    assert.deepEqual([warmPoint.zeta, warmPoint.alpha.low], ['x\ufffdy', 'a\ufffdb']);
+
+    const record = store.appendToStateJsonWithIdentity(slot, { zeta: '\udc00!', optional: undefined, alpha: ['\\udc00'] }, 'id', 'sequence');
+    const stamped = { zeta: '\ufffd!', alpha: ['\\udc00'], id: record.id, sequence: Number(record.sequence) };
+    const warmTail = store.getStateItemJson(slot, 2);
+    const checkLog = (full, point, tail, head) => {
+      assert.deepEqual([bytesOf(full), bytesOf(point), Object.hasOwn(full[1], 'optional'), Object.hasOwn(point, 'optional')],
+        [bytesOf([head, plain, stamped]), bytesOf(plain), false, false]);
+      assert.deepEqual([bytesOf(tail), bytesOf(full.at(-1)), Object.hasOwn(tail, 'optional'), Object.hasOwn(full.at(-1), 'optional')],
+        [bytesOf(stamped), bytesOf(stamped), false, false]);
+    };
+    checkLog(store.getStateJson(slot), warmPoint, warmTail, first);
+    const warmStrings = [bytesOf(warmPoint), bytesOf(warmTail)];
+
+    store.editStateItem(slot, 0, Buffer.from(String.raw`{"zeta":"x\ufffdy","literal":"\\ud800","kind":"edited"}`));
+    const edited = { zeta: 'x\ufffdy', literal: '\\ud800', kind: 'edited' };
+    const checkEdit = (handle) => {
+      assert.deepEqual([handle.getStateItemJson(slot, 0), handle.getStateJson(slot)[0]], [edited, edited]);
+    };
+    checkEdit(store);
+    const cold = reopen();
+    checkEdit(cold);
+    const rebuilt = cold.getStateJson(slot);
+    checkLog(rebuilt, cold.getStateItemJson(slot, 1), cold.getStateItemJson(slot, 2), edited);
+    assert.deepEqual(warmStrings, rebuilt.slice(1).map(bytesOf));
+  });
+
+  scenario('Editing stamped content returns a new canonical point value, not a mutated cached object', (store) => {
+    const slot = 'messages';
+    store.registerState({ id: slot, strategy: 'append_log' });
+    const record = store.appendToStateJsonWithIdentity(slot, { content: [{ text: 'before' }], obsolete: true }, 'id', 'sequence');
+    assert.equal(typeof record.sequence, 'number');
+    const stamp = { id: record.id, sequence: record.sequence };
+    const original = { content: [{ text: 'before' }], obsolete: true, ...stamp };
+    const retained = store.getStateItemJson(slot, 0);
+    const replacement = { content: [{ text: 'edited ✓' }], ...stamp };
+    store.editStateItem(slot, 0, Buffer.from(bytesOf(replacement)));
+    const reread = store.getStateItemJson(slot, 0);
+    assert.deepEqual(reread, replacement);
+    assert.deepEqual([reread.id, reread.sequence], [record.id, record.sequence]);
+    assert.equal(bytesOf(reread), bytesOf(store.getStateJson(slot)[0]));
+    assert.notStrictEqual(reread, retained);
+    assert.deepEqual(retained, original);
+  });
+
+  console.log(`\n✅ Key order tests passed! (${step} passed, 0 failed, 0 skipped)`);
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }
