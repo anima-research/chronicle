@@ -116,6 +116,11 @@ pub struct RecordLog {
     #[cfg(test)]
     pub(crate) rewrite_failures: Mutex<u64>,
 
+    /// How many of the next appends fail their write, so unit tests can
+    /// stand in for a full disk.
+    #[cfg(test)]
+    pub(crate) write_failures: Mutex<u64>,
+
     /// How many of the next `read_at` calls fail with an I/O error before
     /// reading, so unit tests can stand in for a failing device.
     #[cfg(test)]
@@ -272,6 +277,8 @@ impl RecordLog {
             #[cfg(test)]
             rewrite_failures: Mutex::new(0),
             #[cfg(test)]
+            write_failures: Mutex::new(0),
+            #[cfg(test)]
             read_failures: Mutex::new(0),
             branch_max_seq,
             recovery,
@@ -338,23 +345,31 @@ impl RecordLog {
             linked_to: input.linked_to,
         };
 
-        // Serialize and write
-        let bytes = Self::encode_record(&record);
+        // Serialize into the kept bytes, the record's only encoded copy, and
+        // write it from there.
         let offset = *self.file_size.read();
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&bytes)?;
-
-        let new_size = offset + bytes.len() as u64;
-        *self.file_size.write() = new_size;
-        let kept = {
+        let (new_size, kept) = {
             let mut unsynced = self.unsynced.lock();
-            if unsynced.bytes.is_empty() {
-                unsynced.bytes = bytes;
-            } else {
-                unsynced.bytes.extend_from_slice(&bytes);
+            let start = unsynced.bytes.len();
+            let needed = start + Self::encoded_len(&record);
+            if needed > unsynced.bytes.capacity() {
+                // Grow by doubling, as a Vec does, but never past the budget
+                // or the record that this append needs room for.
+                let doubled = (unsynced.bytes.capacity() * 2).min(self.sync_bytes);
+                unsynced.bytes.reserve_exact(needed.max(doubled) - start);
             }
-            unsynced.bytes.len()
+            Self::encode_record_into(&record, &mut unsynced.bytes);
+            let written = self.write_failure().and_then(|()| {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&unsynced.bytes[start..])
+            });
+            if let Err(error) = written {
+                unsynced.bytes.truncate(start);
+                return Err(error.into());
+            }
+            (offset + (unsynced.bytes.len() - start) as u64, unsynced.bytes.len())
         };
+        *self.file_size.write() = new_size;
 
         // Sync periodically based on sync_interval
         let mut writes = self.writes_since_sync.write();
@@ -391,6 +406,18 @@ impl RecordLog {
         let mut unsynced = self.unsynced.lock();
         unsynced.synced_len = size;
         unsynced.bytes = Vec::new();
+    }
+
+    fn write_failure(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut failures = self.write_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("injected write failure"));
+            }
+        }
+        Ok(())
     }
 
     fn fsync_at_open(file: &File) -> std::io::Result<()> {
@@ -547,8 +574,8 @@ impl RecordLog {
         *self.file_size.read()
     }
 
-    fn encode_record(record: &Record) -> Vec<u8> {
-        let len = LOG_MAGIC.len()
+    fn encoded_len(record: &Record) -> usize {
+        LOG_MAGIC.len()
             + 2
             + 4 * 8
             + 2
@@ -560,8 +587,11 @@ impl RecordLog {
             + 8 * record.caused_by.len()
             + 2
             + 8 * record.linked_to.len()
-            + 4;
-        let mut bytes = Vec::with_capacity(len);
+            + 4
+    }
+
+    fn encode_record_into(record: &Record, bytes: &mut Vec<u8>) {
+        let start = bytes.len();
 
         // Magic
         bytes.extend_from_slice(LOG_MAGIC);
@@ -618,8 +648,7 @@ impl RecordLog {
         let checksum = crc32fast::hash(&record.payload);
         bytes.extend_from_slice(&checksum.to_le_bytes());
 
-        debug_assert_eq!(bytes.len(), len);
-        bytes
+        debug_assert_eq!(bytes.len() - start, Self::encoded_len(record));
     }
 
     /// Read a record from the file at current position.
@@ -1134,6 +1163,7 @@ mod tests {
         let mut log = RecordLog::open_with_sync_interval(dir.path().join("log.bin"), 1000).unwrap();
         log.sync_bytes = 1000;
         let kept = || log.unsynced.lock().bytes.len();
+        let capacity = || log.unsynced.lock().bytes.capacity();
         let append = |n: u64| -> (usize, usize) {
             let before = kept();
             let (_, offset) = log
@@ -1144,6 +1174,7 @@ mod tests {
         let mut syncs = 0;
         for n in 1..=10u64 {
             let (before, len) = append(n);
+            assert!(capacity() <= 1000.max(before + len), "{} after append {n}", capacity());
             if before + len > 1000 {
                 assert_eq!(kept(), 0, "append {n} passes the budget and syncs");
                 syncs += 1;
@@ -1158,6 +1189,7 @@ mod tests {
         loop {
             let (before, len) = append(n);
             n += 1;
+            assert!(capacity() <= 1000.max(before + len), "{} after append {n}", capacity());
             if before + len > 1000 {
                 break;
             }
@@ -1166,6 +1198,26 @@ mod tests {
         assert!(text.contains("no record is written until"), "{text}");
         log.sync().unwrap();
         append_byte(&log, n).unwrap();
+    }
+
+    #[test]
+    fn an_append_whose_write_fails_keeps_no_bytes_of_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        {
+            let log = RecordLog::open(&path).unwrap();
+            append_byte(&log, 1).unwrap();
+            let kept = log.unsynced.lock().bytes.clone();
+            *log.write_failures.lock() = 1;
+            assert!(append_byte(&log, 2).is_err());
+            assert_eq!(log.unsynced.lock().bytes, kept);
+            append_byte(&log, 2).unwrap();
+            *log.fsync_failures.lock() = 1;
+            lost(log.sync());
+            zero(&path, 0, log.size());
+            log.sync().unwrap();
+        }
+        assert_eq!(payloads(&path), vec![vec![1], vec![2]]);
     }
 
     #[test]

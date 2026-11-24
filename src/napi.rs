@@ -718,7 +718,8 @@ impl JsStore {
                 .sync()
                 .map_err(|error| match error {
                     StoreError::DurabilityLost(text) => StoreError::DurabilityLost(format!(
-                        "{text}. close() has closed this handle, and the store's own last sync as it \
+                        "{text}. That advice doesn't apply here: close() has closed this handle, \
+                         so sync() on it throws StoreClosed. The store's own last sync as it \
                          closed may still have saved those records, so a reopen shows what the \
                          store holds"
                     )),

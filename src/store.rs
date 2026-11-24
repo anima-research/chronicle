@@ -5773,51 +5773,60 @@ mod tests {
         ));
     }
 
+    // Each call runs on a store of its own, so that its own checkpoint, and
+    // not an earlier call's owed one, meets the standing failure.
     #[test]
     fn a_metadata_call_whose_log_retry_fails_throws_and_publishes_nothing() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config(&dir);
-        let store = Store::create(config.clone()).unwrap();
-        store
-            .register_state(StateRegistration {
-                id: "items".into(),
-                strategy: crate::types::StateStrategy::AppendLog {
-                    delta_snapshot_every: 1000,
-                    full_snapshot_every: 1000,
-                },
-                initial_value: None,
-            })
-            .unwrap();
-        store.create_branch("side", None).unwrap();
-        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
-        let files = || {
-            ["state.bin", "branches.bin"].map(|name| std::fs::read(config.path.join(name)).unwrap())
-        };
-        let published = files();
-        *store.log.fsync_failures.lock() = u64::MAX;
-        fn lost<T>(result: Result<T>) -> bool {
-            matches!(result, Err(StoreError::DurabilityLost(_)))
+        type Call = fn(&Store) -> Result<()>;
+        let calls: [(&str, Call); 7] = [
+            ("register_state", |store| {
+                store.register_state(StateRegistration {
+                    id: "other".into(),
+                    strategy: crate::types::StateStrategy::Snapshot,
+                    initial_value: None,
+                })
+            }),
+            ("update_state_strategy", |store| {
+                store.update_state_strategy(
+                    "items",
+                    crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 50,
+                        full_snapshot_every: 20,
+                    },
+                )
+            }),
+            ("create_branch", |store| store.create_branch("made", None).map(drop)),
+            ("create_empty_branch", |store| store.create_empty_branch("made", None).map(drop)),
+            ("create_branch_at", |store| store.create_branch_at("made", "main", Sequence(0)).map(drop)),
+            ("switch_branch", |store| store.switch_branch("side").map(drop)),
+            ("delete_branch", |store| store.delete_branch("side")),
+        ];
+        for (name, call) in calls {
+            let dir = TempDir::new().unwrap();
+            let config = test_config(&dir);
+            let store = Store::create(config.clone()).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "items".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            store.create_branch("side", None).unwrap();
+            store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+            let files = || {
+                ["state.bin", "branches.bin"].map(|file| std::fs::read(config.path.join(file)).unwrap())
+            };
+            let published = files();
+            *store.log.fsync_failures.lock() = 2;
+            assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert_eq!(files(), published, "{name} published nothing");
+            store.sync().unwrap();
         }
-        assert!(lost(store.sync()));
-        assert!(lost(store.register_state(StateRegistration {
-            id: "other".into(),
-            strategy: crate::types::StateStrategy::Snapshot,
-            initial_value: None,
-        })));
-        assert!(lost(store.update_state_strategy(
-            "items",
-            crate::types::StateStrategy::AppendLog {
-                delta_snapshot_every: 50,
-                full_snapshot_every: 20,
-            },
-        )));
-        assert!(lost(store.create_branch("blocked", None)));
-        assert!(lost(store.create_empty_branch("blocked-empty", None)));
-        assert!(lost(store.create_branch_at("blocked-at", "main", Sequence(0))));
-        assert!(lost(store.switch_branch("side")));
-        assert!(lost(store.delete_branch("side")));
-        assert!(lost(store.sync()));
-        assert_eq!(files(), published, "nothing was published");
     }
 
     #[test]

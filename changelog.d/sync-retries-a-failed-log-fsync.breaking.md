@@ -2,7 +2,8 @@
   - **What ends it:** the failure ends when a retry's fsync succeeds. Reopening the store also ends the failure. A retry writes the records since the last good fsync again, from memory, before it fsyncs. Each of these calls makes the retry, and it can now succeed where it threw before:
     - `sync()` and `close()`;
     - a dropped Rust `Store`;
-    - each call that publishes a checkpoint, such as `registerState()`.
-  - **Migration:** when a write throws `DurabilityLost`, call `sync()`. When `sync()` returns, make the refused write again, because it recorded nothing. When `sync()` throws `DurabilityLost`, the failure stands, and the next `sync()` tries again. A caller that reopens the store on `DurabilityLost` needs no change.
+    - each call that publishes a checkpoint, such as `registerState()`;
+    - a write while such a checkpoint is owed, which saves it first.
+  - **Migration:** when an append or a state write throws `DurabilityLost`, call `sync()`. When `sync()` returns, make the refused write again, because it recorded nothing. When `sync()` throws `DurabilityLost`, the failure stands, and the next `sync()` tries again. A call that publishes a checkpoint is different. When it throws `DurabilityLost`, its change stays in memory, as for any failed checkpoint. The good `sync()` then publishes that change. After `close()` throws `DurabilityLost`, reopen the store to see what it holds. A caller that reopens the store on `DurabilityLost` needs no change.
   - **Unchanged:** the on-disk format is the same, so existing stores open as before. An append still returns its record when its own periodic fsync fails, and the error is still `DurabilityLost`.
 - **Callers that open a store:** an open now fsyncs the record log first, and throws `DurabilityLost` when that fsync fails. In that case, records written before the open may not be on the disk. A later open doesn't report the failure again.
