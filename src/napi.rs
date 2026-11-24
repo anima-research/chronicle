@@ -176,6 +176,7 @@ pub struct JsRecord {
     pub sequence: i64,
     pub record_type: String,
     pub payload: Buffer,
+    /// Microseconds since the Unix epoch.
     pub timestamp: i64,
     pub caused_by: Vec<String>,
     pub linked_to: Vec<String>,
@@ -226,6 +227,7 @@ pub struct JsBranch {
     pub head: i64,
     pub parent_id: Option<String>,
     pub branch_point: Option<i64>,
+    /// Microseconds since the Unix epoch.
     pub created: i64,
 }
 
