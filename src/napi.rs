@@ -479,6 +479,9 @@ pub struct JsStoreEvent {
     /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`, which
     /// is one event for the whole batch at its one sequence. A subscriber
     /// that follows an append log by its deltas needs both.
+    ///
+    /// A "record" event's `record.timestamp` and a "branch_created" event's
+    /// `branch.created` are microseconds since the Unix epoch.
     pub data: String,
 }
 
