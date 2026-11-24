@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { join, posix } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { knownFailure } from './known-failure.mjs';
 import { readTrace } from './durability-trace.mjs';
 
 const WRITER_BOUND_MS = 60_000;
@@ -52,7 +51,7 @@ function traceWriter() {
   const expected = ['begin', ...CONTROL_MARKS,
     ...barriers.flatMap(({ pending, opens }, index) => [...(opens ? [`opened-${index}`] : []), ...(pending ? [`pending-${index}`] : []), `barrier-${index}`]), 'end'];
   const found = trace.marks.map(({ name }) => name);
-  const run = { labels, barriers, root, control, store: join(root, 'store'), trace, failure: null };
+  const run = { labels, barriers, root, control, stores: barriers.map(({ store }) => join(root, store)), trace, failure: null };
   if (found.join('\n') !== expected.join('\n')) {
     run.failure = `the record's marks are not the writer's marks, each once and in order: found ${found.join(', ')}`;
   } else if (trace.problems.length > 0) {
@@ -79,21 +78,29 @@ const unsyncedIn = (mark, dir) => ({
 });
 
 const declaredLabels = new Set();
-function atBarrier(label, { writesNothing = false, leavesUnsynced = false } = {}) {
+function atBarrier(label, { writesNothing = false, leavesUnsynced = false, makesItsPath = false } = {}) {
   declaredLabels.add(label);
   return () => {
     judged();
     const index = run.labels.indexOf(label);
     assert.ok(index >= 0, `tests/durability-writer.mjs has no barrier named ${label}`);
+    const store = run.stores[index];
     if (!writesNothing) {
-      const written = relative(inside(at(`pending-${index}`).written, run.store), run.store);
+      const written = relative(inside(at(`pending-${index}`).written, store), store);
       assert.ok(written.length > 0, `Before ${label}, its mutation wrote no file of the store, so the barrier had nothing to do`);
     }
     if (leavesUnsynced) {
-      const pending = unsyncedIn(at(`pending-${index}`), run.store);
+      const pending = unsyncedIn(at(`pending-${index}`), store);
       assert.ok(pending.files.length > 0, `Before ${label}, the store had no unsynced file, so the barrier had nothing to do`);
     }
-    const unsynced = unsyncedIn(at(`barrier-${index}`), run.store);
+    if (makesItsPath) {
+      const parts = posix.relative(run.root, store).split('/');
+      const waiting = at(`pending-${index}`).names;
+      const paid = parts.map((_, i) => posix.join(run.root, ...parts.slice(0, i + 1)))
+        .filter(name => !waiting.includes(name)).map(name => posix.relative(run.root, name));
+      assert.deepEqual(paid, [], `Before ${label}, these names on the path to the store were already on disk, so the barrier had none of them to pay: ${paid.join(', ')}`);
+    }
+    const unsynced = unsyncedIn(at(`barrier-${index}`), store);
     assert.deepEqual(unsynced, { files: [], names: [] },
       `After ${label}, the store had not asked to put these on disk: files [${unsynced.files.join(', ')}], names [${unsynced.names.join(', ')}]`);
   };
@@ -123,7 +130,7 @@ if (skip) {
   });
 
   test('sync on a new store after one appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
-    atBarrier('sync on a new store after one appendJson'));
+    atBarrier('sync on a new store after one appendJson', { makesItsPath: true }));
   test('sync after registerState returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('sync after registerState'));
   test('sync after appendJson returns after the store asks for each file that it wrote and each name that it made to be put on disk',
@@ -178,6 +185,10 @@ if (skip) {
     atBarrier('sync on a reopened store after appendJson'));
   test('close on a reopened store with a write pending returns after the store asks for each file that it wrote and each name that it made to be put on disk',
     atBarrier('close on a reopened store with a write pending', { leavesUnsynced: true }));
+  test('sync on a new store whose parents create made returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync on a new store whose parents create made', { makesItsPath: true }));
+  test('sync on a store moved into a directory that chronicle did not make returns after the store asks for each file that it wrote and each name that it made to be put on disk',
+    atBarrier('sync on a store moved into a directory that chronicle did not make', { makesItsPath: true }));
 
   test('Each barrier of the writer has its test', () => {
     judged();
@@ -188,17 +199,19 @@ if (skip) {
   test('The store renames no file before it asks for that file to be put on disk', () => {
     judged();
     const renames = run.trace.unsyncedRenames
-      .filter(({ from, to }) => inside([from, to], run.store).length > 0)
-      .map(({ from, to }) => `${posix.relative(run.store, from)} -> ${posix.relative(run.store, to)}`);
+      .filter(({ from, to }) => run.stores.some(store => inside([from, to], store).length > 0))
+      .map(({ from, to }) => `${posix.relative(run.root, from)} -> ${posix.relative(run.root, to)}`);
     assert.deepEqual(renames, [], `The store renamed these files before it asked to put them on disk: ${renames.join(', ')}`);
   });
 
-  test("Each barrier asks for the name of the store's own directory to be put on disk", knownFailure('The store makes its directory and never syncs the directory that holds it.', () => {
+  test("Each barrier asks for the name of the store's own directory, and of each directory on the path to it, to be put on disk", () => {
     judged();
-    const holder = posix.dirname(run.store);
-    const unsynced = run.labels.flatMap((label, index) => at(`barrier-${index}`).names
-      .filter(name => posix.dirname(name) === holder)
-      .map(name => `after ${label}: ${posix.basename(name)}`));
+    const unsynced = run.labels.flatMap((label, index) => {
+      const store = run.stores[index];
+      return at(`barrier-${index}`).names
+        .filter(name => name === store || store.startsWith(`${name}/`))
+        .map(name => `after ${label}: ${posix.relative(run.root, name)}`);
+    });
     assert.deepEqual(unsynced, [], `The store had not asked to put these names on disk: ${unsynced.join(', ')}`);
-  }));
+  });
 }

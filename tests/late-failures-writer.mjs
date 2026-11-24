@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '../index.js';
 
@@ -119,11 +119,16 @@ function run([scenarioFile, root, outside, index]) {
   if (scenario.freshBlob) f.fresh = freshHash(join(outside, 'scratch'));
   scenario.start?.(h);
   mark('begin');
-  let s = JsStore.create({ path });
+  let s = JsStore.create({ path: scenario.movedIn ? `${path}-before` : path });
   base(s, f);
   const { kind } = scenario;
   scenario.setup?.(s, f, h);
   s.sync();
+  if (scenario.movedIn) {
+    s.close();
+    renameSync(`${path}-before`, path);
+    s = JsStore.open({ path });
+  }
   mark('setup');
 
   if (kind === 'long') {

@@ -18,14 +18,13 @@ const OPENS = new Set(['open', 'openat', 'openat2', 'creat']);
 const MKDIRS = new Set(['mkdir', 'mkdirat']);
 const BY_DESCRIPTOR = new Set([...WRITES, ...READS, ...SYNCS]);
 const NOT_MEASURED = 'The instrument does not measure';
-const UNREADABLE_ERRNO = 'The error for a refused sync of the directories that hold a blob has words after its OS error, so a caller cannot read the errno.';
 const NEW_BRANCH_AFTER_THROW = 'When a refused request makes the call throw, the handle already shows the new branch.';
+const LOG_SYNC_LOST = 'After a refused sync of the record log, sync on the same handle throws DurabilityLost until the store is opened again.';
 const newAfterThrow = problem => problem.newAfterThrow === true;
-const wordsAfterOsError = problem => problem.wordsAfterOsError === true;
-const nameInRefused = problem => problem.nameInRefused === true;
 const syncLost = problem => problem.syncLost === true;
 
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
+const holds = (dir, path) => typeof dir === 'string' && dir !== path && (dir === '/' || path.startsWith(`${dir}/`));
 const env = { ...process.env };
 delete env.LD_PRELOAD;
 delete env.CHRONICLE_LATE_AIMED;
@@ -141,7 +140,7 @@ function requestsOfCall(text, store, cwd) {
     call.inCall = inCall;
     const [path, target] = call.paths;
     const made = OPENS.has(call.name) && call.ok && call.flags.includes('O_CREAT') && !existing.has(path);
-    if (inCall && (isUnder(path, store) || isUnder(target, store))) {
+    if (inCall && (isUnder(path, store) || isUnder(target, store) || holds(path, store))) {
       const ordinal = (perName.get(call.name) ?? 0) + 1;
       perName.set(call.name, ordinal);
       requests.push({ id: `${call.name} ${ordinal}`, name: call.name, when: call.when, path, made, call });
@@ -170,7 +169,7 @@ function writePoints(requests) {
 }
 
 const errnoOf = name => (WRITES.has(name) ? 'ENOSPC' : 'EIO');
-const where = (point, store) => posix.relative(posix.dirname(store), point.path ?? store);
+const where = (point, store) => (holds(point.path, store) ? point.path : posix.relative(posix.dirname(store), point.path ?? store));
 
 let active = 0;
 const queue = [];
@@ -296,7 +295,7 @@ function hit(run) {
   const refused = record.all.filter(call => call.injected);
   if (refused.length !== 1) return { why: `the record shows ${refused.length} refused requests`, record };
   const request = record.requests.find(({ call }) => call === refused[0]);
-  if (!request) return { why: `the refused request is not at or under the store's directory in the call: ${refused[0].text}`, record };
+  if (!request) return { why: `the refused request is neither at or under the store's directory nor of a directory that holds it, in the call: ${refused[0].text}`, record };
   return { id: request.id, request, record };
 }
 
@@ -385,11 +384,8 @@ function barrierProblems(run, store, barriers) {
     for (const path of mark.files.filter(each => isUnder(each, store))) {
       problems.push({ text: `${barrier} returned before the store asked to put the file ${posix.relative(store, path)} on disk` });
     }
-    for (const path of mark.names.filter(each => isUnder(each, store) && each !== store)) {
-      problems.push({
-        text: `${barrier} returned before the store asked to put the name ${posix.relative(store, path)} on disk`,
-        nameInRefused: posix.dirname(path) === run.refused,
-      });
+    for (const path of mark.names.filter(each => isUnder(each, run.root))) {
+      problems.push({ text: `${barrier} returned before the store asked to put the name ${posix.relative(run.root, path)} on disk` });
     }
   }
   for (const { from, to } of trace.unsyncedRenames.filter(each => isUnder(each.from, store) || isUnder(each.to, store))) {
@@ -433,7 +429,6 @@ const theErrno = {
   rule: 'the errno',
   judge: ({ out, errno }) => (!out.call.ok && out.call.code !== 'DurabilityLost' && errnoCode(out.call) !== errno ? [{
     text: `the call threw without ${errno}: ${shown(out.call)}`,
-    wordsAfterOsError: out.call.error && Number(/\(os error (\d+)\)./s.exec(out.call.message)?.[1]) === constants.errno[errno],
   }] : []),
 };
 
@@ -576,6 +571,36 @@ const oldAfterThrow = method => ({
     return problems;
   },
 });
+
+const ofTheNamesPass = run => holds(run.refused, run.store) || isUnder(run.refused, `${run.store}/blobs`);
+
+const aRefusedNameSyncThrows = {
+  rule: 'the call',
+  judge: ({ out, run }) => (ofTheNamesPass(run) && out.call.ok
+    ? [{ text: `the call returned although the sync of ${run.refused} was refused` }] : []),
+};
+
+const theSecondTrySyncsItAgain = {
+  rule: 'the second try',
+  judge: ({ out, run }) => {
+    if (!ofTheNamesPass(run) || !out.retry) return [];
+    const all = calls(run.text, run.dir);
+    const begin = all.findIndex(({ mark }) => mark === 'retry-begin');
+    const end = all.findIndex(({ mark }) => mark === 'retry-end');
+    const again = all.slice(begin, end).some(call => SYNCS.has(call.name) && call.ok && call.paths[0] === run.refused);
+    return again ? [] : [{ text: `the second try returned without syncing ${run.refused}, whose sync the call had refused` }];
+  },
+};
+
+const theStoreNameWaits = {
+  rule: 'the barrier',
+  judge: ({ run }) => {
+    const trace = readTrace(run.text, { root: run.root, cwd: run.dir, names: [run.root] });
+    const begin = trace.marks.find(({ name }) => name === 'call-begin');
+    return begin?.names.includes(run.store) ? []
+      : [{ text: `${NOT_MEASURED}: before the call, the store's name was not waiting to be put on disk, so the call had no name of it to pay` }];
+  },
+};
 
 const secondSyncReturns = {
   rule: 'the second try',
@@ -1060,13 +1085,7 @@ if (skip) {
         freshBlob: true,
         call: (s, f, h) => s.storeBlob(Buffer.from('fresh blob'), 'text/plain'),
         reads: h => ({ blob: (s, f) => h.utf8(s.getBlob(f.fresh)) }),
-      }, writeKind, {
-        todos: [
-          { point: 'fsync 1', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: wordsAfterOsError },
-          { point: 'fsync 3', rule: 'the errno', todo: UNREADABLE_ERRNO, owns: wordsAfterOsError },
-          { point: 'fsync 3', rule: 'the barrier', owns: nameInRefused, todo: "After a refused sync of a blob's directory, sync and close return while the blob's name is not synced." },
-        ],
-      }));
+      }, writeKind));
     test('A refused request in switchBranch leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'switchBranch',
@@ -1130,10 +1149,18 @@ if (skip) {
         reads: h => h.threeReads,
       }, syncKind, {
         rules: [secondSyncReturns],
-        todos: [{
-          point: 'fsync 1', rule: 'the second try', owns: syncLost,
-          todo: 'After a refused sync of the record log, sync on the same handle throws DurabilityLost until the store is opened again.',
-        }],
+        todos: [{ point: 'fsync 1', rule: 'the second try', owns: syncLost, todo: LOG_SYNC_LOST }],
+      }));
+    test('A refused request in the first sync of a handle leaves a throw or a return, whole values and a store that opens again',
+      refused({
+        name: 'firstSync',
+        movedIn: true,
+        unsynced: (s, f, h) => h.threeWrites(s),
+        call: (s, f, h) => s.sync(),
+        reads: h => h.threeReads,
+      }, syncKind, {
+        rules: [secondSyncReturns, aRefusedNameSyncThrows, theSecondTrySyncsItAgain, theStoreNameWaits],
+        todos: [{ point: 'fsync 1', rule: 'the second try', owns: syncLost, todo: LOG_SYNC_LOST }],
       }));
     test('A refused request in close leaves a throw or a return, whole values and a store that opens again',
       refused({

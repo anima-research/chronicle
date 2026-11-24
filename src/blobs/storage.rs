@@ -1160,7 +1160,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("is in place, but syncing its directory failed"),
+                .contains("is in place, but its directory isn't synced yet"),
             "{error}"
         );
         assert_eq!(staged(&dir.path().join("blobs")), 0);
@@ -1185,6 +1185,94 @@ mod tests {
         *storage.fails_at.lock() = Some(WriteStep::ShardSync);
         storage.store(b"in place", "text/plain").unwrap_err();
         assert_eq!(storage.get(&hash).unwrap().unwrap().content, b"in place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_owed_syncs_a_shard_whose_sync_failed_after_the_rename() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let hash = Hash::from_bytes(b"owed");
+        let shard = storage.shard_path(&hash);
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        storage.store(b"owed", "text/plain").unwrap_err();
+        synced_directories();
+
+        storage.sync_owed().unwrap();
+        assert_eq!(synced_directories(), [shard]);
+        storage.sync_owed().unwrap();
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_owed_leaves_the_shard_owed() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let hash = Hash::from_bytes(b"owed");
+        let shard = storage.shard_path(&hash);
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        storage.store(b"owed", "text/plain").unwrap_err();
+        synced_directories();
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        let error = storage.sync_owed().unwrap_err().to_string();
+        assert!(error.contains(&shard.display().to_string()), "{error}");
+        assert!(error.ends_with("injected failure at ShardSync"), "{error}");
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+
+        storage.sync_owed().unwrap();
+        assert_eq!(synced_directories(), [shard]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_syncs_the_blob_directory_and_each_shard_that_a_store_or_a_read_found() {
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let earlier = reopened(&dir);
+        let hash = Hash::from_bytes(b"left");
+        let shard = earlier.shard_path(&hash);
+        *earlier.fails_at.lock() = Some(WriteStep::ShardSync);
+        earlier.store(b"left", "text/plain").unwrap_err();
+        drop(earlier);
+
+        let storing = reopened(&dir);
+        let reading = reopened(&dir);
+        synced_directories();
+        assert_eq!(storing.store(b"left", "text/plain").unwrap(), hash);
+        assert_eq!(synced_directories(), [dir.path().to_owned()]);
+        assert_eq!(reading.get(&hash).unwrap().unwrap().content, b"left");
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+
+        for storage in [&storing, &reading] {
+            storage.sync_directories().unwrap();
+            let mut synced = synced_directories();
+            synced.sort();
+            assert_eq!(synced, [blobs.clone(), shard.clone()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_names_pass_returns_the_error_and_the_next_pass_syncs_the_shard() {
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let hash = reopened(&dir).store(b"left", "text/plain").unwrap();
+        let storage = reopened(&dir);
+        let shard = storage.shard_path(&hash);
+        synced_directories();
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        let error = storage.sync_directories().unwrap_err().to_string();
+        assert!(error.contains(&shard.display().to_string()), "{error}");
+        assert!(error.ends_with("injected failure at ShardSync"), "{error}");
+        assert_eq!(synced_directories(), [blobs.clone()]);
+
+        storage.sync_directories().unwrap();
+        assert_eq!(synced_directories(), [blobs, shard]);
     }
 
     // Stores of one content racing from several storages each stage their
