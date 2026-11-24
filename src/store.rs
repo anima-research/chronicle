@@ -4531,6 +4531,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn relative_store_under_a_directory_this_process_may_not_search_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(work) = std::env::var_os("CHRONICLE_HOLDERS_CHILD_WORK") else {
+            return;
+        };
+        let work = PathBuf::from(work);
+        let above = work.parent().unwrap().to_owned();
+        std::env::set_current_dir(&work).unwrap();
+        let config = StoreConfig {
+            path: PathBuf::from("store"),
+            blob_cache_size: 100,
+            create_if_missing: false,
+        };
+        Store::create(config.clone()).unwrap().sync().unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(&work).is_ok() {
+            eprintln!("skipped: the directory could be searched despite its mode (running as root?)");
+            return;
+        }
+        let store = Store::open(config).unwrap();
+        assert_eq!(store.holders, [PathBuf::from(".")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_store_under_a_directory_this_process_may_not_search_opens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let above = dir.path().join("above");
+        let work = above.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::relative_store_under_a_directory_this_process_may_not_search_child",
+                "--nocapture",
+            ])
+            .env("CHRONICLE_HOLDERS_CHILD_WORK", &work)
+            .output()
+            .unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn sync_passes_over_a_directory_holding_the_store_that_this_process_may_not_open() {
         use std::os::unix::fs::PermissionsExt;
 

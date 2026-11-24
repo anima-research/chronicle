@@ -100,9 +100,11 @@ function atBarrier(label, { writesNothing = false, leavesUnsynced = false, makes
         .filter(name => !waiting.includes(name)).map(name => posix.relative(run.root, name));
       assert.deepEqual(paid, [], `Before ${label}, these names on the path to the store were already on disk, so the barrier had none of them to pay: ${paid.join(', ')}`);
     }
-    const unsynced = unsyncedIn(at(`barrier-${index}`), store);
-    assert.deepEqual(unsynced, { files: [], names: [] },
-      `After ${label}, the store had not asked to put these on disk: files [${unsynced.files.join(', ')}], names [${unsynced.names.join(', ')}]`);
+    const barrier = at(`barrier-${index}`);
+    const unsynced = unsyncedIn(barrier, store);
+    const path = barrier.names.filter(name => name === store || store.startsWith(`${name}/`)).map(name => posix.relative(run.root, name));
+    assert.deepEqual({ ...unsynced, path }, { files: [], names: [], path: [] },
+      `After ${label}, the store had not asked to put these on disk: files [${unsynced.files.join(', ')}], names [${unsynced.names.join(', ')}], names on its path [${path.join(', ')}]`);
   };
 }
 

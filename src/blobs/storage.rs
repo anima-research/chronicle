@@ -1376,22 +1376,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_names_pass_passes_over_a_blob_directory_this_process_may_not_open() {
+    fn the_names_pass_syncs_each_shard_of_a_blob_directory_this_process_may_not_list() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
         let blobs = dir.path().join("blobs");
-        reopened(&dir).store(b"left", "text/plain").unwrap();
+        let hash = reopened(&dir).store(b"left", "text/plain").unwrap();
         let storage = reopened(&dir);
+        let shard = storage.shard_path(&hash);
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o300)).unwrap();
-        let readable = fs::File::open(&blobs).is_ok();
+        let listable = fs::read_dir(&blobs).is_ok();
+        synced_directories();
         let passed = storage.sync_directories();
+        let synced = synced_directories();
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
-        if readable {
-            eprintln!("skipped: the directory could be opened despite its mode (running as root?)");
+        if listable {
+            eprintln!("skipped: the directory could be listed despite its mode (running as root?)");
             return;
         }
         passed.unwrap();
+        assert_eq!(synced, [dir.path().to_owned(), blobs, shard]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_passes_over_shards_this_process_may_not_reach() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let hash = reopened(&dir).store(b"left", "text/plain").unwrap();
+        let storage = reopened(&dir);
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o600)).unwrap();
+        let reachable = fs::symlink_metadata(storage.shard_path(&hash)).is_ok();
+        let passed = storage.sync_directories();
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
+        if reachable {
+            eprintln!("skipped: the directory could be searched despite its mode (running as root?)");
+            return;
+        }
+        passed.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_leaves_a_shard_that_is_a_link() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let storage = reopened(&dir);
+        std::os::unix::fs::symlink(outside.path(), blobs.join("ab")).unwrap();
+        synced_directories();
+        storage.sync_directories().unwrap();
+        assert_eq!(synced_directories(), [dir.path().to_owned(), blobs]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_syncs_the_store_directory_when_the_blob_directory_is_gone() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        fs::remove_dir(dir.path().join("blobs")).unwrap();
+        synced_directories();
+        storage.sync_directories().unwrap();
+        assert_eq!(synced_directories(), [dir.path().to_owned()]);
     }
 
     // Stores of one content racing from several storages each stage their
