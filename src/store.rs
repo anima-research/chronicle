@@ -4662,12 +4662,18 @@ mod tests {
         let store = Arc::new(reopen(test_config(&dir)));
         store.set_auto_snapshot(false);
         let writer = Arc::clone(&store);
-        store.state.set_test_hook("count: value read", move |_| {
+        let recount_held_the_lock = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&recount_held_the_lock);
+        store.state.set_test_hook("count: value read", move |state| {
             writer
                 .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
                 .unwrap();
+            state.set_test_hook("count: value read", move |_| {
+                *seen.lock() = Some(writer.write_lock.try_lock().is_none());
+            });
         });
         assert_eq!(store.get_state_len("s").unwrap(), Some(4), "the count of the head that the write moved");
+        assert_eq!(*recount_held_the_lock.lock(), Some(true), "the second count held the write lock");
         assert_eq!(store.get_state_len("s").unwrap(), Some(4));
     }
 

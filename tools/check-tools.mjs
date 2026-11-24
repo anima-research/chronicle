@@ -936,7 +936,7 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       refuses(short, 'a state.bin cut short', 'state.bin is not a whole state index');
       const trailing = copyOf('refuse-trailing');
       writeFileSync(join(trailing, 'state.bin'), Buffer.concat([readFileSync(join(trailing, 'state.bin')), Buffer.from('more')]));
-      refuses(trailing, 'a state.bin with more after its index than the checks of the counts', 'state.bin is not the length its index says');
+      refuses(trailing, 'a state.bin with more after its index than the checks of the counts', 'state.bin holds more after its index than the checks of the counts');
       const nowhere = copyOf('refuse-head');
       withHeads(nowhere, `if key[1] == '${WHOLE}': head[0] += 1`);
       refuses(nowhere, 'a head that names no state update', 'no state update of whole is there');

@@ -1610,8 +1610,11 @@ impl JsStore {
     /// The number of items a state holds on this handle's branch, `null`
     /// where it has no value. For an `append_log` it is the number of items
     /// that a read returns: a list whose count the store hasn't checked is
-    /// read once to count it. For another strategy it is the count the head
-    /// stores.
+    /// read once to count it. That read throws where it meets a record that
+    /// it can't read, such as one that fails its checksum (code
+    /// `ChecksumMismatch`). A list whose value isn't a JSON array has no
+    /// items to count, so the length is the count the head stores, as it is
+    /// for a state of another strategy.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
         let (store, branch) = self.target()?;

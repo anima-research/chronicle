@@ -434,7 +434,8 @@ def read_state_bin(data):
         index, end = mp_decode(data[13:13 + n])
     except DECODE_ERRORS as error:
         raise Refusal('state.bin is not a whole state index (%s).' % error)
-    if end != n or not is_checks_or_nothing(data[13 + n:]): raise Refusal('state.bin is not the length its index says.')
+    if end != n: raise Refusal('state.bin is not the length its index says.')
+    if not is_checks_or_nothing(data[13 + n:]): raise Refusal('state.bin holds more after its index than the checks of the counts.')
     # rmp_serde::to_vec: StateIndex = [heads: map{[branch, state_id] -> [fields]}, strategies: map]
     if not (isinstance(index, list) and len(index) == 2 and isinstance(index[0], MpMap)
             and all(isinstance(key, list) and len(key) == 2 and is_count(key[0]) and isinstance(key[1], str)
