@@ -226,6 +226,26 @@ fn a_log_that_links_to_nothing_beside_only_a_manifest_is_refused_and_nothing_is_
 
 #[cfg(unix)]
 #[test]
+fn data_files_all_linked_to_nothing_beside_only_a_manifest_are_not_taken_for_a_used_store() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let volume = dir.path().join("unmounted");
+    fs::create_dir(&volume).unwrap();
+    only_the_manifest(&path);
+    for file in ["records.log", "state.bin", "branches.bin"] {
+        std::os::unix::fs::symlink(volume.join(file), path.join(file)).unwrap();
+    }
+
+    let message = corruption(Store::open(config(&path)));
+    assert!(message.contains(&*path.join("records.log").to_string_lossy()), "{message}");
+    assert!(message.contains("leads to nothing"), "{message}");
+    assert!(!message.contains("which a store writes only after"), "{message}");
+    assert!(message.contains("remove the link, and the next open creates one here"), "{message}");
+    assert_eq!(fs::read_dir(&volume).unwrap().count(), 0, "the open wrote through a link");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_state_or_branch_file_whose_link_cannot_be_followed_is_refused_and_names_the_link() {
     for file in ["state.bin", "branches.bin"] {
         for leads_to_itself in [false, true] {
@@ -283,11 +303,11 @@ fn an_empty_log_under_a_state_head_is_named_empty_and_nothing_is_saved_or_create
     fs::remove_dir_all(path.join("blobs")).unwrap();
     let before = files(&path);
 
-    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path);
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
     assert_eq!(files(&path), before, "the refused open changed the store's directory");
 }
 
-fn assert_names_the_empty_log(message: &str, store: &Path) {
+fn assert_names_the_empty_log(message: &str, store: &Path, held: &str) {
     assert!(message.contains(&*store.join("records.log").to_string_lossy()), "{message}");
     let heads = format!("is empty, though {} holds heads", store.join("state.bin").to_string_lossy());
     assert!(message.contains(&heads), "{message}");
@@ -297,9 +317,22 @@ fn assert_names_the_empty_log(message: &str, store: &Path) {
     );
     assert!(message.contains("finds the log's first record incomplete"), "{message}");
     assert!(message.contains("Restore the store's records.log"), "{message}");
-    let move_out = format!("move state.bin and branches.bin out of {}", store.to_string_lossy());
+    let move_out = format!("move {held} out of {}", store.to_string_lossy());
     assert!(message.contains(&move_out), "{message}");
     assert!(!message.contains("torn tail"), "{message}");
+}
+
+#[test]
+fn an_empty_log_beside_state_bin_alone_names_only_state_bin_to_move() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    closed_store(&path, with_state_history);
+    fs::write(path.join("records.log"), b"").unwrap();
+    fs::remove_file(path.join("branches.bin")).unwrap();
+
+    let message = corruption(Store::open(config(&path)));
+    assert_names_the_empty_log(&message, &path, "state.bin");
+    assert!(!message.contains("branches.bin"), "{message}");
 }
 
 #[test]
@@ -313,7 +346,7 @@ fn a_store_with_an_empty_log_starts_over_once_its_state_and_branch_files_are_mov
     });
     let kept = kept.unwrap();
     fs::write(path.join("records.log"), b"").unwrap();
-    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path);
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
     move_out(&path, &["state.bin", "branches.bin"]);
 
     let store = Store::open(config(&path)).unwrap();
@@ -357,5 +390,5 @@ fn a_log_whose_only_record_is_torn_keeps_the_torn_tail_words() {
     );
     assert_eq!(fs::metadata(&log).unwrap().len(), 0);
 
-    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path);
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
 }

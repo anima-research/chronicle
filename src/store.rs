@@ -3622,7 +3622,7 @@ impl Store {
     fn refuse_a_lost_log(path: &Path) -> Result<()> {
         let mut used = Vec::new();
         for file in ["state.bin", "branches.bin"] {
-            if Self::holds(path, file)? {
+            if Self::holds(path, file)? && fs::metadata(path.join(file)).is_ok() {
                 used.push(file);
             }
         }

@@ -672,7 +672,9 @@ impl JsStore {
         Ok(Self::root(store))
     }
 
-    /// Open or create a store.
+    /// Open or create a store. A store that holds state.bin or branches.bin
+    /// and has lost its records.log is refused with `code` `Corruption`, as
+    /// `open` refuses it, and the open creates no records.log.
     #[napi(factory)]
     pub fn open_or_create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
