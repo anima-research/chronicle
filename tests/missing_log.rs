@@ -61,7 +61,17 @@ fn assert_names_the_missing_log(message: &str, store: &Path, used: &str) {
     assert!(message.contains(&format!("holds {used},")), "{message}");
     assert!(message.contains("created no records.log"), "{message}");
     assert!(message.contains("Restore the records.log"), "{message}");
+    assert!(message.contains(&format!("move {used} out of {}", store.to_string_lossy())), "{message}");
     assert!(!message.contains("torn tail"), "{message}");
+}
+
+fn move_out(path: &Path, files: &[&str]) -> std::path::PathBuf {
+    let aside = path.with_file_name("moved-aside");
+    fs::create_dir(&aside).unwrap();
+    for file in files {
+        fs::rename(path.join(file), aside.join(file)).unwrap();
+    }
+    aside
 }
 
 #[test]
@@ -108,6 +118,25 @@ fn a_store_with_a_state_and_a_branch_but_no_records_is_refused_without_its_log()
 
     assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
     assert!(fs::symlink_metadata(path.join("records.log")).is_err());
+}
+
+#[test]
+fn a_store_that_lost_its_log_starts_over_once_its_state_and_branch_files_are_moved_out() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let mut kept = None;
+    closed_store(&path, |store| {
+        with_state_history(store);
+        kept = Some(store.store_blob(b"kept", "text/plain").unwrap());
+    });
+    let kept = kept.unwrap();
+    fs::remove_file(path.join("records.log")).unwrap();
+    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
+    move_out(&path, &["state.bin", "branches.bin"]);
+
+    let store = Store::open(config(&path)).unwrap();
+    assert!(store.query_range(None, None, 10, false, None).unwrap().is_empty());
+    assert_eq!(store.get_blob(&kept).unwrap().unwrap().content, b"kept");
 }
 
 #[test]
@@ -268,7 +297,28 @@ fn assert_names_the_empty_log(message: &str, store: &Path) {
     );
     assert!(message.contains("finds the log's first record incomplete"), "{message}");
     assert!(message.contains("Restore the store's records.log"), "{message}");
+    let move_out = format!("move state.bin and branches.bin out of {}", store.to_string_lossy());
+    assert!(message.contains(&move_out), "{message}");
     assert!(!message.contains("torn tail"), "{message}");
+}
+
+#[test]
+fn a_store_with_an_empty_log_starts_over_once_its_state_and_branch_files_are_moved_out() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    let mut kept = None;
+    closed_store(&path, |store| {
+        with_state_history(store);
+        kept = Some(store.store_blob(b"kept", "text/plain").unwrap());
+    });
+    let kept = kept.unwrap();
+    fs::write(path.join("records.log"), b"").unwrap();
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path);
+    move_out(&path, &["state.bin", "branches.bin"]);
+
+    let store = Store::open(config(&path)).unwrap();
+    assert!(store.query_range(None, None, 10, false, None).unwrap().is_empty());
+    assert_eq!(store.get_blob(&kept).unwrap().unwrap().content, b"kept");
 }
 
 #[test]
