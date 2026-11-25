@@ -4,7 +4,7 @@ use crate::blobs::BlobStorage;
 use crate::branches::BranchManager;
 use crate::error::{Result, StoreError};
 use crate::records::{RecordIndex, RecordLog, RecoveryReport};
-use crate::state::{StateManager, StateSelection};
+use crate::state::{ItemCount, StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
     Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence, SnapshotFailure,
@@ -54,23 +54,22 @@ pub struct AppendedBatch {
     /// lock as the write. Item `i` of the batch is at `first_ordinal + i`, so
     /// a caller has every item's ordinal without a read.
     ///
-    /// Where this session hasn't kept the state's count on the branch itself
-    /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
-    /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
-    /// array), the batch first counts
-    /// the state's items, reading its whole value once, or again under the
-    /// write lock where another write to the state lands during that count,
-    /// and the head keeps that count, which `get_state_len` then reports: a
-    /// count a release
-    /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
-    /// A value that doesn't materialize as a JSON array has no items to
-    /// count, and this is then the count `get_state_len` reports; the batch
-    /// is recorded, and the state then fails to materialize, as after an
-    /// `Append` to it, so the items can't be read at those ordinals. An error
-    /// reading the log for the count (an I/O error, or a record of the
-    /// state's chain that fails its checksum or whose framing is bad) is
-    /// returned, and the batch isn't recorded; the error says so, except a
-    /// failed checksum's, which carries no message of its own.
+    /// Where the store hasn't checked the state's count on the branch (a head
+    /// loaded with no saved check or installed by `create_branch_at` at a past
+    /// point, or one after a `DeltaSnapshot` the caller wrote or a value that
+    /// isn't an array), the batch first counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write to
+    /// the state lands during that count, and the head keeps that count, which
+    /// `get_state_len` then reports: a count a release before 0.5.0 stored, or
+    /// one such a `DeltaSnapshot` left, can be off. A value that doesn't
+    /// materialize as a JSON array has no items to count, and this is then the
+    /// count `get_state_len` reports; the batch is recorded, and the state then
+    /// fails to materialize, as after an `Append` to it, so the items can't be
+    /// read at those ordinals. An error reading the log for the count (an I/O
+    /// error, or a record of the state's chain that fails its checksum or whose
+    /// framing is bad) is returned, and the batch isn't recorded; the error
+    /// says so, except a failed checksum's, which carries no message of its
+    /// own.
     pub first_ordinal: usize,
 }
 
@@ -1092,6 +1091,13 @@ impl Store {
     /// given, and one that can't be applied, such as an Append of bytes that
     /// aren't JSON, shows when the state is next materialized.
     ///
+    /// For a state registered as `AppendLog`, an Edit's length is the number
+    /// of items, as `get_state_len_on` gives it: where the store hasn't
+    /// checked the count, the Edit counts the items first, reading the whole
+    /// value once without the write lock, and once more under it if a write
+    /// moved the head meanwhile. An error reading the log for that count is
+    /// returned, and the Edit isn't recorded.
+    ///
     /// An `AppendMany` with no items is refused. The first `AppendMany` a
     /// store records also rewrites its MANIFEST, before the record is
     /// written, to format version 2 with the batch feature named, so a build
@@ -1157,6 +1163,16 @@ impl Store {
         skip_auto_snapshot: bool,
         snapshot_of: Option<u64>,
     ) -> Result<Record> {
+        if matches!(operation, StateOperation::Edit { .. })
+            && matches!(
+                self.state.get_strategy(state_id),
+                Some(crate::types::StateStrategy::AppendLog { .. })
+            )
+        {
+            self.state
+                .checked_item_count(branch_id, state_id)
+                .map_err(|error| Self::count_error(error, "edit"))?;
+        }
         self.update_state_with_builder(
             branch_id,
             state_id,
@@ -1378,7 +1394,7 @@ impl Store {
                     .into(),
             ));
         }
-        // A head this session hasn't checked has its items counted here,
+        // A head the store hasn't checked has its items counted here,
         // before the write lock, as the count reads the state's whole value
         // and every other writer of the store would wait on the lock while
         // it did. The count is kept only if the head is where it was when
@@ -1387,7 +1403,7 @@ impl Store {
         // left the head unchecked, counts again under the lock.
         self.state
             .checked_item_count(branch_id, state_id)
-            .map_err(Self::count_error)?;
+            .map_err(|error| Self::count_error(error, "batch"))?;
         let mut first_ordinal = 0;
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
@@ -1396,10 +1412,17 @@ impl Store {
             // unchecked has its items counted here, unless the batch is
             // empty, which is refused before it's written.
             if !items.is_empty() {
-                first_ordinal = self
+                first_ordinal = match self
                     .state
                     .checked_item_count(branch_id, state_id)
-                    .map_err(Self::count_error)?;
+                    .map_err(|error| Self::count_error(error, "batch"))?
+                {
+                    ItemCount::NoHead => 0,
+                    ItemCount::Counted(count) => count,
+                    ItemCount::Moved => {
+                        unreachable!("a write moved the head while the batch held the write lock")
+                    }
+                };
             }
             Ok(StateOperation::AppendMany(items))
         })?;
@@ -1409,21 +1432,21 @@ impl Store {
         })
     }
 
-    /// The error of a batch whose count failed to read the state's chain,
-    /// which says the batch wasn't recorded, as a failed mark does: an I/O
-    /// error keeps its kind, and a record whose framing is bad stays
-    /// `InvalidFormat`. A failed checksum carries no message to add it to,
-    /// and comes back as it is.
-    fn count_error(error: StoreError) -> StoreError {
+    /// The error of a write (`what`: a batch, an edit) whose count failed to
+    /// read the state's chain, which says the write wasn't recorded, as a
+    /// failed mark does: an I/O error keeps its kind, and a record whose
+    /// framing is bad stays `InvalidFormat`. A failed checksum carries no
+    /// message to add it to, and comes back as it is.
+    fn count_error(error: StoreError, what: &str) -> StoreError {
         match error {
             StoreError::Io(error) => StoreError::Io(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "the batch was not recorded, because reading the state's records to count its items failed: {error}"
+                    "the {what} was not recorded, because reading the state's records to count its items failed: {error}"
                 ),
             )),
             StoreError::InvalidFormat(message) => StoreError::InvalidFormat(format!(
-                "the batch was not recorded, because a record the count read is damaged: {message}"
+                "the {what} was not recorded, because a record the count read is damaged: {message}"
             )),
             other => other,
         }
@@ -1478,17 +1501,34 @@ impl Store {
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
         // - Append, AppendMany: Always succeed, no validation needed (beyond
         //   the batch holding an item, above)
-        // - Edit: Just check index < len
+        // - Edit: Just check index < len, an append log's len being its
+        //   checked count
         // - Redact: No validation: when it's applied, a range past the end is
         //   clamped to the length and a reversed one removes nothing
         // - Set/Snapshot/DeltaSnapshot: No validation needed
         match &operation {
             StateOperation::Edit { index, .. } => {
-                let len = self
-                    .state
-                    .get_head(branch.id, state_id)
-                    .map(|h| h.item_count)
-                    .unwrap_or(0);
+                let len = if matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::AppendLog { .. })
+                ) {
+                    match self
+                        .state
+                        .checked_item_count(branch.id, state_id)
+                        .map_err(|error| Self::count_error(error, "edit"))?
+                    {
+                        ItemCount::NoHead => 0,
+                        ItemCount::Counted(count) => count,
+                        ItemCount::Moved => {
+                            unreachable!("a write moved the head while the edit held the write lock")
+                        }
+                    }
+                } else {
+                    self.state
+                        .get_head(branch.id, state_id)
+                        .map(|h| h.item_count)
+                        .unwrap_or(0)
+                };
                 if *index >= len {
                     return Err(StoreError::InvalidOperation(format!(
                         "Edit index {} out of bounds (len={})",
@@ -1908,20 +1948,61 @@ impl Store {
         }))
     }
 
-    /// Get the length of an AppendLog state without loading all items.
-    ///
-    /// This is O(1) - the count is tracked in the state chain head.
-    /// Returns None if state doesn't exist, Some(0) for empty state.
+    /// The number of items a state holds on the current branch: `None` where
+    /// the state has no value, `Some(0)` for an empty one. See
+    /// [`Store::get_state_len_on`].
     pub fn get_state_len(&self, state_id: &str) -> Result<Option<usize>> {
         self.get_state_len_on(self.branches.current_id(), state_id)
     }
 
     /// `get_state_len` against the given branch.
+    ///
+    /// For a state registered as `AppendLog` it is the number of items that
+    /// a read of the state on the branch returns. The head's stored count is
+    /// returned where the store has checked it, which reads nothing. A head
+    /// it hasn't checked has its value read once to count its items, as a
+    /// batched append does, and the head keeps that count: a count that a
+    /// release before 0.5.0 stored, one that a `DeltaSnapshot` the caller
+    /// wrote left, and one on a branch an earlier release damaged can be
+    /// off. The store saves its checks at each sync, in `state.bin`, so a
+    /// list counted before a sync isn't counted again after an open, unless a
+    /// later write left its head unchecked. A value that
+    /// doesn't materialize as a JSON array has no items to count, and the
+    /// stored count is returned. An error reading the log for the count (an
+    /// I/O error, or a record of the state's chain that fails its checksum
+    /// or whose framing is bad) is returned, and nothing changes. The count
+    /// is taken once without the store's write lock, and once more under it
+    /// if a write moved the state's head meanwhile, so that writers wait for
+    /// that second count. A branch deleted during the count never reads as a
+    /// state with no value: it gives `BranchNotFound`, or the count, as a
+    /// read just before the delete would.
+    ///
+    /// For a state of any other strategy, and one with no registration, it
+    /// is the count the head stores, which reads nothing: for a Tree state an
+    /// estimate between full snapshots.
     pub fn get_state_len_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<usize>> {
         self.branch_by_id(branch_id)?;
-        match self.state.get_head(branch_id, state_id) {
-            Some(head) => Ok(Some(head.item_count)),
-            None => Ok(None),
+        match self.state.get_strategy(state_id) {
+            Some(crate::types::StateStrategy::AppendLog { .. }) => {
+                let count = match self.state.checked_item_count(branch_id, state_id)? {
+                    ItemCount::Moved => {
+                        let _write = self.write_lock.lock();
+                        self.state.checked_item_count(branch_id, state_id)?
+                    }
+                    count => count,
+                };
+                match count {
+                    ItemCount::NoHead => {
+                        self.branch_by_id(branch_id)?;
+                        Ok(None)
+                    }
+                    ItemCount::Counted(count) => Ok(Some(count)),
+                    ItemCount::Moved => {
+                        unreachable!("a write moved the head while the length read held the write lock")
+                    }
+                }
+            }
+            _ => Ok(self.state.get_head(branch_id, state_id).map(|head| head.item_count)),
         }
     }
 
@@ -2008,7 +2089,10 @@ impl Store {
     /// JSON value (no bytes at all read as an empty list), as
     /// `get_state_slice` does, except the last item served from the head
     /// record alone, which reads no earlier item: an `Append`'s, or a batch's
-    /// last item where this session found the head's count exact.
+    /// last item where the store has found the head's count exact. On an
+    /// AppendLog whose count the store hasn't checked, the read counts the
+    /// state's items first, reading its whole value once, and returns that
+    /// count's error reading the log (see `StateManager::get_state_item`).
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -2033,13 +2117,11 @@ impl Store {
     /// range, the state has no value, or its value isn't an array; the
     /// `Deserialization` error where the state's bytes aren't one JSON value
     /// (no bytes at all read as an empty list), as for `get_state_item`,
-    /// except the last item served from the head
-    /// record alone, which reads no earlier item. It answers otherwise than
-    /// `get_state_item` only at the last index of a head whose count this
-    /// session hasn't found exact (unchecked, or checked on a value that
-    /// doesn't materialize), where `get_state_item` answers from the stored
-    /// count and this from the value. Ordinals may repeat and come in any
-    /// order. All of them are answered from one version of the state, read at
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item. It answers otherwise than `get_state_item` only at
+    /// the last index of a head whose check isn't exact (its value doesn't
+    /// materialize), where `get_state_item` answers from the stored count and
+    /// this from the value. Ordinals may repeat and come in any order. All of them are answered from one version of the state, read at
     /// most once, and an empty request reads nothing (see
     /// `StateManager::get_state_items_by_ordinal`).
     pub fn get_state_items_by_ordinal(
@@ -3129,9 +3211,9 @@ impl Store {
         for (state_id, parent_head) in self.state.selected_heads(parent.id, selection) {
             let strategy = self.state.get_strategy(&state_id);
             let is_tree = matches!(strategy, Some(crate::types::StateStrategy::Tree { .. }));
-            let head = match at_offset {
+            let (head, reused) = match at_offset {
                 Some(offset) if !is_tree && parent_head.head_offset <= offset => {
-                    Some(parent_head)
+                    (Some(parent_head), true)
                 }
                 _ => {
                     // The parent's last full snapshot, if it predates the
@@ -3154,11 +3236,11 @@ impl Store {
                         }
                         _ => None,
                     };
-                    self.find_chain_head_at(parent.id, &state_id, at, known_full)?
+                    (self.find_chain_head_at(parent.id, &state_id, at, known_full)?, false)
                 }
             };
             if let Some(head) = head {
-                heads.push((state_id, head));
+                heads.push((state_id, head, reused));
             }
         }
 
@@ -3166,9 +3248,14 @@ impl Store {
 
         // Point the new branch's state heads at the parent's chain at the branch point.
         // No new records are written - the branch shares the existing chain up to this point.
-        for (state_id, head) in heads {
-            self.state
-                .insert_head_for_branch(new_branch.id, &state_id, head);
+        for (state_id, head, reused) in heads {
+            if reused {
+                self.state
+                    .insert_parents_head_for_branch(parent.id, new_branch.id, &state_id, head);
+            } else {
+                self.state
+                    .insert_head_for_branch(new_branch.id, &state_id, head);
+            }
         }
 
         write.checkpoint_required = true;
@@ -4303,7 +4390,6 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot, "setup: the head holds false, as an earlier release saved it");
         let old = json!([0, 1, 2, 3]);
         reads_alike(&store, &old, "at the old head");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(3), "its count, short of the reading");
         store.set_auto_snapshot(false);
         for v in [4, 5] {
             store.update_state("s", StateOperation::Append(n(v))).unwrap();
@@ -4312,6 +4398,7 @@ mod tests {
         drop(store);
         let store = reopen(test_config(&dir));
         reads_alike(&store, &json!([0, 1, 2, 3, 4, 5]), "after the new delta and a reopen");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(6), "the reading's length");
     }
 
     /// Opens a store this process closed a moment ago. A child that a
@@ -4840,8 +4927,8 @@ mod tests {
     }
 
     /// A store with a state "s" of `items` appended one at a time, synced,
-    /// closed and opened again, so the head comes from `state.bin` and this
-    /// session hasn't checked its count. Auto-snapshots are off.
+    /// closed and opened again, so the head and its saved check come from
+    /// `state.bin`. Auto-snapshots are off.
     fn reopened_with_items(dir: &TempDir, items: usize) -> Store {
         let config = test_config(dir);
         {
@@ -4869,6 +4956,17 @@ mod tests {
         store
     }
 
+    fn reopened_unchecked(dir: &TempDir, items: usize) -> Store {
+        drop(reopened_with_items(dir, items));
+        let state_bin = test_config(dir).path.join("state.bin");
+        let bytes = std::fs::read(&state_bin).unwrap();
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        std::fs::write(&state_bin, &bytes[..13 + len]).unwrap();
+        let store = reopen(test_config(dir));
+        store.set_auto_snapshot(false);
+        store
+    }
+
     /// A batch counts the items of a head this session hasn't checked before
     /// it takes the write lock, so other writers don't wait while it reads
     /// the whole value: here the count is read while the test holds the
@@ -4877,7 +4975,7 @@ mod tests {
     #[test]
     fn a_batch_counts_an_unchecked_head_before_it_takes_the_write_lock() {
         let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+        let store = reopened_unchecked(&dir, 3);
         let before = store.state_reconstruction_count();
         std::thread::scope(|scope| {
             let held = store.write_lock.lock();
@@ -4902,7 +5000,7 @@ mod tests {
     #[test]
     fn a_batch_whose_count_fails_to_read_says_it_was_not_recorded() {
         let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+        let store = reopened_unchecked(&dir, 3);
         let head = store.current_branch().head;
         let size = store.stats().unwrap().total_size_bytes;
         *store.log.read_failures.lock() = 1;
@@ -4921,6 +5019,94 @@ mod tests {
         assert_eq!(store.current_branch().head, head, "no record");
         assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
         assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
+    }
+
+    /// A store whose state "s" holds `items` items under a stored count of
+    /// `count`, with no checks, as an earlier release could leave it.
+    fn reopened_with_a_stale_count(dir: &TempDir, items: usize, count: usize) -> Arc<Store> {
+        let store = reopened_with_items(dir, items);
+        let branch = store.current_branch().id;
+        drop(store);
+        let state_bin = test_config(dir).path.join("state.bin");
+        let bytes = std::fs::read(&state_bin).unwrap();
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        let mut index: crate::state::StateIndex = rmp_serde::from_slice(&bytes[13..13 + len]).unwrap();
+        index.heads.get_mut(branch, "s").unwrap().item_count = count;
+        let encoded = rmp_serde::to_vec(&index).unwrap();
+        let mut stale = bytes[..5].to_vec();
+        stale.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        stale.extend_from_slice(&encoded);
+        std::fs::write(&state_bin, stale).unwrap();
+        let store = Arc::new(reopen(test_config(dir)));
+        store.set_auto_snapshot(false);
+        store
+    }
+
+    #[test]
+    fn a_length_read_that_a_write_races_counts_again_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 0);
+        let writer = Arc::clone(&store);
+        let recount_held_the_lock = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&recount_held_the_lock);
+        store.state.set_test_hook("count: value read", move |state| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+            state.set_test_hook("count: value read", move |_| {
+                *seen.lock() = Some(writer.write_lock.try_lock().is_none());
+            });
+        });
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4), "the count of the head that the write moved");
+        assert_eq!(*recount_held_the_lock.lock(), Some(true), "the second count held the write lock");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn an_item_read_whose_count_a_write_races_reads_the_value() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 1);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        assert_eq!(
+            store.get_state_item("s", 0).unwrap(),
+            Some(serde_json::to_vec(&json!(0)).unwrap()),
+            "the item at index 0 of the value, not the moved head record's"
+        );
+    }
+
+    #[test]
+    fn an_edit_whose_count_a_write_races_takes_its_bound_from_a_count_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 1);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        let edit = StateOperation::Edit { index: 3, new_value: serde_json::to_vec(&json!("x")).unwrap() };
+        store.update_state("s", edit).unwrap();
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn a_length_read_of_a_branch_deleted_during_its_count_finds_no_branch() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(reopened_unchecked(&dir, 3));
+        let child = store.create_branch("child", None).unwrap().id;
+        let deleter = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            deleter.delete_branch("child").unwrap();
+        });
+        match store.get_state_len_on(child, "s") {
+            Err(StoreError::BranchNotFound(_)) => {}
+            other => panic!("a length read of a branch deleted during its count: expected BranchNotFound, got {other:?}"),
+        }
     }
 
     /// The snapshot outcomes of writes are noted after the write lock is
