@@ -1064,6 +1064,13 @@ impl Store {
     /// given, and one that can't be applied, such as an Append of bytes that
     /// aren't JSON, shows when the state is next materialized.
     ///
+    /// For a state registered as `AppendLog`, an Edit's length is the number
+    /// of items, as `get_state_len_on` gives it: where the store hasn't
+    /// checked the count, the Edit counts the items first, reading the whole
+    /// value once without the write lock, and once more under it if a write
+    /// moved the head meanwhile. An error reading the log for that count is
+    /// returned, and the Edit isn't recorded.
+    ///
     /// An `AppendMany` with no items is refused. The first `AppendMany` a
     /// store records also rewrites its MANIFEST, before the record is
     /// written, to format version 2 with the batch feature named, so a build
@@ -1129,6 +1136,16 @@ impl Store {
         skip_auto_snapshot: bool,
         snapshot_of: Option<u64>,
     ) -> Result<Record> {
+        if matches!(operation, StateOperation::Edit { .. })
+            && matches!(
+                self.state.get_strategy(state_id),
+                Some(crate::types::StateStrategy::AppendLog { .. })
+            )
+        {
+            self.state
+                .checked_item_count(branch_id, state_id)
+                .map_err(|error| Self::count_error(error, "edit"))?;
+        }
         self.update_state_with_builder(
             branch_id,
             state_id,
@@ -1359,7 +1376,7 @@ impl Store {
         // left the head unchecked, counts again under the lock.
         self.state
             .checked_item_count(branch_id, state_id)
-            .map_err(Self::count_error)?;
+            .map_err(|error| Self::count_error(error, "batch"))?;
         let mut first_ordinal = 0;
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
@@ -1371,7 +1388,7 @@ impl Store {
                 first_ordinal = match self
                     .state
                     .checked_item_count(branch_id, state_id)
-                    .map_err(Self::count_error)?
+                    .map_err(|error| Self::count_error(error, "batch"))?
                 {
                     ItemCount::NoHead => 0,
                     ItemCount::Counted(count) => count,
@@ -1388,21 +1405,21 @@ impl Store {
         })
     }
 
-    /// The error of a batch whose count failed to read the state's chain,
-    /// which says the batch wasn't recorded, as a failed mark does: an I/O
-    /// error keeps its kind, and a record whose framing is bad stays
-    /// `InvalidFormat`. A failed checksum carries no message to add it to,
-    /// and comes back as it is.
-    fn count_error(error: StoreError) -> StoreError {
+    /// The error of a write (`what`: a batch, an edit) whose count failed to
+    /// read the state's chain, which says the write wasn't recorded, as a
+    /// failed mark does: an I/O error keeps its kind, and a record whose
+    /// framing is bad stays `InvalidFormat`. A failed checksum carries no
+    /// message to add it to, and comes back as it is.
+    fn count_error(error: StoreError, what: &str) -> StoreError {
         match error {
             StoreError::Io(error) => StoreError::Io(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "the batch was not recorded, because reading the state's records to count its items failed: {error}"
+                    "the {what} was not recorded, because reading the state's records to count its items failed: {error}"
                 ),
             )),
             StoreError::InvalidFormat(message) => StoreError::InvalidFormat(format!(
-                "the batch was not recorded, because a record the count read is damaged: {message}"
+                "the {what} was not recorded, because a record the count read is damaged: {message}"
             )),
             other => other,
         }
@@ -1457,17 +1474,34 @@ impl Store {
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
         // - Append, AppendMany: Always succeed, no validation needed (beyond
         //   the batch holding an item, above)
-        // - Edit: Just check index < len
+        // - Edit: Just check index < len, an append log's len being its
+        //   checked count
         // - Redact: No validation: when it's applied, a range past the end is
         //   clamped to the length and a reversed one removes nothing
         // - Set/Snapshot/DeltaSnapshot: No validation needed
         match &operation {
             StateOperation::Edit { index, .. } => {
-                let len = self
-                    .state
-                    .get_head(branch.id, state_id)
-                    .map(|h| h.item_count)
-                    .unwrap_or(0);
+                let len = if matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::AppendLog { .. })
+                ) {
+                    match self
+                        .state
+                        .checked_item_count(branch.id, state_id)
+                        .map_err(|error| Self::count_error(error, "edit"))?
+                    {
+                        ItemCount::NoHead => 0,
+                        ItemCount::Counted(count) => count,
+                        ItemCount::Moved => {
+                            unreachable!("a write moved the head while the edit held the write lock")
+                        }
+                    }
+                } else {
+                    self.state
+                        .get_head(branch.id, state_id)
+                        .map(|h| h.item_count)
+                        .unwrap_or(0)
+                };
                 if *index >= len {
                     return Err(StoreError::InvalidOperation(format!(
                         "Edit index {} out of bounds (len={})",
@@ -4709,6 +4743,21 @@ mod tests {
             Some(serde_json::to_vec(&json!(0)).unwrap()),
             "the item at index 0 of the value, not the moved head record's"
         );
+    }
+
+    #[test]
+    fn an_edit_whose_count_a_write_races_takes_its_bound_from_a_count_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 1);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        let edit = StateOperation::Edit { index: 3, new_value: serde_json::to_vec(&json!("x")).unwrap() };
+        store.update_state("s", edit).unwrap();
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
     }
 
     #[test]

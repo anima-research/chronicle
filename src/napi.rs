@@ -1564,7 +1564,10 @@ impl JsStore {
         })
     }
 
-    /// Edit an item in an AppendLog state.
+    /// Edit an item in an AppendLog state. An index at or past the number of
+    /// items is refused. Where the store hasn't checked the list's count, the
+    /// edit counts the list first, reading it whole once, and throws as
+    /// `getStateLen` does where that read meets a record that it can't read.
     #[napi]
     pub fn edit_state_item(
         &self,

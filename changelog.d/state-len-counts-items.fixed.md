@@ -11,9 +11,12 @@
   item that isn't JSON, has no items to count, so `getStateLen` gives the
   count that the store keeps. `getStateItemJson` on an unchecked list counts
   it first in the same way. Before, at the stale count's last index, it
-  returned the list's last item. `listStates()` still gives the count that the
-  store keeps. For a state of another strategy, `getStateLen` still gives that
-  count too.
+  returned the list's last item. `editStateItem` also counts an unchecked list
+  first, and refuses an index at or past its items. Before, it took its bound
+  from the stored count, so it could refuse an item that the list holds, or
+  write an edit past the end that made every full read of the list fail.
+  `listStates()` still gives the count that the store keeps. For a state of
+  another strategy, `getStateLen` still gives that count too.
 - The store saves its checks in `state.bin`, after the index, at each `sync()`
   and `close()`. A list that the store counted before a sync isn't read for
   its count again after an open. A later write, such as a `DeltaSnapshot`

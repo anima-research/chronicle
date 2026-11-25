@@ -488,3 +488,68 @@ fn an_item_read_whose_count_meets_a_damaged_record_throws() {
     }
     assert_eq!(store.stats().unwrap().record_count, records, "nothing written");
 }
+
+#[test]
+fn an_edit_takes_its_bound_from_the_items_where_the_stored_count_is_stale() {
+    let dir = TempDir::new().unwrap();
+    let edit = |index: usize| StateOperation::Edit { index, new_value: serde_json::to_vec(&json!("x")).unwrap() };
+
+    let (path, branch) = three_items(&dir);
+    store_count(&path, branch, "s", 0);
+    as_a_release_without_checks_left_it(&path);
+    let store = open(&path);
+    store.update_state("s", edit(1)).unwrap();
+    assert_eq!(items(&store, "s"), json!([0, "x", 2]), "an index under the items, over the stored count 0");
+    drop(store);
+
+    let other = TempDir::new().unwrap();
+    let (path, branch) = three_items(&other);
+    store_count(&path, branch, "s", 5);
+    as_a_release_without_checks_left_it(&path);
+    let store = open(&path);
+    match store.update_state("s", edit(4)) {
+        Err(StoreError::InvalidOperation(message)) => assert!(message.contains("len=3"), "{message}"),
+        other => panic!("an index past the items, under the stored count 5: expected the bound's refusal, got {other:?}"),
+    }
+    assert_eq!(items(&store, "s"), json!([0, 1, 2]), "nothing written, and the value reads");
+}
+
+#[test]
+fn an_edit_whose_count_meets_a_damaged_record_throws_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = create(&path);
+        register(&store, "s", append_log());
+        append(&store, "s", json!("first"));
+        append(&store, "s", json!("damaged-in-the-chain"));
+        append(&store, "s", json!("last"));
+        store.sync().unwrap();
+    }
+    as_a_release_without_checks_left_it(&path);
+    let store = open(&path);
+    let records = store.stats().unwrap().record_count;
+    damage(&path.join("records.log"), b"damaged-in-the-chain");
+
+    let edit = StateOperation::Edit { index: 0, new_value: serde_json::to_vec(&json!("x")).unwrap() };
+    match store.update_state("s", edit) {
+        Err(StoreError::ChecksumMismatch { .. }) => {}
+        other => panic!("an edit whose count meets a damaged record: expected the checksum error, got {other:?}"),
+    }
+    assert_eq!(store.stats().unwrap().record_count, records, "nothing written");
+}
+
+#[test]
+fn an_edit_of_a_checked_list_or_of_another_strategy_reads_nothing_for_its_bound() {
+    let dir = TempDir::new().unwrap();
+    let (path, _) = three_items(&dir);
+    let store = open(&path);
+    register(&store, "whole", StateStrategy::Snapshot);
+    store.update_state("whole", StateOperation::Set(serde_json::to_vec(&json!([0, 1, 2])).unwrap())).unwrap();
+    store.clear_state_caches();
+    let before = reads(&store);
+    let edit = |index: usize| StateOperation::Edit { index, new_value: serde_json::to_vec(&json!("x")).unwrap() };
+    store.update_state("s", edit(2)).unwrap();
+    store.update_state("whole", edit(2)).unwrap();
+    assert_eq!(reads(&store), before, "the list's check, and the stored count of the other strategy, gave the bounds");
+}
