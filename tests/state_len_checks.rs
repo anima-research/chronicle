@@ -553,3 +553,38 @@ fn an_edit_of_a_checked_list_or_of_another_strategy_reads_nothing_for_its_bound(
     store.update_state("whole", edit(2)).unwrap();
     assert_eq!(reads(&store), before, "the list's check, and the stored count of the other strategy, gave the bounds");
 }
+
+#[test]
+fn item_reads_under_a_stale_count_give_the_items_of_the_full_read_at_each_index() {
+    for stored in [1, 5] {
+        let stale_store = || {
+            let dir = TempDir::new().unwrap();
+            let (path, branch) = three_items(&dir);
+            store_count(&path, branch, "s", stored);
+            as_a_release_without_checks_left_it(&path);
+            (dir, open(&path))
+        };
+        let full = {
+            let (_dir, store) = stale_store();
+            items(&store, "s")
+        };
+        assert_eq!(full, json!([0, 1, 2]), "setup: the full read");
+        for index in 0..6 {
+            let expected = full.get(index).cloned();
+            let (_dir, store) = stale_store();
+            let item = store
+                .get_state_item("s", index)
+                .unwrap()
+                .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap());
+            assert_eq!(item, expected, "stored count {stored}: get_state_item at {index}");
+            let (_dir, store) = stale_store();
+            let by_ordinal: Vec<Option<Value>> = store
+                .get_state_items_by_ordinal("s", &[index])
+                .unwrap()
+                .into_iter()
+                .map(|item| item.map(|bytes| serde_json::from_slice(&bytes).unwrap()))
+                .collect();
+            assert_eq!(by_ordinal, vec![expected], "stored count {stored}: the by-ordinal read at {index}");
+        }
+    }
+}

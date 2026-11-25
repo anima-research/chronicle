@@ -28,8 +28,8 @@
   makes it throw. Earlier releases read only the index in `state.bin`, so they
   can open a store that this release wrote. This release opens a store that
   has no checks, and counts each of its lists at first use. So after the
-  update, each list's first `getStateLen` or batch blocks the calling thread
-  for that read.
+  update, the first of `getStateLen`, `getStateItemJson`, `editStateItem` or a
+  batch on each list blocks the calling thread for that read.
 - `tools/compact-set-states.py` reads a `state.bin` that holds the checks, and
   writes the new one without them. An earlier copy of the tool refuses such a
   `state.bin` and changes nothing. It says that `state.bin` "is not the length
