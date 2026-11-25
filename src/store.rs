@@ -3327,19 +3327,33 @@ impl Store {
     /// `register_state_field_index` rebuilds a missing or stale one.
     ///
     /// Once an fsync of the record log has failed, this call's own or a
-    /// periodic one, this returns the failure every time until the store is
-    /// reopened, as [`StoreError::DurabilityLost`], and publishes nothing.
-    /// Linux reports a write-back error to one fsync, and a later one can
-    /// succeed although the records written before the failure never reached
-    /// the disk, so a checkpoint published after it could name records the
-    /// disk doesn't hold. Registration, strategy changes, and branch
-    /// creation, deletion and switching fail the same way, and so does any
-    /// write while one of them waits for its checkpoint. Reopening the store
-    /// is the only way to resume durable writes. It replays the log from the
-    /// last checkpoint, and can't tell whether records the operating system
-    /// still caches reached the disk: if they didn't while later records did,
-    /// an open after the cache drops them refuses the store as mid-log
-    /// corruption.
+    /// periodic one, the records written since the last good fsync may not
+    /// have reached the disk: Linux reports a write-back error to one fsync,
+    /// and a later one can succeed although the pages that failed never
+    /// reached the disk. So while that failure stands, this first writes
+    /// those records again from the bytes the log keeps in memory, and then
+    /// fsyncs. When that succeeds, the failure ends and this publishes the
+    /// checkpoints as usual. When it fails, this returns
+    /// [`StoreError::DurabilityLost`] and publishes nothing, since a
+    /// checkpoint could name records the disk doesn't hold, and the next call
+    /// tries again. While the failure stands, each later write other than a
+    /// blob write makes the same retry first, before it changes anything: an
+    /// append, a state update, a field-index registration, a registration, a
+    /// strategy change, and a branch creation, deletion or switch. When the
+    /// retry succeeds, the write goes on. When it fails, the write returns
+    /// the same error and changes nothing. While the disk keeps failing, each
+    /// retry writes the kept bytes again, which can be 64 MiB and one record,
+    /// and waits for an fsync, and reads of the log wait for it. A write while a metadata checkpoint is owed saves
+    /// that checkpoint first, which makes the retry too. A registration,
+    /// strategy change, or branch creation, deletion or switch whose own
+    /// checkpoint then fails returns the error and keeps its change, as for
+    /// any failed checkpoint.
+    /// Reopening the store also ends the failure. The open fsyncs the log
+    /// first, and fails with the same error when that fsync fails. It
+    /// replays the log from the last checkpoint, and can't tell whether
+    /// records the operating system still caches reached the disk: if they
+    /// didn't while later records did, an open after the cache drops them
+    /// refuses the store as mid-log corruption.
     ///
     /// On open, complete state updates in the log past the last checkpoint
     /// are replayed, except those on a branch that `branches.bin` doesn't
@@ -3353,7 +3367,8 @@ impl Store {
     /// proceeding, so a successful write cannot depend on an unpersisted
     /// registration or branch. This method retries it too; metadata is not
     /// rolled back. A failed sync with no such change pending holds back no
-    /// later append or state update.
+    /// later append or state update, unless what failed was the record log's
+    /// fsync, as above.
     ///
     /// On Unix a save also syncs the containing directory, where the system
     /// can. Where this process can't open that directory to sync it, the
@@ -3400,19 +3415,22 @@ impl Store {
         }
     }
 
-    /// Finish a failed metadata checkpoint before admitting another mutation.
+    /// Finish a failed metadata checkpoint, or retry a failed fsync of the
+    /// log, before admitting another mutation.
     fn retry_metadata_checkpoint(&self, write: &mut WriteState) -> Result<()> {
         if write.checkpoint_required {
-            self.sync_locked(write)?;
+            self.sync_locked(write)
+        } else {
+            self.log.sync_if_lost()
         }
-        Ok(())
     }
 
     /// Call only while holding write_lock, so a state head cannot reach disk
     /// ahead of its log record and branch/state checkpoints cannot interleave.
     /// A branch change waiting on a checkpoint is announced once one succeeds.
     fn sync_locked(&self, write: &mut WriteState) -> Result<()> {
-        // Sync the append-only log (O(1) - just fsync)
+        // Sync the append-only log. After a failed fsync, this writes the
+        // records since the last good one again first.
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
@@ -5838,11 +5856,15 @@ mod tests {
     // R1-1: a failed periodic fsync must not leave a record that its state's
     // head never adopted, or the next update names the same predecessor and
     // replay refuses the store. The child keeps writing after one failed
-    // fsync, and again while every fsync fails, and exits without Drop, so
-    // the reopen has only the log and the registration's checkpoint to go on.
+    // fsync, which the next write's retry ends, and again while every
+    // fsync fails, and exits without Drop, so the reopen has only the log and
+    // the registration's checkpoint to go on.
     #[test]
     fn failed_periodic_fsync_keeps_heads_and_log_in_step() {
-        for failures in ["one", "every"] {
+        for (failures, expected) in [
+            ("one", (0..250).collect::<Vec<u64>>()),
+            ("every", (0..100).collect()),
+        ] {
             let dir = TempDir::new().unwrap();
             let config = test_config(&dir);
             run_fsync_failure_child(&config, "update", failures);
@@ -5850,7 +5872,7 @@ mod tests {
             let store = Store::open(config).unwrap();
             let items: Vec<u64> =
                 serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
-            assert_eq!(items, (0..250).collect::<Vec<u64>>(), "{failures}");
+            assert_eq!(items, expected, "{failures}");
         }
     }
 
@@ -5859,7 +5881,7 @@ mod tests {
     // its sequence with the next one.
     #[test]
     fn failed_periodic_fsync_leaves_no_generic_sequence_twice() {
-        for failures in ["one", "every"] {
+        for (failures, written) in [("one", 250), ("every", 100)] {
             let dir = TempDir::new().unwrap();
             let config = test_config(&dir);
             run_fsync_failure_child(&config, "append", failures);
@@ -5871,16 +5893,12 @@ mod tests {
                 .map(|id| store.get_record(id).unwrap().unwrap().sequence.0)
                 .collect();
             sequences.sort_unstable();
-            assert_eq!(sequences, (1..=250).collect::<Vec<u64>>(), "{failures}");
+            assert_eq!(sequences, (1..=written).collect::<Vec<u64>>(), "{failures}");
         }
     }
 
-    // After one failed fsync of the log, nothing publishes a checkpoint until
-    // the store is reopened: neither sync(), a metadata mutation nor Drop,
-    // and each of them reports DurabilityLost. Writes go on until a metadata
-    // mutation waits for its checkpoint, and then report it too.
     #[test]
-    fn a_failed_log_fsync_publishes_nothing_until_reopen() {
+    fn a_failed_log_fsync_publishes_nothing_until_a_sync_writes_the_log_again() {
         let dir = TempDir::new().unwrap();
         let config = test_config(&dir);
         let registration = |id: &str| StateRegistration {
@@ -5896,70 +5914,248 @@ mod tests {
         store.set_auto_snapshot(false);
         let checkpoint = std::fs::read(config.path.join("state.bin")).unwrap();
 
-        // The 100th update's periodic fsync fails, and the retry succeeds.
-        *store.log.fsync_failures.lock() = 1;
-        for n in 0..150u64 {
-            store
-                .update_state("items", StateOperation::Append(n.to_string().into_bytes()))
-                .unwrap();
-        }
-        for _ in 0..2 {
-            let result = store.sync();
-            assert_eq!(
-                std::fs::read(config.path.join("state.bin")).unwrap(),
-                checkpoint,
-                "sync() published state.bin"
-            );
-            let error = result.unwrap_err();
-            assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
-            assert!(error.to_string().contains("until it is reopened"), "{error}");
-        }
         fn lost<T>(result: Result<T>) -> bool {
             matches!(result, Err(StoreError::DurabilityLost(_)))
         }
+        let unpublished = |what: &str| {
+            assert_eq!(
+                std::fs::read(config.path.join("state.bin")).unwrap(),
+                checkpoint,
+                "{what} published state.bin"
+            );
+        };
+
+        *store.log.fsync_failures.lock() = u64::MAX;
+        for n in 0..150u64 {
+            let update =
+                store.update_state("items", StateOperation::Append(n.to_string().into_bytes()));
+            if n < 100 {
+                update.unwrap();
+            } else {
+                assert!(lost(update), "update {n} is refused");
+            }
+        }
+        assert!(lost(store.append(RecordInput::raw("event", b"refused".to_vec()))));
+        let result = store.sync();
+        unpublished("a sync whose retry failed");
+        let error = result.unwrap_err();
+        assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+        assert!(error.to_string().contains("Until a retry writes them again"), "{error}");
         assert!(lost(store.register_state(registration("other"))));
-        // Every call that retries the registration's pending checkpoint first
-        // meets the same failure.
-        assert!(
-            lost(store.update_state("items", StateOperation::Append(b"150".to_vec()))),
-            "a write waits for the registration's checkpoint"
-        );
-        assert!(lost(store.append(RecordInput::raw("event", b"blocked".to_vec()))));
-        assert!(lost(store.update_state_strategy(
-            "items",
-            crate::types::StateStrategy::AppendLog {
-                delta_snapshot_every: 50,
-                full_snapshot_every: 20,
-            },
-        )));
-        assert!(lost(store.register_state_field_index(
-            "items",
-            "/n",
-            crate::state::FieldIndexKind::Number
-        )));
-        assert!(lost(store.create_branch("blocked", None)));
-        assert!(lost(store.create_empty_branch("blocked-empty", None)));
-        assert!(lost(store.create_branch_at("blocked-at", "main", Sequence(0))));
-        assert!(lost(store.switch_branch("main")));
-        assert!(lost(store.delete_branch("missing")));
-        assert!(lost(store.sync()));
+        unpublished("a registration whose retry failed");
+
+        *store.log.fsync_failures.lock() = 0;
+        store
+            .update_state("items", StateOperation::Append(b"150".to_vec()))
+            .unwrap();
+        store.sync().unwrap();
+        assert_ne!(std::fs::read(config.path.join("state.bin")).unwrap(), checkpoint);
         drop(store);
-        assert_eq!(
-            std::fs::read(config.path.join("state.bin")).unwrap(),
-            checkpoint,
-            "nothing published state.bin"
-        );
 
         let store = reopen(config);
         let items: Vec<u64> =
             serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
-        assert_eq!(items, (0..150).collect::<Vec<u64>>());
-        assert!(matches!(
-            store.register_state(registration("items")),
-            Err(StoreError::StateExists(_))
-        ));
+        let expected: Vec<u64> = (0..100).chain([150]).collect();
+        assert_eq!(items, expected);
+        assert!(store.get_records_by_type("event").is_empty());
         store.register_state(registration("other")).unwrap();
+    }
+
+    type MetadataCall = (&'static str, fn(&Store) -> Result<()>, fn(&Store) -> bool);
+
+    fn metadata_calls() -> [MetadataCall; 7] {
+        [
+            (
+                "register_state",
+                |store| {
+                    store.register_state(StateRegistration {
+                        id: "other".into(),
+                        strategy: crate::types::StateStrategy::Snapshot,
+                        initial_value: None,
+                    })
+                },
+                |store| store.state.get_strategy("other").is_some(),
+            ),
+            (
+                "update_state_strategy",
+                |store| {
+                    store.update_state_strategy(
+                        "items",
+                        crate::types::StateStrategy::AppendLog {
+                            delta_snapshot_every: 50,
+                            full_snapshot_every: 20,
+                        },
+                    )
+                },
+                |store| {
+                    matches!(
+                        store.state.get_strategy("items"),
+                        Some(crate::types::StateStrategy::AppendLog {
+                            delta_snapshot_every: 50,
+                            full_snapshot_every: 20,
+                        })
+                    )
+                },
+            ),
+            (
+                "create_branch",
+                |store| store.create_branch("made", None).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "create_empty_branch",
+                |store| store.create_empty_branch("made", None).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "create_branch_at",
+                |store| store.create_branch_at("made", "main", Sequence(0)).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "switch_branch",
+                |store| store.switch_branch("side").map(drop),
+                |store| store.current_branch().name == "side",
+            ),
+            (
+                "delete_branch",
+                |store| store.delete_branch("side"),
+                |store| store.get_branch("side").is_none(),
+            ),
+        ]
+    }
+
+    fn metadata_store(dir: &TempDir) -> (Store, StoreConfig) {
+        let config = test_config(dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.create_branch("side", None).unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
         store.sync().unwrap();
+        (store, config)
+    }
+
+    fn checkpoint_files(config: &StoreConfig) -> [Vec<u8>; 2] {
+        ["state.bin", "branches.bin"].map(|file| std::fs::read(config.path.join(file)).unwrap())
+    }
+
+    #[test]
+    fn a_metadata_call_while_a_failure_stands_retries_first_and_changes_nothing() {
+        use crate::state::FieldIndexKind;
+        let field_index: MetadataCall = (
+            "register_state_field_index",
+            |store| store.register_state_field_index("items", "/v", FieldIndexKind::Number),
+            |store| {
+                store
+                    .query_state_index_range("items", "/v", None, None, None, None, false)
+                    .is_some()
+            },
+        );
+        for (name, call, changed) in metadata_calls().into_iter().chain([field_index]) {
+            let dir = TempDir::new().unwrap();
+            let (store, config) = metadata_store(&dir);
+            let published = checkpoint_files(&config);
+            *store.log.fsync_failures.lock() = 2;
+            assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(!changed(&store), "{name} changed nothing");
+            assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
+            call(&store).unwrap();
+            assert!(changed(&store), "{name} went on after a good retry");
+        }
+    }
+
+    #[test]
+    fn a_metadata_call_whose_checkpoint_fsync_fails_keeps_its_change_until_a_good_sync() {
+        for (name, call, changed) in metadata_calls() {
+            let dir = TempDir::new().unwrap();
+            let (store, config) = metadata_store(&dir);
+            let published = checkpoint_files(&config);
+            *store.log.fsync_failures.lock() = 1;
+            assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(changed(&store), "{name} kept its change");
+            assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
+            store.sync().unwrap();
+            drop(store);
+            assert!(changed(&reopen(config)), "{name}: the good sync published the change");
+        }
+    }
+
+    #[test]
+    fn a_write_after_a_failed_log_fsync_retries_it_first() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        let event = |payload: &[u8]| store.append(RecordInput::raw("event", payload.to_vec()));
+        store.sync().unwrap();
+        let synced = store.log.size();
+        event(b"one").unwrap();
+        *store.log.fsync_failures.lock() = 1;
+        assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))));
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(config.path.join("records.log"))
+                .unwrap();
+            file.seek(SeekFrom::Start(synced)).unwrap();
+            file.write_all(&vec![0u8; (store.log.size() - synced) as usize]).unwrap();
+        }
+        event(b"two").unwrap();
+
+        *store.log.fsync_failures.lock() = 2;
+        assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))));
+        let records = store.stats().unwrap().record_count;
+        assert!(matches!(event(b"refused"), Err(StoreError::DurabilityLost(_))));
+        assert_eq!(store.stats().unwrap().record_count, records);
+        event(b"three").unwrap();
+        store.sync().unwrap();
+        drop(store);
+
+        let store = reopen(config);
+        let payloads: Vec<Vec<u8>> = store
+            .get_records_by_type("event")
+            .into_iter()
+            .map(|id| store.get_record(id).unwrap().unwrap().payload)
+            .collect();
+        assert_eq!(payloads, [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    #[test]
+    fn a_refused_batch_leaves_the_manifest_as_it_was() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+        let manifest = std::fs::read(config.path.join("MANIFEST")).unwrap();
+        *store.log.fsync_failures.lock() = 2;
+        assert!(store.sync().is_err());
+
+        let batch = || store.update_state("items", StateOperation::AppendMany(vec![b"1".to_vec()]));
+        assert!(matches!(batch(), Err(StoreError::DurabilityLost(_))));
+        assert_eq!(std::fs::read(config.path.join("MANIFEST")).unwrap(), manifest);
+
+        batch().unwrap();
+        assert_ne!(std::fs::read(config.path.join("MANIFEST")).unwrap(), manifest);
     }
 
     // What a checkpoint published past records the disk lost would meet: a
@@ -6052,8 +6248,12 @@ mod tests {
                 store.append(RecordInput::raw("message", payload)).map(drop)
             };
             if n == 150 {
-                assert!(store.sync().is_err(), "sync reports the failed fsync");
-                assert!(store.sync().is_err(), "and goes on reporting it");
+                if failures == "one" {
+                    store.sync().expect("the sync's retry succeeds");
+                } else {
+                    assert!(store.sync().is_err(), "sync reports the failed fsync");
+                    assert!(store.sync().is_err(), "and goes on reporting it");
+                }
             }
         }
         // Exit without destructors, as a crash would.
