@@ -1668,7 +1668,11 @@ impl JsStore {
     /// except the last item served from the head record alone, which reads
     /// no earlier item: an `appendToState`'s, or a batch's last item where
     /// the store found the head's count exact, in this session or in one
-    /// that saved its check before this open.
+    /// that saved its check before this open. On an `append_log` whose count
+    /// the store hasn't checked, the read counts the list first, reading it
+    /// whole once, so that it answers at the index of the items, and throws
+    /// as `getStateLen` does where that read meets a record that it can't
+    /// read.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1696,11 +1700,9 @@ impl JsStore {
     /// call. The result has one entry per index in `ordinals`, in the order
     /// given: what `getStateItemJson` returns for that index, so `null` if it
     /// is negative or out of range, the state doesn't exist, or the state's
-    /// value isn't an array, except at the last index of a head whose count
-    /// the store hasn't found exact, in this session or in one that saved its
-    /// check before this open (unchecked, or checked on a value that doesn't
-    /// materialize), where `getStateItemJson` answers from the stored
-    /// count and this from the value. Throws, as `getStateItemJson` does, if
+    /// value isn't an array, except at the last index of a list whose value
+    /// can't be rebuilt as an array, where `getStateItemJson` answers from
+    /// the stored count and this from the value. Throws, as `getStateItemJson` does, if
     /// the state's bytes aren't one JSON value (no bytes at all read as an
     /// empty list), except the last item served from the head record alone,
     /// which reads no earlier item. Indices may repeat and come in any order.

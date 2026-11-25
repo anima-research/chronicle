@@ -1363,6 +1363,15 @@ impl StateManager {
     /// the final index, the item is served from the head record alone:
     /// O(one record read) regardless of state size, no cache churn.
     ///
+    /// The final index is the head's count, so for a state registered as an
+    /// AppendLog a head whose count the store hasn't checked is counted first
+    /// (`checked_item_count`), reading its whole value once: a count a
+    /// release before 0.5.0 stored can be off, and the head record's item
+    /// would then answer an index it isn't at. That count's error reading
+    /// the log (an I/O error, or a record that fails its checksum or whose
+    /// framing is bad) is returned. Where a write moves the head during the
+    /// count, the item is read from the value.
+    ///
     /// Byte fidelity: an item appended as a `serde_json::Value`, as
     /// `append_to_state_json_with_identity` and its batched form append
     /// theirs, is stored as that Value's serialization, and materialization
@@ -1390,9 +1399,23 @@ impl StateManager {
         state_id: &str,
         index: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let Some((head, check)) = self.head_and_check(branch_id, state_id) else {
+        let Some((mut head, mut check)) = self.head_and_check(branch_id, state_id) else {
             return Ok(None);
         };
+        let mut fast_path = true;
+        if check.is_none() && matches!(self.get_strategy(state_id), Some(StateStrategy::AppendLog { .. })) {
+            match self.checked_item_count(branch_id, state_id)? {
+                ItemCount::NoHead => return Ok(None),
+                ItemCount::Counted(_) => {
+                    let Some((counted, counted_check)) = self.head_and_check(branch_id, state_id) else {
+                        return Ok(None);
+                    };
+                    fast_path = counted_check.is_some();
+                    (head, check) = (counted, counted_check);
+                }
+                ItemCount::Moved => fast_path = false,
+            }
+        }
         let exact = check.is_some_and(|check| check.exact);
 
         // Warm cache wins: O(1) and avoids even the head-record read.
@@ -1404,7 +1427,7 @@ impl StateManager {
         self.run_test_hook("item lookup: cache missed");
 
         // Head-record fast path: last item + Append head.
-        if head.item_count > 0 && index == head.item_count - 1 {
+        if fast_path && head.item_count > 0 && index == head.item_count - 1 {
             if let Some(item) = self.last_item_from_head(&head, exact)? {
                 return Ok(Some(item));
             }
@@ -1421,10 +1444,9 @@ impl StateManager {
     /// in `ordinals`, in the order given, what `get_state_item` returns for
     /// it, `None` where it is out of range, the state has no value on this
     /// branch, or its value isn't an array, except at the last index of a
-    /// head whose count the store hasn't found exact (unchecked, or checked
-    /// on a value that doesn't materialize), where `get_state_item`
-    /// answers from the stored count and this from the value. Ordinals may
-    /// repeat and come in any order.
+    /// head whose check isn't exact (its value doesn't materialize), where
+    /// `get_state_item` answers from the stored count and this from the
+    /// value. Ordinals may repeat and come in any order.
     ///
     /// Every answer comes from one version of the state, and the version is
     /// read once: from the warm item cache when it is current; from the head
@@ -1433,8 +1455,8 @@ impl StateManager {
     /// head's count (see `checked_item_count`); and otherwise from one
     /// materialization, cached for later reads. So a batch of ordinals costs
     /// at most one materialization, not one per ordinal; at the last index of
-    /// a head whose count the store hasn't found exact, that is a
-    /// materialization where `get_state_item` reads only the head record. An
+    /// a head whose check isn't exact, that is a materialization where
+    /// `get_state_item` reads only the head record. An
     /// empty request reads nothing. An ordinal past the end costs what it
     /// costs `get_state_item`: on a cold cache, the materialization that
     /// finds the end, as the head's item count isn't exact for every store.
@@ -2535,7 +2557,8 @@ mod tests {
     /// The same race for the item lookups' head-record paths: a count that
     /// lands after the lookup copied the head (stored count 4, one too
     /// many) must not let the copy's last index, 3, be served from the head
-    /// record as if it were in range.
+    /// record as if it were in range. `get_state_item` counts an unchecked
+    /// head before its fast path, so it reads the counted head.
     #[test]
     fn an_item_lookup_never_serves_a_stale_last_index_a_check_landed_beside() {
         let correct = |manager: &StateManager| {
@@ -2549,9 +2572,8 @@ mod tests {
 
         let batch = StateOperation::AppendMany(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
         let (_dir, _log, manager) = stale_head(&[batch], 4);
-        manager.set_test_hook("item lookup: cache missed", correct);
         assert_eq!(manager.get_state_item(TEST_BRANCH, "items", 3).unwrap(), None);
-        assert!(manager.test_hooks.lock().is_empty());
+        assert_eq!(manager.get_head(TEST_BRANCH, "items").unwrap().item_count, 3, "the lookup counted the head first");
     }
 
     /// A count read without the store's write lock can race a write that

@@ -9,7 +9,9 @@
   (`ChecksumMismatch`) or a record whose framing is bad (`InvalidFormat`). A
   list whose value can't be rebuilt as a JSON array, such as one that holds an
   item that isn't JSON, has no items to count, so `getStateLen` gives the
-  count that the store keeps. `listStates()` still gives the count that the
+  count that the store keeps. `getStateItemJson` on an unchecked list counts
+  it first in the same way. Before, at the stale count's last index, it
+  returned the list's last item. `listStates()` still gives the count that the
   store keeps. For a state of another strategy, `getStateLen` still gives that
   count too.
 - The store saves its checks in `state.bin`, after the index, at each `sync()`

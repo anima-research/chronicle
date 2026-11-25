@@ -447,3 +447,44 @@ fn a_saved_exact_check_serves_a_batchs_last_item_from_its_record_after_a_reopen(
     assert_eq!(last, vec![Some(serde_json::to_vec(&json!(2)).unwrap())]);
     assert_eq!(reads(&store), before, "the saved check is exact, so the batch's last item came from its record");
 }
+
+#[test]
+fn an_item_read_at_a_stale_counts_last_index_counts_the_list_first() {
+    let dir = TempDir::new().unwrap();
+    let (path, branch) = three_items(&dir);
+    store_count(&path, branch, "s", 1);
+    as_a_release_without_checks_left_it(&path);
+    let store = open(&path);
+    assert_eq!(
+        store.get_state_item("s", 0).unwrap(),
+        Some(serde_json::to_vec(&json!(0)).unwrap()),
+        "the item at index 0, not the head record's"
+    );
+    let before = reads(&store);
+    assert_eq!(store.get_state_len("s").unwrap(), Some(3));
+    assert_eq!(reads(&store), before, "the item read left the count checked");
+}
+
+#[test]
+fn an_item_read_whose_count_meets_a_damaged_record_throws() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = create(&path);
+        register(&store, "s", append_log());
+        append(&store, "s", json!("first"));
+        append(&store, "s", json!("damaged-in-the-chain"));
+        append(&store, "s", json!("last"));
+        store.sync().unwrap();
+    }
+    as_a_release_without_checks_left_it(&path);
+    let store = open(&path);
+    let records = store.stats().unwrap().record_count;
+    damage(&path.join("records.log"), b"damaged-in-the-chain");
+
+    match store.get_state_item("s", 2) {
+        Err(StoreError::ChecksumMismatch { .. }) => {}
+        other => panic!("an item read whose count meets a damaged record: expected the checksum error, got {other:?}"),
+    }
+    assert_eq!(store.stats().unwrap().record_count, records, "nothing written");
+}

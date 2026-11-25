@@ -2028,7 +2028,10 @@ impl Store {
     /// JSON value (no bytes at all read as an empty list), as
     /// `get_state_slice` does, except the last item served from the head
     /// record alone, which reads no earlier item: an `Append`'s, or a batch's
-    /// last item where the store has found the head's count exact.
+    /// last item where the store has found the head's count exact. On an
+    /// AppendLog whose count the store hasn't checked, the read counts the
+    /// state's items first, reading its whole value once, and returns that
+    /// count's error reading the log (see `StateManager::get_state_item`).
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -2053,13 +2056,11 @@ impl Store {
     /// range, the state has no value, or its value isn't an array; the
     /// `Deserialization` error where the state's bytes aren't one JSON value
     /// (no bytes at all read as an empty list), as for `get_state_item`,
-    /// except the last item served from the head
-    /// record alone, which reads no earlier item. It answers otherwise than
-    /// `get_state_item` only at the last index of a head whose count the
-    /// store hasn't found exact (unchecked, or checked on a value that
-    /// doesn't materialize), where `get_state_item` answers from the stored
-    /// count and this from the value. Ordinals may repeat and come in any
-    /// order. All of them are answered from one version of the state, read at
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item. It answers otherwise than `get_state_item` only at
+    /// the last index of a head whose check isn't exact (its value doesn't
+    /// materialize), where `get_state_item` answers from the stored count and
+    /// this from the value. Ordinals may repeat and come in any order. All of them are answered from one version of the state, read at
     /// most once, and an empty request reads nothing (see
     /// `StateManager::get_state_items_by_ordinal`).
     pub fn get_state_items_by_ordinal(
@@ -4652,24 +4653,31 @@ mod tests {
         assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
     }
 
-    #[test]
-    fn a_length_read_that_a_write_races_counts_again_under_the_write_lock() {
-        let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+    /// A store whose state "s" holds `items` items under a stored count of
+    /// `count`, with no checks, as an earlier release could leave it.
+    fn reopened_with_a_stale_count(dir: &TempDir, items: usize, count: usize) -> Arc<Store> {
+        let store = reopened_with_items(dir, items);
         let branch = store.current_branch().id;
         drop(store);
-        let state_bin = test_config(&dir).path.join("state.bin");
+        let state_bin = test_config(dir).path.join("state.bin");
         let bytes = std::fs::read(&state_bin).unwrap();
         let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
         let mut index: crate::state::StateIndex = rmp_serde::from_slice(&bytes[13..13 + len]).unwrap();
-        index.heads.get_mut(branch, "s").unwrap().item_count = 0;
+        index.heads.get_mut(branch, "s").unwrap().item_count = count;
         let encoded = rmp_serde::to_vec(&index).unwrap();
         let mut stale = bytes[..5].to_vec();
         stale.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
         stale.extend_from_slice(&encoded);
         std::fs::write(&state_bin, stale).unwrap();
-        let store = Arc::new(reopen(test_config(&dir)));
+        let store = Arc::new(reopen(test_config(dir)));
         store.set_auto_snapshot(false);
+        store
+    }
+
+    #[test]
+    fn a_length_read_that_a_write_races_counts_again_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 0);
         let writer = Arc::clone(&store);
         let recount_held_the_lock = Arc::new(Mutex::new(None));
         let seen = Arc::clone(&recount_held_the_lock);
@@ -4684,6 +4692,23 @@ mod tests {
         assert_eq!(store.get_state_len("s").unwrap(), Some(4), "the count of the head that the write moved");
         assert_eq!(*recount_held_the_lock.lock(), Some(true), "the second count held the write lock");
         assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn an_item_read_whose_count_a_write_races_reads_the_value() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 1);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        assert_eq!(
+            store.get_state_item("s", 0).unwrap(),
+            Some(serde_json::to_vec(&json!(0)).unwrap()),
+            "the item at index 0 of the value, not the moved head record's"
+        );
     }
 
     #[test]
