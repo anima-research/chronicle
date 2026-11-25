@@ -1831,6 +1831,31 @@ impl StateManager {
         index.heads.insert((branch_id, state_id.to_string()), head);
     }
 
+    /// Install for `branch_id` the head that `parent` holds for `state_id`,
+    /// taken unchanged, as `insert_head_for_branch` does. Where the parent
+    /// still holds that head with the same count, the new head also takes
+    /// the parent's check of that count, as `copy_heads_for_branch` gives a
+    /// copied head.
+    pub fn insert_parents_head_for_branch(
+        &self,
+        parent: BranchId,
+        branch_id: BranchId,
+        state_id: &str,
+        head: StateChainHead,
+    ) {
+        let mut index = self.index.write();
+        let check = index
+            .heads
+            .get(parent, state_id)
+            .filter(|current| current.head_offset == head.head_offset && current.item_count == head.item_count)
+            .and_then(|_| self.count_check(parent, state_id, head.head_offset));
+        self.share_cached(branch_id, state_id, head.head_offset);
+        index.heads.insert((branch_id, state_id.to_string()), head);
+        if check.is_some() {
+            self.set_count_check(branch_id, state_id, check);
+        }
+    }
+
     /// Register (or refresh) a secondary index on a JSON field of every item
     /// currently in `state_id` (materialized on `branch_id`), extracted via
     /// the JSON-pointer `field_path`. Idempotent: a no-op if an index for

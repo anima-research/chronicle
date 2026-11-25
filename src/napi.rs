@@ -206,15 +206,16 @@ pub struct JsAppendedBatch {
     /// held on the handle's branch just before the batch. Item `i` of the
     /// batch is at `firstOrdinal + i`.
     ///
-    /// The first batch to a state on a branch the store opened with, or on
-    /// one `createBranchAt` started, counts the state's items, reading its
-    /// whole value once, or again under the write lock where another write
-    /// to the state lands during that count, and `getStateLen` reports that
-    /// count from then on:
-    /// a count a release before 0.5.0 stored can be off. A value that isn't
-    /// a JSON array, or holds an item that isn't JSON, has no items to count,
-    /// and this is then the length `getStateLen` reports; the batch is
-    /// recorded, and the state then fails to materialize, as after an
+    /// Where the store hasn't checked the state's count on the branch (a head
+    /// loaded with no saved check, one that `createBranchAt` set at a past
+    /// point, or one after a `DeltaSnapshot` written from Rust or a value that
+    /// isn't an array), the batch first counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write to
+    /// the state lands during that count, and `getStateLen` reports that count
+    /// from then on: a count a release before 0.5.0 stored can be off. A value
+    /// that isn't a JSON array, or holds an item that isn't JSON, has no items
+    /// to count, and this is then the length `getStateLen` reports; the batch
+    /// is recorded, and the state then fails to materialize, as after an
     /// `appendToState` to it, so the items can't be read at those indices.
     pub first_ordinal: i64,
 }
@@ -1610,11 +1611,12 @@ impl JsStore {
     /// The number of items a state holds on this handle's branch, `null`
     /// where it has no value. For an `append_log` it is the number of items
     /// that a read returns: a list whose count the store hasn't checked is
-    /// read once to count it. That read throws where it meets a record that
-    /// it can't read, such as one that fails its checksum (code
-    /// `ChecksumMismatch`). A list whose value isn't a JSON array has no
-    /// items to count, so the length is the count the head stores, as it is
-    /// for a state of another strategy.
+    /// read once to count it. That read throws on an I/O error (code `Io`),
+    /// a record that fails its checksum (`ChecksumMismatch`) or a record
+    /// whose framing is bad (`InvalidFormat`). A list whose value can't be
+    /// rebuilt as a JSON array, such as one that holds an item that isn't
+    /// JSON, has no items to count, so the length is the count the head
+    /// stores, as it is for a state of another strategy.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
         let (store, branch) = self.target()?;

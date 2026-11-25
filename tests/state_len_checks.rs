@@ -302,6 +302,15 @@ fn a_branch_made_at_the_head_takes_the_check_and_one_given_a_stale_head_counts_i
     let before = reads(&store);
     assert_eq!(store.get_state_len("s").unwrap(), Some(3));
     assert_eq!(reads(&store), before, "the child took its parent's check");
+
+    store.switch_branch("main").unwrap();
+    let at = store.current_branch().head;
+    store.create_branch_at("checked-at-the-head", "main", at).unwrap();
+    store.switch_branch("checked-at-the-head").unwrap();
+    store.clear_state_caches();
+    let before = reads(&store);
+    assert_eq!(store.get_state_len("s").unwrap(), Some(3));
+    assert_eq!(reads(&store), before, "a branch made at a checked head took its parent's check");
 }
 
 #[test]
@@ -419,4 +428,22 @@ fn damage(file: &Path, marker: &[u8]) {
     let mut handle = fs::OpenOptions::new().write(true).open(file).unwrap();
     handle.seek(SeekFrom::Start(at as u64)).unwrap();
     handle.write_all(&[bytes[at] ^ 0x20]).unwrap();
+}
+
+#[test]
+fn a_saved_exact_check_serves_a_batchs_last_item_from_its_record_after_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    {
+        let store = create(&path);
+        register(&store, "s", append_log());
+        store.append_many_to_state_json("s", &[json!(0), json!(1), json!(2)]).unwrap();
+        store.sync().unwrap();
+    }
+    let store = open(&path);
+    store.clear_state_caches();
+    let before = reads(&store);
+    let last = store.get_state_items_by_ordinal("s", &[2]).unwrap();
+    assert_eq!(last, vec![Some(serde_json::to_vec(&json!(2)).unwrap())]);
+    assert_eq!(reads(&store), before, "the saved check is exact, so the batch's last item came from its record");
 }

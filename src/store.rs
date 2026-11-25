@@ -55,22 +55,21 @@ pub struct AppendedBatch {
     /// a caller has every item's ordinal without a read.
     ///
     /// Where the store hasn't checked the state's count on the branch (a head
-    /// loaded with no saved check or installed by `create_branch_at`, or one
-    /// after a `DeltaSnapshot` the caller wrote or a value that isn't an
-    /// array), the batch first counts
-    /// the state's items, reading its whole value once, or again under the
-    /// write lock where another write to the state lands during that count,
-    /// and the head keeps that count, which `get_state_len` then reports: a
-    /// count a release
-    /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
-    /// A value that doesn't materialize as a JSON array has no items to
-    /// count, and this is then the count `get_state_len` reports; the batch
-    /// is recorded, and the state then fails to materialize, as after an
-    /// `Append` to it, so the items can't be read at those ordinals. An error
-    /// reading the log for the count (an I/O error, or a record of the
-    /// state's chain that fails its checksum or whose framing is bad) is
-    /// returned, and the batch isn't recorded; the error says so, except a
-    /// failed checksum's, which carries no message of its own.
+    /// loaded with no saved check or installed by `create_branch_at` at a past
+    /// point, or one after a `DeltaSnapshot` the caller wrote or a value that
+    /// isn't an array), the batch first counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write to
+    /// the state lands during that count, and the head keeps that count, which
+    /// `get_state_len` then reports: a count a release before 0.5.0 stored, or
+    /// one such a `DeltaSnapshot` left, can be off. A value that doesn't
+    /// materialize as a JSON array has no items to count, and this is then the
+    /// count `get_state_len` reports; the batch is recorded, and the state then
+    /// fails to materialize, as after an `Append` to it, so the items can't be
+    /// read at those ordinals. An error reading the log for the count (an I/O
+    /// error, or a record of the state's chain that fails its checksum or whose
+    /// framing is bad) is returned, and the batch isn't recorded; the error
+    /// says so, except a failed checksum's, which carries no message of its
+    /// own.
     pub first_ordinal: usize,
 }
 
@@ -1913,8 +1912,9 @@ impl Store {
     /// or whose framing is bad) is returned, and nothing changes. The count
     /// is taken once without the store's write lock, and once more under it
     /// if a write moved the state's head meanwhile, so that writers wait for
-    /// that second count. A branch deleted during the count gives
-    /// `BranchNotFound`, as one deleted before it does.
+    /// that second count. A branch deleted during the count never reads as a
+    /// state with no value: it gives `BranchNotFound`, or the count, as a
+    /// read just before the delete would.
     ///
     /// For a state of any other strategy, and one with no registration, it
     /// is the count the head stores, which reads nothing: for a Tree state an
@@ -3149,9 +3149,9 @@ impl Store {
         for (state_id, parent_head) in self.state.selected_heads(parent.id, selection) {
             let strategy = self.state.get_strategy(&state_id);
             let is_tree = matches!(strategy, Some(crate::types::StateStrategy::Tree { .. }));
-            let head = match at_offset {
+            let (head, reused) = match at_offset {
                 Some(offset) if !is_tree && parent_head.head_offset <= offset => {
-                    Some(parent_head)
+                    (Some(parent_head), true)
                 }
                 _ => {
                     // The parent's last full snapshot, if it predates the
@@ -3174,11 +3174,11 @@ impl Store {
                         }
                         _ => None,
                     };
-                    self.find_chain_head_at(parent.id, &state_id, at, known_full)?
+                    (self.find_chain_head_at(parent.id, &state_id, at, known_full)?, false)
                 }
             };
             if let Some(head) = head {
-                heads.push((state_id, head));
+                heads.push((state_id, head, reused));
             }
         }
 
@@ -3186,9 +3186,14 @@ impl Store {
 
         // Point the new branch's state heads at the parent's chain at the branch point.
         // No new records are written - the branch shares the existing chain up to this point.
-        for (state_id, head) in heads {
-            self.state
-                .insert_head_for_branch(new_branch.id, &state_id, head);
+        for (state_id, head, reused) in heads {
+            if reused {
+                self.state
+                    .insert_parents_head_for_branch(parent.id, new_branch.id, &state_id, head);
+            } else {
+                self.state
+                    .insert_head_for_branch(new_branch.id, &state_id, head);
+            }
         }
 
         write.checkpoint_required = true;
