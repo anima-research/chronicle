@@ -6067,7 +6067,9 @@ mod tests {
             assert!(!changed(&store), "{name} undid its change");
             assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
             store.sync().unwrap();
-            assert!(!changed(&store), "{name}: the good sync published no change");
+            drop(store);
+            let store = reopen(config.clone());
+            assert!(!changed(&store), "{name}: the good sync published none of it");
             call(&store).unwrap();
             assert!(changed(&store), "{name} ran again once the fsync succeeded");
             drop(store);

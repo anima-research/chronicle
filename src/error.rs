@@ -15,8 +15,9 @@ pub enum StoreError {
     /// write those records again and fsync. Each returns this while
     /// that retry fails, and a write then changes nothing. The failure ends
     /// when a retry succeeds, or when the store is reopened. A metadata call
-    /// whose own checkpoint's fsync fails returns it too, and undoes its
-    /// change.
+    /// whose own checkpoint fails at the fsync of the log returns it too, and
+    /// undoes its change. A failed save of `state.bin` or `branches.bin`
+    /// returns `Io`.
     /// An open whose fsync of the log fails returns it too.
     #[error("Durability lost: {0}")]
     DurabilityLost(String),
@@ -127,8 +128,10 @@ pub enum ErrorCode {
     /// write the records since the last good fsync again and fsync. Each
     /// throws this while that retry fails, and a write then changes nothing.
     /// The failure ends when a retry succeeds, or when the store is reopened.
-    /// A metadata call whose own checkpoint's fsync fails throws it too, and
-    /// undoes its change. An open whose fsync of the log fails throws it too.
+    /// A metadata call whose own checkpoint fails at the fsync of the log
+    /// throws it too, and undoes its change. A failed save of `state.bin` or
+    /// `branches.bin` throws `Io`. An open whose fsync of the log fails throws
+    /// it too.
     DurabilityLost,
     /// Not raised by this release.
     RecordNotFound,
