@@ -130,6 +130,8 @@ struct WriteState {
     /// Subscribers hear of it once that checkpoint succeeds.
     pending_branch_event: Option<BranchEvent>,
 
+    branch_list_save_began: bool,
+
     /// The format features the MANIFEST on disk names (0 for a version 1
     /// manifest). A write that needs one it lacks rewrites the MANIFEST
     /// first; see `Store::require_features`.
@@ -3170,7 +3172,11 @@ impl Store {
 
     fn undo_create(&self, write: &mut WriteState, branch: BranchId) {
         self.branches.remove(branch);
-        self.state.retire_branch(branch);
+        if write.branch_list_save_began {
+            self.state.retire_branch(branch);
+        } else {
+            self.state.release_branch(branch);
+        }
         write.pending_branch_event = None;
     }
 
@@ -3290,7 +3296,8 @@ impl Store {
     /// State registration, strategy changes, and branch creation, deletion
     /// and switching checkpoint before returning, because the record log
     /// cannot reconstruct them. If that checkpoint fails, the call throws and
-    /// the store holds what it held before the call, so the same call can run
+    /// the store holds what it held before the call, except that a failed
+    /// creation's branch ID isn't given out again. So the same call can run
     /// again once the cause is mended. The disk can still hold part of the
     /// change: `state.bin` is saved before `branches.bin`, and a save can put
     /// its new file in place and then fail. So each later write of a record
@@ -3370,12 +3377,14 @@ impl Store {
     }
 
     fn sync_locked_selecting(&self, write: &mut WriteState, current: BranchId) -> Result<()> {
+        write.branch_list_save_began = false;
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
         #[cfg(test)]
         self.run_test_hook("checkpoint: branch list");
+        write.branch_list_save_began = true;
         self.branches.save_selecting(current)?;
         // Deleted branches are now gone from branches.bin, so their chain
         // heads can go too (see `StateManager::retire_branch` for why not
@@ -5983,6 +5992,39 @@ mod tests {
             Err(StoreError::DurabilityLost(_))
         ));
         assert_eq!(branch_names(&store), ["main"]);
+    }
+
+    #[test]
+    fn an_undone_creation_drops_its_heads_at_once_unless_its_branch_list_save_began() {
+        for (file, kept) in [("state.bin", false), ("branches.bin", true)] {
+            let dir = TempDir::new().unwrap();
+            let store = Store::create(test_config(&dir)).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "items".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            store
+                .update_state("items", StateOperation::Append(b"1".to_vec()))
+                .unwrap();
+            store.sync().unwrap();
+            let heads = store.state.head_count();
+            let path = store.path().join(file);
+            let previous = obstruct(&path);
+            assert!(
+                matches!(store.create_branch("child", None), Err(StoreError::Io(_))),
+                "{file}"
+            );
+            assert_eq!(store.state.head_count() > heads, kept, "{file}");
+            repair(&path, previous);
+            store.sync().unwrap();
+            assert_eq!(store.state.head_count(), heads, "{file}");
+        }
     }
 
     #[test]

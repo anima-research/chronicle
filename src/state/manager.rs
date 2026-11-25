@@ -1973,7 +1973,8 @@ impl StateManager {
         self.cache.read().len()
     }
 
-    /// Mark a branch that has just been deleted, so that
+    /// Mark a branch that has just been deleted, or whose creation was
+    /// undone after its checkpoint began to save the branch list, so that
     /// `purge_retired_branches` releases what is held for it.
     ///
     /// Its field indexes (derived data) are set aside at once, so the next
@@ -2002,6 +2003,14 @@ impl StateManager {
     /// of heads removed. The next `save` writes a `state.bin` without them.
     pub fn purge_retired_branches(&self) -> usize {
         let retired: Vec<BranchId> = std::mem::take(&mut *self.retired_branches.lock());
+        self.release_branches(retired)
+    }
+
+    pub(crate) fn release_branch(&self, branch_id: BranchId) {
+        self.release_branches(vec![branch_id]);
+    }
+
+    fn release_branches(&self, retired: Vec<BranchId>) -> usize {
         if retired.is_empty() {
             return 0;
         }
