@@ -469,7 +469,12 @@ impl RecordLog {
             Ok(()) => {
                 *self.writes_since_sync.write() = 0;
                 self.synced_to(*self.file_size.read());
-                *self.durability_failure.lock() = None;
+                if self.durability_failure.lock().take().is_some() {
+                    tracing::info!(
+                        "record log fsync succeeded again: the records written since the last \
+                         good fsync were written again and synced, so writes go on as usual"
+                    );
+                }
                 Ok(())
             }
             Err(error) => {
@@ -486,7 +491,7 @@ impl RecordLog {
                      last good fsync may not have reached the disk. Until a retry writes \
                      them again and its fsync succeeds, or the store is reopened, no record is \
                      written and the store publishes no checkpoint. sync() makes the retry, \
-                     and so does each later write"
+                     and so does each later write other than a blob write"
                 )))
             }
         }
@@ -514,8 +519,9 @@ impl RecordLog {
             tracing::warn!(
                 %error,
                 "record log fsync failed: records written since the last good fsync may not \
-                 have reached the disk, so appends and every metadata checkpoint fail until a \
-                 sync() writes them again and its fsync succeeds, or the store is reopened"
+                 have reached the disk. Each later write other than a blob write, and each \
+                 sync(), first writes them again and fsyncs, and fails while that retry fails. \
+                 If writes keep failing, check the disk and its filesystem"
             );
             *kept = Some(error.to_string());
         }
@@ -1101,7 +1107,12 @@ mod tests {
             lost(log.sync());
             *log.rewrite_failures.lock() = 1;
             let text = lost(log.sync());
-            assert!(text.contains("this sync's retry failed: injected rewrite failure"), "{text}");
+            assert!(
+                text.contains(
+                    "(injected fsync failure, and this sync's retry failed: injected rewrite failure)"
+                ),
+                "{text}"
+            );
             lost(append_byte(&log, 4));
 
             zero(&path, synced, log.size());

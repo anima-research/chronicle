@@ -3249,12 +3249,14 @@ impl Store {
     /// checkpoints as usual. When it fails, this returns
     /// [`StoreError::DurabilityLost`] and publishes nothing, since a
     /// checkpoint could name records the disk doesn't hold, and the next call
-    /// tries again. While the failure stands, each later write makes the
-    /// same retry first, before it changes anything: an append, a state
-    /// update, a field-index registration, a registration, a strategy change,
-    /// and a branch creation, deletion or switch. When the retry succeeds,
-    /// the write goes on. When it fails, the write returns the same error and
-    /// changes nothing. A write while a metadata checkpoint is owed saves
+    /// tries again. While the failure stands, each later write other than a
+    /// blob write makes the same retry first, before it changes anything: an
+    /// append, a state update, a field-index registration, a registration, a
+    /// strategy change, and a branch creation, deletion or switch. When the
+    /// retry succeeds, the write goes on. When it fails, the write returns
+    /// the same error and changes nothing. While the disk keeps failing, each
+    /// retry writes the kept bytes again, which can be 64 MiB and one record,
+    /// and waits for an fsync, and reads of the log wait for it. A write while a metadata checkpoint is owed saves
     /// that checkpoint first, which makes the retry too. A registration,
     /// strategy change, or branch creation, deletion or switch whose own
     /// checkpoint then fails returns the error and keeps its change, as for
@@ -5773,61 +5775,132 @@ mod tests {
         store.register_state(registration("other")).unwrap();
     }
 
+    type MetadataCall = (&'static str, fn(&Store) -> Result<()>, fn(&Store) -> bool);
+
+    fn metadata_calls() -> [MetadataCall; 7] {
+        [
+            (
+                "register_state",
+                |store| {
+                    store.register_state(StateRegistration {
+                        id: "other".into(),
+                        strategy: crate::types::StateStrategy::Snapshot,
+                        initial_value: None,
+                    })
+                },
+                |store| store.state.get_strategy("other").is_some(),
+            ),
+            (
+                "update_state_strategy",
+                |store| {
+                    store.update_state_strategy(
+                        "items",
+                        crate::types::StateStrategy::AppendLog {
+                            delta_snapshot_every: 50,
+                            full_snapshot_every: 20,
+                        },
+                    )
+                },
+                |store| {
+                    matches!(
+                        store.state.get_strategy("items"),
+                        Some(crate::types::StateStrategy::AppendLog {
+                            delta_snapshot_every: 50,
+                            full_snapshot_every: 20,
+                        })
+                    )
+                },
+            ),
+            (
+                "create_branch",
+                |store| store.create_branch("made", None).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "create_empty_branch",
+                |store| store.create_empty_branch("made", None).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "create_branch_at",
+                |store| store.create_branch_at("made", "main", Sequence(0)).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "switch_branch",
+                |store| store.switch_branch("side").map(drop),
+                |store| store.current_branch().name == "side",
+            ),
+            (
+                "delete_branch",
+                |store| store.delete_branch("side"),
+                |store| store.get_branch("side").is_none(),
+            ),
+        ]
+    }
+
+    fn metadata_store(dir: &TempDir) -> (Store, StoreConfig) {
+        let config = test_config(dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.create_branch("side", None).unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+        store.sync().unwrap();
+        (store, config)
+    }
+
+    fn checkpoint_files(config: &StoreConfig) -> [Vec<u8>; 2] {
+        ["state.bin", "branches.bin"].map(|file| std::fs::read(config.path.join(file)).unwrap())
+    }
+
+    #[test]
+    fn a_metadata_call_while_a_failure_stands_retries_first_and_changes_nothing() {
+        use crate::state::FieldIndexKind;
+        let field_index: MetadataCall = (
+            "register_state_field_index",
+            |store| store.register_state_field_index("items", "/v", FieldIndexKind::Number),
+            |store| {
+                store
+                    .query_state_index_range("items", "/v", None, None, None, None, false)
+                    .is_some()
+            },
+        );
+        for (name, call, changed) in metadata_calls().into_iter().chain([field_index]) {
+            let dir = TempDir::new().unwrap();
+            let (store, config) = metadata_store(&dir);
+            let published = checkpoint_files(&config);
+            *store.log.fsync_failures.lock() = 2;
+            assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(!changed(&store), "{name} changed nothing");
+            assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
+            call(&store).unwrap();
+            assert!(changed(&store), "{name} went on after a good retry");
+        }
+    }
+
     #[test]
     fn a_metadata_call_whose_checkpoint_fsync_fails_keeps_its_change_until_a_good_sync() {
-        type Call = fn(&Store) -> Result<()>;
-        let calls: [(&str, Call); 7] = [
-            ("register_state", |store| {
-                store.register_state(StateRegistration {
-                    id: "other".into(),
-                    strategy: crate::types::StateStrategy::Snapshot,
-                    initial_value: None,
-                })
-            }),
-            ("update_state_strategy", |store| {
-                store.update_state_strategy(
-                    "items",
-                    crate::types::StateStrategy::AppendLog {
-                        delta_snapshot_every: 50,
-                        full_snapshot_every: 20,
-                    },
-                )
-            }),
-            ("create_branch", |store| store.create_branch("made", None).map(drop)),
-            ("create_empty_branch", |store| store.create_empty_branch("made", None).map(drop)),
-            ("create_branch_at", |store| store.create_branch_at("made", "main", Sequence(0)).map(drop)),
-            ("switch_branch", |store| store.switch_branch("side").map(drop)),
-            ("delete_branch", |store| store.delete_branch("side")),
-        ];
-        for (name, call) in calls {
+        for (name, call, changed) in metadata_calls() {
             let dir = TempDir::new().unwrap();
-            let config = test_config(&dir);
-            let store = Store::create(config.clone()).unwrap();
-            store
-                .register_state(StateRegistration {
-                    id: "items".into(),
-                    strategy: crate::types::StateStrategy::AppendLog {
-                        delta_snapshot_every: 1000,
-                        full_snapshot_every: 1000,
-                    },
-                    initial_value: None,
-                })
-                .unwrap();
-            store.create_branch("side", None).unwrap();
-            store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
-            let files = || {
-                ["state.bin", "branches.bin"].map(|file| std::fs::read(config.path.join(file)).unwrap())
-            };
-            let published = files();
+            let (store, config) = metadata_store(&dir);
+            let published = checkpoint_files(&config);
             *store.log.fsync_failures.lock() = 1;
             assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
-            assert_eq!(files(), published, "{name} published nothing");
+            assert!(changed(&store), "{name} kept its change");
+            assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
             store.sync().unwrap();
-            assert_ne!(
-                files(),
-                published,
-                "{name} kept its change, and the good sync published it"
-            );
+            drop(store);
+            assert!(changed(&reopen(config)), "{name}: the good sync published the change");
         }
     }
 

@@ -2037,11 +2037,14 @@ impl JsStore {
     /// it fails, it throws and publishes nothing, and the next `sync()` or
     /// write tries again. Its message begins `Durability lost:`, and its
     /// `code` is `DurabilityLost`. While the failure stands, each later write
-    /// makes the same retry first, before it changes anything: an append, a
-    /// state write, a field-index registration, registering a state,
-    /// changing a strategy, and creating, deleting or switching a branch.
-    /// When the retry succeeds, the write goes on. When it fails, the write
-    /// throws it and changes nothing. Registering a state, changing a
+    /// other than a blob write makes the same retry first, before it changes
+    /// anything: an append, a state write, a field-index registration,
+    /// registering a state, changing a strategy, and creating, deleting or
+    /// switching a branch. When the retry succeeds, the write goes on. When it
+    /// fails, the write throws it and changes nothing. While the disk keeps
+    /// failing, each retry writes the kept bytes again, which can be 64 MiB
+    /// and one record, and waits for an fsync, and reads of the log wait for
+    /// it. Registering a state, changing a
     /// strategy, and creating, deleting or switching a branch then save their
     /// own checkpoint. When that save fails, they throw and keep the change,
     /// as for any failed checkpoint.

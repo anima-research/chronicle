@@ -10,11 +10,13 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 
     /// An fsync of the record log failed, so records written since the last
-    /// good fsync may not have reached the disk. Every later append, and
-    /// every call that would publish a checkpoint, returns this until a sync
-    /// writes those records again and its fsync succeeds, or the store is
-    /// reopened, unless a check of the call's own refuses it first. An open
-    /// whose fsync of the log fails returns it too.
+    /// good fsync may not have reached the disk. While the failure stands,
+    /// `Store::sync` and each later write other than a blob write first
+    /// write those records again and fsync. Each returns this while
+    /// that retry fails, and a write then changes nothing. The failure ends
+    /// when a retry succeeds, or when the store is reopened. A metadata call
+    /// whose own checkpoint's fsync fails returns it too, after its change.
+    /// An open whose fsync of the log fails returns it too.
     #[error("Durability lost: {0}")]
     DurabilityLost(String),
 
@@ -119,12 +121,13 @@ pub enum ErrorCode {
     /// reached through more links than it follows. The message carries its
     /// error.
     Io,
-    /// An fsync of the record log failed. Appends and state writes throw it
-    /// until a `sync()` writes the records since the last good fsync again
-    /// and its fsync succeeds, or the store is reopened. `sync()`, `close()`
-    /// and the calls that checkpoint make that retry and throw it when the
-    /// retry fails. An open whose fsync of the log fails throws it too. A
-    /// check of a call's own can refuse the call first.
+    /// An fsync of the record log failed. While the failure stands,
+    /// `sync()`, `close()` and each later write other than a blob write first
+    /// write the records since the last good fsync again and fsync. Each
+    /// throws this while that retry fails, and a write then changes nothing.
+    /// The failure ends when a retry succeeds, or when the store is reopened.
+    /// A metadata call whose own checkpoint's fsync fails throws it too,
+    /// after its change. An open whose fsync of the log fails throws it too.
     DurabilityLost,
     /// Not raised by this release.
     RecordNotFound,
