@@ -132,6 +132,8 @@ struct WriteState {
     /// manifest). A write that needs one it lacks rewrites the MANIFEST
     /// first; see `Store::require_features`.
     features: u64,
+
+    names_synced: bool,
 }
 
 /// A branch change to announce once a checkpoint persists it.
@@ -153,6 +155,8 @@ pub struct Store {
 
     /// Lock file for exclusive access.
     _lock_file: File,
+
+    holders: Vec<PathBuf>,
 
     /// Record log (shared with StateManager for disk-based traversal).
     log: Arc<RecordLog>,
@@ -386,6 +390,8 @@ impl Store {
             }));
         }
 
+        let holders = Self::holders("create", &config.path)?;
+
         // With the lock held, staging files here were left by interrupted
         // saves, a create's own manifest save among them (as open sweeps them).
         crate::atomic_file::remove_staging_files(&config.path);
@@ -411,6 +417,7 @@ impl Store {
         Ok(Self {
             config,
             _lock_file: lock_file,
+            holders,
             log,
             index,
             blobs,
@@ -447,6 +454,7 @@ impl Store {
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
         let mut features = Self::verify_manifest(&config.path)?;
+        let holders = Self::holders("open", &config.path)?;
 
         // A MANIFEST naming format features was renamed into place by a
         // batch's mark, and a failed directory sync after that rename left
@@ -661,6 +669,7 @@ impl Store {
         Ok(Self {
             config,
             _lock_file: lock_file,
+            holders,
             log,
             index,
             blobs,
@@ -3396,9 +3405,63 @@ impl Store {
     /// may open from an earlier checkpoint. The record index is rebuilt on
     /// startup; checkpoint cost depends on state heads, branch metadata, and
     /// any registered field indexes.
+    ///
+    /// On Unix, the first time on each open handle, this also syncs the
+    /// directories that hold the store's directory, up to the root of its
+    /// filesystem or to the first one that this process may not look at, and
+    /// the store's directory, the blob directory and each shard directory in
+    /// it, so that a power loss can't take the store's name or a blob's,
+    /// whatever made them. On macOS, where each directory sync would ask the
+    /// drive to write back its whole cache, this first-time sync syncs each
+    /// directory with `fsync` and then asks each drive to write back its cache
+    /// once. After that, it syncs each blob directory whose sync after a blob
+    /// store this handle still owes. As a blob store's syncs do, these go only
+    /// where the system syncs directories and this process may open them. For
+    /// a store path through a symbolic link, the directory that holds the
+    /// link's own name isn't synced, and the first-time sync doesn't follow a
+    /// symbolic link in the blob directory. A failed sync of one of these
+    /// directories returns its error, and the next call tries it again. On
+    /// ext4, a retry just after a failed journal commit can succeed although
+    /// the name never reached the disk, so a successful retry doesn't prove
+    /// that it did. Appends, state writes and blob stores go on meanwhile.
+    /// Until that first call, a power loss can take a new store's directory
+    /// and the parents that `create` made, even after a registration or a
+    /// branch change has saved its checkpoint.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
-        self.sync_locked(&mut write)
+        self.sync_locked(&mut write)?;
+        let in_sync = |error: std::io::Error| std::io::Error::new(error.kind(), format!("sync: {error}"));
+        if !write.names_synced {
+            let mut devices = crate::atomic_file::Devices::default();
+            devices.note(&self.config.path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync: cannot read the metadata of {}: {error}", self.config.path.display()),
+                )
+            })?;
+            for directory in &self.holders {
+                crate::atomic_file::sync_directory_at_unflushed(directory).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "sync: cannot sync {}, a directory that holds the store {}: {error}",
+                            directory.display(),
+                            self.config.path.display()
+                        ),
+                    )
+                })?;
+            }
+            self.blobs.sync_directories(&mut devices).map_err(in_sync)?;
+            devices.flush().map_err(|(directory, error)| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync: cannot flush the drive that holds {}: {error}", directory.display()),
+                )
+            })?;
+            write.names_synced = true;
+        }
+        self.blobs.sync_owed().map_err(in_sync)?;
+        Ok(())
     }
 
     /// Make the MANIFEST name `required` format features before a record
@@ -3933,6 +3996,55 @@ impl Store {
         }
     }
 
+    #[cfg(unix)]
+    fn holders(verb: &str, path: &Path) -> Result<Vec<PathBuf>> {
+        use std::os::unix::fs::MetadataExt;
+        let failed = |what: String, error: std::io::Error| {
+            StoreError::Io(std::io::Error::new(error.kind(), format!("{verb}: {what}: {error}")))
+        };
+        let refused = |error: &std::io::Error| error.kind() == std::io::ErrorKind::PermissionDenied;
+        let real = match fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(error) if refused(&error) => path.to_owned(),
+            Err(error) => {
+                return Err(failed(format!("cannot find the real path of {}", path.display()), error))
+            }
+        };
+        let device = fs::metadata(&real)
+            .map_err(|error| failed(format!("cannot read the metadata of {}", real.display()), error))?
+            .dev();
+        let mut holders = Vec::new();
+        for directory in real.ancestors().skip(1) {
+            let directory = if directory.as_os_str().is_empty() { Path::new(".") } else { directory };
+            let metadata = match fs::metadata(directory) {
+                Ok(metadata) => metadata,
+                Err(error) if refused(&error) => break,
+                Err(error) => {
+                    return Err(failed(
+                        format!(
+                            "cannot read the metadata of {}, a directory that holds the store {}",
+                            directory.display(),
+                            path.display()
+                        ),
+                        error,
+                    ))
+                }
+            };
+            if metadata.dev() != device {
+                break;
+            }
+            holders.push(directory.to_owned());
+        }
+        Ok(holders)
+    }
+
+    // Windows has no portable directory sync, and checkpoint saves go without
+    // it there too.
+    #[cfg(not(unix))]
+    fn holders(_verb: &str, _path: &Path) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
     // LOCK is opened without truncating it, and nothing is written to it. It
     // must be a regular file in the store's directory, or absent (then it's
     // created). A symlink is refused: its target can be replaced by a rename,
@@ -4021,7 +4133,9 @@ impl Drop for Store {
                 path = %self.config.path.display(),
                 "final sync on drop failed: the next open replays state updates from the log \
                  past the last checkpoint, and may lose any registration or branch change \
-                 whose checkpoint failed"
+                 whose checkpoint failed. If the sync of a directory that holds the store or \
+                 its blobs failed, a power loss before the next sync can also take the store's \
+                 name or a blob's"
             );
         }
     }
@@ -4660,6 +4774,96 @@ mod tests {
             Store::open_if_another_created(damaged_config, refused),
             Err(StoreError::InvalidOperation(message)) if message.contains("records.log")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_store_under_a_directory_this_process_may_not_search_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(work) = std::env::var_os("CHRONICLE_HOLDERS_CHILD_WORK") else {
+            return;
+        };
+        let work = PathBuf::from(work);
+        let above = work.parent().unwrap().to_owned();
+        std::env::set_current_dir(&work).unwrap();
+        let config = StoreConfig {
+            path: PathBuf::from("store"),
+            blob_cache_size: 100,
+            create_if_missing: false,
+        };
+        Store::create(config.clone()).unwrap().sync().unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(&work).is_ok() {
+            eprintln!("skipped: the directory could be searched despite its mode (running as root?)");
+            return;
+        }
+        let store = Store::open(config).unwrap();
+        assert_eq!(store.holders, [PathBuf::from(".")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_store_under_a_directory_this_process_may_not_search_opens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let above = dir.path().join("above");
+        let work = above.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::relative_store_under_a_directory_this_process_may_not_search_child",
+                "--nocapture",
+            ])
+            .env("CHRONICLE_HOLDERS_CHILD_WORK", &work)
+            .output()
+            .unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_sync_of_a_handle_flushes_the_store_device_once() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store.store_blob(b"left", "text/plain").unwrap();
+        crate::atomic_file::flushed_devices();
+        store.sync().unwrap();
+        assert_eq!(crate::atomic_file::flushed_devices(), [config.path.clone()]);
+        store.sync().unwrap();
+        assert_eq!(crate::atomic_file::flushed_devices(), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_passes_over_a_directory_holding_the_store_that_this_process_may_not_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let holder = dir.path().join("holder");
+        let store = Store::create(StoreConfig {
+            path: holder.join("store"),
+            ..test_config(&dir)
+        })
+        .unwrap();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = fs::File::open(&holder).is_ok();
+        let synced = store.sync();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            eprintln!("skipped: the directory could be opened despite its mode (running as root?)");
+            return;
+        }
+        synced.unwrap();
     }
 
     /// Where open_or_create can't look at the directory again after its
