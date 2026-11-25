@@ -55,13 +55,13 @@ fn files(path: &Path) -> BTreeMap<OsString, Option<Vec<u8>>> {
         .collect()
 }
 
-fn assert_names_the_missing_log(message: &str, store: &Path, used: &str) {
+fn assert_names_the_missing_log(message: &str, store: &Path, used: &str, moved: &str) {
     assert!(message.contains(&*store.to_string_lossy()), "{message}");
     assert!(message.contains("records.log is missing"), "{message}");
     assert!(message.contains(&format!("holds {used},")), "{message}");
     assert!(message.contains("created no records.log"), "{message}");
     assert!(message.contains("Restore the records.log"), "{message}");
-    assert!(message.contains(&format!("move {used} out of {}", store.to_string_lossy())), "{message}");
+    assert!(message.contains(&format!("move {moved} out of {}", store.to_string_lossy())), "{message}");
     assert!(!message.contains("torn tail"), "{message}");
 }
 
@@ -84,10 +84,10 @@ fn a_used_store_without_its_log_is_refused_and_no_log_is_created() {
     let before = files(&path);
 
     for _ in 0..2 {
-        assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
+        assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin", "state.bin, state-indexes.bin and branches.bin");
         assert_eq!(files(&path), before, "a refused open changed the store's directory");
     }
-    assert_names_the_missing_log(&corruption(Store::open_or_create(config(&path))), &path, "state.bin and branches.bin");
+    assert_names_the_missing_log(&corruption(Store::open_or_create(config(&path))), &path, "state.bin and branches.bin", "state.bin, state-indexes.bin and branches.bin");
     assert_eq!(files(&path), before, "a refused open_or_create changed the store's directory");
 }
 
@@ -102,7 +102,7 @@ fn a_store_with_records_and_no_registered_state_is_refused_without_its_log() {
     });
     fs::remove_file(path.join("records.log")).unwrap();
 
-    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
+    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin", "state.bin, state-indexes.bin and branches.bin");
     assert!(fs::symlink_metadata(path.join("records.log")).is_err());
 }
 
@@ -116,7 +116,7 @@ fn a_store_with_a_state_and_a_branch_but_no_records_is_refused_without_its_log()
     });
     fs::remove_file(path.join("records.log")).unwrap();
 
-    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
+    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin", "state.bin, state-indexes.bin and branches.bin");
     assert!(fs::symlink_metadata(path.join("records.log")).is_err());
 }
 
@@ -131,8 +131,8 @@ fn a_store_that_lost_its_log_starts_over_once_its_state_and_branch_files_are_mov
     });
     let kept = kept.unwrap();
     fs::remove_file(path.join("records.log")).unwrap();
-    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
-    move_out(&path, &["state.bin", "branches.bin"]);
+    assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin", "state.bin, state-indexes.bin and branches.bin");
+    move_out(&path, &["state.bin", "state-indexes.bin", "branches.bin"]);
 
     let store = Store::open(config(&path)).unwrap();
     assert!(store.query_range(None, None, 10, false, None).unwrap().is_empty());
@@ -141,14 +141,17 @@ fn a_store_that_lost_its_log_starts_over_once_its_state_and_branch_files_are_mov
 
 #[test]
 fn state_bin_or_branches_bin_alone_shows_a_used_store_without_its_log() {
-    for (kept, gone) in [("state.bin", "branches.bin"), ("branches.bin", "state.bin")] {
+    for (kept, gone, moved) in [
+        ("state.bin", "branches.bin", "state.bin and state-indexes.bin"),
+        ("branches.bin", "state.bin", "state-indexes.bin and branches.bin"),
+    ] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("store");
         closed_store(&path, with_state_history);
         fs::remove_file(path.join("records.log")).unwrap();
         fs::remove_file(path.join(gone)).unwrap();
 
-        assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, kept);
+        assert_names_the_missing_log(&corruption(Store::open(config(&path))), &path, kept, moved);
         assert!(fs::symlink_metadata(path.join("records.log")).is_err(), "{kept}");
     }
 }
@@ -303,7 +306,7 @@ fn an_empty_log_under_a_state_head_is_named_empty_and_nothing_is_saved_or_create
     fs::remove_dir_all(path.join("blobs")).unwrap();
     let before = files(&path);
 
-    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin, state-indexes.bin and branches.bin");
     assert_eq!(files(&path), before, "the refused open changed the store's directory");
 }
 
@@ -331,7 +334,7 @@ fn an_empty_log_beside_state_bin_alone_names_only_state_bin_to_move() {
     fs::remove_file(path.join("branches.bin")).unwrap();
 
     let message = corruption(Store::open(config(&path)));
-    assert_names_the_empty_log(&message, &path, "state.bin");
+    assert_names_the_empty_log(&message, &path, "state.bin and state-indexes.bin");
     assert!(!message.contains("branches.bin"), "{message}");
 }
 
@@ -346,8 +349,8 @@ fn a_store_with_an_empty_log_starts_over_once_its_state_and_branch_files_are_mov
     });
     let kept = kept.unwrap();
     fs::write(path.join("records.log"), b"").unwrap();
-    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
-    move_out(&path, &["state.bin", "branches.bin"]);
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin, state-indexes.bin and branches.bin");
+    move_out(&path, &["state.bin", "state-indexes.bin", "branches.bin"]);
 
     let store = Store::open(config(&path)).unwrap();
     assert!(store.query_range(None, None, 10, false, None).unwrap().is_empty());
@@ -390,5 +393,5 @@ fn a_log_whose_only_record_is_torn_keeps_the_torn_tail_words() {
     );
     assert_eq!(fs::metadata(&log).unwrap().len(), 0);
 
-    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin and branches.bin");
+    assert_names_the_empty_log(&corruption(Store::open(config(&path))), &path, "state.bin, state-indexes.bin and branches.bin");
 }

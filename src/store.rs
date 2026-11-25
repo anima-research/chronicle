@@ -3676,7 +3676,7 @@ impl Store {
         Err(StoreError::Corruption(format!(
             "{} is missing, though {use_shown}. This open created no records.log. Restore the records.log that belongs with this {used}, then open the store again. {}",
             log.display(),
-            Self::start_over(path, &used, "creates an empty records.log and keeps the blobs")
+            Self::start_over(path, "creates an empty records.log and keeps the blobs")?
         )))
     }
 
@@ -3684,20 +3684,29 @@ impl Store {
         if log.size() > 0 || log.recovery().is_some() || state.checkpoint_offset().is_none() {
             return Ok(());
         }
-        let held = if Self::holds(path, "branches.bin")? { "state.bin and branches.bin" } else { "state.bin" };
         Err(StoreError::Corruption(format!(
             "{} is empty, though {} holds heads of records that the log held. An open by an earlier release of Chronicle creates such an empty file where a store's records.log is missing. An open that finds the log's first record incomplete and cuts it off leaves one too. Restore the store's records.log over this file if a copy exists, then open the store again. {}",
             path.join("records.log").display(),
             path.join("state.bin").display(),
-            Self::start_over(path, held, "keeps the empty records.log and the blobs")
+            Self::start_over(path, "keeps the empty records.log and the blobs")?
         )))
     }
 
-    fn start_over(path: &Path, files: &str, then: &str) -> String {
-        format!(
+    fn start_over(path: &Path, then: &str) -> Result<String> {
+        let mut files = Vec::new();
+        for file in ["state.bin", "state-indexes.bin", "branches.bin"] {
+            if Self::holds(path, file)? {
+                files.push(file);
+            }
+        }
+        let files = match files.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => files.concat(),
+        };
+        Ok(format!(
             "If no copy of the log exists, the store's records are lost. To start the store over without them, move {files} out of {}, and the next open {then}",
             path.display()
-        )
+        ))
     }
 
     // Published whole, through a staging file renamed over it, so a crash
