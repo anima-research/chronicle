@@ -4594,6 +4594,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_first_sync_of_a_handle_flushes_the_store_device_once() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store.store_blob(b"left", "text/plain").unwrap();
+        crate::atomic_file::flushed_devices();
+        store.sync().unwrap();
+        assert_eq!(crate::atomic_file::flushed_devices(), [config.path.clone()]);
+        store.sync().unwrap();
+        assert_eq!(crate::atomic_file::flushed_devices(), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn sync_passes_over_a_directory_holding_the_store_that_this_process_may_not_open() {
         use std::os::unix::fs::PermissionsExt;
 

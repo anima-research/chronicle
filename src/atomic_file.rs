@@ -609,6 +609,20 @@ mod tests {
         assert_ne!(Handle::from_path(&alias).unwrap(), before);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn devices_flush_each_device_once() {
+        let dir = TempDir::new().unwrap();
+        let inner = dir.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+        let mut devices = Devices::default();
+        devices.note(dir.path()).unwrap();
+        devices.note(&inner).unwrap();
+        flushed_devices();
+        devices.flush().unwrap();
+        assert_eq!(flushed_devices(), [dir.path().to_owned()]);
+    }
+
     // A directory the writer can write and search but not read, as at mode
     // 0300, is saved in without its sync, and each writer says so once.
     #[cfg(unix)]

@@ -1350,13 +1350,15 @@ mod tests {
         assert_eq!(reading.get(&hash).unwrap().unwrap().content, b"left");
         assert_eq!(synced_directories(), Vec::<PathBuf>::new());
 
-        storing.sync_directories().unwrap();
+        storing.sync_directories(&mut Devices::default()).unwrap();
         let mut synced = synced_directories();
         synced.sort();
         assert_eq!(synced, [blobs.clone(), shard.clone()]);
 
-        reading.sync_directories().unwrap();
+        let mut devices = Devices::default();
+        reading.sync_directories(&mut devices).unwrap();
         let mut synced = synced_directories();
+        assert_eq!(devices.noted, synced);
         synced.sort();
         assert_eq!(synced, [dir.path().to_owned(), blobs, shard]);
     }
@@ -1372,12 +1374,12 @@ mod tests {
         synced_directories();
 
         *storage.fails_at.lock() = Some(WriteStep::ShardSync);
-        let error = storage.sync_directories().unwrap_err().to_string();
+        let error = storage.sync_directories(&mut Devices::default()).unwrap_err().to_string();
         assert!(error.contains(&shard.display().to_string()), "{error}");
         assert!(error.ends_with("injected failure at ShardSync"), "{error}");
         assert_eq!(synced_directories(), [dir.path().to_owned(), blobs.clone()]);
 
-        storage.sync_directories().unwrap();
+        storage.sync_directories(&mut Devices::default()).unwrap();
         assert_eq!(synced_directories(), [blobs, shard]);
     }
 
@@ -1394,7 +1396,7 @@ mod tests {
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o300)).unwrap();
         let listable = fs::read_dir(&blobs).is_ok();
         synced_directories();
-        let passed = storage.sync_directories();
+        let passed = storage.sync_directories(&mut Devices::default());
         let synced = synced_directories();
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
         if listable {
@@ -1416,7 +1418,7 @@ mod tests {
         let storage = reopened(&dir);
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o600)).unwrap();
         let reachable = fs::symlink_metadata(storage.shard_path(&hash)).is_ok();
-        let passed = storage.sync_directories();
+        let passed = storage.sync_directories(&mut Devices::default());
         fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
         if reachable {
             eprintln!("skipped: the directory could be searched despite its mode (running as root?)");
@@ -1434,7 +1436,7 @@ mod tests {
         let storage = reopened(&dir);
         std::os::unix::fs::symlink(outside.path(), blobs.join("ab")).unwrap();
         synced_directories();
-        storage.sync_directories().unwrap();
+        storage.sync_directories(&mut Devices::default()).unwrap();
         assert_eq!(synced_directories(), [dir.path().to_owned(), blobs]);
     }
 
@@ -1445,7 +1447,7 @@ mod tests {
         let storage = reopened(&dir);
         fs::remove_dir(dir.path().join("blobs")).unwrap();
         synced_directories();
-        storage.sync_directories().unwrap();
+        storage.sync_directories(&mut Devices::default()).unwrap();
         assert_eq!(synced_directories(), [dir.path().to_owned()]);
     }
 
