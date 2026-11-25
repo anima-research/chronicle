@@ -23,7 +23,6 @@ const thrownCopyHoldsChange = problem => problem.thrownCopyHoldsChange === true;
 const METADATA_ON_DISK = { rule: 'the reopen', owns: thrownCopyHoldsChange };
 const wordsAfterOsError = problem => problem.wordsAfterOsError === true;
 const nameInRefused = problem => problem.nameInRefused === true;
-const syncLost = problem => problem.syncLost === true;
 
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
 const env = { ...process.env };
@@ -476,7 +475,7 @@ const theSecondTry = {
   judge: facts => {
     const { out } = facts;
     const problems = [];
-    if (out.retry && !out.retry.ok && !(out.call.code === 'DurabilityLost' && out.retry.code === 'DurabilityLost')) {
+    if (out.retry && !out.retry.ok) {
       problems.push({ text: `the same call again threw: ${shown(out.retry)}` });
     }
     if (out.retry?.ok) problems.push(...whole(facts, 'the reads after the same call again', out.retryReads, true));
@@ -579,12 +578,6 @@ const oldAfterThrow = method => ({
     return problems;
   },
 });
-
-const secondSyncReturns = {
-  rule: 'the second try',
-  judge: ({ out }) => (out.retry && !out.retry.ok && out.call.code === 'DurabilityLost' && out.retry.code === 'DurabilityLost'
-    ? [{ text: `sync again threw: ${shown(out.retry)}`, syncLost: true }] : []),
-};
 
 const coldCall = {
   rule: 'the call',
@@ -1141,13 +1134,7 @@ if (skip) {
         unsynced: (s, f, h) => h.threeWrites(s),
         call: (s, f, h) => s.sync(),
         reads: h => h.threeReads,
-      }, syncKind, {
-        rules: [secondSyncReturns],
-        todos: [{
-          point: 'fsync 1', rule: 'the second try', owns: syncLost,
-          todo: 'After a refused sync of the record log, sync on the same handle throws DurabilityLost until the store is opened again.',
-        }],
-      }));
+      }, syncKind));
     test('A refused request in close leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'close',

@@ -752,7 +752,8 @@ fn get_records_answers_each_id_in_order() {
 /// A record that fails to read fails `get_records` with its error, as it
 /// fails `get_record`, instead of answering `None` in its place. The damage
 /// is made while the store is open: open checks every record's checksum
-/// and refuses a damaged one before the tail.
+/// and refuses a damaged one before the tail. It is made after a sync, since
+/// the log reads the records past its last good fsync from memory.
 #[test]
 fn get_records_returns_the_error_of_a_record_that_fails_to_read() {
     use std::io::{Seek, SeekFrom, Write};
@@ -767,6 +768,7 @@ fn get_records_returns_the_error_of_a_record_that_fails_to_read() {
     let readable = note("readable");
     let damaged = note("damaged-in-the-middle");
     let last = note("last");
+    store.sync().unwrap();
 
     let log = dir.path().join("records.log");
     let bytes = std::fs::read(&log).unwrap();
