@@ -176,6 +176,7 @@ pub struct JsRecord {
     pub sequence: i64,
     pub record_type: String,
     pub payload: Buffer,
+    /// Microseconds since the Unix epoch.
     pub timestamp: i64,
     pub caused_by: Vec<String>,
     pub linked_to: Vec<String>,
@@ -226,6 +227,7 @@ pub struct JsBranch {
     pub head: i64,
     pub parent_id: Option<String>,
     pub branch_point: Option<i64>,
+    /// Microseconds since the Unix epoch.
     pub created: i64,
 }
 
@@ -477,6 +479,9 @@ pub struct JsStoreEvent {
     /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`, which
     /// is one event for the whole batch at its one sequence. A subscriber
     /// that follows an append log by its deltas needs both.
+    ///
+    /// A "record" event's `record.timestamp` and a "branch_created" event's
+    /// `branch.created` are microseconds since the Unix epoch.
     pub data: String,
 }
 
@@ -688,9 +693,9 @@ impl JsStore {
     /// is synced, every view made from this handle stops working ("Store has
     /// been closed"), and the lock file is released before `close()` returns
     /// — live views do not keep the store or its lock alive. If the record
-    /// log's fsync has failed, or a sync of a directory that holds the store
-    /// or its blobs fails, this throws that error after closing the store,
-    /// so it can be reopened.
+    /// log's fsync has failed and the sync's retry of it fails too, or a sync
+    /// of a directory that holds the store or its blobs fails, this throws
+    /// that error after closing the store, so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed", but for `isClosed()`,
@@ -715,7 +720,19 @@ impl JsStore {
                 writer.finish();
             }
             // Sync before closing
-            store.sync().map_err(to_napi_error)?;
+            store
+                .sync()
+                .map_err(|error| match error {
+                    StoreError::DurabilityLost(text) => StoreError::DurabilityLost(format!(
+                        "{text}. That advice doesn't apply here: close() has closed this handle, \
+                         so sync() on it throws StoreClosed. The store's own last sync as it \
+                         closed may still have saved those records. A reopen shows what the \
+                         store holds, but it can't tell whether records that the operating \
+                         system still caches reached the disk"
+                    )),
+                    other => other,
+                })
+                .map_err(to_napi_error)?;
             // Drop the Arc. The slot and the writer thread, joined above, were
             // the only long-lived references (views hold the slot, not the
             // store), so the store is dropped here.
@@ -2019,15 +2036,26 @@ impl JsStore {
     /// Flush pending record/state contents and publish metadata checkpoints.
     /// A failure to save field indexes is only logged, since they are derived.
     /// Once an fsync of the record log has failed, this call's own or a
-    /// periodic one, this throws that failure every time until the store is
-    /// reopened, and publishes nothing: records written before it may not
-    /// have reached the disk, and a later fsync can't show that they did.
-    /// Its message begins `Durability lost:`, and its `code` is
-    /// `DurabilityLost`. Registering a state, changing a strategy, and
-    /// creating, deleting or switching a branch throw it too, unless a check
-    /// of their own refuses them first, and so does any write while one of
-    /// them waits for its checkpoint.
-    /// Reopening the store is the only way to resume durable writes.
+    /// periodic one, records written since the last good fsync may not have
+    /// reached the disk, and a later fsync alone can't show that they did.
+    /// So while that failure stands, this writes those records again from
+    /// memory and then fsyncs. When that succeeds, it returns as usual. When
+    /// it fails, it throws and publishes nothing, and the next `sync()` or
+    /// write tries again. Its message begins `Durability lost:`, and its
+    /// `code` is `DurabilityLost`. While the failure stands, each later write
+    /// other than a blob write makes the same retry first, before it changes
+    /// anything: an append, a state write, a field-index registration,
+    /// registering a state, changing a strategy, and creating, deleting or
+    /// switching a branch. When the retry succeeds, the write goes on. When it
+    /// fails, the write throws it and changes nothing. While the disk keeps
+    /// failing, each retry writes the kept bytes again, which can be 64 MiB
+    /// and one record, and waits for an fsync, and reads of the log wait for
+    /// it. Registering a state, changing a
+    /// strategy, and creating, deleting or switching a branch then save their
+    /// own checkpoint. When that save fails, they throw and keep the change,
+    /// as for any failed checkpoint.
+    /// Reopening the store also ends the failure. The open fsyncs the log
+    /// first, and throws the same error when that fsync fails.
     /// Reopening can't tell whether records the operating system still caches
     /// reached the disk: if they didn't while later records did, an open
     /// after the cache drops them refuses the store as mid-log corruption.
@@ -2063,7 +2091,8 @@ impl JsStore {
     /// before returning. After one of those checkpoints fails, further
     /// mutations retry it before proceeding, and the change stays applied in
     /// memory. A failed sync with no such change pending holds back no later
-    /// append or state update.
+    /// append or state update, unless what failed was the record log's fsync,
+    /// as above.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;

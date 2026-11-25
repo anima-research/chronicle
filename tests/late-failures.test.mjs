@@ -19,9 +19,7 @@ const MKDIRS = new Set(['mkdir', 'mkdirat']);
 const BY_DESCRIPTOR = new Set([...WRITES, ...READS, ...SYNCS]);
 const NOT_MEASURED = 'The instrument does not measure';
 const NEW_BRANCH_AFTER_THROW = 'When a refused request makes the call throw, the handle already shows the new branch.';
-const LOG_SYNC_LOST = 'After a refused sync of the record log, sync on the same handle throws DurabilityLost until the store is opened again.';
 const newAfterThrow = problem => problem.newAfterThrow === true;
-const syncLost = problem => problem.syncLost === true;
 
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
 const holds = (dir, path) => typeof dir === 'string' && dir !== path && (dir === '/' || path.startsWith(`${dir}/`));
@@ -471,7 +469,7 @@ const theSecondTry = {
   judge: facts => {
     const { out } = facts;
     const problems = [];
-    if (out.retry && !out.retry.ok && !(out.call.code === 'DurabilityLost' && out.retry.code === 'DurabilityLost')) {
+    if (out.retry && !out.retry.ok) {
       problems.push({ text: `the same call again threw: ${shown(out.retry)}` });
     }
     if (out.retry?.ok) problems.push(...whole(facts, 'the reads after the same call again', out.retryReads, true));
@@ -619,12 +617,6 @@ const theStoreNameWaits = {
     return begin?.names.includes(run.store) ? []
       : [{ text: `${NOT_MEASURED}: before the call, the store's name was not waiting to be put on disk, so the call had no name of it to pay` }];
   },
-};
-
-const secondSyncReturns = {
-  rule: 'the second try',
-  judge: ({ out }) => (out.retry && !out.retry.ok && out.call.code === 'DurabilityLost' && out.retry.code === 'DurabilityLost'
-    ? [{ text: `sync again threw: ${shown(out.retry)}`, syncLost: true }] : []),
 };
 
 const coldCall = {
@@ -1168,10 +1160,7 @@ if (skip) {
         unsynced: (s, f, h) => h.threeWrites(s),
         call: (s, f, h) => s.sync(),
         reads: h => h.threeReads,
-      }, syncKind, {
-        rules: [secondSyncReturns],
-        todos: [{ point: 'fsync 1', rule: 'the second try', owns: syncLost, todo: LOG_SYNC_LOST }],
-      }));
+      }, syncKind));
     test('A refused request in the first sync of a handle leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'firstSync',
@@ -1180,8 +1169,7 @@ if (skip) {
         call: (s, f, h) => s.sync(),
         reads: h => h.threeReads,
       }, syncKind, {
-        rules: [secondSyncReturns, aRefusedNameSyncThrows, theSecondTrySyncsItAgain, theStoreNameWaits],
-        todos: [{ point: 'fsync 1', rule: 'the second try', owns: syncLost, todo: LOG_SYNC_LOST }],
+        rules: [aRefusedNameSyncThrows, theSecondTrySyncsItAgain, theStoreNameWaits],
       }));
     test('A refused request in close leaves a throw or a return, whole values and a store that opens again',
       refused({
