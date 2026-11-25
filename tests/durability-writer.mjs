@@ -1,9 +1,11 @@
-import { closeSync, existsSync, fsyncSync, openSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { JsStore } from '../index.js';
 
 const root = process.argv[2];
 const path = join(root, 'store');
+const deeper = join(root, 'made', 'deeper', 'store');
+const moved = join(root, 'moved', 'store');
 const control = join(root, 'control');
 const mark = name => existsSync(`/chronicle-mark/${name}`);
 const entry = blobHash => ({ blobHash, size: 4, mode: 0o644 });
@@ -18,7 +20,7 @@ const barriers = [
     store.appendJson('journal', { n: 0 });
   }, sync, () => {
     store = JsStore.create({ path });
-  }],
+  }, path],
   ['sync after registerState', () => {
     for (const [id, strategy] of [['mode', 'snapshot'], ['raw', 'snapshot'], ['messages', 'append_log'],
       ['identified', 'append_log'], ['files', 'tree']]) {
@@ -109,13 +111,30 @@ const barriers = [
     store.appendJson('journal', { n: 3 });
   }, sync, () => {
     store = JsStore.open({ path });
-  }],
+  }, path],
   ['close on a reopened store with a write pending', () => {
     store.appendJson('journal', { n: 4 });
   }, () => store.close()],
+  ['sync on a new store whose parents create made', () => {
+    store.appendJson('journal', { n: 5 });
+  }, sync, () => {
+    store = JsStore.create({ path: deeper });
+  }, deeper],
+  ['sync on a store moved into a directory that chronicle did not make', () => {
+    store.appendJson('journal', { n: 6 });
+  }, sync, () => {
+    store.close();
+    mkdirSync(join(root, 'moved'));
+    renameSync(deeper, moved);
+    store = JsStore.open({ path: moved });
+  }, moved],
 ];
 
-console.log(JSON.stringify(barriers.map(([label, , barrier, open]) => ({ label, pending: barrier !== undefined, opens: open !== undefined }))));
+let opened = null;
+console.log(JSON.stringify(barriers.map(([label, , barrier, open, at]) => {
+  opened = at ?? opened;
+  return { label, pending: barrier !== undefined, opens: open !== undefined, store: relative(root, opened) };
+})));
 mark('begin');
 writeFileSync(join(control, 'first'), 'unsynced');
 writeFileSync(join(control, 'other'), 'unsynced');
