@@ -13,6 +13,7 @@ on:
       - 'tests/create_existing_store.rs'
       - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
+      - 'tests/missing_log.rs'
       - 'tests/review7_fixes.rs'
       - 'tests/state_len_checks.rs'
   pull_request:
@@ -27,6 +28,7 @@ on:
       - 'tests/create_existing_store.rs'
       - 'tests/crash_state_recovery.rs'
       - 'tests/lock_file.rs'
+      - 'tests/missing_log.rs'
       - 'tests/review7_fixes.rs'
       - 'tests/state_len_checks.rs'
   workflow_dispatch:
@@ -88,6 +90,12 @@ jobs:
 
       - name: Create over an existing store tests
         run: cargo test --test create_existing_store -- --nocapture
+
+      # Open reads each store file's type, and where a symbolic link leads,
+      # by each platform's rules, so the lost-log tests run here too. On
+      # Windows the link tests are compiled out.
+      - name: Lost log tests
+        run: cargo test --test missing_log -- --nocapture
 
       # The batch replay tests re-run the test binary as a child that writes
       # and is killed or exits, then cut the log with set_len: nothing
