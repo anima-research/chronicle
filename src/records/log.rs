@@ -166,11 +166,14 @@ impl RecordLog {
     /// again.
     ///
     /// The open fsyncs the log before it takes the log's length as the point
-    /// of its last good fsync, so that a later failure can only touch records
-    /// that this handle wrote and keeps. If that fsync fails, the open fails
-    /// with `StoreError::DurabilityLost`: records written before this open
-    /// may not be on the disk, and a later open doesn't report the failure
-    /// again.
+    /// of its last good fsync. That fsync writes the pages an earlier process
+    /// left dirty, and reports a write-back failure that no handle has seen
+    /// yet. Linux doesn't report a failure that an earlier handle already
+    /// received to a later open, so after such a failure the reopened log is
+    /// only as durable as that handle left it. If the open's fsync fails, the
+    /// open fails with `StoreError::DurabilityLost`: records written before
+    /// this open may not be on the disk, and a later open doesn't report the
+    /// failure again.
     ///
     /// On open, the log is validated end-to-end (framing + checksums). A
     /// torn/partial *tail* — the crash-during-append case — is recovered by
@@ -374,11 +377,7 @@ impl RecordLog {
         Ok((record, offset))
     }
 
-    /// `StoreError::DurabilityLost` while an fsync failure of the log stands,
-    /// which [`RecordLog::append`] returns before it writes. A caller with
-    /// changes of its own to make before an append checks this first, so a
-    /// refused write changes nothing.
-    pub(crate) fn refuse_while_lost(&self) -> Result<()> {
+    fn refuse_while_lost(&self) -> Result<()> {
         match &*self.durability_failure.lock() {
             Some(failure) => Err(StoreError::DurabilityLost(format!(
                 "fsync of the record log failed ({failure}), so no record is written until \
@@ -386,6 +385,14 @@ impl RecordLog {
                  succeeds, or the store is reopened"
             ))),
             None => Ok(()),
+        }
+    }
+
+    pub(crate) fn sync_if_lost(&self) -> Result<()> {
+        if self.durability_failure.lock().is_some() {
+            self.sync()
+        } else {
+            Ok(())
         }
     }
 
@@ -476,9 +483,10 @@ impl RecordLog {
                 };
                 Err(StoreError::DurabilityLost(format!(
                     "fsync of the record log failed ({failure}); records written since the \
-                     last good fsync may not have reached the disk. Until a sync() writes \
+                     last good fsync may not have reached the disk. Until a retry writes \
                      them again and its fsync succeeds, or the store is reopened, no record is \
-                     written and the store publishes no checkpoint"
+                     written and the store publishes no checkpoint. sync() makes the retry, \
+                     and so does each later write"
                 )))
             }
         }
@@ -1089,7 +1097,7 @@ mod tests {
 
             *log.fsync_failures.lock() = 2;
             let text = lost(log.sync());
-            assert!(text.contains("Until a sync() writes them again"), "{text}");
+            assert!(text.contains("Until a retry writes them again"), "{text}");
             lost(log.sync());
             *log.rewrite_failures.lock() = 1;
             let text = lost(log.sync());

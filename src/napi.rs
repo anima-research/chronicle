@@ -2034,16 +2034,17 @@ impl JsStore {
     /// reached the disk, and a later fsync alone can't show that they did.
     /// So while that failure stands, this writes those records again from
     /// memory and then fsyncs. When that succeeds, it returns as usual. When
-    /// it fails, it throws and publishes nothing, and the next `sync()` tries
-    /// again. Its message begins `Durability lost:`, and its `code` is
-    /// `DurabilityLost`. While the failure stands, every append and state
-    /// write throws it before it writes, unless a check of its own refuses it
-    /// first. Registering a state, changing a strategy, and creating,
-    /// deleting or switching a branch make their change and then save their
-    /// checkpoint, which makes the same retry: when it fails, they throw it
-    /// and keep the change, as for any failed checkpoint. A write while such
-    /// a checkpoint is owed saves it first, and throws it without its change
-    /// when that save fails.
+    /// it fails, it throws and publishes nothing, and the next `sync()` or
+    /// write tries again. Its message begins `Durability lost:`, and its
+    /// `code` is `DurabilityLost`. While the failure stands, each later write
+    /// makes the same retry first, before it changes anything: an append, a
+    /// state write, a field-index registration, registering a state,
+    /// changing a strategy, and creating, deleting or switching a branch.
+    /// When the retry succeeds, the write goes on. When it fails, the write
+    /// throws it and changes nothing. Registering a state, changing a
+    /// strategy, and creating, deleting or switching a branch then save their
+    /// own checkpoint. When that save fails, they throw and keep the change,
+    /// as for any failed checkpoint.
     /// Reopening the store also ends the failure. The open fsyncs the log
     /// first, and throws the same error when that fsync fails.
     /// Reopening can't tell whether records the operating system still caches
