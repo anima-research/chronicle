@@ -3291,22 +3291,36 @@ impl Store {
     /// filesystem or to the first one that this process may not look at, and
     /// the store's directory, the blob directory and each shard directory in
     /// it, so that a power loss can't take the store's name or a blob's,
-    /// whatever made them. After that, it syncs each blob directory whose sync after a blob
-    /// store this handle still owes. As a blob store's syncs do, these go
-    /// only where the system syncs directories and this process may open
-    /// them. For a store path through a symbolic link, the directory that
-    /// holds the link's own name isn't synced. For a link in the blob
-    /// directory, a shard directory or a blob name, the directory that it
-    /// leads to isn't synced. A failed sync of one of these directories
-    /// returns its error, and the next call tries it again. Appends, state
-    /// writes and blob stores go on meanwhile.
+    /// whatever made them. On macOS, where each directory sync would ask the
+    /// drive to write back its whole cache, this first-time sync syncs each
+    /// directory with `fsync` and then asks each drive to write back its cache
+    /// once. After that, it syncs each blob directory whose sync after a blob
+    /// store this handle still owes. As a blob store's syncs do, these go only
+    /// where the system syncs directories and this process may open them. For
+    /// a store path through a symbolic link, the directory that holds the
+    /// link's own name isn't synced, and the first-time sync doesn't follow a
+    /// symbolic link in the blob directory. A failed sync of one of these
+    /// directories returns its error, and the next call tries it again. On
+    /// ext4, a retry just after a failed journal commit can succeed although
+    /// the name never reached the disk, so a successful retry doesn't prove
+    /// that it did. Appends, state writes and blob stores go on meanwhile.
+    /// Until that first call, a power loss can take a new store's directory
+    /// and the parents that `create` made, even after a registration or a
+    /// branch change has saved its checkpoint.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.sync_locked(&mut write)?;
         let in_sync = |error: std::io::Error| std::io::Error::new(error.kind(), format!("sync: {error}"));
         if !write.names_synced {
+            let mut devices = crate::atomic_file::Devices::default();
+            devices.note(&self.config.path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync: cannot read the metadata of {}: {error}", self.config.path.display()),
+                )
+            })?;
             for directory in &self.holders {
-                crate::atomic_file::sync_directory_at(directory).map_err(|error| {
+                crate::atomic_file::sync_directory_at_unflushed(directory).map_err(|error| {
                     std::io::Error::new(
                         error.kind(),
                         format!(
@@ -3317,7 +3331,13 @@ impl Store {
                     )
                 })?;
             }
-            self.blobs.sync_directories().map_err(in_sync)?;
+            self.blobs.sync_directories(&mut devices).map_err(in_sync)?;
+            devices.flush().map_err(|(directory, error)| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync: cannot flush the drive that holds {}: {error}", directory.display()),
+                )
+            })?;
             write.names_synced = true;
         }
         self.blobs.sync_owed().map_err(in_sync)?;

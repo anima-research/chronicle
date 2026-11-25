@@ -1,6 +1,7 @@
 //! Blob storage implementation.
 
 use super::chunks;
+use crate::atomic_file::Devices;
 use crate::error::{Result, StoreError};
 use crate::types::{Blob, Hash};
 use lru::LruCache;
@@ -382,7 +383,7 @@ impl BlobStorage {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot sync {}, so {} wasn't written, and storing the blob again tries the sync again: {error}",
+                    "cannot sync {}, so {} wasn't written, and storing the blob again or the next sync tries again: {error}",
                     directory.display(),
                     blob_path.display()
                 ),
@@ -456,14 +457,16 @@ impl BlobStorage {
         &self.shards[shard_of(hash)]
     }
 
+    fn entry(&self) -> &Path {
+        self.path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    }
+
     fn sync_entry(&self) -> std::result::Result<(), Unsynced> {
         if !self.entry_synced.load(Ordering::SeqCst) {
-            let parent = self
-                .path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            sync_directory_named(parent)?;
+            sync_directory_named(self.entry())?;
             self.entry_synced.store(true, Ordering::SeqCst);
         }
         Ok(())
@@ -518,15 +521,18 @@ impl BlobStorage {
             .map_err(unsynced_error)
     }
 
-    pub(crate) fn sync_directories(&self) -> io::Result<()> {
-        self.sync_blob_directory_and_shards().map_err(unsynced_error)
+    pub(crate) fn sync_directories(&self, devices: &mut Devices) -> io::Result<()> {
+        self.sync_blob_directory_and_shards(devices).map_err(unsynced_error)
     }
 
-    fn sync_blob_directory_and_shards(&self) -> std::result::Result<(), Unsynced> {
+    fn sync_blob_directory_and_shards(&self, devices: &mut Devices) -> std::result::Result<(), Unsynced> {
         if cfg!(not(unix)) {
             return Ok(());
         }
-        self.sync_entry()?;
+        if !self.entry_synced.load(Ordering::SeqCst) {
+            sync_in_pass(self.entry(), devices)?;
+            self.entry_synced.store(true, Ordering::SeqCst);
+        }
         match fs::symlink_metadata(&self.path) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -537,11 +543,17 @@ impl BlobStorage {
                 })
             }
         }
-        sync_directory_named(&self.path)?;
+        sync_in_pass(&self.path, devices)?;
         for shard in 0..self.shards.len() {
             let directory = self.shard_dir(shard);
             match fs::symlink_metadata(&directory) {
-                Ok(metadata) if metadata.is_dir() => self.sync_shard(&directory)?,
+                Ok(metadata) if metadata.is_dir() => {
+                    self.fail_at(WriteStep::ShardSync).map_err(|error| Unsynced {
+                        directory: directory.clone(),
+                        error,
+                    })?;
+                    sync_in_pass(&directory, devices)?;
+                }
                 Ok(_) => {}
                 Err(error)
                     if matches!(
@@ -1007,6 +1019,17 @@ fn unsynced_error(Unsynced { directory, error }: Unsynced) -> io::Error {
             directory.display()
         ),
     )
+}
+
+fn sync_in_pass(directory: &Path, devices: &mut Devices) -> std::result::Result<(), Unsynced> {
+    let unsynced = |error| Unsynced {
+        directory: directory.to_owned(),
+        error,
+    };
+    crate::atomic_file::sync_directory_at_unflushed(directory).map_err(unsynced)?;
+    #[cfg(test)]
+    SYNCED_DIRECTORIES.with(|synced| synced.borrow_mut().push(directory.to_owned()));
+    devices.note(directory).map_err(unsynced)
 }
 
 fn sync_directory_named(path: &Path) -> std::result::Result<(), Unsynced> {

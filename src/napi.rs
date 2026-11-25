@@ -2042,16 +2042,23 @@ impl JsStore {
     /// filesystem or to the first one that this process may not look at, and
     /// the store's directory, `blobs/` and each shard directory in it, so that
     /// a power loss can't take the store's name or a blob's, whatever made
-    /// them. After that, it
-    /// syncs each blob directory whose sync after a blob store this handle
-    /// still owes. As for a checkpoint save, a directory that this process
-    /// may not open is passed over, and so is every directory on a system
-    /// that doesn't sync directories. For a store path through a symbolic
-    /// link, the directory that holds the link's own name isn't synced. For
-    /// a link in `blobs/`, a shard directory or a blob name, the directory
-    /// that it leads to isn't synced. A failed sync of one of these
-    /// directories throws its error, and the next `sync()` tries it again.
-    /// Appends, state writes and blob stores go on meanwhile.
+    /// them. On macOS, where each directory sync would ask the drive to write
+    /// back its whole cache, this first-time sync syncs each directory with
+    /// `fsync` and then asks each drive to write back its cache once. After
+    /// that, it syncs each blob directory whose sync after a blob store this
+    /// handle still owes. As for a checkpoint save, a directory that this
+    /// process may not open is passed over, and so is every directory on a
+    /// system that doesn't sync directories. For a store path through a
+    /// symbolic link, the directory that holds the link's own name isn't
+    /// synced, and the first-time sync doesn't follow a symbolic link in
+    /// `blobs/`. A failed sync of one of these directories throws its error,
+    /// and the next `sync()` tries it again. On ext4, a retry just after a
+    /// failed journal commit can succeed although the name never reached the
+    /// disk, so a successful retry doesn't prove that it did. Appends, state
+    /// writes and blob stores go on meanwhile. Until that first call, a power
+    /// loss can take a new store's directory and the parents that `create`
+    /// made, even after a registration or a branch change has saved its
+    /// checkpoint.
     /// State registration, strategy changes and branch changes checkpoint
     /// before returning. After one of those checkpoints fails, further
     /// mutations retry it before proceeding, and the change stays applied in

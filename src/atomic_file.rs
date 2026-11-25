@@ -441,6 +441,109 @@ pub(crate) fn sync_directory_at(_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn sync_directory_at_unflushed(directory: &Path) -> io::Result<()> {
+    match File::open(directory) {
+        Ok(directory) => sync_directory_unflushed(&directory),
+        Err(error) if directory_open_refused(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_directory_at_unflushed(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+// On Apple targets std's sync_all is fcntl(F_FULLFSYNC), which asks the drive
+// to write back its whole cache. fsync(2) moves a directory's changes to the
+// drive without that, and Devices::flush then flushes each drive once.
+#[cfg(target_vendor = "apple")]
+fn sync_directory_unflushed(directory: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    retried(|| unsafe { libc::fsync(directory.as_raw_fd()) })
+}
+
+#[cfg(target_vendor = "apple")]
+fn retried(call: impl Fn() -> libc::c_int) -> io::Result<()> {
+    loop {
+        if call() != -1 {
+            return Ok(());
+        }
+        match io::Error::last_os_error() {
+            error if error.kind() == io::ErrorKind::Interrupted => {}
+            error if directory_sync_refused(&error) => return Ok(()),
+            error => return Err(error),
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn sync_directory_unflushed(directory: &File) -> io::Result<()> {
+    sync_directory(directory)
+}
+
+#[cfg(target_vendor = "apple")]
+fn flush_device_of(directory: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let directory = match File::open(directory) {
+        Ok(directory) => directory,
+        Err(error) if directory_open_refused(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    retried(|| unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_FULLFSYNC) })
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn flush_device_of(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLUSHED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn flushed_devices() -> Vec<PathBuf> {
+    FLUSHED.with(|flushed| flushed.take())
+}
+
+#[derive(Default)]
+pub(crate) struct Devices {
+    devices: Vec<(u64, PathBuf)>,
+    #[cfg(test)]
+    pub(crate) noted: Vec<PathBuf>,
+}
+
+impl Devices {
+    #[cfg(unix)]
+    pub(crate) fn note(&mut self, directory: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let device = fs::metadata(directory)?.dev();
+        #[cfg(test)]
+        self.noted.push(directory.to_owned());
+        if !self.devices.iter().any(|(each, _)| *each == device) {
+            self.devices.push((device, directory.to_owned()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn note(&mut self, _directory: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn flush(&self) -> std::result::Result<(), (PathBuf, io::Error)> {
+        for (_, directory) in &self.devices {
+            #[cfg(test)]
+            FLUSHED.with(|flushed| flushed.borrow_mut().push(directory.clone()));
+            flush_device_of(directory).map_err(|error| (directory.clone(), error))?;
+        }
+        Ok(())
+    }
+}
+
 /// Sync the directory a save of the checkpoint at `path` renames into: the
 /// one holding the file its symbolic links lead to, as `atomic_write` finds
 /// it, or `path`'s own where it is no link. An error names that directory.
