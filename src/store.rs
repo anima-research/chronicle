@@ -3424,9 +3424,10 @@ impl Store {
     /// State registration, strategy changes, and branch creation, deletion
     /// and switching checkpoint before returning, because the record log
     /// cannot reconstruct them. If that checkpoint fails, the call throws and
-    /// the store holds what it held before the call, except that a failed
-    /// creation's branch ID isn't given out again. So the same call can run
-    /// again once the cause is mended. The disk can still hold part of the
+    /// undoes its change. The open store's branch list, selection,
+    /// registrations and strategies are then as they were before the call. A
+    /// failed creation's branch ID isn't given out again. So the same call can
+    /// run again on the same handle once the cause is mended. The disk can still hold part of the
     /// change: `state.bin` is saved before `branches.bin`, and a save can put
     /// its new file in place and then fail. So each later write of a record
     /// or a state, field-index registration or metadata call saves the

@@ -318,6 +318,10 @@ fn a_registration_whose_branch_list_save_failed_can_be_on_disk_at_reopen() {
     run_crash(dir.path(), "registration-in-state-bin");
     let store = Store::open(config(dir.path())).unwrap();
     assert_eq!(store.stats().unwrap().state_slot_count, 1);
+    assert!(matches!(
+        store.register_state(registration("items")),
+        Err(StoreError::StateExists(_))
+    ));
     append(&store, 7).unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&store.get_state("items").unwrap().unwrap()).unwrap(),

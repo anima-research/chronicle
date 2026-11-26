@@ -2101,8 +2101,9 @@ impl JsStore {
     /// checkpoint.
     /// State registration, strategy changes and branch changes checkpoint
     /// before returning. When one of those checkpoints fails, the call throws
-    /// and the store holds what it held before the call, except that a failed
-    /// creation's branch ID isn't given out again. The disk can still
+    /// and undoes its change. The open store's branch list, selection,
+    /// registrations and strategies are then as they were before the call. A
+    /// failed creation's branch ID isn't given out again. The disk can still
     /// hold part of the change until the next checkpoint, so each later
     /// write of a record or a state, field-index registration or metadata
     /// call saves the checkpoint again before it changes anything. A blob
