@@ -18,8 +18,8 @@ const OPENS = new Set(['open', 'openat', 'openat2', 'creat']);
 const MKDIRS = new Set(['mkdir', 'mkdirat']);
 const BY_DESCRIPTOR = new Set([...WRITES, ...READS, ...SYNCS]);
 const NOT_MEASURED = 'The instrument does not measure';
-const NEW_BRANCH_AFTER_THROW = 'When a refused request makes the call throw, the handle already shows the new branch.';
-const newAfterThrow = problem => problem.newAfterThrow === true;
+const thrownCopyHoldsChange = problem => problem.thrownCopyHoldsChange === true;
+const METADATA_ON_DISK = { rule: 'the reopen', owns: thrownCopyHoldsChange };
 
 const isUnder = (path, dir) => typeof path === 'string' && (path === dir || path.startsWith(`${dir}/`));
 const holds = (dir, path) => typeof dir === 'string' && dir !== path && (dir === '/' || path.startsWith(`${dir}/`));
@@ -545,7 +545,10 @@ const theReopen = {
         } else if (!isDeepStrictEqual(read.value, facts.old[name].value)) {
           const last = lastRead[where](name);
           if (!last.ok || !isDeepStrictEqual(last.value, read.value)) {
-            add(`${which}, opened again, gave the new value for ${name}, where the handle last gave ${shown(last)}`);
+            problems.push({
+              text: `${which}, opened again, gave the new value for ${name}, where the handle last gave ${shown(last)}`,
+              thrownCopyHoldsChange: where === 'thrown',
+            });
           }
         }
       }
@@ -562,7 +565,7 @@ const oldAfterThrow = method => ({
     for (const [what, reads] of [['the reads after the call', out.reads[0]], ['the second reads after the call', out.reads[1]]]) {
       for (const [name, read] of Object.entries(reads)) {
         if (read.ok && !isDeepStrictEqual(read.value, old[name].value)) {
-          problems.push({ text: `${what}, ${name} gave ${JSON.stringify(read.value)} after the call threw, not the old value`, newAfterThrow: true });
+          problems.push({ text: `${what}, ${name} gave ${JSON.stringify(read.value)} after the call threw, not the old value` });
         }
       }
     }
@@ -803,7 +806,7 @@ async function scenarioResult(scenario, kind) {
 
 const asText = value => (typeof value === 'function' ? String(value) : value);
 
-function refused(scenario, kind, { rules = [], todos = [], firstAim } = {}) {
+function refused(scenario, kind, { rules = [], todos = [], allows = [], firstAim } = {}) {
   return async t => {
     const file = join(base, `${scenario.name}.json`);
     writeFileSync(file, JSON.stringify({
@@ -841,7 +844,8 @@ function refused(scenario, kind, { rules = [], todos = [], firstAim } = {}) {
         const ownedBy = (rule, problem) => here.find(each => each.rule === rule && each.owns(problem));
         const holds = keep => {
           for (const [run, problems] of judged) {
-            const found = RULES.flatMap(rule => problems.get(rule).filter(problem => keep(rule, problem)).map(({ text }) => text));
+            const allowed = (rule, problem) => allows.some(each => each.rule === rule && each.owns(problem));
+            const found = RULES.flatMap(rule => problems.get(rule).filter(problem => keep(rule, problem) && !allowed(rule, problem)).map(({ text }) => text));
             const gave = run.out ? `, the call gave ${shown(run.out.call)}` : '';
             assert.deepEqual(found, [], `With ${point.id} (${at}) refused${gave}: ${found.join(' | ')}`);
           }
@@ -1007,14 +1011,20 @@ if (skip) {
         name: 'createBranch',
         call: (s, f, h) => s.createBranch('made'),
         reads: h => ({ branches: h.branchNames }),
-      }, writeKind));
+      }, writeKind, {
+        rules: [oldAfterThrow()],
+        allows: [METADATA_ON_DISK],
+      }));
     test('A refused request in createBranchAt leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'createBranchAt',
         setup: (s, f, h) => { f.at = s.currentSequence(); s.setStateJson('mode', { mode: 'later' }); },
         call: (s, f, h) => s.createBranchAt('made', 'main', f.at),
         reads: h => ({ branches: h.branchNames, made: h.branchStates('made') }),
-      }, writeKind));
+      }, writeKind, {
+        rules: [oldAfterThrow()],
+        allows: [METADATA_ON_DISK],
+      }));
     test('A refused request in createBranchAtWithStates leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'createBranchAtWithStates',
@@ -1023,9 +1033,7 @@ if (skip) {
         reads: h => ({ branches: h.branchNames, made: h.branchStates('made') }),
       }, writeKind, {
         rules: [oldAfterThrow()],
-        todos: [
-          { rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
-        ],
+        allows: [METADATA_ON_DISK],
       }));
     test('A refused request in createBranchWithStates leaves a throw or a return, whole values and a store that opens again',
       refused({
@@ -1034,9 +1042,7 @@ if (skip) {
         reads: h => ({ branches: h.branchNames, made: h.branchStates('made') }),
       }, writeKind, {
         rules: [oldAfterThrow()],
-        todos: [
-          { rule: 'the reads', todo: NEW_BRANCH_AFTER_THROW, owns: newAfterThrow },
-        ],
+        allows: [METADATA_ON_DISK],
       }));
     test('A refused request in deleteBranch leaves a throw or a return, whole values and a store that opens again',
       refused({
@@ -1044,7 +1050,10 @@ if (skip) {
         setup: (s, f, h) => s.createBranch('gone'),
         call: (s, f, h) => s.deleteBranch('gone'),
         reads: h => ({ branches: h.branchNames }),
-      }, writeKind));
+      }, writeKind, {
+        rules: [oldAfterThrow()],
+        allows: [METADATA_ON_DISK],
+      }));
     test('A refused request in editStateItem leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'editStateItem',
@@ -1063,7 +1072,10 @@ if (skip) {
         name: 'registerState',
         call: (s, f, h) => s.registerState({ id: 'added', strategy: 'snapshot' }),
         reads: h => ({ states: h.stateList }),
-      }, writeKind));
+      }, writeKind, {
+        rules: [oldAfterThrow()],
+        allows: [METADATA_ON_DISK],
+      }));
     test('A refused request in registerStateFieldIndex leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'registerStateFieldIndex',
@@ -1107,9 +1119,7 @@ if (skip) {
         reads: h => ({ current: s => s.currentBranch().name }),
       }, writeKind, {
         rules: [oldAfterThrow()],
-        todos: [
-          { rule: 'the reads', owns: newAfterThrow, todo: 'When a refused request makes switchBranch throw, the handle has already switched to the target.' },
-        ],
+        allows: [METADATA_ON_DISK],
       }));
     test('A refused request in treeBatch leaves a throw or a return, whole values and a store that opens again',
       refused({
@@ -1153,7 +1163,10 @@ if (skip) {
           for (let n = 0; n < 5; n++) s.appendToStateJson('messages', h.message('probe', n));
           return s.listStates().find(({ id }) => id === 'messages').opsSinceSnapshot;
         },
-      }, writeKind));
+      }, writeKind, {
+        rules: [oldAfterThrow()],
+        allows: [METADATA_ON_DISK],
+      }));
     test('A refused request in sync leaves a throw or a return, whole values and a store that opens again',
       refused({
         name: 'sync',

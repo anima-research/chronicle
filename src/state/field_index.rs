@@ -284,6 +284,8 @@ pub struct FieldIndexManager {
     )]
     indexes: HashMap<BranchId, BranchIndexes>,
     #[serde(skip)]
+    set_aside: HashMap<BranchId, BranchIndexes>,
+    #[serde(skip)]
     checkpoint: Checkpoint,
 }
 
@@ -512,6 +514,19 @@ impl FieldIndexManager {
     /// Drop every index held for `branch_id` (the branch was deleted).
     pub fn drop_branch(&mut self, branch_id: BranchId) {
         self.indexes.remove(&branch_id);
+        self.set_aside.remove(&branch_id);
+    }
+
+    pub(crate) fn set_aside_branch(&mut self, branch_id: BranchId) {
+        if let Some(indexes) = self.indexes.remove(&branch_id) {
+            self.set_aside.insert(branch_id, indexes);
+        }
+    }
+
+    pub(crate) fn restore_branch(&mut self, branch_id: BranchId) {
+        if let Some(indexes) = self.set_aside.remove(&branch_id) {
+            self.indexes.insert(branch_id, indexes);
+        }
     }
 
     /// Advance the tracked `head_offset` for every index registered for

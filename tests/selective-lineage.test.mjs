@@ -5,7 +5,6 @@ import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'no
 import { constants as osConstants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as nextTurn } from 'node:timers/promises';
-import { knownFailure } from './known-failure.mjs';
 import { ErrorCode, JsStore } from '../index.js';
 
 const MSG = 'messages';
@@ -341,7 +340,7 @@ test('A selective fork whose own checkpoint fails throws', {
 for (const [kind, method] of [['live', 'createBranchWithStates'], ['past', 'createBranchAtWithStates']]) {
   test(`${method} whose own checkpoint fails leaves the name free, and a retry makes the child`, {
     skip: process.platform === 'win32' && 'renames the open store directory',
-  }, knownFailure(`${method} keeps the child it allocated when its own checkpoint fails: the name stays taken, and a retry throws BranchExists.`, t => {
+  }, t => {
     const { fixture, row, names, original, thrown, during, retry } = forkUnderFailedCheckpoint(t, forks[kind]);
     assert.deepEqual([thrown?.code, /\(os error (\d+)\)$/.exec(thrown?.message ?? '')?.[1]], [ErrorCode.Io, String(osConstants.errno.ENOTDIR)]);
     assert.deepEqual(during, original);
@@ -352,7 +351,7 @@ for (const [kind, method] of [['live', 'createBranchWithStates'], ['past', 'crea
     const reopened = fixture.reopen();
     assert.deepEqual([names(reopened), reopened.view(`derived/${kind}`).getStateJson(MSG)],
       [[...original, `derived/${kind}`].sort(), [row]]);
-  }));
+  });
 }
 
 test('Storage, presentation and later writes have distinct inclusive cutoffs', t => {
