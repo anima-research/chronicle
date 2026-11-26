@@ -11,22 +11,25 @@
   item that isn't JSON, has no items to count, so `getStateLen` gives the
   count that the store keeps. `getStateItemJson` on an unchecked list counts
   it first in the same way. Before, at the stale count's last index, it
-  returned the list's last item. `editStateItem` also counts an unchecked list
-  first, and refuses an index at or past its items. Before, it took its bound
+  could return the list's last item. `editStateItem` also counts an unchecked list
+  first, and refuses an index at or past its items, where its value reads as
+  a JSON array. Before, it took its bound
   from the stored count, so it could refuse an item that the list holds, or
   write an edit past the end that made every full read of the list fail.
   `listStates()` still gives the count that the store keeps. For a state of
   another strategy, `getStateLen` still gives that count too.
 - The store saves its checks in `state.bin`, after the index, at each `sync()`
-  and `close()`. A list that the store counted before a sync isn't read for
+  and the store's `close()`. A list that the store counted before a sync isn't read for
   its count again after an open. A later write, such as a `DeltaSnapshot`
   written from Rust, can leave the head unchecked, and the list is then read
   again. After an open, a saved check also lets `getStateItemsJson` read a
-  list's last item from its record alone. So does `getStateItemJson` after a
+  list's last item from its record alone, when the list's last write is an
+  append. So does `getStateItemJson` after a
   batch. Before, they did so only once a session had checked the count. That
   read meets no earlier item, so an earlier item that isn't JSON no longer
-  makes it throw. Earlier releases read only the index in `state.bin`, so they
-  can open a store that this release wrote. This release opens a store that
+  makes it throw. Earlier releases read only the index in `state.bin`, so the
+  saved checks don't keep an earlier release from opening a store that it
+  could otherwise read. This release opens a store that
   has no checks, and counts each of its lists at first use. So after the
   update, the first of `getStateLen`, `getStateItemJson`, `editStateItem` or a
   batch on each list blocks the calling thread for that read.
