@@ -206,15 +206,16 @@ pub struct JsAppendedBatch {
     /// held on the handle's branch just before the batch. Item `i` of the
     /// batch is at `firstOrdinal + i`.
     ///
-    /// The first batch to a state on a branch the store opened with, or on
-    /// one `createBranchAt` started, counts the state's items, reading its
-    /// whole value once, or again under the write lock where another write
-    /// to the state lands during that count, and `getStateLen` reports that
-    /// count from then on:
-    /// a count a release before 0.5.0 stored can be off. A value that isn't
-    /// a JSON array, or holds an item that isn't JSON, has no items to count,
-    /// and this is then the length `getStateLen` reports; the batch is
-    /// recorded, and the state then fails to materialize, as after an
+    /// Where the store hasn't checked the state's count on the branch (a head
+    /// loaded with no saved check, one that `createBranchAt` set at a past
+    /// point, or one after a `DeltaSnapshot` written from Rust or a value that
+    /// isn't an array), the batch first counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write to
+    /// the state lands during that count, and `getStateLen` reports that count
+    /// from then on: a count a release before 0.5.0 stored can be off. A value
+    /// that isn't a JSON array, or holds an item that isn't JSON, has no items
+    /// to count, and this is then the length `getStateLen` reports; the batch
+    /// is recorded, and the state then fails to materialize, as after an
     /// `appendToState` to it, so the items can't be read at those indices.
     pub first_ordinal: i64,
 }
@@ -428,6 +429,9 @@ pub struct JsValueCount {
 pub struct JsStateInfo {
     pub id: String,
     pub strategy: String,
+    /// The count that the state's head keeps, read with nothing else. For an
+    /// `append_log` whose count the store hasn't checked it can differ from
+    /// `getStateLen`, which counts the items.
     pub item_count: Option<i64>,
     pub ops_since_snapshot: i64,
 }
@@ -697,8 +701,9 @@ impl JsStore {
     /// is synced, every view made from this handle stops working ("Store has
     /// been closed"), and the lock file is released before `close()` returns
     /// — live views do not keep the store or its lock alive. If the record
-    /// log's fsync has failed and the sync's retry of it fails too, this
-    /// throws that error after closing the store, so it can be reopened.
+    /// log's fsync has failed and the sync's retry of it fails too, or a sync
+    /// of a directory that holds the store or its blobs fails, this throws
+    /// that error after closing the store, so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed", but for `isClosed()`,
@@ -986,7 +991,7 @@ impl JsStore {
     /// when writing or syncing the blob fails, and for a content type longer
     /// than 65,535 bytes. A sync that fails after the blob is in place still
     /// throws, and storing the blob again before the store closes tries the
-    /// sync again.
+    /// sync again, and so does the next `sync()`, which throws while it fails.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -1565,7 +1570,10 @@ impl JsStore {
         })
     }
 
-    /// Edit an item in an AppendLog state.
+    /// Edit an item in an AppendLog state. An index at or past the number of
+    /// items is refused. Where the store hasn't checked the list's count, the
+    /// edit counts the list first, reading it whole once, and throws as
+    /// `getStateLen` does where that read meets a record that it can't read.
     #[napi]
     pub fn edit_state_item(
         &self,
@@ -1609,7 +1617,15 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Get the length of an AppendLog state.
+    /// The number of items a state holds on this handle's branch, `null`
+    /// where it has no value. For an `append_log` it is the number of items
+    /// that a read returns: a list whose count the store hasn't checked is
+    /// read once to count it. That read throws on an I/O error (code `Io`),
+    /// a record that fails its checksum (`ChecksumMismatch`) or a record
+    /// whose framing is bad (`InvalidFormat`). A list whose value can't be
+    /// rebuilt as a JSON array, such as one that holds an item that isn't
+    /// JSON, has no items to count, so the length is the count the head
+    /// stores, as it is for a state of another strategy.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
         let (store, branch) = self.target()?;
@@ -1660,7 +1676,12 @@ impl JsStore {
     /// bytes aren't one JSON value (no bytes at all read as an empty list),
     /// except the last item served from the head record alone, which reads
     /// no earlier item: an `appendToState`'s, or a batch's last item where
-    /// this session found the head's count exact.
+    /// the store found the head's count exact, in this session or in one
+    /// that saved its check before this open. On an `append_log` whose count
+    /// the store hasn't checked, the read counts the list first, reading it
+    /// whole once, so that it answers at the index of the items, and throws
+    /// as `getStateLen` does where that read meets a record that it can't
+    /// read.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1688,10 +1709,9 @@ impl JsStore {
     /// call. The result has one entry per index in `ordinals`, in the order
     /// given: what `getStateItemJson` returns for that index, so `null` if it
     /// is negative or out of range, the state doesn't exist, or the state's
-    /// value isn't an array, except at the last index of a head whose count
-    /// this session hasn't found exact (unchecked, or checked on a value that
-    /// doesn't materialize), where `getStateItemJson` answers from the stored
-    /// count and this from the value. Throws, as `getStateItemJson` does, if
+    /// value isn't an array, except at the last index of a list whose value
+    /// can't be rebuilt as an array, where `getStateItemJson` answers from
+    /// the stored count and this from the value. Throws, as `getStateItemJson` does, if
     /// the state's bytes aren't one JSON value (no bytes at all read as an
     /// empty list), except the last item served from the head record alone,
     /// which reads no earlier item. Indices may repeat and come in any order.
@@ -2056,6 +2076,28 @@ impl JsStore {
     /// On Unix a save also syncs the containing directory, where the system
     /// can. On Windows it doesn't wait for the rename to reach the disk, so
     /// after an OS crash or power loss the store may open from an earlier
+    /// checkpoint.
+    /// On Unix, the first time on each open handle, this also syncs the
+    /// directories that hold the store's directory, up to the root of its
+    /// filesystem or to the first one that this process may not look at, and
+    /// the store's directory, `blobs/` and each shard directory in it, so that
+    /// a power loss can't take the store's name or a blob's, whatever made
+    /// them. On macOS, where each directory sync would ask the drive to write
+    /// back its whole cache, this first-time sync syncs each directory with
+    /// `fsync` and then asks each drive to write back its cache once. After
+    /// that, it syncs each blob directory whose sync after a blob store this
+    /// handle still owes. As for a checkpoint save, a directory that this
+    /// process may not open is passed over, and so is every directory on a
+    /// system that doesn't sync directories. For a store path through a
+    /// symbolic link, the directory that holds the link's own name isn't
+    /// synced, and the first-time sync doesn't follow a symbolic link in
+    /// `blobs/`. A failed sync of one of these directories throws its error,
+    /// and the next `sync()` tries it again. On ext4, a retry just after a
+    /// failed journal commit can succeed although the name never reached the
+    /// disk, so a successful retry doesn't prove that it did. Appends, state
+    /// writes and blob stores go on meanwhile. Until that first call, a power
+    /// loss can take a new store's directory and the parents that `create`
+    /// made, even after a registration or a branch change has saved its
     /// checkpoint.
     /// State registration, strategy changes and branch changes checkpoint
     /// before returning. When one of those checkpoints fails, the call throws

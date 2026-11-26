@@ -15,6 +15,7 @@ on:
       - 'tests/lock_file.rs'
       - 'tests/missing_log.rs'
       - 'tests/review7_fixes.rs'
+      - 'tests/state_len_checks.rs'
   pull_request:
     paths:
       - '.github/workflows/checkpoint-platforms.yml'
@@ -29,6 +30,7 @@ on:
       - 'tests/lock_file.rs'
       - 'tests/missing_log.rs'
       - 'tests/review7_fixes.rs'
+      - 'tests/state_len_checks.rs'
   workflow_dispatch:
 
 permissions:
@@ -107,3 +109,8 @@ jobs:
       # compiled out and the filter runs none.
       - name: Marked store open tests
         run: cargo test --test review7_fixes a_marked_store -- --nocapture
+
+      # The checks of the counts are a section of state.bin, saved through the
+      # same checkpoint replacement and read back at open.
+      - name: Count checks tests
+        run: cargo test --test state_len_checks -- --nocapture

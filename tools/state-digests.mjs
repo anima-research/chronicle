@@ -99,12 +99,17 @@ try {
     }
     const top = on.currentSequence();
     out.push(`branch ${branch}\tsequence=${top}\trecords=${count}\t${records.digest('hex').slice(0, 16)}\ttypes=${types.size}`);
-    for (const { id, strategy, itemCount, opsSinceSnapshot } of on.listStates().sort(byId)) {
-      const value = read(() => (strategy === 'tree'
+    // A length read can correct the count that a head keeps, which a close then saves, so the counts are listed
+    // after every length read of the branch, and a second check reads the same counts as the first.
+    const values = new Map();
+    for (const { id, strategy } of on.listStates()) {
+      values.set(id, read(() => (strategy === 'tree'
         ? `tree ${sha(JSON.stringify(on.treeList(id)))}`
-        : `${strategy} ${bytes(on.getState(id))} items=${on.getStateLen(id) ?? '-'}`));
-      out.push(`  ${branch}\t${id}\t${value}\tcount=${itemCount ?? '-'} ops=${opsSinceSnapshot ?? '-'}`);
+        : `${strategy} ${bytes(on.getState(id))} items=${on.getStateLen(id) ?? '-'}`)));
       await turn();
+    }
+    for (const { id, strategy, itemCount, opsSinceSnapshot } of on.listStates().sort(byId)) {
+      out.push(`  ${branch}\t${id}\t${values.get(id)}\tcount=${itemCount ?? '-'} ops=${opsSinceSnapshot ?? '-'}`);
       if (strategy !== 'tree' && !named(id)) {
         const history = [];
         for (let k = 1; k <= 8; k++) {

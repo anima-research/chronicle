@@ -1,6 +1,7 @@
 //! Blob storage implementation.
 
 use super::chunks;
+use crate::atomic_file::Devices;
 use crate::error::{Result, StoreError};
 use crate::types::{Blob, Hash};
 use lru::LruCache;
@@ -69,6 +70,11 @@ struct ShardDurability {
     renames_synced: AtomicU64,
 }
 
+struct Unsynced {
+    directory: PathBuf,
+    error: io::Error,
+}
+
 /// Content-addressed blob storage.
 pub struct BlobStorage {
     /// Base directory for blobs.
@@ -134,10 +140,16 @@ impl BlobStorage {
     /// them. What an earlier process made there is taken as it is, and so is
     /// what another `BlobStorage` on the same directory makes: a `Store`
     /// holds one, and its lock refuses a second `Store`, but
-    /// `BlobStorage::new` takes no lock. A sync that fails before the rename
-    /// returns an error with nothing stored; one that fails after it returns
-    /// an error with the blob in place. Either way, storing the blob again
-    /// through this `BlobStorage` tries the sync again.
+    /// `BlobStorage::new` takes no lock. The first
+    /// [`Store::sync`](crate::Store::sync) of each handle of the `Store` that
+    /// holds this `BlobStorage` syncs the directory that holds the blob
+    /// directory, the blob directory and each of its 256 shard directories
+    /// that is there and isn't a symbolic link, whatever made them. A sync that fails
+    /// before the rename returns an error with nothing stored; one that fails
+    /// after it returns an error with the blob in place. Either way, storing
+    /// the blob again through this `BlobStorage` tries the sync again, and so
+    /// does the next `Store::sync` of the `Store` that holds it, which
+    /// returns the error while it fails.
     ///
     /// When the blob's file is already there and reads back as `content`, it is
     /// left as it is, content type included. That holds for a file naming the
@@ -316,11 +328,11 @@ impl BlobStorage {
     }
 
     fn sync_existing(&self, hash: &Hash, blob_path: &Path) -> Result<()> {
-        self.sync_name(hash).map_err(|error| {
+        self.sync_name(shard_of(hash)).map_err(|Unsynced { error, .. }| {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "the blob {} is stored, but syncing its directory failed: {error}; storing it again tries the sync again",
+                    "the blob {} is stored, but its directory isn't synced yet, and storing it again or the next sync tries again: {error}",
                     blob_path.display()
                 ),
             )
@@ -367,12 +379,12 @@ impl BlobStorage {
             shard.creations_finished.fetch_add(1, Ordering::SeqCst);
             created?;
         }
-        self.sync_shard_entry(hash).map_err(|error| {
+        self.sync_shard_entry(shard_of(hash)).map_err(|Unsynced { directory, error }| {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot sync the directories holding {}: {error}; {} wasn't written, and storing the blob again tries the sync again",
-                    self.path.display(),
+                    "cannot sync {}, so {} wasn't written, and storing the blob again or the next sync tries again: {error}",
+                    directory.display(),
                     blob_path.display()
                 ),
             )
@@ -413,11 +425,11 @@ impl BlobStorage {
         })?;
         staging.disable_cleanup(true);
 
-        self.sync_name(hash).map_err(|error| {
+        self.sync_name(shard_of(hash)).map_err(|Unsynced { error, .. }| {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "the new blob {} is in place, but syncing its directory failed: {error}; storing it again tries the sync again",
+                    "the new blob {} is in place, but its directory isn't synced yet, and storing it again or the next sync tries again: {error}",
                     blob_path.display()
                 ),
             )
@@ -442,36 +454,114 @@ impl BlobStorage {
     }
 
     fn shard(&self, hash: &Hash) -> &ShardDurability {
-        &self.shards[usize::from(hash.0[0])]
+        &self.shards[shard_of(hash)]
     }
 
-    fn sync_shard_entry(&self, hash: &Hash) -> io::Result<()> {
+    fn entry(&self) -> &Path {
+        self.path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    }
+
+    fn sync_entry(&self) -> std::result::Result<(), Unsynced> {
         if !self.entry_synced.load(Ordering::SeqCst) {
-            let parent = self
-                .path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            sync_directory(parent)?;
+            sync_directory_named(self.entry())?;
             self.entry_synced.store(true, Ordering::SeqCst);
-        }
-        let shard = self.shard(hash);
-        if shard.creations_synced.load(Ordering::SeqCst) < shard.creations_begun.load(Ordering::SeqCst) {
-            let finished = shard.creations_finished.load(Ordering::SeqCst);
-            sync_directory(&self.path)?;
-            shard.creations_synced.fetch_max(finished, Ordering::SeqCst);
         }
         Ok(())
     }
 
-    fn sync_name(&self, hash: &Hash) -> io::Result<()> {
-        self.sync_shard_entry(hash)?;
-        let shard = self.shard(hash);
-        if shard.renames_synced.load(Ordering::SeqCst) < shard.renames_begun.load(Ordering::SeqCst) {
-            let finished = shard.renames_finished.load(Ordering::SeqCst);
-            self.fail_at(WriteStep::ShardSync)?;
-            sync_directory(&self.shard_path(hash))?;
-            shard.renames_synced.fetch_max(finished, Ordering::SeqCst);
+    fn sync_shard_entry(&self, shard: usize) -> std::result::Result<(), Unsynced> {
+        self.sync_entry()?;
+        let durability = &self.shards[shard];
+        if durability.creations_synced.load(Ordering::SeqCst)
+            < durability.creations_begun.load(Ordering::SeqCst)
+        {
+            let finished = durability.creations_finished.load(Ordering::SeqCst);
+            sync_directory_named(&self.path)?;
+            durability.creations_synced.fetch_max(finished, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn sync_name(&self, shard: usize) -> std::result::Result<(), Unsynced> {
+        self.sync_shard_entry(shard)?;
+        let durability = &self.shards[shard];
+        if durability.renames_synced.load(Ordering::SeqCst)
+            < durability.renames_begun.load(Ordering::SeqCst)
+        {
+            let finished = durability.renames_finished.load(Ordering::SeqCst);
+            self.sync_shard(&self.shard_dir(shard))?;
+            durability.renames_synced.fetch_max(finished, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn sync_shard(&self, directory: &Path) -> std::result::Result<(), Unsynced> {
+        self.fail_at(WriteStep::ShardSync)
+            .and_then(|()| sync_directory(directory))
+            .map_err(|error| Unsynced {
+                directory: directory.to_owned(),
+                error,
+            })
+    }
+
+    pub(crate) fn sync_owed(&self) -> io::Result<()> {
+        self.shards
+            .iter()
+            .enumerate()
+            .filter(|(_, durability)| {
+                durability.creations_synced.load(Ordering::SeqCst)
+                    < durability.creations_begun.load(Ordering::SeqCst)
+                    || durability.renames_synced.load(Ordering::SeqCst)
+                        < durability.renames_begun.load(Ordering::SeqCst)
+            })
+            .try_for_each(|(shard, _)| self.sync_name(shard))
+            .map_err(unsynced_error)
+    }
+
+    pub(crate) fn sync_directories(&self, devices: &mut Devices) -> io::Result<()> {
+        self.sync_blob_directory_and_shards(devices).map_err(unsynced_error)
+    }
+
+    fn sync_blob_directory_and_shards(&self, devices: &mut Devices) -> std::result::Result<(), Unsynced> {
+        if cfg!(not(unix)) {
+            return Ok(());
+        }
+        if !self.entry_synced.load(Ordering::SeqCst) {
+            sync_in_pass(self.entry(), devices)?;
+            self.entry_synced.store(true, Ordering::SeqCst);
+        }
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(Unsynced {
+                    directory: self.path.clone(),
+                    error,
+                })
+            }
+        }
+        sync_in_pass(&self.path, devices)?;
+        for shard in 0..self.shards.len() {
+            let directory = self.shard_dir(shard);
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() => {
+                    self.fail_at(WriteStep::ShardSync).map_err(|error| Unsynced {
+                        directory: directory.clone(),
+                        error,
+                    })?;
+                    sync_in_pass(&directory, devices)?;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) => {}
+                Err(error) => return Err(Unsynced { directory, error }),
+            }
         }
         Ok(())
     }
@@ -813,7 +903,11 @@ impl BlobStorage {
 
     /// Get the shard directory for a hash.
     fn shard_path(&self, hash: &Hash) -> PathBuf {
-        self.path.join(hash.shard_prefix())
+        self.shard_dir(shard_of(hash))
+    }
+
+    fn shard_dir(&self, shard: usize) -> PathBuf {
+        self.path.join(format!("{shard:02x}"))
     }
 
     /// Get the full path for a blob.
@@ -829,6 +923,10 @@ fn content_type_len(content_type: &str) -> Result<u16> {
             content_type.len()
         ))
     })
+}
+
+fn shard_of(hash: &Hash) -> usize {
+    usize::from(hash.0[0])
 }
 
 fn whole_file_len(content_type_len: usize, content_len: usize) -> u64 {
@@ -911,6 +1009,34 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+fn unsynced_error(Unsynced { directory, error }: Unsynced) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "cannot sync {}, which holds blobs that this store relies on: {error}",
+            directory.display()
+        ),
+    )
+}
+
+fn sync_in_pass(directory: &Path, devices: &mut Devices) -> std::result::Result<(), Unsynced> {
+    let unsynced = |error| Unsynced {
+        directory: directory.to_owned(),
+        error,
+    };
+    crate::atomic_file::sync_directory_at_unflushed(directory).map_err(unsynced)?;
+    #[cfg(test)]
+    SYNCED_DIRECTORIES.with(|synced| synced.borrow_mut().push(directory.to_owned()));
+    devices.note(directory).map_err(unsynced)
+}
+
+fn sync_directory_named(path: &Path) -> std::result::Result<(), Unsynced> {
+    sync_directory(path).map_err(|error| Unsynced {
+        directory: path.to_owned(),
+        error,
+    })
 }
 
 #[cfg(test)]
@@ -1160,7 +1286,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("is in place, but syncing its directory failed"),
+                .contains("is in place, but its directory isn't synced yet"),
             "{error}"
         );
         assert_eq!(staged(&dir.path().join("blobs")), 0);
@@ -1185,6 +1311,167 @@ mod tests {
         *storage.fails_at.lock() = Some(WriteStep::ShardSync);
         storage.store(b"in place", "text/plain").unwrap_err();
         assert_eq!(storage.get(&hash).unwrap().unwrap().content, b"in place");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_owed_syncs_a_shard_whose_sync_failed_after_the_rename() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let hash = Hash::from_bytes(b"owed");
+        let shard = storage.shard_path(&hash);
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        storage.store(b"owed", "text/plain").unwrap_err();
+        synced_directories();
+
+        storage.sync_owed().unwrap();
+        assert_eq!(synced_directories(), [shard]);
+        storage.sync_owed().unwrap();
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_owed_leaves_the_shard_owed() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        let hash = Hash::from_bytes(b"owed");
+        let shard = storage.shard_path(&hash);
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        storage.store(b"owed", "text/plain").unwrap_err();
+        synced_directories();
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        let error = storage.sync_owed().unwrap_err().to_string();
+        assert!(error.contains(&shard.display().to_string()), "{error}");
+        assert!(error.ends_with("injected failure at ShardSync"), "{error}");
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+
+        storage.sync_owed().unwrap();
+        assert_eq!(synced_directories(), [shard]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_syncs_the_directories_on_the_way_to_each_blob_that_a_store_or_a_read_found() {
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let earlier = reopened(&dir);
+        let hash = Hash::from_bytes(b"left");
+        let shard = earlier.shard_path(&hash);
+        *earlier.fails_at.lock() = Some(WriteStep::ShardSync);
+        earlier.store(b"left", "text/plain").unwrap_err();
+        drop(earlier);
+
+        let storing = reopened(&dir);
+        let reading = reopened(&dir);
+        synced_directories();
+        assert_eq!(storing.store(b"left", "text/plain").unwrap(), hash);
+        assert_eq!(synced_directories(), [dir.path().to_owned()]);
+        assert_eq!(reading.get(&hash).unwrap().unwrap().content, b"left");
+        assert_eq!(synced_directories(), Vec::<PathBuf>::new());
+
+        storing.sync_directories(&mut Devices::default()).unwrap();
+        let mut synced = synced_directories();
+        synced.sort();
+        assert_eq!(synced, [blobs.clone(), shard.clone()]);
+
+        let mut devices = Devices::default();
+        reading.sync_directories(&mut devices).unwrap();
+        let mut synced = synced_directories();
+        assert_eq!(devices.noted, synced);
+        synced.sort();
+        assert_eq!(synced, [dir.path().to_owned(), blobs, shard]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_names_pass_returns_the_error_and_the_next_pass_syncs_the_shard() {
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let hash = reopened(&dir).store(b"left", "text/plain").unwrap();
+        let storage = reopened(&dir);
+        let shard = storage.shard_path(&hash);
+        synced_directories();
+
+        *storage.fails_at.lock() = Some(WriteStep::ShardSync);
+        let error = storage.sync_directories(&mut Devices::default()).unwrap_err().to_string();
+        assert!(error.contains(&shard.display().to_string()), "{error}");
+        assert!(error.ends_with("injected failure at ShardSync"), "{error}");
+        assert_eq!(synced_directories(), [dir.path().to_owned(), blobs.clone()]);
+
+        storage.sync_directories(&mut Devices::default()).unwrap();
+        assert_eq!(synced_directories(), [blobs, shard]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_syncs_each_shard_of_a_blob_directory_this_process_may_not_list() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let hash = reopened(&dir).store(b"left", "text/plain").unwrap();
+        let storage = reopened(&dir);
+        let shard = storage.shard_path(&hash);
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o300)).unwrap();
+        let listable = fs::read_dir(&blobs).is_ok();
+        synced_directories();
+        let passed = storage.sync_directories(&mut Devices::default());
+        let synced = synced_directories();
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
+        if listable {
+            eprintln!("skipped: the directory could be listed despite its mode (running as root?)");
+            return;
+        }
+        passed.unwrap();
+        assert_eq!(synced, [dir.path().to_owned(), blobs, shard]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_passes_over_shards_this_process_may_not_reach() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let hash = reopened(&dir).store(b"left", "text/plain").unwrap();
+        let storage = reopened(&dir);
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o600)).unwrap();
+        let reachable = fs::symlink_metadata(storage.shard_path(&hash)).is_ok();
+        let passed = storage.sync_directories(&mut Devices::default());
+        fs::set_permissions(&blobs, fs::Permissions::from_mode(0o700)).unwrap();
+        if reachable {
+            eprintln!("skipped: the directory could be searched despite its mode (running as root?)");
+            return;
+        }
+        passed.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_leaves_a_shard_that_is_a_link() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let blobs = dir.path().join("blobs");
+        let storage = reopened(&dir);
+        std::os::unix::fs::symlink(outside.path(), blobs.join("ab")).unwrap();
+        synced_directories();
+        storage.sync_directories(&mut Devices::default()).unwrap();
+        assert_eq!(synced_directories(), [dir.path().to_owned(), blobs]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_names_pass_syncs_the_store_directory_when_the_blob_directory_is_gone() {
+        let dir = TempDir::new().unwrap();
+        let storage = reopened(&dir);
+        fs::remove_dir(dir.path().join("blobs")).unwrap();
+        synced_directories();
+        storage.sync_directories(&mut Devices::default()).unwrap();
+        assert_eq!(synced_directories(), [dir.path().to_owned()]);
     }
 
     // Stores of one content racing from several storages each stage their

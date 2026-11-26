@@ -877,6 +877,37 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       console.log('ok: after the tool the store reads as a twin the tool never ran on; then each branch takes appends, snapshots and a set, and reads after a reopen as the twin does; a branch made before the cut holds the list state and not the cut one');
     },
 
+    'the checks of the counts': () => {
+      const { path } = branchedStore('checks-of-counts');
+      const stateBin = join(path, 'state.bin');
+      const indexEnd = (bytes) => 13 + Number(bytes.readBigUInt64LE(5));
+      const before = readFileSync(stateBin);
+      assert.ok(before.subarray(indexEnd(before), indexEnd(before) + 4).equals(Buffer.from('SCC\0')),
+        'the premise: this build saves the checks of the counts after the index');
+      const run = compact(path, '--state', WHOLE, '--apply');
+      assert.equal(run.status, 0, `compact-set-states.py on a state.bin that holds the checks exited ${run.status}:\n${run.out}${run.err}`);
+      const after = readFileSync(stateBin);
+      assert.equal(after.length, indexEnd(after), 'the new state.bin holds the index alone');
+      console.log('ok: compact-set-states.py reads a state.bin that holds the checks of the counts, and writes the new one without them');
+    },
+
+    'a stale count that the store has not checked': () => {
+      const { path } = branchedStore('stale-count');
+      withHeads(path, "if key[1] == 'messages': head[6] = 0");
+      const twice = join(scratch, 'stale-count-twice');
+      cpSync(path, twice, { recursive: true });
+      const first = digest(twice, 'a store with a stale count, the first time');
+      assert.equal(digest(twice, 'a store with a stale count, the second time'), first,
+        'state-digests.mjs should read a store with a stale count the same twice');
+      const lists = first.split('\n').filter((line) => line.includes('\tmessages\tappend_log '));
+      assert.ok(lists.length > 0, `the digest should read messages:\n${first}`);
+      for (const line of lists) {
+        assert.match(line, /items=(\d+)\tcount=\1 /, 'the digest should give the count that the length read checked');
+      }
+      applies(path, 'a store whose list has a stale count that the store has not checked');
+      console.log('ok: state-digests.mjs reads a store with a stale count the same twice, and gives the checked count');
+    },
+
     'the refusals': () => {
       const { path: base } = branchedStore('refusals');
       const copyOf = (name) => {
@@ -920,6 +951,9 @@ console.error('peak ' + readFileSync('/proc/self/status', 'utf8').match(/VmHWM:\
       const short = copyOf('refuse-short-index');
       writeFileSync(join(short, 'state.bin'), Buffer.from('STI\0'));
       refuses(short, 'a state.bin cut short', 'state.bin is not a whole state index');
+      const trailing = copyOf('refuse-trailing');
+      writeFileSync(join(trailing, 'state.bin'), Buffer.concat([readFileSync(join(trailing, 'state.bin')), Buffer.from('more')]));
+      refuses(trailing, 'a state.bin with more after its index than the checks of the counts', 'state.bin holds more after its index than the checks of the counts');
       const nowhere = copyOf('refuse-head');
       withHeads(nowhere, `if key[1] == '${WHOLE}': head[0] += 1`);
       refuses(nowhere, 'a head that names no state update', 'no state update of whole is there');

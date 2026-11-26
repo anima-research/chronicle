@@ -17,7 +17,7 @@ pub use manager::{
     StateManager, StateSelection,
 };
 pub(crate) use chain_walk::ChainWalk;
-pub(crate) use manager::is_non_append_change;
+pub(crate) use manager::{is_non_append_change, ItemCount};
 pub use operations::{apply_operation, materialize_operations};
 pub(crate) use operations::{
     array_len_after, array_len_from, materialize_operations_tagged, snapshot_item_count,
