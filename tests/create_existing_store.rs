@@ -230,18 +230,20 @@ fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
 }
 
 #[test]
-fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
+fn an_open_or_create_refusing_a_blobs_file_takes_no_lock_and_a_retry_creates() {
+    // A `blobs` that isn't a directory is refused by open_or_create's first
+    // look, before any create takes the lock, and nothing is written there.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("store");
     fs::create_dir(&path).unwrap();
     fs::write(path.join("blobs"), b"").unwrap();
     let failed = Store::open_or_create(config(&path));
     assert!(
-        matches!(&failed, Err(StoreError::Io(cause)) if cause.kind() == std::io::ErrorKind::AlreadyExists),
+        matches!(&failed, Err(StoreError::InvalidFormat(_))),
         "got {:?}",
         failed.as_ref().err().map(|e| e.to_string())
     );
-    assert!(path.join("LOCK").exists(), "the failed create never took the lock");
+    assert!(!path.join("LOCK").exists(), "the refusal took the lock");
 
     fs::remove_file(path.join("blobs")).unwrap();
     let store = Store::open_or_create(config(&path)).expect("immediate create after removing the file");
@@ -262,6 +264,37 @@ fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
     drop(store);
     let messages = Store::open(config(&path)).unwrap().get_state("messages").unwrap().unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&messages).unwrap(), serde_json::json!([{"n": 1}]));
+}
+
+// An error inside create after it has taken the lock releases the lock: the
+// directory is made read-only once a LOCK file is there, so the lock is taken
+// and making blobs/ then fails. Where the account isn't held to the mode
+// (root), this can't be made to fail, and the test says so and stops.
+#[cfg(unix)]
+#[test]
+fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("LOCK"), b"").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(path.join("probe"), b"").is_ok() {
+        fs::remove_file(path.join("probe")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: this account writes into a read-only directory");
+        return;
+    }
+    let failed = Store::open_or_create(config(&path));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(&failed, Err(StoreError::Io(cause)) if cause.kind() == std::io::ErrorKind::PermissionDenied),
+        "got {:?}",
+        failed.as_ref().err().map(|e| e.to_string())
+    );
+    assert!(!path.join("blobs").exists(), "blobs/ was made after all");
+    let store = Store::open_or_create(config(&path)).expect("immediate create once the directory is writable");
+    store.sync().unwrap();
 }
 
 #[test]
