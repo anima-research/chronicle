@@ -649,8 +649,14 @@ impl JsStore {
     }
 
     /// Create a new store at the given path. Refuses a path that already holds
-    /// a store (its MANIFEST, records.log, state.bin or branches.bin); use
-    /// `openOrCreate` or `open` for a store that may exist.
+    /// a store (its MANIFEST, records.log, state.bin, branches.bin or
+    /// state-indexes.bin, or a blobs/ with data in it); use `openOrCreate` or
+    /// `open` for a store that may exist. A blobs/ with data and no MANIFEST
+    /// is refused as a damaged store (move blobs/ aside to start over), and so
+    /// is a blobs link that leads to nothing or a blobs that isn't a directory.
+    /// A blobs/ that can't be listed fails with the listing's I/O error, naming
+    /// it. A store's blobs/, or the directory a blobs link leads to, belongs to
+    /// that store alone.
     #[napi(factory)]
     pub fn create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -676,9 +682,13 @@ impl JsStore {
         Ok(Self::root(store))
     }
 
-    /// Open or create a store. A store that holds state.bin or branches.bin
-    /// and has lost its records.log is refused with `code` `Corruption`, as
-    /// `open` refuses it, and the open creates no records.log.
+    /// Open or create a store. A directory with no MANIFEST is created into
+    /// only where `create` would take it, so it refuses what `create` refuses
+    /// (see there), with open's account of a damaged store. A store's blobs/,
+    /// or the directory a blobs link leads to, belongs to that store alone. A
+    /// store that holds state.bin or branches.bin and has lost its records.log
+    /// is refused with `code` `Corruption`, as `open` refuses it, and the open
+    /// creates no records.log.
     #[napi(factory)]
     pub fn open_or_create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
