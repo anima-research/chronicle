@@ -1,8 +1,9 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { constants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
@@ -25,6 +26,7 @@ function freshStore() {
 
 function throwsCoded(call, code, message) {
   assert.throws(call, (error) => {
+    assert.ok(error instanceof Error, `the refusal threw ${typeof error}, not an Error`);
     assert.equal(error.code, code);
     if (typeof message === 'string') assert.equal(error.message, message);
     else assert.match(error.message, message);
@@ -77,11 +79,26 @@ test("the store's errors carry their kind", () => {
     ErrorCode.InvalidSequence,
     /^Invalid sequence: Seq\(\d+\) \(head is Seq\(\d+\)\)$/,
   );
+  const foreign = Buffer.from([0xff, 0, 0x61]);
+  store.setState('notes', foreign);
+  assert.throws(() => store.getStateJson('notes'));
+  throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
+  const raw = store.getState('notes');
+  assert.ok(Buffer.isBuffer(raw));
+  assert.deepEqual(raw, foreign);
+  assert.throws(() => JSON.parse(raw.toString('utf8')), SyntaxError);
+  throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
   store.setState('notes', Buffer.from('not json'));
   throwsCoded(() => store.getStateJson('notes'), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.getStateJsonAt('notes', store.currentSequence()), ErrorCode.Deserialization, /at line 1 column \d+$/);
   store.registerState({ id: 'items', strategy: 'append_log' });
   store.appendToState('items', Buffer.from('not json'));
+  assert.throws(() => store.getStateJson('items'));
+  assert.throws(() => store.getState('items'), (error) => {
+    assert.match(error.message, /^Deserialization error: /);
+    return true;
+  });
+  assert.throws(() => store.getStateTail('items', 1));
   throwsCoded(() => store.getStateItemJson('items', 0), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.getStateItemsJson('items', [0]), ErrorCode.Deserialization, /at line 1 column \d+$/);
   throwsCoded(() => store.deleteBranch('main'), ErrorCode.InvalidOperation, 'Invalid operation: Cannot delete main branch');
@@ -188,7 +205,31 @@ test("batched appends, and create or openOrCreate where something is already the
 test('a second open of a store in use is Locked', () => {
   const { store, dir } = freshStore();
   throwsCoded(() => JsStore.open({ path: dir }), ErrorCode.Locked, 'Store is locked by another process');
-  store.close();
+
+  const probeFromChild = () => execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { ErrorCode, JsStore } from './index.js';
+    const [held, independent] = process.argv.slice(1);
+    assert.throws(() => JsStore.open({ path: held }), { code: ErrorCode.Locked });
+    assert.throws(() => JsStore.openOrCreate({ path: held }), { code: ErrorCode.Locked });
+    const other = JsStore.openOrCreate({ path: independent });
+    const payload = Buffer.from('independent write');
+    const record = other.append('note', payload);
+    assert.deepEqual(other.getRecord(record.id).payload, payload);
+    other.close();
+  `, dir, join(dir, '..', 'other')], { cwd: import.meta.dirname, timeout: 30_000 });
+
+  try {
+    probeFromChild();
+  } finally {
+    store.close();
+  }
+  const inspector = JsStore.open({ path: dir });
+  try {
+    probeFromChild();
+  } finally {
+    inspector.close();
+  }
 });
 
 const owners = [['the root', (store) => store], ['a view', (store) => store.view('main')]];
@@ -438,7 +479,23 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
 
   const content = randomBytes(100_000);
   const hash = createHash('sha256').update(content).digest('hex');
-  mkdirSync(join(dir, 'blobs', hash.slice(0, 2), hash), { recursive: true });
+  const shard = join(dir, 'blobs', hash.slice(0, 2));
+  const destination = join(shard, hash);
+
+  if (process.platform !== 'win32') {
+    writeFileSync(shard, 'not a directory');
+    const osError = thrownBy(() => writeFileSync(destination, content));
+    const systemFailure = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
+    const posixMessage = new RegExp(`^IO error: .*\\(os error ${Math.abs(osError.errno)}\\)$`, 's');
+    const hasErrnoCode = typeof systemFailure.code === 'string' && /^E[A-Z0-9]+$/.test(systemFailure.code);
+    assert.ok(
+      hasErrnoCode ? systemFailure.code === osError.code : systemFailure instanceof Error && posixMessage.test(systemFailure.message),
+      `expected ${osError.code} or ${posixMessage}, got ${systemFailure.code}: ${systemFailure.message}`,
+    );
+    rmSync(shard);
+  }
+
+  mkdirSync(destination, { recursive: true });
   const failed = thrownBy(() => store.storeBlob(content, 'application/octet-stream'));
   assert.equal(failed.code, ErrorCode.Io);
   for (const chunked of [false, true]) {
@@ -449,6 +506,36 @@ test('storeBlobAsync rejects with the code and message storeBlob throws for the 
     });
   }
   store.close();
+});
+
+const errnoNames = new Map();
+for (const [name, number] of Object.entries(constants.errno)) if (!errnoNames.has(number)) errnoNames.set(number, name);
+function workspaceErrno({ error, code, message }) {
+  if (!error) return undefined;
+  if (typeof code === 'string' && /^E[A-Z0-9]+$/.test(code)) return code;
+  const os = /^IO error: .*\(os error (\d+)\)$/s.exec(message);
+  return os === null ? undefined : errnoNames.get(Number(os[1]));
+}
+
+test('a blob write that the system refuses carries its errno as workspace reads it', {
+  skip: process.platform === 'win32' && "limits the size of a child's files with the POSIX shell",
+}, () => {
+  const { store, dir } = freshStore();
+  store.close();
+  const outcome = JSON.parse(execFileSync('/bin/sh', ['-c', 'ulimit -f 64 && exec "$0" "$@"', process.execPath, '--input-type=module', '-e', `
+    import { JsStore } from './index.js';
+    const store = JsStore.open({ path: process.argv[1] });
+    let outcome = null;
+    try {
+      store.storeBlob(Buffer.alloc(1 << 20, 0x5a), 'application/octet-stream');
+    } catch (error) {
+      outcome = { error: error instanceof Error, code: error.code, message: error.message };
+    }
+    store.close();
+    process.stdout.write(JSON.stringify(outcome));
+  `, dir], { cwd: import.meta.dirname, encoding: 'utf8', timeout: 30_000 }));
+  assert.notEqual(outcome, null, 'the blob was stored past the limit on the size of files');
+  assert.equal(workspaceErrno(outcome), 'EFBIG', `${outcome.code}: ${outcome.message}`);
 });
 
 test('storeBlobAsync on a closed view or store throws StoreClosed', () => {
@@ -469,8 +556,19 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
   for (const [i, content] of contents.entries()) {
     hashes.push(await store.storeBlobAsync(content, 'application/octet-stream', { chunked: i < 3 }));
   }
-  store.close();
   const blobFile = (hash) => join(dir, 'blobs', hash.slice(0, 2), hash);
+  const otherWholeFile = readFileSync(blobFile(hashes[3]));
+  const coldCases = [
+    ['truncated', (path, saved) => writeFileSync(path, saved.subarray(0, -1))],
+    ['bad format', (path) => writeFileSync(path, 'not a blob file')],
+    ['wrong digest', (path) => writeFileSync(path, otherWholeFile)],
+    ['missing', (path) => rmSync(path)],
+  ].map(([kind, damage]) => {
+    const content = Buffer.from(kind);
+    const hash = store.storeBlob(content, 'text/plain');
+    return { kind, content, hash, damage };
+  });
+  store.close();
   const firstChunk = (hash) => {
     const list = readFileSync(blobFile(hash));
     const at = 19 + list.readUInt16LE(5);
@@ -491,7 +589,36 @@ test("damage found in a chunked blob's file or its chunks is InvalidFormat, and 
   throwsCoded(() => reopened.getBlob(hashes[1]), ErrorCode.InvalidFormat, /is damaged: its checksum doesn't match/);
   throwsCoded(() => reopened.getBlob(hashes[2]), ErrorCode.InvalidFormat, /names the chunk [0-9a-f]{64}, which isn't stored/);
   throwsCoded(() => reopened.getBlob(hashes[3]), ErrorCode.ChecksumMismatch, /.+/);
+  writeFileSync(blobFile(hashes[3]), otherWholeFile);
+  assert.deepEqual(reopened.getBlob(hashes[3]), contents[3]);
+
+  for (const { kind, content, hash, damage } of coldCases) {
+    const path = blobFile(hash);
+    const good = readFileSync(path);
+    damage(path, good);
+    if (kind === 'missing') {
+      assert.equal(reopened.getBlob(hash), null);
+    } else {
+      assert.throws(() => reopened.getBlob(hash), (error) => {
+        assert.equal(reopened.isClosed(), false, kind);
+        const reason = error instanceof Error ? error.message : String(error);
+        assert.match(reason, /[^\s\p{C}]/u, kind);
+        return true;
+      }, kind);
+      rmSync(path);
+      assert.equal(reopened.getBlob(hash), null, kind);
+      assert.equal(reopened.storeBlob(content, 'text/plain'), hash, kind);
+      assert.deepEqual(reopened.getBlob(hash), content, kind);
+    }
+    writeFileSync(path, good);
+    assert.deepEqual(reopened.getBlob(hash), content, kind);
+  }
+
   reopened.close();
+  assert.throws(() => reopened.getBlob(coldCases.at(-1).hash), () => {
+    assert.equal(reopened.isClosed(), true);
+    return true;
+  });
 });
 
 test('opening a store that is not there is InvalidFormat', () => {

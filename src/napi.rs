@@ -176,6 +176,7 @@ pub struct JsRecord {
     pub sequence: i64,
     pub record_type: String,
     pub payload: Buffer,
+    /// Microseconds since the Unix epoch.
     pub timestamp: i64,
     pub caused_by: Vec<String>,
     pub linked_to: Vec<String>,
@@ -205,15 +206,16 @@ pub struct JsAppendedBatch {
     /// held on the handle's branch just before the batch. Item `i` of the
     /// batch is at `firstOrdinal + i`.
     ///
-    /// The first batch to a state on a branch the store opened with, or on
-    /// one `createBranchAt` started, counts the state's items, reading its
-    /// whole value once, or again under the write lock where another write
-    /// to the state lands during that count, and `getStateLen` reports that
-    /// count from then on:
-    /// a count a release before 0.5.0 stored can be off. A value that isn't
-    /// a JSON array, or holds an item that isn't JSON, has no items to count,
-    /// and this is then the length `getStateLen` reports; the batch is
-    /// recorded, and the state then fails to materialize, as after an
+    /// Where the store hasn't checked the state's count on the branch (a head
+    /// loaded with no saved check, one that `createBranchAt` set at a past
+    /// point, or one after a `DeltaSnapshot` written from Rust or a value that
+    /// isn't an array), the batch first counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write to
+    /// the state lands during that count, and `getStateLen` reports that count
+    /// from then on: a count a release before 0.5.0 stored can be off. A value
+    /// that isn't a JSON array, or holds an item that isn't JSON, has no items
+    /// to count, and this is then the length `getStateLen` reports; the batch
+    /// is recorded, and the state then fails to materialize, as after an
     /// `appendToState` to it, so the items can't be read at those indices.
     pub first_ordinal: i64,
 }
@@ -226,6 +228,7 @@ pub struct JsBranch {
     pub head: i64,
     pub parent_id: Option<String>,
     pub branch_point: Option<i64>,
+    /// Microseconds since the Unix epoch.
     pub created: i64,
 }
 
@@ -426,6 +429,9 @@ pub struct JsValueCount {
 pub struct JsStateInfo {
     pub id: String,
     pub strategy: String,
+    /// The count that the state's head keeps, read with nothing else. For an
+    /// `append_log` whose count the store hasn't checked it can differ from
+    /// `getStateLen`, which counts the items.
     pub item_count: Option<i64>,
     pub ops_since_snapshot: i64,
 }
@@ -477,6 +483,9 @@ pub struct JsStoreEvent {
     /// `appendManyToStateJson` or `appendManyToStateJsonWithIdentity`, which
     /// is one event for the whole batch at its one sequence. A subscriber
     /// that follows an append log by its deltas needs both.
+    ///
+    /// A "record" event's `record.timestamp` and a "branch_created" event's
+    /// `branch.created` are microseconds since the Unix epoch.
     pub data: String,
 }
 
@@ -659,7 +668,9 @@ impl JsStore {
         Ok(Self::root(store))
     }
 
-    /// Open an existing store.
+    /// Open an existing store. A store that holds state.bin or branches.bin
+    /// and has lost its records.log is refused with `code` `Corruption`,
+    /// and the open creates no records.log.
     #[napi(factory)]
     pub fn open(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -674,7 +685,10 @@ impl JsStore {
     /// Open or create a store. A directory with no MANIFEST is created into
     /// only where `create` would take it, so it refuses what `create` refuses
     /// (see there), with open's account of a damaged store. A store's blobs/,
-    /// or the directory a blobs link leads to, belongs to that store alone.
+    /// or the directory a blobs link leads to, belongs to that store alone. A
+    /// store that holds state.bin or branches.bin and has lost its records.log
+    /// is refused with `code` `Corruption`, as `open` refuses it, and the open
+    /// creates no records.log.
     #[napi(factory)]
     pub fn open_or_create(config: JsStoreConfig) -> Result<JsStore> {
         let store_config = StoreConfig {
@@ -697,8 +711,9 @@ impl JsStore {
     /// is synced, every view made from this handle stops working ("Store has
     /// been closed"), and the lock file is released before `close()` returns
     /// — live views do not keep the store or its lock alive. If the record
-    /// log's fsync has failed, this throws that error after closing the
-    /// store, so it can be reopened.
+    /// log's fsync has failed and the sync's retry of it fails too, or a sync
+    /// of a directory that holds the store or its blobs fails, this throws
+    /// that error after closing the store, so it can be reopened.
     ///
     /// On a view this only detaches the view: its subscriptions are removed
     /// and its methods throw "View has been closed", but for `isClosed()`,
@@ -723,7 +738,19 @@ impl JsStore {
                 writer.finish();
             }
             // Sync before closing
-            store.sync().map_err(to_napi_error)?;
+            store
+                .sync()
+                .map_err(|error| match error {
+                    StoreError::DurabilityLost(text) => StoreError::DurabilityLost(format!(
+                        "{text}. That advice doesn't apply here: close() has closed this handle, \
+                         so sync() on it throws StoreClosed. The store's own last sync as it \
+                         closed may still have saved those records. A reopen shows what the \
+                         store holds, but it can't tell whether records that the operating \
+                         system still caches reached the disk"
+                    )),
+                    other => other,
+                })
+                .map_err(to_napi_error)?;
             // Drop the Arc. The slot and the writer thread, joined above, were
             // the only long-lived references (views hold the slot, not the
             // store), so the store is dropped here.
@@ -974,7 +1001,7 @@ impl JsStore {
     /// when writing or syncing the blob fails, and for a content type longer
     /// than 65,535 bytes. A sync that fails after the blob is in place still
     /// throws, and storing the blob again before the store closes tries the
-    /// sync again.
+    /// sync again, and so does the next `sync()`, which throws while it fails.
     #[napi]
     pub fn store_blob(&self, content: Buffer, content_type: String) -> Result<String> {
         let store = self.get_store()?;
@@ -1096,11 +1123,9 @@ impl JsStore {
     }
 
     /// Create a new branch, and checkpoint it before returning.
-    /// If the checkpoint fails, this throws but the branch stays in memory;
-    /// the next successful checkpoint publishes it and tells subscribers:
-    /// `sync()`, or the retry that every later mutation makes first. Calling
-    /// this again retries that checkpoint first and, once it succeeds, throws,
-    /// since the branch exists.
+    /// If the checkpoint fails, this throws and the store has no such branch:
+    /// the name is free, and the same call can run again once the cause is
+    /// mended. Subscribers hear of a branch only when the call returns it.
     ///
     /// With `from` omitted the parent is the current branch — on a view, the
     /// branch the view is pinned to.
@@ -1176,7 +1201,7 @@ impl JsStore {
 
     /// Create a new branch at a specific sequence point.
     /// This enables time-travel branching - the new branch will have state as of that sequence.
-    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
+    /// A failed checkpoint leaves no branch, as for `createBranch`.
     #[napi]
     pub fn create_branch_at(&self, name: String, from: String, at_sequence: i64) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -1194,7 +1219,7 @@ impl JsStore {
     }
 
     /// Create a new branch without copying state from parent.
-    /// A failed checkpoint leaves the branch in memory, as for `createBranch`.
+    /// A failed checkpoint leaves no branch, as for `createBranch`.
     #[napi]
     pub fn create_empty_branch(&self, name: String, from: Option<String>) -> Result<JsBranch> {
         let store = self.get_store()?;
@@ -1213,10 +1238,9 @@ impl JsStore {
     }
 
     /// Switch to a branch, and checkpoint the switch before returning.
-    /// If the checkpoint fails, this throws but the switch stays in effect;
-    /// the next successful checkpoint publishes it: `sync()`, or the retry
-    /// that every later mutation makes first, so later writes go to the new
-    /// branch.
+    /// The store selects the branch once the checkpoint has saved it. If the
+    /// checkpoint fails, this throws and the branch that was current stays
+    /// current, so later writes go to it.
     ///
     ///
     /// Root handle only. A view is pinned to its branch for life and throws:
@@ -1279,11 +1303,8 @@ impl JsStore {
     }
 
     /// Delete a branch, and checkpoint the deletion before returning.
-    /// If the checkpoint fails, this throws but the branch stays deleted in
-    /// memory; the next successful checkpoint publishes the deletion and
-    /// tells subscribers: `sync()`, or the retry that every later mutation
-    /// makes first. Calling this again retries that checkpoint first and,
-    /// once it succeeds, throws, since the branch is gone.
+    /// If the checkpoint fails, this throws and the branch is still there,
+    /// with its state, and a view of it works as before.
     ///
     ///
     /// The main branch and the current branch cannot be deleted; nor can a
@@ -1308,11 +1329,8 @@ impl JsStore {
     // --- State Management ---
 
     /// Register a new state, and checkpoint it before returning. If the
-    /// checkpoint fails, this throws but the registration stays in memory;
-    /// the next successful checkpoint publishes it: `sync()`, or the retry
-    /// that every later mutation makes first. Calling this again retries that
-    /// checkpoint first and, once it succeeds, throws, since the state is
-    /// registered.
+    /// checkpoint fails, this throws and the state is not registered, so the
+    /// same call can run again once the cause is mended.
     #[napi]
     pub fn register_state(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -1334,10 +1352,8 @@ impl JsStore {
     /// so boot-time registration constants actually apply to existing
     /// stores instead of being pinned to first-registration values.
     /// `initialValue` is ignored (the state already has a chain).
-    /// Checkpoints before returning. If the checkpoint fails, this throws but
-    /// the new strategy stays in memory; the next successful checkpoint
-    /// publishes it: `sync()`, or the retry that every later mutation makes
-    /// first.
+    /// Checkpoints before returning. If the checkpoint fails, this throws and
+    /// the previous strategy is in force again.
     #[napi]
     pub fn update_state_strategy(&self, registration: JsStateRegistration) -> Result<()> {
         let store = self.get_store()?;
@@ -1564,7 +1580,10 @@ impl JsStore {
         })
     }
 
-    /// Edit an item in an AppendLog state.
+    /// Edit an item in an AppendLog state. An index at or past the number of
+    /// items is refused. Where the store hasn't checked the list's count, the
+    /// edit counts the list first, reading it whole once, and throws as
+    /// `getStateLen` does where that read meets a record that it can't read.
     #[napi]
     pub fn edit_state_item(
         &self,
@@ -1608,7 +1627,15 @@ impl JsStore {
         Ok(record.into())
     }
 
-    /// Get the length of an AppendLog state.
+    /// The number of items a state holds on this handle's branch, `null`
+    /// where it has no value. For an `append_log` it is the number of items
+    /// that a read returns: a list whose count the store hasn't checked is
+    /// read once to count it. That read throws on an I/O error (code `Io`),
+    /// a record that fails its checksum (`ChecksumMismatch`) or a record
+    /// whose framing is bad (`InvalidFormat`). A list whose value can't be
+    /// rebuilt as a JSON array, such as one that holds an item that isn't
+    /// JSON, has no items to count, so the length is the count the head
+    /// stores, as it is for a state of another strategy.
     #[napi]
     pub fn get_state_len(&self, state_id: String) -> Result<Option<i64>> {
         let (store, branch) = self.target()?;
@@ -1659,7 +1686,12 @@ impl JsStore {
     /// bytes aren't one JSON value (no bytes at all read as an empty list),
     /// except the last item served from the head record alone, which reads
     /// no earlier item: an `appendToState`'s, or a batch's last item where
-    /// this session found the head's count exact.
+    /// the store found the head's count exact, in this session or in one
+    /// that saved its check before this open. On an `append_log` whose count
+    /// the store hasn't checked, the read counts the list first, reading it
+    /// whole once, so that it answers at the index of the items, and throws
+    /// as `getStateLen` does where that read meets a record that it can't
+    /// read.
     #[napi]
     pub fn get_state_item_json(
         &self,
@@ -1687,10 +1719,9 @@ impl JsStore {
     /// call. The result has one entry per index in `ordinals`, in the order
     /// given: what `getStateItemJson` returns for that index, so `null` if it
     /// is negative or out of range, the state doesn't exist, or the state's
-    /// value isn't an array, except at the last index of a head whose count
-    /// this session hasn't found exact (unchecked, or checked on a value that
-    /// doesn't materialize), where `getStateItemJson` answers from the stored
-    /// count and this from the value. Throws, as `getStateItemJson` does, if
+    /// value isn't an array, except at the last index of a list whose value
+    /// can't be rebuilt as an array, where `getStateItemJson` answers from
+    /// the stored count and this from the value. Throws, as `getStateItemJson` does, if
     /// the state's bytes aren't one JSON value (no bytes at all read as an
     /// empty list), except the last item served from the head record alone,
     /// which reads no earlier item. Indices may repeat and come in any order.
@@ -2027,15 +2058,26 @@ impl JsStore {
     /// Flush pending record/state contents and publish metadata checkpoints.
     /// A failure to save field indexes is only logged, since they are derived.
     /// Once an fsync of the record log has failed, this call's own or a
-    /// periodic one, this throws that failure every time until the store is
-    /// reopened, and publishes nothing: records written before it may not
-    /// have reached the disk, and a later fsync can't show that they did.
-    /// Its message begins `Durability lost:`, and its `code` is
-    /// `DurabilityLost`. Registering a state, changing a strategy, and
-    /// creating, deleting or switching a branch throw it too, unless a check
-    /// of their own refuses them first, and so does any write while one of
-    /// them waits for its checkpoint.
-    /// Reopening the store is the only way to resume durable writes.
+    /// periodic one, records written since the last good fsync may not have
+    /// reached the disk, and a later fsync alone can't show that they did.
+    /// So while that failure stands, this writes those records again from
+    /// memory and then fsyncs. When that succeeds, it returns as usual. When
+    /// it fails, it throws and publishes nothing, and the next `sync()` or
+    /// write tries again. Its message begins `Durability lost:`, and its
+    /// `code` is `DurabilityLost`. While the failure stands, each later write
+    /// other than a blob write makes the same retry first, before it changes
+    /// anything: an append, a state write, a field-index registration,
+    /// registering a state, changing a strategy, and creating, deleting or
+    /// switching a branch. When the retry succeeds, the write goes on. When it
+    /// fails, the write throws it and changes nothing. While the disk keeps
+    /// failing, each retry writes the kept bytes again, which can be 64 MiB
+    /// and one record, and waits for an fsync, and reads of the log wait for
+    /// it. Registering a state, changing a
+    /// strategy, and creating, deleting or switching a branch then save their
+    /// own checkpoint. When that save fails, they throw and undo the change,
+    /// as for any failed checkpoint.
+    /// Reopening the store also ends the failure. The open fsyncs the log
+    /// first, and throws the same error when that fsync fails.
     /// Reopening can't tell whether records the operating system still caches
     /// reached the disk: if they didn't while later records did, an open
     /// after the cache drops them refuses the store as mid-log corruption.
@@ -2045,11 +2087,39 @@ impl JsStore {
     /// can. On Windows it doesn't wait for the rename to reach the disk, so
     /// after an OS crash or power loss the store may open from an earlier
     /// checkpoint.
+    /// On Unix, the first time on each open handle, this also syncs the
+    /// directories that hold the store's directory, up to the root of its
+    /// filesystem or to the first one that this process may not look at, and
+    /// the store's directory, `blobs/` and each shard directory in it, so that
+    /// a power loss can't take the store's name or a blob's, whatever made
+    /// them. On macOS, where each directory sync would ask the drive to write
+    /// back its whole cache, this first-time sync syncs each directory with
+    /// `fsync` and then asks each drive to write back its cache once. After
+    /// that, it syncs each blob directory whose sync after a blob store this
+    /// handle still owes. As for a checkpoint save, a directory that this
+    /// process may not open is passed over, and so is every directory on a
+    /// system that doesn't sync directories. For a store path through a
+    /// symbolic link, the directory that holds the link's own name isn't
+    /// synced, and the first-time sync doesn't follow a symbolic link in
+    /// `blobs/`. A failed sync of one of these directories throws its error,
+    /// and the next `sync()` tries it again. On ext4, a retry just after a
+    /// failed journal commit can succeed although the name never reached the
+    /// disk, so a successful retry doesn't prove that it did. Appends, state
+    /// writes and blob stores go on meanwhile. Until that first call, a power
+    /// loss can take a new store's directory and the parents that `create`
+    /// made, even after a registration or a branch change has saved its
+    /// checkpoint.
     /// State registration, strategy changes and branch changes checkpoint
-    /// before returning. After one of those checkpoints fails, further
-    /// mutations retry it before proceeding, and the change stays applied in
-    /// memory. A failed sync with no such change pending holds back no later
-    /// append or state update.
+    /// before returning. When one of those checkpoints fails, the call throws
+    /// and undoes its change. The open store's branch list, selection,
+    /// registrations and strategies are then as they were before the call. A
+    /// failed creation's branch ID isn't given out again. The disk can still
+    /// hold part of the change until the next checkpoint, so each later
+    /// write of a record or a state, field-index registration or metadata
+    /// call saves the checkpoint again before it changes anything. A blob
+    /// write doesn't. A failed sync with no such change pending holds back
+    /// no later append or state update, unless what failed was the record
+    /// log's fsync, as above.
     #[napi]
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;

@@ -88,17 +88,34 @@ pub struct RecordLog {
     /// Sync every N writes (0 = sync every write, critical for durability vs performance)
     sync_interval: u64,
 
-    /// The first failed fsync of the log, kept until it is opened again:
-    /// [`RecordLog::sync`] returns it every time. Linux reports a writeback
-    /// error to one fsync on an open file, and a later fsync succeeds although
-    /// the pages that failed may never reach the disk, so after one failure no
-    /// fsync can show that the records written before it are durable.
+    sync_bytes: usize,
+
+    /// The first failed fsync of the log since its last good one. Linux
+    /// reports a writeback error to one fsync on an open file, and a later
+    /// fsync succeeds although the pages that failed may never reach the disk,
+    /// so a later fsync alone can't show that the records written before it
+    /// are durable. While a failure stands, `append` refuses, and
+    /// [`RecordLog::sync`] writes the bytes in `unsynced` again before its
+    /// fsync, which clears the failure when it succeeds.
     durability_failure: Mutex<Option<String>>,
+
+    /// The bytes written to the log since its last good fsync, kept in memory
+    /// so that a sync after a failed fsync can write them again. They come
+    /// from memory and never from the file: after a failed write-back, the
+    /// file can give the page cache's copy or the disk's older bytes. For the
+    /// same reason, a read of a record among them decodes it from here.
+    unsynced: Mutex<Unsynced>,
 
     /// How many of the next fsyncs fail without reaching the file, so unit
     /// tests can stand in for a device error.
     #[cfg(test)]
     pub(crate) fsync_failures: Mutex<u64>,
+
+    #[cfg(test)]
+    pub(crate) rewrite_failures: Mutex<u64>,
+
+    #[cfg(test)]
+    pub(crate) write_failures: Mutex<u64>,
 
     /// How many of the next `read_at` calls fail with an I/O error before
     /// reading, so unit tests can stand in for a failing device.
@@ -113,9 +130,21 @@ pub struct RecordLog {
     recovery: Option<RecoveryReport>,
 }
 
+struct Unsynced {
+    synced_len: u64,
+    bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPEN_FSYNC_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl RecordLog {
     /// Default sync interval - sync every 100 writes for balance of durability and performance.
     const DEFAULT_SYNC_INTERVAL: u64 = 100;
+
+    const SYNC_BYTES: usize = 64 * 1024 * 1024;
 
     /// Open or create a record log with default sync interval.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -128,9 +157,23 @@ impl RecordLog {
     /// - sync_interval = 100: sync every 100 writes (good balance)
     /// - sync_interval = 1000: sync every 1000 writes (fastest, least durable)
     ///
-    /// A failed fsync doesn't fail the append that made it:
-    /// [`RecordLog::sync`] reports it, every time until the log is opened
+    /// An append also syncs sooner, once the records since the last good
+    /// fsync pass 64 MiB.
+    ///
+    /// A failed fsync doesn't fail the append that made it. The appends after
+    /// it are refused until [`RecordLog::sync`] writes the records since the
+    /// last good fsync again and its fsync succeeds, or the log is opened
     /// again.
+    ///
+    /// The open fsyncs the log before it takes the log's length as the point
+    /// of its last good fsync. That fsync writes the pages an earlier process
+    /// left dirty, and reports a write-back failure that no handle has seen
+    /// yet. Linux doesn't report a failure that an earlier handle already
+    /// received to a later open, so after such a failure the reopened log is
+    /// only as durable as that handle left it. If the open's fsync fails, the
+    /// open fails with `StoreError::DurabilityLost`: records written before
+    /// this open may not be on the disk, and a later open doesn't report the
+    /// failure again.
     ///
     /// On open, the log is validated end-to-end (framing + checksums). A
     /// torn/partial *tail* — the crash-during-append case — is recovered by
@@ -178,7 +221,6 @@ impl RecordLog {
                      a tear and is dropped the same way"
                 );
                 file.set_len(scan.valid_len)?;
-                file.sync_all()?;
                 Some(RecoveryReport {
                     truncated_at: scan.valid_len,
                     dropped_bytes: dropped,
@@ -195,15 +237,41 @@ impl RecordLog {
             (1, 0, HashMap::new(), None)
         };
 
+        Self::fsync_at_open(&file).map_err(|error| {
+            let truncated = match &recovery {
+                Some(report) => format!(
+                    ". Before the fsync, this open truncated a torn tail of {} bytes after the \
+                     last whole record, and a later open won't report that either",
+                    report.dropped_bytes
+                ),
+                None => String::new(),
+            };
+            StoreError::DurabilityLost(format!(
+                "fsync of the record log {} at open failed ({error}): records written to it \
+                 before this open may not be on the disk, and a later open won't report this \
+                 failure again{truncated}",
+                path.display()
+            ))
+        })?;
+
         Ok(Self {
             file: RwLock::new(file),
             next_id: RwLock::new(next_id),
             file_size: RwLock::new(file_size),
             writes_since_sync: RwLock::new(0),
             sync_interval: if sync_interval == 0 { 1 } else { sync_interval },
+            sync_bytes: Self::SYNC_BYTES,
             durability_failure: Mutex::new(None),
+            unsynced: Mutex::new(Unsynced {
+                synced_len: file_size,
+                bytes: Vec::new(),
+            }),
             #[cfg(test)]
             fsync_failures: Mutex::new(0),
+            #[cfg(test)]
+            rewrite_failures: Mutex::new(0),
+            #[cfg(test)]
+            write_failures: Mutex::new(0),
             #[cfg(test)]
             read_failures: Mutex::new(0),
             branch_max_seq,
@@ -237,9 +305,12 @@ impl RecordLog {
     /// `sync_interval`-th append also fsyncs the log. A failed fsync doesn't
     /// fail the append, since the record is already complete in the file:
     /// failing it would leave a record its caller never adopted, which the
-    /// next record on the same chain would contradict at replay. The next
-    /// append tries the fsync again, and from then on [`RecordLog::sync`]
-    /// returns the failure until the log is opened again.
+    /// next record on the same chain would contradict at replay. From then
+    /// on, an append is refused with `StoreError::DurabilityLost` before it
+    /// writes or takes a record ID, until [`RecordLog::sync`] writes the
+    /// records since the last good fsync again and its fsync succeeds, or
+    /// the log is opened again. So the bytes that a sync writes again are at
+    /// most the records since the last good fsync.
     pub fn append(
         &self,
         input: RecordInput,
@@ -247,6 +318,7 @@ impl RecordLog {
         sequence: Sequence,
     ) -> Result<(Record, u64)> {
         let mut file = self.file.write();
+        self.refuse_while_lost()?;
 
         // Assign ID
         let id = RecordId(*self.next_id.read());
@@ -267,28 +339,87 @@ impl RecordLog {
             linked_to: input.linked_to,
         };
 
-        // Serialize and write
         let offset = *self.file_size.read();
-        file.seek(SeekFrom::Start(offset))?;
-
-        self.write_record(&mut *file, &record)?;
-
-        let new_size = file.stream_position()?;
+        let (new_size, kept) = {
+            let mut unsynced = self.unsynced.lock();
+            let start = unsynced.bytes.len();
+            let needed = start + Self::encoded_len(&record);
+            if needed > unsynced.bytes.capacity() {
+                let doubled = (unsynced.bytes.capacity() * 2).min(self.sync_bytes);
+                unsynced.bytes.reserve_exact(needed.max(doubled) - start);
+            }
+            Self::encode_record_into(&record, &mut unsynced.bytes);
+            let written = self.write_failure().and_then(|()| {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&unsynced.bytes[start..])
+            });
+            if let Err(error) = written {
+                unsynced.bytes.truncate(start);
+                return Err(error.into());
+            }
+            (offset + (unsynced.bytes.len() - start) as u64, unsynced.bytes.len())
+        };
         *self.file_size.write() = new_size;
 
         // Sync periodically based on sync_interval
         let mut writes = self.writes_since_sync.write();
         *writes += 1;
-        if *writes >= self.sync_interval {
+        if *writes >= self.sync_interval || kept > self.sync_bytes {
             match self.fsync(&file) {
-                Ok(()) => *writes = 0,
-                // `writes` stays at the interval, so the next append tries
-                // again.
+                Ok(()) => {
+                    *writes = 0;
+                    self.synced_to(new_size);
+                }
                 Err(error) => self.keep_failure(&error),
             }
         }
 
         Ok((record, offset))
+    }
+
+    fn refuse_while_lost(&self) -> Result<()> {
+        match &*self.durability_failure.lock() {
+            Some(failure) => Err(StoreError::DurabilityLost(format!(
+                "fsync of the record log failed ({failure}), so no record is written until \
+                 sync() writes the records since the last good fsync again and its fsync \
+                 succeeds, or the store is reopened"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn sync_if_lost(&self) -> Result<()> {
+        if self.durability_failure.lock().is_some() {
+            self.sync()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn synced_to(&self, size: u64) {
+        let mut unsynced = self.unsynced.lock();
+        unsynced.synced_len = size;
+        unsynced.bytes = Vec::new();
+    }
+
+    fn write_failure(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut failures = self.write_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(std::io::Error::other("injected write failure"));
+            }
+        }
+        Ok(())
+    }
+
+    fn fsync_at_open(file: &File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if OPEN_FSYNC_FAILURES.with(|failures| failures.replace(failures.get().saturating_sub(1)) > 0) {
+            return Err(std::io::Error::other("injected fsync failure"));
+        }
+        file.sync_all()
     }
 
     /// fsync the log file.
@@ -317,24 +448,68 @@ impl RecordLog {
     /// Force sync all pending writes to disk.
     ///
     /// Once an fsync of the log has failed, this call's own or a periodic one
-    /// that `append` made, this returns that failure every time, as
-    /// `StoreError::DurabilityLost`, even when its own fsync succeeds, until
-    /// the log is opened again: records written before the failure may not
-    /// have reached the disk, and no later fsync can show that they did.
+    /// that `append` made, the records written since the last good fsync may
+    /// not have reached the disk, and a later fsync alone can't show that they
+    /// did. So while that failure stands, this first writes those records
+    /// again at their offsets, from the bytes kept in memory, and then
+    /// fsyncs. When that fsync succeeds, every byte since the last good fsync
+    /// has been written and synced again, so the failure ends and this
+    /// returns `Ok`. When the write or the fsync fails, the failure stands
+    /// and this returns it as `StoreError::DurabilityLost`.
     pub fn sync(&self) -> Result<()> {
-        let file = self.file.write();
-        match self.fsync(&file) {
-            Ok(()) => *self.writes_since_sync.write() = 0,
-            Err(error) => self.keep_failure(&error),
+        let mut file = self.file.write();
+        let standing = self.durability_failure.lock().is_some();
+        let synced = if standing {
+            self.write_unsynced_again(&mut file)
+                .and_then(|()| self.fsync(&file))
+        } else {
+            self.fsync(&file)
+        };
+        match synced {
+            Ok(()) => {
+                *self.writes_since_sync.write() = 0;
+                self.synced_to(*self.file_size.read());
+                if self.durability_failure.lock().take().is_some() {
+                    tracing::info!(
+                        "record log fsync succeeded again: the records written since the last \
+                         good fsync were written again and synced, so writes go on as usual"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.keep_failure(&error);
+                let first = self.durability_failure.lock().clone().unwrap_or_default();
+                let now = error.to_string();
+                let failure = if standing {
+                    format!("{first}, and this sync's retry failed: {now}")
+                } else {
+                    first
+                };
+                Err(StoreError::DurabilityLost(format!(
+                    "fsync of the record log failed ({failure}); records written since the \
+                     last good fsync may not have reached the disk. Until a retry writes \
+                     them again and its fsync succeeds, or the store is reopened, no record is \
+                     written and the store publishes no checkpoint. sync() makes the retry, \
+                     and so does each later write other than a blob write"
+                )))
+            }
         }
-        match &*self.durability_failure.lock() {
-            Some(text) => Err(StoreError::DurabilityLost(format!(
-                "fsync of the record log failed ({text}); records written before it may \
-                 not have reached the disk, and the store publishes no checkpoint until \
-                 it is reopened"
-            ))),
-            None => Ok(()),
+    }
+
+    fn write_unsynced_again(&self, file: &mut File) -> std::io::Result<()> {
+        let unsynced = self.unsynced.lock();
+        file.seek(SeekFrom::Start(unsynced.synced_len))?;
+        #[cfg(test)]
+        {
+            let mut failures = self.rewrite_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                file.write_all(&unsynced.bytes[..unsynced.bytes.len() / 2])?;
+                return Err(std::io::Error::other("injected rewrite failure"));
+            }
         }
+        file.write_all(&unsynced.bytes)
     }
 
     /// Keep the first failed fsync of the log, with one warning.
@@ -343,15 +518,18 @@ impl RecordLog {
         if kept.is_none() {
             tracing::warn!(
                 %error,
-                "record log fsync failed: records written before it may not have reached \
-                 the disk, so sync() and every metadata checkpoint fail until the store is \
-                 reopened"
+                "record log fsync failed: records written since the last good fsync may not \
+                 have reached the disk. Each later write other than a blob write, and each \
+                 sync(), first writes them again and fsyncs, and fails while that retry fails. \
+                 If writes keep failing, check the disk and its filesystem"
             );
             *kept = Some(error.to_string());
         }
     }
 
-    /// Read a record at a given offset.
+    /// Read a record at a given offset. A record written since the last good
+    /// fsync of the log is read from the bytes kept for a retry, not from
+    /// the file.
     pub fn read_at(&self, offset: u64) -> Result<Record> {
         #[cfg(test)]
         {
@@ -362,8 +540,7 @@ impl RecordLog {
             }
         }
         let mut file = self.file.write();
-        file.seek(SeekFrom::Start(offset))?;
-        Self::read_record(&mut *file)
+        self.read_one(&mut file, offset).map(|(record, _)| record)
     }
 
     /// Read the records at several offsets, in the order given, taking the
@@ -373,11 +550,26 @@ impl RecordLog {
         let mut file = self.file.write();
         offsets
             .iter()
-            .map(|&offset| {
-                file.seek(SeekFrom::Start(offset))?;
-                Self::read_record(&mut *file)
-            })
+            .map(|&offset| self.read_one(&mut file, offset).map(|(record, _)| record))
             .collect()
+    }
+
+    fn read_one(&self, file: &mut File, offset: u64) -> Result<(Record, u64)> {
+        {
+            let unsynced = self.unsynced.lock();
+            if let Some(start) = offset.checked_sub(unsynced.synced_len) {
+                let kept = usize::try_from(start)
+                    .ok()
+                    .and_then(|start| unsynced.bytes.get(start..))
+                    .unwrap_or_default();
+                let mut reader = std::io::Cursor::new(kept);
+                let record = Self::read_record_inner(&mut reader, None)?;
+                return Ok((record, offset + reader.position()));
+            }
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let record = Self::read_record(file)?;
+        Ok((record, file.stream_position()?))
     }
 
     /// Iterate all records from the beginning.
@@ -385,7 +577,8 @@ impl RecordLog {
         self.iter_from(0)
     }
 
-    /// Iterate all records from a given offset.
+    /// Iterate all records from a given offset. The records written since
+    /// the last good fsync are read as [`RecordLog::read_at`] reads them.
     pub fn iter_from(&self, offset: u64) -> RecordIterator<'_> {
         RecordIterator {
             log: self,
@@ -399,33 +592,50 @@ impl RecordLog {
         *self.file_size.read()
     }
 
-    /// Write a record to the file.
-    fn write_record(&self, file: &mut File, record: &Record) -> Result<()> {
+    fn encoded_len(record: &Record) -> usize {
+        LOG_MAGIC.len()
+            + 2
+            + 4 * 8
+            + 2
+            + record.record_type.len()
+            + 1
+            + 4
+            + record.payload.len()
+            + 2
+            + 8 * record.caused_by.len()
+            + 2
+            + 8 * record.linked_to.len()
+            + 4
+    }
+
+    fn encode_record_into(record: &Record, bytes: &mut Vec<u8>) {
+        let start = bytes.len();
+
         // Magic
-        file.write_all(LOG_MAGIC)?;
+        bytes.extend_from_slice(LOG_MAGIC);
 
         // Version
-        file.write_all(&[LOG_VERSION])?;
+        bytes.push(LOG_VERSION);
 
         // Flags (reserved)
-        file.write_all(&[0u8])?;
+        bytes.push(0u8);
 
         // Record ID
-        file.write_all(&record.id.0.to_le_bytes())?;
+        bytes.extend_from_slice(&record.id.0.to_le_bytes());
 
         // Sequence
-        file.write_all(&record.sequence.0.to_le_bytes())?;
+        bytes.extend_from_slice(&record.sequence.0.to_le_bytes());
 
         // Branch
-        file.write_all(&record.branch.0.to_le_bytes())?;
+        bytes.extend_from_slice(&record.branch.0.to_le_bytes());
 
         // Timestamp
-        file.write_all(&record.timestamp.0.to_le_bytes())?;
+        bytes.extend_from_slice(&record.timestamp.0.to_le_bytes());
 
         // Type
         let type_bytes = record.record_type.as_bytes();
-        file.write_all(&(type_bytes.len() as u16).to_le_bytes())?;
-        file.write_all(type_bytes)?;
+        bytes.extend_from_slice(&(type_bytes.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(type_bytes);
 
         // Encoding
         let encoding_byte = match record.encoding {
@@ -433,30 +643,30 @@ impl RecordLog {
             PayloadEncoding::MessagePack => 1u8,
             PayloadEncoding::Raw => 2u8,
         };
-        file.write_all(&[encoding_byte])?;
+        bytes.push(encoding_byte);
 
         // Payload
-        file.write_all(&(record.payload.len() as u32).to_le_bytes())?;
-        file.write_all(&record.payload)?;
+        bytes.extend_from_slice(&(record.payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&record.payload);
 
         // Caused by
-        file.write_all(&(record.caused_by.len() as u16).to_le_bytes())?;
+        bytes.extend_from_slice(&(record.caused_by.len() as u16).to_le_bytes());
         for id in &record.caused_by {
-            file.write_all(&id.0.to_le_bytes())?;
+            bytes.extend_from_slice(&id.0.to_le_bytes());
         }
 
         // Linked to
-        file.write_all(&(record.linked_to.len() as u16).to_le_bytes())?;
+        bytes.extend_from_slice(&(record.linked_to.len() as u16).to_le_bytes());
         for id in &record.linked_to {
-            file.write_all(&id.0.to_le_bytes())?;
+            bytes.extend_from_slice(&id.0.to_le_bytes());
         }
 
         // Checksum of entire record (excluding checksum itself)
         // For simplicity, we'll compute checksum of payload only
         let checksum = crc32fast::hash(&record.payload);
-        file.write_all(&checksum.to_le_bytes())?;
+        bytes.extend_from_slice(&checksum.to_le_bytes());
 
-        Ok(())
+        debug_assert_eq!(bytes.len() - start, Self::encoded_len(record));
     }
 
     /// Read a record from the file at current position.
@@ -481,7 +691,7 @@ impl RecordLog {
     /// Shared record decoder. When `bound` is `Some(remaining)`, any length
     /// field larger than `remaining` is rejected as `InvalidFormat` before
     /// allocation.
-    fn read_record_inner(file: &mut File, bound: Option<u64>) -> Result<Record> {
+    fn read_record_inner<R: Read>(file: &mut R, bound: Option<u64>) -> Result<Record> {
         #[cfg(test)]
         RECORD_DECODES.with(|decodes| decodes.set(decodes.get() + 1));
 
@@ -792,10 +1002,7 @@ impl<'a> Iterator for RecordIterator<'a> {
         let current_offset = self.offset;
         let read = {
             let mut file = self.log.file.write();
-            file.seek(SeekFrom::Start(current_offset))
-                .map_err(StoreError::from)
-                .and_then(|_| RecordLog::read_record(&mut *file))
-                .and_then(|record| Ok((record, file.stream_position()?)))
+            self.log.read_one(&mut file, current_offset)
         };
         match read {
             Ok((record, next_offset)) => {
@@ -829,54 +1036,277 @@ mod tests {
         assert_eq!(offset, 0);
     }
 
+    fn lost<T: std::fmt::Debug>(result: Result<T>) -> String {
+        let error = result.unwrap_err();
+        assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+        let text = error.to_string();
+        assert!(text.starts_with("Durability lost:"), "{text}");
+        assert!(text.contains("injected fsync failure"), "{text}");
+        text
+    }
+
+    fn append_byte(log: &RecordLog, n: u64) -> Result<(Record, u64)> {
+        log.append(
+            RecordInput::raw("test", vec![n as u8]),
+            BranchId(1),
+            Sequence(n),
+        )
+    }
+
+    fn zero(path: &Path, from: u64, to: u64) {
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(from)).unwrap();
+        file.write_all(&vec![0u8; (to - from) as usize]).unwrap();
+    }
+
+    fn payloads(path: &Path) -> Vec<Vec<u8>> {
+        let log = RecordLog::open(path).unwrap();
+        assert!(log.recovery().is_none());
+        log.iter().map(|each| each.unwrap().1.payload).collect()
+    }
+
     #[test]
-    fn failed_periodic_fsync_keeps_the_record_and_is_reported_until_reopen() {
+    fn a_failed_periodic_fsync_keeps_its_record_and_refuses_appends_until_a_sync_succeeds() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("log.bin");
         {
             let log = RecordLog::open_with_sync_interval(&path, 2).unwrap();
-            let append = |n: u64| {
-                log.append(
-                    RecordInput::raw("test", vec![n as u8]),
-                    BranchId(1),
-                    Sequence(n),
-                )
-            };
-            append(1).unwrap();
-
-            // The interval's fsync fails, and the append still returns its
-            // record.
+            append_byte(&log, 1).unwrap();
             *log.fsync_failures.lock() = 1;
-            let (record, offset) = append(2).unwrap();
+            let (record, offset) = append_byte(&log, 2).unwrap();
             assert_eq!(log.read_at(offset).unwrap().id, record.id);
 
-            // The retry succeeds, and every sync() still reports the failure.
-            append(3).unwrap();
-            for _ in 0..2 {
-                let error = log.sync().unwrap_err();
-                assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
-                let text = error.to_string();
-                assert!(text.starts_with("Durability lost:"), "{text}");
-                assert!(text.contains("injected fsync failure"), "{text}");
-            }
-        }
+            let size = std::fs::metadata(&path).unwrap().len();
+            let text = lost(append_byte(&log, 3));
+            assert!(text.contains("no record is written until"), "{text}");
+            assert_eq!(log.size(), size);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
 
-        // Opened again, the log syncs and holds every record.
-        let log = RecordLog::open(&path).unwrap();
-        log.sync().unwrap();
-        assert_eq!(log.iter().count(), 3);
+            log.sync().unwrap();
+            assert_eq!(append_byte(&log, 3).unwrap().0.id, RecordId(3));
+            log.sync().unwrap();
+        }
+        assert_eq!(payloads(&path), vec![vec![1], vec![2], vec![3]]);
     }
 
     #[test]
-    fn a_failed_sync_is_reported_by_every_later_one() {
+    fn a_failed_retry_keeps_every_kept_byte_for_the_next_one() {
         let dir = TempDir::new().unwrap();
-        let log = RecordLog::open(dir.path().join("log.bin")).unwrap();
-        log.append(RecordInput::raw("test", vec![1]), BranchId(1), Sequence(1))
-            .unwrap();
+        let path = dir.path().join("log.bin");
+        {
+            let log = RecordLog::open(&path).unwrap();
+            append_byte(&log, 1).unwrap();
+            log.sync().unwrap();
+            let synced = log.size();
+            append_byte(&log, 2).unwrap();
+            append_byte(&log, 3).unwrap();
+
+            *log.fsync_failures.lock() = 2;
+            let text = lost(log.sync());
+            assert!(text.contains("Until a retry writes them again"), "{text}");
+            lost(log.sync());
+            *log.rewrite_failures.lock() = 1;
+            let text = lost(log.sync());
+            assert!(
+                text.contains(
+                    "(injected fsync failure, and this sync's retry failed: injected rewrite failure)"
+                ),
+                "{text}"
+            );
+            lost(append_byte(&log, 4));
+
+            zero(&path, synced, log.size());
+            log.sync().unwrap();
+            append_byte(&log, 4).unwrap();
+            log.sync().unwrap();
+        }
+        assert_eq!(payloads(&path), vec![vec![1], vec![2], vec![3], vec![4]]);
+    }
+
+    #[test]
+    fn a_retry_writes_the_lost_records_again_from_memory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        let payload = |i: u64| format!("record {i}").into_bytes();
+        {
+            let log = RecordLog::open_with_sync_interval(&path, 1000).unwrap();
+            let append = |i: u64| {
+                log.append(RecordInput::raw("test", payload(i)), BranchId(1), Sequence(i))
+                    .unwrap()
+            };
+            (1..=100u64).for_each(|i| {
+                append(i);
+            });
+            log.sync().unwrap();
+            let synced = log.size();
+            (101..=200u64).for_each(|i| {
+                append(i);
+            });
+            *log.fsync_failures.lock() = 1;
+            lost(log.sync());
+
+            zero(&path, synced, log.size());
+            log.sync().unwrap();
+        }
+        assert_eq!(payloads(&path), (1..=200u64).map(payload).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_read_past_the_last_good_fsync_decodes_the_kept_bytes() {
+        for failed_sync in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("log.bin");
+            let payload = |i: u64| format!("record {i}").into_bytes();
+            let log = RecordLog::open_with_sync_interval(&path, 1000).unwrap();
+            let append = |i: u64| {
+                log.append(RecordInput::raw("test", payload(i)), BranchId(1), Sequence(i))
+                    .unwrap()
+            };
+            let mut written: Vec<(Record, u64)> = (1..=3u64).map(append).collect();
+            log.sync().unwrap();
+            let synced = log.size();
+            written.extend((4..=6u64).map(append));
+            if failed_sync {
+                *log.fsync_failures.lock() = 1;
+                lost(log.sync());
+            }
+            zero(&path, synced, log.size());
+
+            let expected: Vec<Vec<u8>> = (1..=6u64).map(payload).collect();
+            let one: Vec<Vec<u8>> = written
+                .iter()
+                .map(|(record, offset)| {
+                    let read = log.read_at(*offset).unwrap();
+                    assert_eq!(read.id, record.id, "failed sync: {failed_sync}");
+                    read.payload
+                })
+                .collect();
+            assert_eq!(one, expected, "read_at, failed sync: {failed_sync}");
+            let offsets: Vec<u64> = written.iter().map(|(_, offset)| *offset).collect();
+            let many: Vec<Vec<u8>> = log
+                .read_many_at(&offsets)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.payload)
+                .collect();
+            assert_eq!(many, expected, "read_many_at, failed sync: {failed_sync}");
+            let iterated: Vec<Vec<u8>> = log.iter().map(|each| each.unwrap().1.payload).collect();
+            assert_eq!(iterated, expected, "iter, failed sync: {failed_sync}");
+        }
+    }
+
+    #[test]
+    fn the_bytes_kept_for_a_retry_are_the_records_since_the_last_good_fsync() {
+        let dir = TempDir::new().unwrap();
+        let log = RecordLog::open_with_sync_interval(dir.path().join("log.bin"), 3).unwrap();
+        let kept = || {
+            let unsynced = log.unsynced.lock();
+            (unsynced.synced_len, unsynced.bytes.len() as u64)
+        };
+        let released = || log.unsynced.lock().bytes.capacity() == 0;
+        let append = |n: u64| append_byte(&log, n).unwrap().1;
+        append(1);
+        append(2);
+        assert_eq!(kept(), (0, log.size()));
+        append(3);
+        assert_eq!(kept(), (log.size(), 0), "the interval's fsync");
+        assert!(released(), "the interval's fsync");
+        let fourth = append(4);
+        assert_eq!(kept(), (fourth, log.size() - fourth));
+        log.sync().unwrap();
+        assert_eq!(kept(), (log.size(), 0), "sync()'s fsync");
+        assert!(released(), "sync()'s fsync");
+    }
+
+    #[test]
+    fn an_append_that_passes_the_byte_budget_fsyncs_at_once() {
+        let dir = TempDir::new().unwrap();
+        let mut log = RecordLog::open_with_sync_interval(dir.path().join("log.bin"), 1000).unwrap();
+        log.sync_bytes = 1000;
+        let kept = || log.unsynced.lock().bytes.len();
+        let capacity = || log.unsynced.lock().bytes.capacity();
+        let append = |n: u64| -> (usize, usize) {
+            let before = kept();
+            let (_, offset) = log
+                .append(RecordInput::raw("test", vec![n as u8; 300]), BranchId(1), Sequence(n))
+                .unwrap();
+            (before, (log.size() - offset) as usize)
+        };
+        let mut syncs = 0;
+        for n in 1..=10u64 {
+            let (before, len) = append(n);
+            assert!(capacity() <= 1000.max(before + len), "{} after append {n}", capacity());
+            if before + len > 1000 {
+                assert_eq!(kept(), 0, "append {n} passes the budget and syncs");
+                syncs += 1;
+            } else {
+                assert_eq!(kept(), before + len, "append {n}");
+            }
+        }
+        assert!(syncs >= 2, "{syncs}");
+
         *log.fsync_failures.lock() = 1;
-        assert!(matches!(log.sync(), Err(StoreError::DurabilityLost(_))));
-        // This call's own fsync succeeds, and the earlier failure stands.
-        assert!(matches!(log.sync(), Err(StoreError::DurabilityLost(_))));
+        let mut n = 11;
+        loop {
+            let (before, len) = append(n);
+            n += 1;
+            assert!(capacity() <= 1000.max(before + len), "{} after append {n}", capacity());
+            if before + len > 1000 {
+                break;
+            }
+        }
+        let text = lost(append_byte(&log, n));
+        assert!(text.contains("no record is written until"), "{text}");
+        log.sync().unwrap();
+        append_byte(&log, n).unwrap();
+    }
+
+    #[test]
+    fn an_append_whose_write_fails_keeps_no_bytes_of_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        {
+            let log = RecordLog::open(&path).unwrap();
+            append_byte(&log, 1).unwrap();
+            let kept = log.unsynced.lock().bytes.clone();
+            *log.write_failures.lock() = 1;
+            assert!(append_byte(&log, 2).is_err());
+            assert_eq!(log.unsynced.lock().bytes, kept);
+            append_byte(&log, 2).unwrap();
+            *log.fsync_failures.lock() = 1;
+            lost(log.sync());
+            zero(&path, 0, log.size());
+            log.sync().unwrap();
+        }
+        assert_eq!(payloads(&path), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn an_open_whose_fsync_fails_refuses_the_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        {
+            let log = RecordLog::open(&path).unwrap();
+            append_byte(&log, 1).unwrap();
+        }
+        OPEN_FSYNC_FAILURES.with(|failures| failures.set(1));
+        let error = RecordLog::open(&path).err().expect("the open refuses");
+        let text = error.to_string();
+        assert!(matches!(error, StoreError::DurabilityLost(_)), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("at open failed (injected fsync failure)"), "{text}");
+        assert!(text.contains("a later open won't report this failure again"), "{text}");
+        assert!(!text.contains("torn tail"), "{text}");
+        assert_eq!(payloads(&path), vec![vec![1]]);
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"REC\0torn").unwrap();
+        drop(file);
+        OPEN_FSYNC_FAILURES.with(|failures| failures.set(1));
+        let text = RecordLog::open(&path).err().expect("the open refuses").to_string();
+        assert!(text.contains("truncated a torn tail of 8 bytes"), "{text}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
     }
 
     // What a failed write-back can leave once the page cache no longer holds
@@ -1001,7 +1431,9 @@ mod tests {
             let input = RecordInput::raw("test", format!("record {i}").into_bytes());
             offsets.push(log.append(input, BranchId(1), Sequence(i)).unwrap().1);
         }
-        // Damage the third record's payload under the open log.
+        // Damage the third record's payload under the open log, after a sync,
+        // since the log reads records past its last good fsync from memory.
+        log.sync().unwrap();
         let mut file = OpenOptions::new().write(true).open(&path).unwrap();
         file.seek(SeekFrom::Start(offsets[2] + payload_offset(4)))
             .unwrap();

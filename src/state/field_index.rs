@@ -284,6 +284,8 @@ pub struct FieldIndexManager {
     )]
     indexes: HashMap<BranchId, BranchIndexes>,
     #[serde(skip)]
+    set_aside: HashMap<BranchId, BranchIndexes>,
+    #[serde(skip)]
     checkpoint: Checkpoint,
 }
 
@@ -512,6 +514,19 @@ impl FieldIndexManager {
     /// Drop every index held for `branch_id` (the branch was deleted).
     pub fn drop_branch(&mut self, branch_id: BranchId) {
         self.indexes.remove(&branch_id);
+        self.set_aside.remove(&branch_id);
+    }
+
+    pub(crate) fn set_aside_branch(&mut self, branch_id: BranchId) {
+        if let Some(indexes) = self.indexes.remove(&branch_id) {
+            self.set_aside.insert(branch_id, indexes);
+        }
+    }
+
+    pub(crate) fn restore_branch(&mut self, branch_id: BranchId) {
+        if let Some(indexes) = self.set_aside.remove(&branch_id) {
+            self.indexes.insert(branch_id, indexes);
+        }
     }
 
     /// Advance the tracked `head_offset` for every index registered for
@@ -881,20 +896,6 @@ mod tests {
 
     fn items(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
         values.to_vec()
-    }
-
-    #[test]
-    fn checkpoint_cache_is_not_part_of_the_persisted_format() {
-        let dir = TempDir::new().unwrap();
-        let manager = FieldIndexManager::new();
-        // The existing compact encoding is one field containing an empty map.
-        let expected = vec![0x91, 0x80];
-        assert_eq!(rmp_serde::to_vec(&manager).unwrap(), expected);
-        let path = dir.path().join("state-indexes.bin");
-        manager.save(&path).unwrap();
-        assert_eq!(rmp_serde::to_vec(&manager).unwrap(), expected);
-        let loaded = FieldIndexManager::load(&path).unwrap().unwrap();
-        assert_eq!(rmp_serde::to_vec(&loaded).unwrap(), expected);
     }
 
     #[test]

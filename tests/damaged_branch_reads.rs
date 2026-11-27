@@ -71,28 +71,25 @@ fn reopened(store: Store, dir: &TempDir) -> Store {
     store
 }
 
-fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>, usize)> {
+fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>)> {
     vec![
         (
             "Redact",
             vec![StateOperation::Redact { start: 1, end: 100 }],
             json!([2]),
             vec![json!(0), json!(1), json!(2), json!(3)],
-            3,
         ),
         (
             "Edit",
             vec![StateOperation::Edit { index: 1, new_value: bytes(json!("edited")) }],
             json!([2]),
             vec![json!(0), json!(1), json!(2), json!(3)],
-            4,
         ),
         (
             "Set",
             vec![StateOperation::Append(bytes(json!(7))), StateOperation::Set(bytes(json!([9])))],
             json!([7, 2]),
             vec![json!(9), json!(7), json!(2), json!(3)],
-            3,
         ),
         (
             "Delta",
@@ -102,7 +99,6 @@ fn cases() -> Vec<(&'static str, Vec<StateOperation>, Value, Vec<Value>, usize)>
             ],
             json!([7, 2]),
             vec![json!(0), json!(1), json!(7), json!(2), json!(3)],
-            3,
         ),
     ]
 }
@@ -122,17 +118,17 @@ fn assert_reads(store: &Store, expected: &[Value], what: &str) {
 
 #[test]
 fn a_damaged_branch_reads_as_it_did() {
-    for (name, change, old_delta, reading, count) in cases() {
+    for (name, change, old_delta, reading) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
         assert_reads(&store, &reading, name);
-        assert_eq!(store.get_state_len("s").unwrap(), Some(count), "{name}: get_state_len as it was");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(reading.len()), "{name}: get_state_len counts the reading");
     }
 }
 
 #[test]
 fn a_damaged_branch_reads_as_it_did_at_a_past_sequence() {
-    for (name, change, old_delta, mut reading, _) in cases() {
+    for (name, change, old_delta, mut reading) in cases() {
         let dir = TempDir::new().unwrap();
         let store = damaged_branch(&dir, &change, old_delta);
         let before_3 = chronicle::Sequence(store.current_branch().head.0 - 1);
@@ -145,7 +141,7 @@ fn a_damaged_branch_reads_as_it_did_at_a_past_sequence() {
 
 #[test]
 fn a_later_redact_or_edit_on_a_damaged_branch_takes_the_item_its_position_names_there() {
-    for (name, change, old_delta, reading, _) in cases() {
+    for (name, change, old_delta, reading) in cases() {
         let at = if name == "Delta" { 1 } else { 2 };
         let mut removed = reading.clone();
         removed.remove(at);
@@ -166,7 +162,7 @@ fn a_later_redact_or_edit_on_a_damaged_branch_takes_the_item_its_position_names_
 
 #[test]
 fn a_branch_made_from_a_damaged_branch_starts_from_its_reading() {
-    for (name, change, old_delta, mut reading, _) in cases() {
+    for (name, change, old_delta, mut reading) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
         // The child moves past the point first, so the grandchild's head is
@@ -190,7 +186,7 @@ fn a_branch_made_from_a_damaged_branch_starts_from_its_reading() {
 
 #[test]
 fn a_full_snapshot_of_a_damaged_branch_keeps_its_reading() {
-    for (name, change, old_delta, reading, _) in cases() {
+    for (name, change, old_delta, reading) in cases() {
         let dir = TempDir::new().unwrap();
         let store = reopened(damaged_branch(&dir, &change, old_delta), &dir);
         let full_before = store.get_compaction_stats("s").unwrap().last_full_snapshot_offset;

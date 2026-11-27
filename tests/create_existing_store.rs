@@ -204,6 +204,67 @@ fn open_or_create_refuses_a_directory_holding_other_files_and_writes_nothing() {
 }
 
 #[test]
+fn an_open_or_create_error_after_lock_acquisition_releases_the_lock() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    populated(&path);
+
+    let log = path.join("records.log");
+    let saved = dir.path().join("saved-log");
+    fs::rename(&log, &saved).unwrap();
+    fs::create_dir(&log).unwrap();
+    let failed = Store::open_or_create(config(&path));
+    match &failed {
+        Err(StoreError::Io(_cause)) => {
+            #[cfg(unix)]
+            assert_eq!(_cause.raw_os_error(), Some(libc::EISDIR), "{_cause}");
+        }
+        other => panic!("got {:?}", other.as_ref().err().map(|e| e.to_string())),
+    }
+
+    fs::remove_dir(&log).unwrap();
+    fs::rename(saved, log).unwrap();
+    let store = Store::open_or_create(config(&path)).expect("immediate reopen after repairing the log");
+    let messages = store.get_state("messages").unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&messages).unwrap(), serde_json::json!([{"n": 1}]));
+}
+
+#[test]
+fn an_open_or_create_error_after_create_takes_the_lock_releases_it() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("blobs"), b"").unwrap();
+    let failed = Store::open_or_create(config(&path));
+    assert!(
+        matches!(&failed, Err(StoreError::Io(cause)) if cause.kind() == std::io::ErrorKind::AlreadyExists),
+        "got {:?}",
+        failed.as_ref().err().map(|e| e.to_string())
+    );
+    assert!(path.join("LOCK").exists(), "the failed create never took the lock");
+
+    fs::remove_file(path.join("blobs")).unwrap();
+    let store = Store::open_or_create(config(&path)).expect("immediate create after removing the file");
+    store
+        .register_state(StateRegistration {
+            id: "messages".into(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 100,
+                full_snapshot_every: 100,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+    store
+        .update_state("messages", StateOperation::Append(b"{\"n\":1}".to_vec()))
+        .unwrap();
+    store.sync().unwrap();
+    drop(store);
+    let messages = Store::open(config(&path)).unwrap().get_state("messages").unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&messages).unwrap(), serde_json::json!([{"n": 1}]));
+}
+
+#[test]
 fn open_or_create_creates_beside_a_finder_ds_store() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("volume");

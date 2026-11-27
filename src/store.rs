@@ -4,7 +4,7 @@ use crate::blobs::BlobStorage;
 use crate::branches::BranchManager;
 use crate::error::{Result, StoreError};
 use crate::records::{RecordIndex, RecordLog, RecoveryReport};
-use crate::state::{StateManager, StateSelection};
+use crate::state::{ItemCount, StateManager, StateSelection};
 use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
     Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence, SnapshotFailure,
@@ -54,23 +54,22 @@ pub struct AppendedBatch {
     /// lock as the write. Item `i` of the batch is at `first_ordinal + i`, so
     /// a caller has every item's ordinal without a read.
     ///
-    /// Where this session hasn't kept the state's count on the branch itself
-    /// (a head loaded from `state.bin` or installed by `create_branch_at`, or
-    /// one after a `DeltaSnapshot` the caller wrote or a value that isn't an
-    /// array), the batch first counts
-    /// the state's items, reading its whole value once, or again under the
-    /// write lock where another write to the state lands during that count,
-    /// and the head keeps that count, which `get_state_len` then reports: a
-    /// count a release
-    /// before 0.5.0 stored, or one such a `DeltaSnapshot` left, can be off.
-    /// A value that doesn't materialize as a JSON array has no items to
-    /// count, and this is then the count `get_state_len` reports; the batch
-    /// is recorded, and the state then fails to materialize, as after an
-    /// `Append` to it, so the items can't be read at those ordinals. An error
-    /// reading the log for the count (an I/O error, or a record of the
-    /// state's chain that fails its checksum or whose framing is bad) is
-    /// returned, and the batch isn't recorded; the error says so, except a
-    /// failed checksum's, which carries no message of its own.
+    /// Where the store hasn't checked the state's count on the branch (a head
+    /// loaded with no saved check or installed by `create_branch_at` at a past
+    /// point, or one after a `DeltaSnapshot` the caller wrote or a value that
+    /// isn't an array), the batch first counts the state's items, reading its
+    /// whole value once, or again under the write lock where another write to
+    /// the state lands during that count, and the head keeps that count, which
+    /// `get_state_len` then reports: a count a release before 0.5.0 stored, or
+    /// one such a `DeltaSnapshot` left, can be off. A value that doesn't
+    /// materialize as a JSON array has no items to count, and this is then the
+    /// count `get_state_len` reports; the batch is recorded, and the state then
+    /// fails to materialize, as after an `Append` to it, so the items can't be
+    /// read at those ordinals. An error reading the log for the count (an I/O
+    /// error, or a record of the state's chain that fails its checksum or whose
+    /// framing is bad) is returned, and the batch isn't recorded; the error
+    /// says so, except a failed checksum's, which carries no message of its
+    /// own.
     pub first_ordinal: usize,
 }
 
@@ -120,19 +119,24 @@ const MANIFEST_HEADER_LEN: u64 = STORE_MAGIC.len() as u64 + 1;
 #[derive(Default)]
 struct WriteState {
     /// Metadata-only mutations cannot be replayed from records.log. If their
-    /// checkpoint failed, finish it before allowing another mutation to use
-    /// the in-memory definition. Reads may still inspect that tentative state.
+    /// checkpoint failed, the mutation is undone in memory, but the disk can
+    /// hold part of it, so the next write of a record or a state, field-index
+    /// registration or metadata mutation saves the checkpoint again before
+    /// it changes anything.
     checkpoint_required: bool,
 
-    /// A branch creation or deletion that no checkpoint has persisted yet.
-    /// Subscribers hear of it once one does, as its caller does. At most one
-    /// is ever pending, since a mutation first finishes a failed checkpoint.
+    /// The branch creation or deletion whose own checkpoint is running.
+    /// Subscribers hear of it once that checkpoint succeeds.
     pending_branch_event: Option<BranchEvent>,
+
+    branch_list_save_began: bool,
 
     /// The format features the MANIFEST on disk names (0 for a version 1
     /// manifest). A write that needs one it lacks rewrites the MANIFEST
     /// first; see `Store::require_features`.
     features: u64,
+
+    names_synced: bool,
 }
 
 /// A branch change to announce once a checkpoint persists it.
@@ -154,6 +158,8 @@ pub struct Store {
 
     /// Lock file for exclusive access.
     _lock_file: File,
+
+    holders: Vec<PathBuf>,
 
     /// Record log (shared with StateManager for disk-based traversal).
     log: Arc<RecordLog>,
@@ -191,6 +197,9 @@ pub struct Store {
     /// state's entry outlives its failure, keeping the sequence for that
     /// check, until its branch is deleted or the store closes.
     snapshot_failures: Mutex<BTreeMap<BranchId, BTreeMap<String, SnapshotOutcome>>>,
+
+    #[cfg(test)]
+    test_hooks: Mutex<std::collections::HashMap<&'static str, Box<dyn FnOnce(&Store) + Send>>>,
 }
 
 /// The snapshot outcome a [`Store`] has taken in last for one state on one
@@ -416,6 +425,8 @@ impl Store {
             }));
         }
 
+        let holders = Self::holders("create", &config.path)?;
+
         // With the lock held, staging files here were left by interrupted
         // saves, a create's own manifest save among them (as open sweeps them).
         crate::atomic_file::remove_staging_files(&config.path);
@@ -443,6 +454,7 @@ impl Store {
         Ok(Self {
             config,
             _lock_file: lock_file,
+            holders,
             log,
             index,
             blobs,
@@ -453,10 +465,27 @@ impl Store {
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery: None,
             snapshot_failures: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
     /// Open an existing store.
+    ///
+    /// A store writes `state.bin` and `branches.bin` only after its
+    /// `records.log`. So a store that holds either of them and has no
+    /// `records.log` has lost its log: open refuses it with `Corruption`,
+    /// naming the missing file, and creates no `records.log`. A
+    /// `records.log`, `state.bin` or `branches.bin` that is a symbolic link
+    /// whose target the open can't reach, such as one that leads to nothing,
+    /// is refused with `Corruption` in any store, and nothing is created
+    /// where it leads. A directory with a `MANIFEST` and none of the other
+    /// three files, as a create that stopped after its `MANIFEST` leaves it,
+    /// is opened, and the open creates its log. A `records.log` that is 0
+    /// bytes as the open finds it, while `state.bin` holds a state head, is
+    /// refused with `Corruption`, naming it empty: an open by an earlier
+    /// release creates such a file where the log is missing, and so can an
+    /// open that cuts off an incomplete first record.
     pub fn open(config: StoreConfig) -> Result<Self> {
         // Verify manifest
         Self::verify_manifest(&config.path)?;
@@ -464,6 +493,7 @@ impl Store {
         // Acquire lock
         let lock_file = Self::acquire_lock(&config.path)?;
         let mut features = Self::verify_manifest(&config.path)?;
+        let holders = Self::holders("open", &config.path)?;
 
         // A MANIFEST naming format features was renamed into place by a
         // batch's mark, and a failed directory sync after that rename left
@@ -490,12 +520,15 @@ impl Store {
         // doc says what else it can reach.
         crate::atomic_file::remove_staging_files(&config.path);
 
+        Self::refuse_a_lost_log(&config.path)?;
+
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
-        let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
-        blobs.remove_staging_files();
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
+        Self::refuse_an_emptied_log(&config.path, &log, &state)?;
+        let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
+        blobs.remove_staging_files();
 
         // Reconcile branch heads against what the durable log actually holds.
         // `branches.bin` is only flushed on sync/Drop, so after an unclean
@@ -675,6 +708,7 @@ impl Store {
         Ok(Self {
             config,
             _lock_file: lock_file,
+            holders,
             log,
             index,
             blobs,
@@ -688,6 +722,8 @@ impl Store {
             auto_snapshot_enabled: AtomicBool::new(true),
             recovery,
             snapshot_failures: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1055,17 +1091,18 @@ impl Store {
 
     /// Register a new state and persist its strategy before returning.
     /// The log cannot reconstruct a lost registration after a crash.
-    /// If the checkpoint fails, the error is returned but the registration
-    /// stays in memory, and the next successful checkpoint publishes it:
-    /// `sync()`, or the retry that every later mutation makes first. Calling
-    /// this again retries that checkpoint first and, once it succeeds, returns
-    /// `StateExists`, since the registration was kept.
+    /// If the checkpoint fails, the error is returned and the store holds no
+    /// registration, so the same call can run again once the cause is
+    /// mended. See [`Store::sync`] for what the disk can hold until the next
+    /// successful checkpoint.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
+        let id = registration.id.clone();
         self.state.register_state(registration)?;
         write.checkpoint_required = true;
         self.sync_locked(&mut write)
+            .inspect_err(|_| self.state.restore_strategy(&id, None))
     }
 
     /// Update the strategy parameters of an already-registered state (same
@@ -1073,9 +1110,7 @@ impl Store {
     /// re-registration retune snapshot cadence on existing stores instead of
     /// being permanently pinned to the values from first registration.
     /// Checkpoints before returning. If the checkpoint fails, the error is
-    /// returned but the new strategy stays in memory, and the next successful
-    /// checkpoint publishes it: `sync()`, or the retry that every later
-    /// mutation makes first.
+    /// returned and the previous strategy is in force again.
     pub fn update_state_strategy(
         &self,
         state_id: &str,
@@ -1083,9 +1118,11 @@ impl Store {
     ) -> Result<()> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
+        let previous = self.state.get_strategy(state_id);
         self.state.update_state_strategy(state_id, strategy)?;
         write.checkpoint_required = true;
         self.sync_locked(&mut write)
+            .inspect_err(|_| self.state.restore_strategy(state_id, previous))
     }
 
     /// Update a state and record it.
@@ -1095,6 +1132,13 @@ impl Store {
     /// Tree operation against its strategy. Other operations are recorded as
     /// given, and one that can't be applied, such as an Append of bytes that
     /// aren't JSON, shows when the state is next materialized.
+    ///
+    /// For a state registered as `AppendLog`, an Edit's length is the number
+    /// of items, as `get_state_len_on` gives it: where the store hasn't
+    /// checked the count, the Edit counts the items first, reading the whole
+    /// value once without the write lock, and once more under it if a write
+    /// moved the head meanwhile. An error reading the log for that count is
+    /// returned, and the Edit isn't recorded.
     ///
     /// An `AppendMany` with no items is refused. The first `AppendMany` a
     /// store records also rewrites its MANIFEST, before the record is
@@ -1161,6 +1205,16 @@ impl Store {
         skip_auto_snapshot: bool,
         snapshot_of: Option<u64>,
     ) -> Result<Record> {
+        if matches!(operation, StateOperation::Edit { .. })
+            && matches!(
+                self.state.get_strategy(state_id),
+                Some(crate::types::StateStrategy::AppendLog { .. })
+            )
+        {
+            self.state
+                .checked_item_count(branch_id, state_id)
+                .map_err(|error| Self::count_error(error, "edit"))?;
+        }
         self.update_state_with_builder(
             branch_id,
             state_id,
@@ -1382,7 +1436,7 @@ impl Store {
                     .into(),
             ));
         }
-        // A head this session hasn't checked has its items counted here,
+        // A head the store hasn't checked has its items counted here,
         // before the write lock, as the count reads the state's whole value
         // and every other writer of the store would wait on the lock while
         // it did. The count is kept only if the head is where it was when
@@ -1391,7 +1445,7 @@ impl Store {
         // left the head unchecked, counts again under the lock.
         self.state
             .checked_item_count(branch_id, state_id)
-            .map_err(Self::count_error)?;
+            .map_err(|error| Self::count_error(error, "batch"))?;
         let mut first_ordinal = 0;
         let record = self.update_state_with_builder(branch_id, state_id, false, None, |id, seq| {
             let items = items_builder(id, seq)?;
@@ -1400,10 +1454,17 @@ impl Store {
             // unchecked has its items counted here, unless the batch is
             // empty, which is refused before it's written.
             if !items.is_empty() {
-                first_ordinal = self
+                first_ordinal = match self
                     .state
                     .checked_item_count(branch_id, state_id)
-                    .map_err(Self::count_error)?;
+                    .map_err(|error| Self::count_error(error, "batch"))?
+                {
+                    ItemCount::NoHead => 0,
+                    ItemCount::Counted(count) => count,
+                    ItemCount::Moved => {
+                        unreachable!("a write moved the head while the batch held the write lock")
+                    }
+                };
             }
             Ok(StateOperation::AppendMany(items))
         })?;
@@ -1413,21 +1474,21 @@ impl Store {
         })
     }
 
-    /// The error of a batch whose count failed to read the state's chain,
-    /// which says the batch wasn't recorded, as a failed mark does: an I/O
-    /// error keeps its kind, and a record whose framing is bad stays
-    /// `InvalidFormat`. A failed checksum carries no message to add it to,
-    /// and comes back as it is.
-    fn count_error(error: StoreError) -> StoreError {
+    /// The error of a write (`what`: a batch, an edit) whose count failed to
+    /// read the state's chain, which says the write wasn't recorded, as a
+    /// failed mark does: an I/O error keeps its kind, and a record whose
+    /// framing is bad stays `InvalidFormat`. A failed checksum carries no
+    /// message to add it to, and comes back as it is.
+    fn count_error(error: StoreError, what: &str) -> StoreError {
         match error {
             StoreError::Io(error) => StoreError::Io(std::io::Error::new(
                 error.kind(),
                 format!(
-                    "the batch was not recorded, because reading the state's records to count its items failed: {error}"
+                    "the {what} was not recorded, because reading the state's records to count its items failed: {error}"
                 ),
             )),
             StoreError::InvalidFormat(message) => StoreError::InvalidFormat(format!(
-                "the batch was not recorded, because a record the count read is damaged: {message}"
+                "the {what} was not recorded, because a record the count read is damaged: {message}"
             )),
             other => other,
         }
@@ -1482,17 +1543,34 @@ impl Store {
         // Validate operation WITHOUT loading full state (critical for 50M+ operations)
         // - Append, AppendMany: Always succeed, no validation needed (beyond
         //   the batch holding an item, above)
-        // - Edit: Just check index < len
+        // - Edit: Just check index < len, an append log's len being its
+        //   checked count
         // - Redact: No validation: when it's applied, a range past the end is
         //   clamped to the length and a reversed one removes nothing
         // - Set/Snapshot/DeltaSnapshot: No validation needed
         match &operation {
             StateOperation::Edit { index, .. } => {
-                let len = self
-                    .state
-                    .get_head(branch.id, state_id)
-                    .map(|h| h.item_count)
-                    .unwrap_or(0);
+                let len = if matches!(
+                    self.state.get_strategy(state_id),
+                    Some(crate::types::StateStrategy::AppendLog { .. })
+                ) {
+                    match self
+                        .state
+                        .checked_item_count(branch.id, state_id)
+                        .map_err(|error| Self::count_error(error, "edit"))?
+                    {
+                        ItemCount::NoHead => 0,
+                        ItemCount::Counted(count) => count,
+                        ItemCount::Moved => {
+                            unreachable!("a write moved the head while the edit held the write lock")
+                        }
+                    }
+                } else {
+                    self.state
+                        .get_head(branch.id, state_id)
+                        .map(|h| h.item_count)
+                        .unwrap_or(0)
+                };
                 if *index >= len {
                     return Err(StoreError::InvalidOperation(format!(
                         "Edit index {} out of bounds (len={})",
@@ -1912,20 +1990,61 @@ impl Store {
         }))
     }
 
-    /// Get the length of an AppendLog state without loading all items.
-    ///
-    /// This is O(1) - the count is tracked in the state chain head.
-    /// Returns None if state doesn't exist, Some(0) for empty state.
+    /// The number of items a state holds on the current branch: `None` where
+    /// the state has no value, `Some(0)` for an empty one. See
+    /// [`Store::get_state_len_on`].
     pub fn get_state_len(&self, state_id: &str) -> Result<Option<usize>> {
         self.get_state_len_on(self.branches.current_id(), state_id)
     }
 
     /// `get_state_len` against the given branch.
+    ///
+    /// For a state registered as `AppendLog` it is the number of items that
+    /// a read of the state on the branch returns. The head's stored count is
+    /// returned where the store has checked it, which reads nothing. A head
+    /// it hasn't checked has its value read once to count its items, as a
+    /// batched append does, and the head keeps that count: a count that a
+    /// release before 0.5.0 stored, one that a `DeltaSnapshot` the caller
+    /// wrote left, and one on a branch an earlier release damaged can be
+    /// off. The store saves its checks at each sync, in `state.bin`, so a
+    /// list counted before a sync isn't counted again after an open, unless a
+    /// later write left its head unchecked. A value that
+    /// doesn't materialize as a JSON array has no items to count, and the
+    /// stored count is returned. An error reading the log for the count (an
+    /// I/O error, or a record of the state's chain that fails its checksum
+    /// or whose framing is bad) is returned, and nothing changes. The count
+    /// is taken once without the store's write lock, and once more under it
+    /// if a write moved the state's head meanwhile, so that writers wait for
+    /// that second count. A branch deleted during the count never reads as a
+    /// state with no value: it gives `BranchNotFound`, or the count, as a
+    /// read just before the delete would.
+    ///
+    /// For a state of any other strategy, and one with no registration, it
+    /// is the count the head stores, which reads nothing: for a Tree state an
+    /// estimate between full snapshots.
     pub fn get_state_len_on(&self, branch_id: BranchId, state_id: &str) -> Result<Option<usize>> {
         self.branch_by_id(branch_id)?;
-        match self.state.get_head(branch_id, state_id) {
-            Some(head) => Ok(Some(head.item_count)),
-            None => Ok(None),
+        match self.state.get_strategy(state_id) {
+            Some(crate::types::StateStrategy::AppendLog { .. }) => {
+                let count = match self.state.checked_item_count(branch_id, state_id)? {
+                    ItemCount::Moved => {
+                        let _write = self.write_lock.lock();
+                        self.state.checked_item_count(branch_id, state_id)?
+                    }
+                    count => count,
+                };
+                match count {
+                    ItemCount::NoHead => {
+                        self.branch_by_id(branch_id)?;
+                        Ok(None)
+                    }
+                    ItemCount::Counted(count) => Ok(Some(count)),
+                    ItemCount::Moved => {
+                        unreachable!("a write moved the head while the length read held the write lock")
+                    }
+                }
+            }
+            _ => Ok(self.state.get_head(branch_id, state_id).map(|head| head.item_count)),
         }
     }
 
@@ -2012,7 +2131,10 @@ impl Store {
     /// JSON value (no bytes at all read as an empty list), as
     /// `get_state_slice` does, except the last item served from the head
     /// record alone, which reads no earlier item: an `Append`'s, or a batch's
-    /// last item where this session found the head's count exact.
+    /// last item where the store has found the head's count exact. On an
+    /// AppendLog whose count the store hasn't checked, the read counts the
+    /// state's items first, reading its whole value once, and returns that
+    /// count's error reading the log (see `StateManager::get_state_item`).
     pub fn get_state_item(&self, state_id: &str, index: usize) -> Result<Option<Vec<u8>>> {
         self.get_state_item_on(self.branches.current_id(), state_id, index)
     }
@@ -2037,13 +2159,11 @@ impl Store {
     /// range, the state has no value, or its value isn't an array; the
     /// `Deserialization` error where the state's bytes aren't one JSON value
     /// (no bytes at all read as an empty list), as for `get_state_item`,
-    /// except the last item served from the head
-    /// record alone, which reads no earlier item. It answers otherwise than
-    /// `get_state_item` only at the last index of a head whose count this
-    /// session hasn't found exact (unchecked, or checked on a value that
-    /// doesn't materialize), where `get_state_item` answers from the stored
-    /// count and this from the value. Ordinals may repeat and come in any
-    /// order. All of them are answered from one version of the state, read at
+    /// except the last item served from the head record alone, which reads
+    /// no earlier item. It answers otherwise than `get_state_item` only at
+    /// the last index of a head whose check isn't exact (its value doesn't
+    /// materialize), where `get_state_item` answers from the stored count and
+    /// this from the value. Ordinals may repeat and come in any order. All of them are answered from one version of the state, read at
     /// most once, and an empty request reads nothing (see
     /// `StateManager::get_state_items_by_ordinal`).
     pub fn get_state_items_by_ordinal(
@@ -2962,11 +3082,13 @@ impl Store {
     // --- Branch Operations ---
 
     /// Create a new branch from the current branch head and checkpoint it.
-    /// If the checkpoint fails, the error is returned but the branch stays in
-    /// memory, and the next successful checkpoint publishes it and tells
-    /// subscribers: `sync()`, or the retry that every later mutation makes
-    /// first. Calling this again retries that checkpoint first and, once it
-    /// succeeds, returns `BranchExists`.
+    /// Subscribers hear of the branch when this returns it.
+    ///
+    /// If the checkpoint fails, the error is returned and the store holds no
+    /// such branch: its name is free, and the same call can run again once
+    /// the cause is mended. The failed call's branch ID is not given again
+    /// by this store. See [`Store::sync`] for what the disk can hold until
+    /// the next successful checkpoint.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         self.create_branch_inheriting(name, from, None)
     }
@@ -3025,14 +3147,15 @@ impl Store {
             branch: new_branch.clone(),
             parent: Some(parent_name),
         });
-        self.sync_locked(&mut write)?;
+        self.sync_locked(&mut write)
+            .inspect_err(|_| self.undo_create(&mut write, new_branch.id))?;
 
         Ok(new_branch)
     }
 
     /// Create and checkpoint a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
-    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
+    /// A failed checkpoint leaves no branch, as for `create_branch`.
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
@@ -3049,7 +3172,8 @@ impl Store {
             branch: new_branch.clone(),
             parent: parent_name,
         });
-        self.sync_locked(&mut write)?;
+        self.sync_locked(&mut write)
+            .inspect_err(|_| self.undo_create(&mut write, new_branch.id))?;
 
         // Don't copy state - let the caller populate state manually
         Ok(new_branch)
@@ -3067,7 +3191,7 @@ impl Store {
     /// * `from` - Parent branch name to branch from
     /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
     ///
-    /// A failed checkpoint leaves the branch in memory, as for `create_branch`.
+    /// A failed checkpoint leaves no branch, as for `create_branch`.
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
         self.create_branch_at_inheriting(name, from, at, None)
     }
@@ -3133,9 +3257,9 @@ impl Store {
         for (state_id, parent_head) in self.state.selected_heads(parent.id, selection) {
             let strategy = self.state.get_strategy(&state_id);
             let is_tree = matches!(strategy, Some(crate::types::StateStrategy::Tree { .. }));
-            let head = match at_offset {
+            let (head, reused) = match at_offset {
                 Some(offset) if !is_tree && parent_head.head_offset <= offset => {
-                    Some(parent_head)
+                    (Some(parent_head), true)
                 }
                 _ => {
                     // The parent's last full snapshot, if it predates the
@@ -3158,11 +3282,11 @@ impl Store {
                         }
                         _ => None,
                     };
-                    self.find_chain_head_at(parent.id, &state_id, at, known_full)?
+                    (self.find_chain_head_at(parent.id, &state_id, at, known_full)?, false)
                 }
             };
             if let Some(head) = head {
-                heads.push((state_id, head));
+                heads.push((state_id, head, reused));
             }
         }
 
@@ -3170,9 +3294,14 @@ impl Store {
 
         // Point the new branch's state heads at the parent's chain at the branch point.
         // No new records are written - the branch shares the existing chain up to this point.
-        for (state_id, head) in heads {
-            self.state
-                .insert_head_for_branch(new_branch.id, &state_id, head);
+        for (state_id, head, reused) in heads {
+            if reused {
+                self.state
+                    .insert_parents_head_for_branch(parent.id, new_branch.id, &state_id, head);
+            } else {
+                self.state
+                    .insert_head_for_branch(new_branch.id, &state_id, head);
+            }
         }
 
         write.checkpoint_required = true;
@@ -3180,23 +3309,37 @@ impl Store {
             branch: new_branch.clone(),
             parent: Some(from.to_string()),
         });
-        self.sync_locked(&mut write)?;
+        self.sync_locked(&mut write)
+            .inspect_err(|_| self.undo_create(&mut write, new_branch.id))?;
 
         Ok(new_branch)
     }
 
+    fn undo_create(&self, write: &mut WriteState, branch: BranchId) {
+        self.branches.remove(branch);
+        if write.branch_list_save_began {
+            self.state.retire_branch(branch);
+        } else {
+            self.state.release_branch(branch);
+        }
+        write.pending_branch_event = None;
+    }
+
     /// Switch to a different branch and checkpoint the current-branch pointer.
-    /// If the checkpoint fails, the error is returned but the switch stays in
-    /// effect, and the next successful checkpoint publishes it: `sync()`, or
-    /// the retry that every later mutation makes first, so later writes go
-    /// to the new branch.
+    /// The checkpoint saves the target as the current branch, and the store
+    /// selects it once that checkpoint has succeeded, so no call sees a
+    /// selection that wasn't saved. If the checkpoint fails, the error is
+    /// returned and the branch that was current stays current.
     pub fn switch_branch(&self, name: &str) -> Result<Branch> {
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
-        let branch = self.branches.switch_branch(name)?;
+        let branch = self
+            .branches
+            .get_branch(name)
+            .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
         write.checkpoint_required = true;
-        self.sync_locked(&mut write)?;
-        Ok(branch)
+        self.sync_locked_selecting(&mut write, branch.id)?;
+        self.branches.switch_branch(name)
     }
 
     /// Get the current branch.
@@ -3212,38 +3355,43 @@ impl Store {
     /// Delete a branch and checkpoint the deletion.
     ///
     /// Besides removing the branch, this releases what the store held for
-    /// it: its cached state values and field indexes immediately, and its
-    /// chain heads once the deletion has been saved (this call's checkpoint,
-    /// or the next `sync`), so neither memory nor `state.bin` keeps growing
-    /// with branches that no longer exist. Records the branch wrote stay in
-    /// the append-only log.
+    /// it once this call's checkpoint has saved the deletion: its cached
+    /// state values, field indexes and chain heads, so neither memory nor
+    /// `state.bin` keeps growing with branches that no longer exist. The
+    /// checkpoint writes no field index of the branch, and its heads leave
+    /// `state.bin` at the next `sync`. Records the branch wrote stay in the
+    /// append-only log.
     ///
-    /// If the checkpoint fails, the error is returned but the branch stays
-    /// deleted in memory, and the next successful checkpoint publishes the
-    /// deletion and tells subscribers: `sync()`, or the retry that every
-    /// later mutation makes first. Calling this again retries that checkpoint
-    /// first and, once it succeeds, returns `BranchNotFound`.
+    /// If the checkpoint fails, the error is returned and the branch is
+    /// still there, with what the store held for it. See [`Store::sync`] for
+    /// what the disk can hold until the next successful checkpoint.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         // Serialized with writes, so a write that has already resolved this
         // branch finishes before the branch disappears under it.
         let mut write = self.write_lock.lock();
         self.retry_metadata_checkpoint(&mut write)?;
 
-        let branch_id = self.branches.get_branch(name).map(|b| b.id);
+        let branch = self
+            .branches
+            .get_branch(name)
+            .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
         self.branches.delete_branch(name)?;
-        if let Some(branch_id) = branch_id {
-            self.state.retire_branch(branch_id);
-            // A snapshot outcome that comes in after this, from a write that
-            // finished on the branch before it went, is kept until close;
-            // `snapshot_failures` doesn't list it.
-            self.snapshot_failures.lock().remove(&branch_id);
-        }
+        self.state.retire_branch(branch.id);
 
         write.checkpoint_required = true;
         write.pending_branch_event = Some(BranchEvent::Deleted {
             name: name.to_string(),
         });
-        self.sync_locked(&mut write)?;
+        if let Err(error) = self.sync_locked(&mut write) {
+            self.state.unretire_branch(branch.id);
+            self.branches.restore(branch);
+            write.pending_branch_event = None;
+            return Err(error);
+        }
+        // A snapshot outcome that comes in after this, from a write that
+        // finished on the branch before it went, is kept until close;
+        // `snapshot_failures` doesn't list it.
+        self.snapshot_failures.lock().remove(&branch.id);
 
         Ok(())
     }
@@ -3271,19 +3419,33 @@ impl Store {
     /// `register_state_field_index` rebuilds a missing or stale one.
     ///
     /// Once an fsync of the record log has failed, this call's own or a
-    /// periodic one, this returns the failure every time until the store is
-    /// reopened, as [`StoreError::DurabilityLost`], and publishes nothing.
-    /// Linux reports a write-back error to one fsync, and a later one can
-    /// succeed although the records written before the failure never reached
-    /// the disk, so a checkpoint published after it could name records the
-    /// disk doesn't hold. Registration, strategy changes, and branch
-    /// creation, deletion and switching fail the same way, and so does any
-    /// write while one of them waits for its checkpoint. Reopening the store
-    /// is the only way to resume durable writes. It replays the log from the
-    /// last checkpoint, and can't tell whether records the operating system
-    /// still caches reached the disk: if they didn't while later records did,
-    /// an open after the cache drops them refuses the store as mid-log
-    /// corruption.
+    /// periodic one, the records written since the last good fsync may not
+    /// have reached the disk: Linux reports a write-back error to one fsync,
+    /// and a later one can succeed although the pages that failed never
+    /// reached the disk. So while that failure stands, this first writes
+    /// those records again from the bytes the log keeps in memory, and then
+    /// fsyncs. When that succeeds, the failure ends and this publishes the
+    /// checkpoints as usual. When it fails, this returns
+    /// [`StoreError::DurabilityLost`] and publishes nothing, since a
+    /// checkpoint could name records the disk doesn't hold, and the next call
+    /// tries again. While the failure stands, each later write other than a
+    /// blob write makes the same retry first, before it changes anything: an
+    /// append, a state update, a field-index registration, a registration, a
+    /// strategy change, and a branch creation, deletion or switch. When the
+    /// retry succeeds, the write goes on. When it fails, the write returns
+    /// the same error and changes nothing. While the disk keeps failing, each
+    /// retry writes the kept bytes again, which can be 64 MiB and one record,
+    /// and waits for an fsync, and reads of the log wait for it. A write while a metadata checkpoint is owed saves
+    /// that checkpoint first, which makes the retry too. A registration,
+    /// strategy change, or branch creation, deletion or switch whose own
+    /// checkpoint then fails returns the error and undoes its change, as for
+    /// any failed checkpoint.
+    /// Reopening the store also ends the failure. The open fsyncs the log
+    /// first, and fails with the same error when that fsync fails. It
+    /// replays the log from the last checkpoint, and can't tell whether
+    /// records the operating system still caches reached the disk: if they
+    /// didn't while later records did, an open after the cache drops them
+    /// refuses the store as mid-log corruption.
     ///
     /// On open, complete state updates in the log past the last checkpoint
     /// are replayed, except those on a branch that `branches.bin` doesn't
@@ -3292,12 +3454,21 @@ impl Store {
     ///
     /// State registration, strategy changes, and branch creation, deletion
     /// and switching checkpoint before returning, because the record log
-    /// cannot reconstruct them. If that checkpoint fails, the change stays in
-    /// memory, and every later mutation retries the checkpoint before
-    /// proceeding, so a successful write cannot depend on an unpersisted
-    /// registration or branch. This method retries it too; metadata is not
-    /// rolled back. A failed sync with no such change pending holds back no
-    /// later append or state update.
+    /// cannot reconstruct them. If that checkpoint fails, the call throws and
+    /// undoes its change. The open store's branch list, selection,
+    /// registrations and strategies are then as they were before the call. A
+    /// failed creation's branch ID isn't given out again. So the same call can
+    /// run again on the same handle once the cause is mended. The disk can still hold part of the
+    /// change: `state.bin` is saved before `branches.bin`, and a save can put
+    /// its new file in place and then fail. So each later write of a record
+    /// or a state, field-index registration or metadata call saves the
+    /// checkpoint again before it changes anything, and this method does
+    /// too. A blob write doesn't. A process that stops before that save
+    /// opens the store as the disk has it, which can include a registration,
+    /// a strategy, a branch's selection or deletion, or a branch with its
+    /// state, from a call that threw. A failed sync with no such change
+    /// pending holds back no later append or state update, unless what
+    /// failed was the record log's fsync, as above.
     ///
     /// On Unix a save also syncs the containing directory, where the system
     /// can. Where this process can't open that directory to sync it, the
@@ -3307,9 +3478,63 @@ impl Store {
     /// may open from an earlier checkpoint. The record index is rebuilt on
     /// startup; checkpoint cost depends on state heads, branch metadata, and
     /// any registered field indexes.
+    ///
+    /// On Unix, the first time on each open handle, this also syncs the
+    /// directories that hold the store's directory, up to the root of its
+    /// filesystem or to the first one that this process may not look at, and
+    /// the store's directory, the blob directory and each shard directory in
+    /// it, so that a power loss can't take the store's name or a blob's,
+    /// whatever made them. On macOS, where each directory sync would ask the
+    /// drive to write back its whole cache, this first-time sync syncs each
+    /// directory with `fsync` and then asks each drive to write back its cache
+    /// once. After that, it syncs each blob directory whose sync after a blob
+    /// store this handle still owes. As a blob store's syncs do, these go only
+    /// where the system syncs directories and this process may open them. For
+    /// a store path through a symbolic link, the directory that holds the
+    /// link's own name isn't synced, and the first-time sync doesn't follow a
+    /// symbolic link in the blob directory. A failed sync of one of these
+    /// directories returns its error, and the next call tries it again. On
+    /// ext4, a retry just after a failed journal commit can succeed although
+    /// the name never reached the disk, so a successful retry doesn't prove
+    /// that it did. Appends, state writes and blob stores go on meanwhile.
+    /// Until that first call, a power loss can take a new store's directory
+    /// and the parents that `create` made, even after a registration or a
+    /// branch change has saved its checkpoint.
     pub fn sync(&self) -> Result<()> {
         let mut write = self.write_lock.lock();
-        self.sync_locked(&mut write)
+        self.sync_locked(&mut write)?;
+        let in_sync = |error: std::io::Error| std::io::Error::new(error.kind(), format!("sync: {error}"));
+        if !write.names_synced {
+            let mut devices = crate::atomic_file::Devices::default();
+            devices.note(&self.config.path).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync: cannot read the metadata of {}: {error}", self.config.path.display()),
+                )
+            })?;
+            for directory in &self.holders {
+                crate::atomic_file::sync_directory_at_unflushed(directory).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "sync: cannot sync {}, a directory that holds the store {}: {error}",
+                            directory.display(),
+                            self.config.path.display()
+                        ),
+                    )
+                })?;
+            }
+            self.blobs.sync_directories(&mut devices).map_err(in_sync)?;
+            devices.flush().map_err(|(directory, error)| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("sync: cannot flush the drive that holds {}: {error}", directory.display()),
+                )
+            })?;
+            write.names_synced = true;
+        }
+        self.blobs.sync_owed().map_err(in_sync)?;
+        Ok(())
     }
 
     /// Make the MANIFEST name `required` format features before a record
@@ -3344,23 +3569,41 @@ impl Store {
         }
     }
 
-    /// Finish a failed metadata checkpoint before admitting another mutation.
+    /// Finish a failed metadata checkpoint, or retry a failed fsync of the
+    /// log, before admitting another mutation.
     fn retry_metadata_checkpoint(&self, write: &mut WriteState) -> Result<()> {
         if write.checkpoint_required {
-            self.sync_locked(write)?;
+            self.sync_locked(write)
+        } else {
+            self.log.sync_if_lost()
         }
-        Ok(())
     }
 
     /// Call only while holding write_lock, so a state head cannot reach disk
     /// ahead of its log record and branch/state checkpoints cannot interleave.
-    /// A branch change waiting on a checkpoint is announced once one succeeds.
     fn sync_locked(&self, write: &mut WriteState) -> Result<()> {
-        // Sync the append-only log (O(1) - just fsync)
+        self.sync_locked_selecting(write, self.branches.current_id())
+    }
+
+    #[cfg(test)]
+    fn run_test_hook(&self, point: &'static str) {
+        let hook = self.test_hooks.lock().remove(point);
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    fn sync_locked_selecting(&self, write: &mut WriteState, current: BranchId) -> Result<()> {
+        write.branch_list_save_began = false;
+        // Sync the append-only log. After a failed fsync, this writes the
+        // records since the last good one again first.
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
-        self.branches.save()?;
+        #[cfg(test)]
+        self.run_test_hook("checkpoint: branch list");
+        write.branch_list_save_began = true;
+        self.branches.save_selecting(current)?;
         // Deleted branches are now gone from branches.bin, so their chain
         // heads can go too (see `StateManager::retire_branch` for why not
         // before). They drop out of state.bin at the next sync.
@@ -3648,17 +3891,21 @@ impl Store {
         )
     }
 
+    fn holds(path: &Path, file: &str) -> std::io::Result<bool> {
+        match fs::symlink_metadata(path.join(file)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
+            )),
+        }
+    }
+
     fn present_store_file(path: &Path) -> std::io::Result<Option<&'static str>> {
         for file in Self::STORE_FILES {
-            match fs::symlink_metadata(path.join(file)) {
-                Ok(_) => return Ok(Some(file)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(std::io::Error::new(
-                        error.kind(),
-                        format!("cannot tell whether {} holds a store's {file}: {error}", path.display()),
-                    ))
-                }
+            if Self::holds(path, file)? {
+                return Ok(Some(file));
             }
         }
         Self::blobs_with_data(path)
@@ -3702,6 +3949,96 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    fn refuse_a_lost_log(path: &Path) -> Result<()> {
+        let mut used = Vec::new();
+        for file in ["state.bin", "branches.bin"] {
+            if Self::holds(path, file)? && fs::metadata(path.join(file)).is_ok() {
+                used.push(file);
+            }
+        }
+        let used = used.join(" and ");
+        let use_shown = format!(
+            "{} holds {used}, which a store writes only after it has made its records.log",
+            path.display()
+        );
+        for file in ["records.log", "state.bin", "branches.bin"] {
+            let link = path.join(file);
+            if !fs::symlink_metadata(&link).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                continue;
+            }
+            let Err(error) = fs::metadata(&link) else {
+                continue;
+            };
+            let leads_to_nothing = error.kind() == std::io::ErrorKind::NotFound;
+            let (unreachable, remedy) = if leads_to_nothing {
+                (
+                    Self::link_to_nothing(&link),
+                    format!(
+                        "Make the link lead to the store's {file}, by mounting the volume it points into, say, then open the store again"
+                    ),
+                )
+            } else {
+                (
+                    format!("{} is a symbolic link whose target the open can't reach: {error}", link.display()),
+                    "Make the link's target reachable, then open the store again".to_string(),
+                )
+            };
+            return Err(StoreError::Corruption(format!(
+                "{unreachable}, so the open stopped and created nothing where it leads. {}",
+                match (file, leads_to_nothing) {
+                    ("records.log", _) if !used.is_empty() => format!("{use_shown}. {remedy}"),
+                    ("records.log", true) => format!(
+                        "{remedy}. If the store has no records.log yet, remove the link, and the next open creates one here"
+                    ),
+                    (_, true) => format!(
+                        "{remedy}. If the store has never saved its {file}, remove the link, and its next save writes one here"
+                    ),
+                    _ => remedy,
+                }
+            )));
+        }
+        let log = path.join("records.log");
+        if used.is_empty()
+            || !matches!(fs::symlink_metadata(&log), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(());
+        }
+        Err(StoreError::Corruption(format!(
+            "{} is missing, though {use_shown}. This open created no records.log. Restore the records.log that belongs with this {used}, then open the store again. {}",
+            log.display(),
+            Self::start_over(path, "creates an empty records.log and keeps the blobs")?
+        )))
+    }
+
+    fn refuse_an_emptied_log(path: &Path, log: &RecordLog, state: &StateManager) -> Result<()> {
+        if log.size() > 0 || log.recovery().is_some() || state.checkpoint_offset().is_none() {
+            return Ok(());
+        }
+        Err(StoreError::Corruption(format!(
+            "{} is empty, though {} holds heads of records that the log held. An open by an earlier release of Chronicle creates such an empty file where a store's records.log is missing. An open that finds the log's first record incomplete and cuts it off leaves one too. Restore the store's records.log over this file if a copy exists, then open the store again. {}",
+            path.join("records.log").display(),
+            path.join("state.bin").display(),
+            Self::start_over(path, "keeps the empty records.log and the blobs")?
+        )))
+    }
+
+    fn start_over(path: &Path, then: &str) -> Result<String> {
+        let mut files = Vec::new();
+        for file in ["state.bin", "state-indexes.bin", "branches.bin"] {
+            if Self::holds(path, file)? {
+                files.push(file);
+            }
+        }
+        let files = match files.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => files.concat(),
+        };
+        Ok(format!(
+            "If no copy of the log exists, the store's records are lost. To start the store over without them, move {files} out of {}, and the next open {then}",
+            path.display()
+        ))
     }
 
     // Published whole, through a staging file renamed over it, so a crash
@@ -3835,6 +4172,55 @@ impl Store {
         }
     }
 
+    #[cfg(unix)]
+    fn holders(verb: &str, path: &Path) -> Result<Vec<PathBuf>> {
+        use std::os::unix::fs::MetadataExt;
+        let failed = |what: String, error: std::io::Error| {
+            StoreError::Io(std::io::Error::new(error.kind(), format!("{verb}: {what}: {error}")))
+        };
+        let refused = |error: &std::io::Error| error.kind() == std::io::ErrorKind::PermissionDenied;
+        let real = match fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(error) if refused(&error) => path.to_owned(),
+            Err(error) => {
+                return Err(failed(format!("cannot find the real path of {}", path.display()), error))
+            }
+        };
+        let device = fs::metadata(&real)
+            .map_err(|error| failed(format!("cannot read the metadata of {}", real.display()), error))?
+            .dev();
+        let mut holders = Vec::new();
+        for directory in real.ancestors().skip(1) {
+            let directory = if directory.as_os_str().is_empty() { Path::new(".") } else { directory };
+            let metadata = match fs::metadata(directory) {
+                Ok(metadata) => metadata,
+                Err(error) if refused(&error) => break,
+                Err(error) => {
+                    return Err(failed(
+                        format!(
+                            "cannot read the metadata of {}, a directory that holds the store {}",
+                            directory.display(),
+                            path.display()
+                        ),
+                        error,
+                    ))
+                }
+            };
+            if metadata.dev() != device {
+                break;
+            }
+            holders.push(directory.to_owned());
+        }
+        Ok(holders)
+    }
+
+    // Windows has no portable directory sync, and checkpoint saves go without
+    // it there too.
+    #[cfg(not(unix))]
+    fn holders(_verb: &str, _path: &Path) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
     // LOCK is opened without truncating it, and nothing is written to it. It
     // must be a regular file in the store's directory, or absent (then it's
     // created). A symlink is refused: its target can be replaced by a rename,
@@ -3922,8 +4308,10 @@ impl Drop for Store {
                 %error,
                 path = %self.config.path.display(),
                 "final sync on drop failed: the next open replays state updates from the log \
-                 past the last checkpoint, and may lose any registration or branch change \
-                 whose checkpoint failed"
+                 past the last checkpoint, and finds the registrations and branches that the \
+                 last saves left on disk, which can hold part of a change whose call failed. \
+                 If the sync of a directory that holds the store or its blobs failed, a power \
+                 loss before the next sync can also take the store's name or a blob's"
             );
         }
     }
@@ -4178,7 +4566,6 @@ mod tests {
         assert!(!head.has_non_append_since_snapshot, "setup: the head holds false, as an earlier release saved it");
         let old = json!([0, 1, 2, 3]);
         reads_alike(&store, &old, "at the old head");
-        assert_eq!(store.get_state_len("s").unwrap(), Some(3), "its count, short of the reading");
         store.set_auto_snapshot(false);
         for v in [4, 5] {
             store.update_state("s", StateOperation::Append(n(v))).unwrap();
@@ -4187,6 +4574,7 @@ mod tests {
         drop(store);
         let store = reopen(test_config(&dir));
         reads_alike(&store, &json!([0, 1, 2, 3, 4, 5]), "after the new delta and a reopen");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(6), "the reading's length");
     }
 
     /// Opens a store this process closed a moment ago. A child that a
@@ -4284,6 +4672,84 @@ mod tests {
         let store = reopen(test_config(&dir));
         assert_eq!(RECORD_DECODES.with(|decodes| decodes.get()), 2 * records);
         assert_eq!(store.get_state_len("log").unwrap(), Some(40));
+    }
+
+    #[test]
+    fn a_reopened_store_answers_a_length_without_reading_a_record() {
+        use crate::records::RECORD_DECODES;
+        let decodes = || RECORD_DECODES.with(|decodes| decodes.get());
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_items(&dir, 64);
+        let rebuilds = store.state_reconstruction_count();
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        let len = store.get_state_len("s").unwrap();
+        assert_eq!(
+            (len, decodes(), store.state_reconstruction_count()),
+            (Some(64), 0, rebuilds)
+        );
+
+        assert!(store.get_state("s").unwrap().is_some());
+        assert!(
+            decodes() > 0 && store.state_reconstruction_count() > rebuilds,
+            "the counters see a read of the chain"
+        );
+    }
+
+    #[test]
+    fn registering_a_fresh_field_index_again_reads_no_record() {
+        use crate::records::RECORD_DECODES;
+        use crate::state::FieldIndexKind;
+        let decodes = || RECORD_DECODES.with(|decodes| decodes.get());
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        {
+            let store = Store::create(config.clone()).unwrap();
+            store.set_auto_snapshot(false);
+            store
+                .register_state(StateRegistration {
+                    id: "messages".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            for i in 0..64 {
+                let item = serde_json::to_vec(&json!({ "v": i, "w": i })).unwrap();
+                store
+                    .update_state("messages", StateOperation::Append(item))
+                    .unwrap();
+            }
+            store
+                .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+                .unwrap();
+            store.clear_state_caches();
+            let rebuilds = store.state_reconstruction_count();
+            RECORD_DECODES.with(|decodes| decodes.set(0));
+            store
+                .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+                .unwrap();
+            assert_eq!((decodes(), store.state_reconstruction_count()), (0, rebuilds));
+            store.sync().unwrap();
+        }
+
+        let store = reopen(config);
+        let rebuilds = store.state_reconstruction_count();
+        RECORD_DECODES.with(|decodes| decodes.set(0));
+        store
+            .register_state_field_index("messages", "/v", FieldIndexKind::Number)
+            .unwrap();
+        assert_eq!((decodes(), store.state_reconstruction_count()), (0, rebuilds));
+        assert_eq!(
+            store.query_state_index_range("messages", "/v", Some(7.0), Some(9.0), None, None, false),
+            Some(vec![7, 8, 9])
+        );
+
+        store
+            .register_state_field_index("messages", "/w", FieldIndexKind::Number)
+            .unwrap();
+        assert!(decodes() > 0, "the counter sees an index built from the slot");
     }
 
     #[test]
@@ -4486,6 +4952,96 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn relative_store_under_a_directory_this_process_may_not_search_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(work) = std::env::var_os("CHRONICLE_HOLDERS_CHILD_WORK") else {
+            return;
+        };
+        let work = PathBuf::from(work);
+        let above = work.parent().unwrap().to_owned();
+        std::env::set_current_dir(&work).unwrap();
+        let config = StoreConfig {
+            path: PathBuf::from("store"),
+            blob_cache_size: 100,
+            create_if_missing: false,
+        };
+        Store::create(config.clone()).unwrap().sync().unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(&work).is_ok() {
+            eprintln!("skipped: the directory could be searched despite its mode (running as root?)");
+            return;
+        }
+        let store = Store::open(config).unwrap();
+        assert_eq!(store.holders, [PathBuf::from(".")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_store_under_a_directory_this_process_may_not_search_opens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let above = dir.path().join("above");
+        let work = above.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::relative_store_under_a_directory_this_process_may_not_search_child",
+                "--nocapture",
+            ])
+            .env("CHRONICLE_HOLDERS_CHILD_WORK", &work)
+            .output()
+            .unwrap();
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_first_sync_of_a_handle_flushes_the_store_device_once() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store.store_blob(b"left", "text/plain").unwrap();
+        crate::atomic_file::flushed_devices();
+        store.sync().unwrap();
+        assert_eq!(crate::atomic_file::flushed_devices(), [config.path.clone()]);
+        store.sync().unwrap();
+        assert_eq!(crate::atomic_file::flushed_devices(), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_passes_over_a_directory_holding_the_store_that_this_process_may_not_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let holder = dir.path().join("holder");
+        let store = Store::create(StoreConfig {
+            path: holder.join("store"),
+            ..test_config(&dir)
+        })
+        .unwrap();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = fs::File::open(&holder).is_ok();
+        let synced = store.sync();
+        fs::set_permissions(&holder, fs::Permissions::from_mode(0o700)).unwrap();
+        if readable {
+            eprintln!("skipped: the directory could be opened despite its mode (running as root?)");
+            return;
+        }
+        synced.unwrap();
+    }
+
     /// Where open_or_create can't look at the directory again after its
     /// create was refused, it returns that error, not the refusal, which is
     /// true only of what create saw under the lock. Unix only: a directory
@@ -4547,8 +5103,8 @@ mod tests {
     }
 
     /// A store with a state "s" of `items` appended one at a time, synced,
-    /// closed and opened again, so the head comes from `state.bin` and this
-    /// session hasn't checked its count. Auto-snapshots are off.
+    /// closed and opened again, so the head and its saved check come from
+    /// `state.bin`. Auto-snapshots are off.
     fn reopened_with_items(dir: &TempDir, items: usize) -> Store {
         let config = test_config(dir);
         {
@@ -4576,6 +5132,17 @@ mod tests {
         store
     }
 
+    fn reopened_unchecked(dir: &TempDir, items: usize) -> Store {
+        drop(reopened_with_items(dir, items));
+        let state_bin = test_config(dir).path.join("state.bin");
+        let bytes = std::fs::read(&state_bin).unwrap();
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        std::fs::write(&state_bin, &bytes[..13 + len]).unwrap();
+        let store = reopen(test_config(dir));
+        store.set_auto_snapshot(false);
+        store
+    }
+
     /// A batch counts the items of a head this session hasn't checked before
     /// it takes the write lock, so other writers don't wait while it reads
     /// the whole value: here the count is read while the test holds the
@@ -4584,7 +5151,7 @@ mod tests {
     #[test]
     fn a_batch_counts_an_unchecked_head_before_it_takes_the_write_lock() {
         let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+        let store = reopened_unchecked(&dir, 3);
         let before = store.state_reconstruction_count();
         std::thread::scope(|scope| {
             let held = store.write_lock.lock();
@@ -4609,7 +5176,7 @@ mod tests {
     #[test]
     fn a_batch_whose_count_fails_to_read_says_it_was_not_recorded() {
         let dir = TempDir::new().unwrap();
-        let store = reopened_with_items(&dir, 3);
+        let store = reopened_unchecked(&dir, 3);
         let head = store.current_branch().head;
         let size = store.stats().unwrap().total_size_bytes;
         *store.log.read_failures.lock() = 1;
@@ -4628,6 +5195,94 @@ mod tests {
         assert_eq!(store.current_branch().head, head, "no record");
         assert_eq!(store.stats().unwrap().total_size_bytes, size, "nothing appended to the log");
         assert_eq!(store.append_many_to_state_json("s", &[json!("a")]).unwrap().first_ordinal, 3);
+    }
+
+    /// A store whose state "s" holds `items` items under a stored count of
+    /// `count`, with no checks, as an earlier release could leave it.
+    fn reopened_with_a_stale_count(dir: &TempDir, items: usize, count: usize) -> Arc<Store> {
+        let store = reopened_with_items(dir, items);
+        let branch = store.current_branch().id;
+        drop(store);
+        let state_bin = test_config(dir).path.join("state.bin");
+        let bytes = std::fs::read(&state_bin).unwrap();
+        let len = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) as usize;
+        let mut index: crate::state::StateIndex = rmp_serde::from_slice(&bytes[13..13 + len]).unwrap();
+        index.heads.get_mut(branch, "s").unwrap().item_count = count;
+        let encoded = rmp_serde::to_vec(&index).unwrap();
+        let mut stale = bytes[..5].to_vec();
+        stale.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        stale.extend_from_slice(&encoded);
+        std::fs::write(&state_bin, stale).unwrap();
+        let store = Arc::new(reopen(test_config(dir)));
+        store.set_auto_snapshot(false);
+        store
+    }
+
+    #[test]
+    fn a_length_read_that_a_write_races_counts_again_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 0);
+        let writer = Arc::clone(&store);
+        let recount_held_the_lock = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&recount_held_the_lock);
+        store.state.set_test_hook("count: value read", move |state| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+            state.set_test_hook("count: value read", move |_| {
+                *seen.lock() = Some(writer.write_lock.try_lock().is_none());
+            });
+        });
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4), "the count of the head that the write moved");
+        assert_eq!(*recount_held_the_lock.lock(), Some(true), "the second count held the write lock");
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn an_item_read_whose_count_a_write_races_reads_the_value() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 1);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        assert_eq!(
+            store.get_state_item("s", 0).unwrap(),
+            Some(serde_json::to_vec(&json!(0)).unwrap()),
+            "the item at index 0 of the value, not the moved head record's"
+        );
+    }
+
+    #[test]
+    fn an_edit_whose_count_a_write_races_takes_its_bound_from_a_count_under_the_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = reopened_with_a_stale_count(&dir, 3, 1);
+        let writer = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            writer
+                .update_state("s", StateOperation::Append(serde_json::to_vec(&json!(3)).unwrap()))
+                .unwrap();
+        });
+        let edit = StateOperation::Edit { index: 3, new_value: serde_json::to_vec(&json!("x")).unwrap() };
+        store.update_state("s", edit).unwrap();
+        assert_eq!(store.get_state_len("s").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn a_length_read_of_a_branch_deleted_during_its_count_finds_no_branch() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(reopened_unchecked(&dir, 3));
+        let child = store.create_branch("child", None).unwrap().id;
+        let deleter = Arc::clone(&store);
+        store.state.set_test_hook("count: value read", move |_| {
+            deleter.delete_branch("child").unwrap();
+        });
+        match store.get_state_len_on(child, "s") {
+            Err(StoreError::BranchNotFound(_)) => {}
+            other => panic!("a length read of a branch deleted during its count: expected BranchNotFound, got {other:?}"),
+        }
     }
 
     /// The snapshot outcomes of writes are noted after the write lock is
@@ -5560,7 +6215,7 @@ mod tests {
         // state.bin with the heads still in it, then branches.bin without the
         // branch, and only then let the heads go...
         assert_eq!(store.state.head_count(), baseline_heads);
-        // ...the field indexes (derived data) were dropped at once, so the
+        // ...the field indexes (derived data) were set aside at once, so the
         // same checkpoint already wrote a file without them...
         assert_eq!(fs::metadata(&indexes_bin).unwrap().len(), baseline_indexes);
         // ...and state.bin, which the last deletion's checkpoint wrote with
@@ -5693,11 +6348,15 @@ mod tests {
     // R1-1: a failed periodic fsync must not leave a record that its state's
     // head never adopted, or the next update names the same predecessor and
     // replay refuses the store. The child keeps writing after one failed
-    // fsync, and again while every fsync fails, and exits without Drop, so
-    // the reopen has only the log and the registration's checkpoint to go on.
+    // fsync, which the next write's retry ends, and again while every
+    // fsync fails, and exits without Drop, so the reopen has only the log and
+    // the registration's checkpoint to go on.
     #[test]
     fn failed_periodic_fsync_keeps_heads_and_log_in_step() {
-        for failures in ["one", "every"] {
+        for (failures, expected) in [
+            ("one", (0..250).collect::<Vec<u64>>()),
+            ("every", (0..100).collect()),
+        ] {
             let dir = TempDir::new().unwrap();
             let config = test_config(&dir);
             run_fsync_failure_child(&config, "update", failures);
@@ -5705,7 +6364,7 @@ mod tests {
             let store = Store::open(config).unwrap();
             let items: Vec<u64> =
                 serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
-            assert_eq!(items, (0..250).collect::<Vec<u64>>(), "{failures}");
+            assert_eq!(items, expected, "{failures}");
         }
     }
 
@@ -5714,7 +6373,7 @@ mod tests {
     // its sequence with the next one.
     #[test]
     fn failed_periodic_fsync_leaves_no_generic_sequence_twice() {
-        for failures in ["one", "every"] {
+        for (failures, written) in [("one", 250), ("every", 100)] {
             let dir = TempDir::new().unwrap();
             let config = test_config(&dir);
             run_fsync_failure_child(&config, "append", failures);
@@ -5726,16 +6385,12 @@ mod tests {
                 .map(|id| store.get_record(id).unwrap().unwrap().sequence.0)
                 .collect();
             sequences.sort_unstable();
-            assert_eq!(sequences, (1..=250).collect::<Vec<u64>>(), "{failures}");
+            assert_eq!(sequences, (1..=written).collect::<Vec<u64>>(), "{failures}");
         }
     }
 
-    // After one failed fsync of the log, nothing publishes a checkpoint until
-    // the store is reopened: neither sync(), a metadata mutation nor Drop,
-    // and each of them reports DurabilityLost. Writes go on until a metadata
-    // mutation waits for its checkpoint, and then report it too.
     #[test]
-    fn a_failed_log_fsync_publishes_nothing_until_reopen() {
+    fn a_failed_log_fsync_publishes_nothing_until_a_sync_writes_the_log_again() {
         let dir = TempDir::new().unwrap();
         let config = test_config(&dir);
         let registration = |id: &str| StateRegistration {
@@ -5751,66 +6406,253 @@ mod tests {
         store.set_auto_snapshot(false);
         let checkpoint = std::fs::read(config.path.join("state.bin")).unwrap();
 
-        // The 100th update's periodic fsync fails, and the retry succeeds.
-        *store.log.fsync_failures.lock() = 1;
-        for n in 0..150u64 {
-            store
-                .update_state("items", StateOperation::Append(n.to_string().into_bytes()))
-                .unwrap();
-        }
-        for _ in 0..2 {
-            let result = store.sync();
-            assert_eq!(
-                std::fs::read(config.path.join("state.bin")).unwrap(),
-                checkpoint,
-                "sync() published state.bin"
-            );
-            let error = result.unwrap_err();
-            assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
-            assert!(error.to_string().contains("until it is reopened"), "{error}");
-        }
         fn lost<T>(result: Result<T>) -> bool {
             matches!(result, Err(StoreError::DurabilityLost(_)))
         }
+        let unpublished = |what: &str| {
+            assert_eq!(
+                std::fs::read(config.path.join("state.bin")).unwrap(),
+                checkpoint,
+                "{what} published state.bin"
+            );
+        };
+
+        *store.log.fsync_failures.lock() = u64::MAX;
+        for n in 0..150u64 {
+            let update =
+                store.update_state("items", StateOperation::Append(n.to_string().into_bytes()));
+            if n < 100 {
+                update.unwrap();
+            } else {
+                assert!(lost(update), "update {n} is refused");
+            }
+        }
+        assert!(lost(store.append(RecordInput::raw("event", b"refused".to_vec()))));
+        let result = store.sync();
+        unpublished("a sync whose retry failed");
+        let error = result.unwrap_err();
+        assert!(matches!(error, StoreError::DurabilityLost(_)), "{error}");
+        assert!(error.to_string().contains("Until a retry writes them again"), "{error}");
         assert!(lost(store.register_state(registration("other"))));
-        // Every call that retries the registration's pending checkpoint first
-        // meets the same failure.
-        assert!(
-            lost(store.update_state("items", StateOperation::Append(b"150".to_vec()))),
-            "a write waits for the registration's checkpoint"
-        );
-        assert!(lost(store.append(RecordInput::raw("event", b"blocked".to_vec()))));
-        assert!(lost(store.update_state_strategy(
-            "items",
-            crate::types::StateStrategy::AppendLog {
-                delta_snapshot_every: 50,
-                full_snapshot_every: 20,
-            },
-        )));
-        assert!(lost(store.register_state_field_index(
-            "items",
-            "/n",
-            crate::state::FieldIndexKind::Number
-        )));
-        assert!(lost(store.create_branch("blocked", None)));
-        assert!(lost(store.create_empty_branch("blocked-empty", None)));
-        assert!(lost(store.create_branch_at("blocked-at", "main", Sequence(0))));
-        assert!(lost(store.switch_branch("main")));
-        assert!(lost(store.delete_branch("missing")));
-        assert!(lost(store.sync()));
+        unpublished("a registration whose retry failed");
+
+        *store.log.fsync_failures.lock() = 0;
+        store
+            .update_state("items", StateOperation::Append(b"150".to_vec()))
+            .unwrap();
+        store.sync().unwrap();
+        assert_ne!(std::fs::read(config.path.join("state.bin")).unwrap(), checkpoint);
         drop(store);
-        assert_eq!(
-            std::fs::read(config.path.join("state.bin")).unwrap(),
-            checkpoint,
-            "nothing published state.bin"
-        );
 
         let store = reopen(config);
         let items: Vec<u64> =
             serde_json::from_slice(&store.get_state("items").unwrap().unwrap()).unwrap();
-        assert_eq!(items, (0..150).collect::<Vec<u64>>());
+        let expected: Vec<u64> = (0..100).chain([150]).collect();
+        assert_eq!(items, expected);
+        assert!(store.get_records_by_type("event").is_empty());
         store.register_state(registration("other")).unwrap();
+    }
+
+    type MetadataCall = (&'static str, fn(&Store) -> Result<()>, fn(&Store) -> bool);
+
+    fn metadata_calls() -> [MetadataCall; 7] {
+        [
+            (
+                "register_state",
+                |store| {
+                    store.register_state(StateRegistration {
+                        id: "other".into(),
+                        strategy: crate::types::StateStrategy::Snapshot,
+                        initial_value: None,
+                    })
+                },
+                |store| store.state.get_strategy("other").is_some(),
+            ),
+            (
+                "update_state_strategy",
+                |store| {
+                    store.update_state_strategy(
+                        "items",
+                        crate::types::StateStrategy::AppendLog {
+                            delta_snapshot_every: 50,
+                            full_snapshot_every: 20,
+                        },
+                    )
+                },
+                |store| {
+                    matches!(
+                        store.state.get_strategy("items"),
+                        Some(crate::types::StateStrategy::AppendLog {
+                            delta_snapshot_every: 50,
+                            full_snapshot_every: 20,
+                        })
+                    )
+                },
+            ),
+            (
+                "create_branch",
+                |store| store.create_branch("made", None).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "create_empty_branch",
+                |store| store.create_empty_branch("made", None).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "create_branch_at",
+                |store| store.create_branch_at("made", "main", Sequence(0)).map(drop),
+                |store| store.get_branch("made").is_some(),
+            ),
+            (
+                "switch_branch",
+                |store| store.switch_branch("side").map(drop),
+                |store| store.current_branch().name == "side",
+            ),
+            (
+                "delete_branch",
+                |store| store.delete_branch("side"),
+                |store| store.get_branch("side").is_none(),
+            ),
+        ]
+    }
+
+    fn metadata_store(dir: &TempDir) -> (Store, StoreConfig) {
+        let config = test_config(dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.create_branch("side", None).unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
         store.sync().unwrap();
+        (store, config)
+    }
+
+    fn checkpoint_files(config: &StoreConfig) -> [Vec<u8>; 2] {
+        ["state.bin", "branches.bin"].map(|file| std::fs::read(config.path.join(file)).unwrap())
+    }
+
+    #[test]
+    fn a_metadata_call_while_a_failure_stands_retries_first_and_changes_nothing() {
+        use crate::state::FieldIndexKind;
+        let field_index: MetadataCall = (
+            "register_state_field_index",
+            |store| store.register_state_field_index("items", "/v", FieldIndexKind::Number),
+            |store| {
+                store
+                    .query_state_index_range("items", "/v", None, None, None, None, false)
+                    .is_some()
+            },
+        );
+        for (name, call, changed) in metadata_calls().into_iter().chain([field_index]) {
+            let dir = TempDir::new().unwrap();
+            let (store, config) = metadata_store(&dir);
+            let published = checkpoint_files(&config);
+            *store.log.fsync_failures.lock() = 2;
+            assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(!changed(&store), "{name} changed nothing");
+            assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
+            call(&store).unwrap();
+            assert!(changed(&store), "{name} went on after a good retry");
+        }
+    }
+
+    #[test]
+    fn a_metadata_call_whose_checkpoint_fsync_fails_leaves_the_store_as_it_was() {
+        for (name, call, changed) in metadata_calls() {
+            let dir = TempDir::new().unwrap();
+            let (store, config) = metadata_store(&dir);
+            let published = checkpoint_files(&config);
+            *store.log.fsync_failures.lock() = 1;
+            assert!(matches!(call(&store), Err(StoreError::DurabilityLost(_))), "{name}");
+            assert!(!changed(&store), "{name} undid its change");
+            assert_eq!(checkpoint_files(&config), published, "{name} published nothing");
+            store.sync().unwrap();
+            drop(store);
+            let store = reopen(config.clone());
+            assert!(!changed(&store), "{name}: the good sync published none of it");
+            call(&store).unwrap();
+            assert!(changed(&store), "{name} ran again once the fsync succeeded");
+            drop(store);
+            assert!(changed(&reopen(config)), "{name}: its second run was published");
+        }
+    }
+
+    #[test]
+    fn a_write_after_a_failed_log_fsync_retries_it_first() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        let event = |payload: &[u8]| store.append(RecordInput::raw("event", payload.to_vec()));
+        store.sync().unwrap();
+        let synced = store.log.size();
+        event(b"one").unwrap();
+        *store.log.fsync_failures.lock() = 1;
+        assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))));
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(config.path.join("records.log"))
+                .unwrap();
+            file.seek(SeekFrom::Start(synced)).unwrap();
+            file.write_all(&vec![0u8; (store.log.size() - synced) as usize]).unwrap();
+        }
+        event(b"two").unwrap();
+
+        *store.log.fsync_failures.lock() = 2;
+        assert!(matches!(store.sync(), Err(StoreError::DurabilityLost(_))));
+        let records = store.stats().unwrap().record_count;
+        assert!(matches!(event(b"refused"), Err(StoreError::DurabilityLost(_))));
+        assert_eq!(store.stats().unwrap().record_count, records);
+        event(b"three").unwrap();
+        store.sync().unwrap();
+        drop(store);
+
+        let store = reopen(config);
+        let payloads: Vec<Vec<u8>> = store
+            .get_records_by_type("event")
+            .into_iter()
+            .map(|id| store.get_record(id).unwrap().unwrap().payload)
+            .collect();
+        assert_eq!(payloads, [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    }
+
+    #[test]
+    fn a_refused_batch_leaves_the_manifest_as_it_was() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let store = Store::create(config.clone()).unwrap();
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: crate::types::StateStrategy::AppendLog {
+                    delta_snapshot_every: 1000,
+                    full_snapshot_every: 1000,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+        let manifest = std::fs::read(config.path.join("MANIFEST")).unwrap();
+        *store.log.fsync_failures.lock() = 2;
+        assert!(store.sync().is_err());
+
+        let batch = || store.update_state("items", StateOperation::AppendMany(vec![b"1".to_vec()]));
+        assert!(matches!(batch(), Err(StoreError::DurabilityLost(_))));
+        assert_eq!(std::fs::read(config.path.join("MANIFEST")).unwrap(), manifest);
+
+        batch().unwrap();
+        assert_ne!(std::fs::read(config.path.join("MANIFEST")).unwrap(), manifest);
     }
 
     // What a checkpoint published past records the disk lost would meet: a
@@ -5903,11 +6745,148 @@ mod tests {
                 store.append(RecordInput::raw("message", payload)).map(drop)
             };
             if n == 150 {
-                assert!(store.sync().is_err(), "sync reports the failed fsync");
-                assert!(store.sync().is_err(), "and goes on reporting it");
+                if failures == "one" {
+                    store.sync().expect("the sync's retry succeeds");
+                } else {
+                    assert!(store.sync().is_err(), "sync reports the failed fsync");
+                    assert!(store.sync().is_err(), "and goes on reporting it");
+                }
             }
         }
         // Exit without destructors, as a crash would.
         std::process::exit(73);
+    }
+
+    fn obstruct(path: &std::path::Path) -> Option<Vec<u8>> {
+        let previous = std::fs::read(path).ok();
+        if previous.is_some() {
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::create_dir(path).unwrap();
+        previous
+    }
+
+    fn repair(path: &std::path::Path, previous: Option<Vec<u8>>) {
+        std::fs::remove_dir(path).unwrap();
+        if let Some(bytes) = previous {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    fn branch_names(store: &Store) -> Vec<String> {
+        let mut names: Vec<String> = store.list_branches().into_iter().map(|b| b.name).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn no_call_sees_a_switch_target_before_its_save_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.create_branch("target", None).unwrap();
+        let branches = store.path().join("branches.bin");
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let watch = |store: &Store| {
+            let seen = std::sync::Arc::clone(&seen);
+            store.test_hooks.lock().insert(
+                "checkpoint: branch list",
+                Box::new(move |store: &Store| seen.lock().push(store.current_branch().name)),
+            );
+        };
+
+        watch(&store);
+        let previous = obstruct(&branches);
+        assert!(matches!(store.switch_branch("target"), Err(StoreError::Io(_))));
+        repair(&branches, previous);
+        assert_eq!(store.current_branch().name, "main");
+        let record = store.append(RecordInput::raw("event", b"after".to_vec())).unwrap();
+        assert_eq!(store.get_branch("main").unwrap().id, record.branch);
+
+        watch(&store);
+        store.switch_branch("target").unwrap();
+        assert_eq!(store.current_branch().name, "target");
+        assert_eq!(*seen.lock(), ["main", "main"]);
+    }
+
+    #[test]
+    fn a_create_whose_log_fsync_fails_leaves_no_branch() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        store.append(RecordInput::raw("event", b"one".to_vec())).unwrap();
+        *store.log.fsync_failures.lock() = 1;
+        assert!(matches!(
+            store.create_branch("child", None),
+            Err(StoreError::DurabilityLost(_))
+        ));
+        assert_eq!(branch_names(&store), ["main"]);
+    }
+
+    #[test]
+    fn an_undone_creation_drops_its_heads_at_once_unless_its_branch_list_save_began() {
+        for (file, kept) in [("state.bin", false), ("branches.bin", true)] {
+            let dir = TempDir::new().unwrap();
+            let store = Store::create(test_config(&dir)).unwrap();
+            store
+                .register_state(StateRegistration {
+                    id: "items".into(),
+                    strategy: crate::types::StateStrategy::AppendLog {
+                        delta_snapshot_every: 1000,
+                        full_snapshot_every: 1000,
+                    },
+                    initial_value: None,
+                })
+                .unwrap();
+            store
+                .update_state("items", StateOperation::Append(b"1".to_vec()))
+                .unwrap();
+            store.sync().unwrap();
+            let heads = store.state.head_count();
+            let path = store.path().join(file);
+            let previous = obstruct(&path);
+            assert!(
+                matches!(store.create_branch("child", None), Err(StoreError::Io(_))),
+                "{file}"
+            );
+            assert_eq!(store.state.head_count() > heads, kept, "{file}");
+            repair(&path, previous);
+            store.sync().unwrap();
+            assert_eq!(store.state.head_count(), heads, "{file}");
+        }
+    }
+
+    #[test]
+    fn a_strategy_change_whose_checkpoint_fails_leaves_the_old_strategy_in_force() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+        let old = crate::types::StateStrategy::AppendLog {
+            delta_snapshot_every: 100,
+            full_snapshot_every: 100,
+        };
+        let changed = crate::types::StateStrategy::AppendLog {
+            delta_snapshot_every: 7,
+            full_snapshot_every: 9,
+        };
+        store
+            .register_state(StateRegistration {
+                id: "items".into(),
+                strategy: old.clone(),
+                initial_value: None,
+            })
+            .unwrap();
+        let strategy = || format!("{:?}", store.state.get_strategy("items").unwrap());
+        for file in ["state.bin", "branches.bin"] {
+            let path = store.path().join(file);
+            let previous = obstruct(&path);
+            assert!(
+                matches!(store.update_state_strategy("items", changed.clone()), Err(StoreError::Io(_))),
+                "{file}"
+            );
+            assert_eq!(strategy(), format!("{old:?}"), "{file}");
+            repair(&path, previous);
+            store.sync().unwrap();
+            assert_eq!(strategy(), format!("{old:?}"), "{file}");
+        }
+        store.update_state_strategy("items", changed.clone()).unwrap();
+        assert_eq!(strategy(), format!("{changed:?}"));
     }
 }
