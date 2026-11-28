@@ -12,6 +12,123 @@ Releases up to and including 0.2.7 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.8.0 — 2026-11-28
+
+### Breaking
+
+- **Callers that handle a failed metadata call:** a call whose checkpoint fails now throws and undoes its change. The open store's branch list, selection, registrations and strategies are as they were before the call. A failed branch creation's ID stays used: the open store doesn't give it out again. The metadata calls are `registerState()`, `updateStateStrategy()`, the branch creations, `switchBranch()` and `deleteBranch()`. Before, the change stayed in memory, and the next good checkpoint published it and told subscribers. Now a subscriber hears of a branch's creation or deletion only when its call succeeds.
+  - **Migration:** after such a throw, make the same call again on the same open handle once the cause is mended. There, a retry no longer gets `BranchExists`, `StateExists` or `BranchNotFound` because of the call that failed. Before, a caller could call `sync()` after the throw to publish the change. Now it makes the call again. After a reopen, read what the store holds before you retry, since the disk can hold part of the failed change. A caller that reads the store after a throw also needs no change.
+  - **Unchanged:** this change leaves the on-disk format as it was. A later write of a record or a state, a field-index registration and a metadata call still save the owed checkpoint first. A blob write does not save it. Until that save, the disk can still hold part of the failed change. If the process stops before that save, the next open can show that part.
+- **Rust callers of `StateManager`:** `retire_branch` no longer releases a branch's caches and counts at once. It sets the branch's field indexes aside, and `purge_retired_branches` releases them with the rest. A caller that retires a branch calls `purge_retired_branches` once the branch list without it is saved.
+
+- **Callers that write after a failed log fsync:** a write to the store now first writes the records since the last good fsync again, from memory, and fsyncs. When that retry succeeds, the write goes on, and the caller doesn't see the failure. This covers each append, state write, field-index registration and metadata call through `Store` and the Node API, but not a blob write. Such a write throws `DurabilityLost` while the retry still fails, and then it records nothing. A metadata call can also throw it when its own checkpoint fails at the fsync of the log, and then it undoes its change. Before, appends and state writes went on with no retry, and `sync()` and each metadata call's checkpoint threw `DurabilityLost` until the store was reopened.
+- **Rust callers of `RecordLog`:** its `append` now refuses with `DurabilityLost` while a failed fsync stands. It made no such check before. Call its `sync()`, which makes the retry, and append again once that succeeds.
+  - **What ends it:** the failure ends when a retry's fsync succeeds. Reopening the store also ends the failure. Each of these calls makes the retry, and it can now succeed where it threw before:
+    - each write named above;
+    - `sync()`, and `close()` of the store (a view's `close()` syncs nothing);
+    - a dropped Rust `Store`.
+  - **Migration:** when a write throws `DurabilityLost`, make it again later on the same open handle. An append or a state write recorded nothing, and a metadata call undid its change, as the entry on failed metadata calls says. Each later write and `sync()` tries the retry again. While the disk keeps failing, each retry writes up to 64 MiB and one record again and waits for the disk, and reads of the log wait for it too. After `close()` throws `DurabilityLost`, reopen the store to see what it holds. A caller that reopens the store on `DurabilityLost` needs no change.
+  - **Unchanged:** this change leaves the on-disk format as it was. An append still returns its record when its own periodic fsync fails, and the error is still `DurabilityLost`.
+- **Callers that open a store:** an open now fsyncs the record log before it returns. It does so after it scans the log and cuts any torn tail. It throws `DurabilityLost` when that fsync fails. In that case, records written before the open may not be on the disk, and the error also names the bytes of any torn tail that the open cut. A later open reports neither the failure nor the cut again.
+
+### Added
+
+- The napi type declarations now say that `JsBranch.created` and
+  `JsRecord.timestamp` are microseconds since the Unix epoch. They say the
+  same of `record.timestamp` and `branch.created` in a subscription event's
+  `data`. The values don't change. For a JavaScript `Date`, divide by 1,000
+  first, as in `new Date(branch.created / 1000)`.
+
+### Changed
+
+- The record log is still flushed to disk every 100 records. It is now also flushed once the unflushed records pass 64 MiB. The log keeps those records in memory for a retry of a failed flush, and the new limit bounds that memory to 64 MiB and the record that passes it.
+- A read of a record written since the last good flush now uses the log's copy in memory. After a failed write-back, the file can give the disk's older bytes, even before a flush reports the failure. Those bytes can read as an error, or as a record of zeros.
+
+### Fixed
+
+- `Store::open` and `Store::open_or_create` refuse with `Corruption` a used store that has lost its `records.log`. In the Node API these are `open` and `openOrCreate`. A used store is one that holds `state.bin` or `branches.bin`. The error names the missing file, and the open creates no `records.log`. The error says what to restore, and how to start the store over when no copy of the log exists. They used to create an empty `records.log`. If a state head pointed into that empty log, the open refused and blamed a torn tail or a corrupt `state.bin`. If no state head did, the store opened with no records. A directory with a `MANIFEST` and none of the other three files still opens and gets its log.
+- Such an earlier open left an empty `records.log` behind. Where `state.bin` holds a state head, the open still refuses that empty log with `Corruption`, but its words now call the log empty and name the two kinds of open that leave one, instead of a torn tail.
+- In any store, the open refuses with `Corruption` when `records.log`, `state.bin` or `branches.bin` is a symbolic link whose target it can't reach, such as a link to nothing. The error names the link, and the open creates nothing where it leads. Such a link at `state.bin` or `branches.bin` used to read as an absent file, and the store opened without the state registrations or the branches that the file held. This change refuses no other store.
+
+- For an `append_log`, `getStateLen` now gives the number of items in the
+  list, as a read returns them. It gave the count that the store keeps, and
+  that count can be wrong. Releases 0.1.0 to 0.4.x left wrong counts in some
+  stores. A `DeltaSnapshot` written from Rust, or a damaged branch, can leave
+  one too. For example, the count was 0 for the list `[0, 1, 2]`. The store
+  now checks each list's count once. The first `getStateLen` or batch on a
+  branch reads an unchecked list whole, in the calling thread. The read throws
+  on an I/O error (`Io`), a record that fails its checksum
+  (`ChecksumMismatch`) or a record whose framing is bad (`InvalidFormat`). A
+  list whose value can't be rebuilt as a JSON array, such as one that holds an
+  item that isn't JSON, has no items to count, so `getStateLen` gives the
+  count that the store keeps. `getStateItemJson` on an unchecked list counts
+  it first in the same way. Before, at the stale count's last index, it
+  could return the list's last item. `editStateItem` also counts an unchecked list
+  first, and refuses an index at or past its items, where its value reads as
+  a JSON array. Before, it took its bound
+  from the stored count, so it could refuse an item that the list holds, or
+  write an edit past the end that made every full read of the list fail.
+  `listStates()` still gives the count that the store keeps. For a state of
+  another strategy, `getStateLen` still gives that count too.
+- The store saves its checks in `state.bin`, after the index, at each `sync()`
+  and the store's `close()`. A list that the store counted before a sync isn't read for
+  its count again after an open. A later write, such as a `DeltaSnapshot`
+  written from Rust, can leave the head unchecked, and the list is then read
+  again. After an open, a saved check also lets `getStateItemsJson` read a
+  list's last item from its record alone, when the list's last write is an
+  append. So does `getStateItemJson` after a
+  batch. Before, they did so only once a session had checked the count. That
+  read meets no earlier item, so an earlier item that isn't JSON no longer
+  makes it throw. Earlier releases read only the index in `state.bin`, so the
+  saved checks don't keep an earlier release from opening a store that it
+  could otherwise read. This release opens a store that
+  has no checks, and counts each of its lists at first use. So after the
+  update, the first of `getStateLen`, `getStateItemJson`, `editStateItem` or a
+  batch on each list blocks the calling thread for that read.
+- `tools/compact-set-states.py` reads a `state.bin` that holds the checks, and
+  writes the new one without them. An earlier copy of the tool refuses such a
+  `state.bin` and changes nothing. It says that `state.bin` "is not the length
+  its index says".
+
+- On Unix, `sync()` and the store's `close()` now sync the directories that hold the
+  store's directory, up to the root of its filesystem or to the first one
+  that this process may not look at. They do it on the first call on each
+  open handle. Before, a power loss after `sync()` could lose a new store.
+  New parent directories could be lost the same way.
+- That first call also syncs the store's directory, `blobs/` and each
+  shard directory. Before, a power loss could lose a blob whose shard was
+  never synced.
+- On a store with all 256 shards, the first-time pass makes up to 258
+  more directory syncs, plus one for each directory that holds the store. On macOS these use `fsync`, and the pass then asks each drive to
+  write back its cache once (`F_FULLFSYNC`), not once for each directory.
+  Its cost on a Mac's own disk isn't measured.
+- `sync()` and `close()` also retry a shard sync that failed in a blob
+  store. Before, `sync()` skipped such a directory.
+- When a directory sync fails, `sync()` and `close()` throw an error with
+  the `code` `Io`. The next `sync()` tries it again. After `close()`
+  throws, the reopened store's first `sync()` also tries again. A failed
+  directory sync doesn't hold back appends, state writes or blob stores. On ext4, a retry just
+  after a failed journal commit can succeed although the name never
+  reached the disk, so a successful retry doesn't prove that it did.
+- Until the first `sync()` or `close()`, a power loss can take a new
+  store's directory and the parents that `create` made, even after a
+  registration or a branch change has saved its checkpoint.
+- As with a checkpoint save, `sync()` skips a directory that this process
+  may not open. On a system that doesn't sync directories, it skips them
+  all. It doesn't sync the name of a symbolic link on the store's path,
+  and the first-time pass doesn't follow a link in `blobs/`. This change
+  leaves the on-disk format as it was.
+- The errors of a failed blob directory sync now end with the system's
+  error, as `IO error: … (os error N)`, so a caller can read the error
+  number. The first one also names the directory whose sync failed. These
+  are the new messages:
+  - `cannot sync …, so … wasn't written, and storing the blob again or the
+    next sync tries again: …`
+  - `the blob … is stored, but its directory isn't synced yet, and storing it
+    again or the next sync tries again: …`
+  - `the new blob … is in place, but its directory isn't synced yet, and
+    storing it again or the next sync tries again: …`
+
 ## 0.7.1 — 2026-11-20
 
 This release adds one recovery tool and its check to `tools/`, and fixes
